@@ -1,0 +1,22 @@
+paths:
+  policy_config: train_sand_official.yaml
+  policy_checkpoint: ../outputs/train_v2a_sand_official/checkpoint.pt
+  dataset_root: ../outputs/hssd_curvenav_v2_pilot_200
+  sidecar_root: ../outputs/hssd_curvenav_v2_pilot_200_policy_hardneg_v1
+  output_dir: ../outputs/train_critic_hssd_v2
+
+training:
+  seed: 42
+  batch_size: 128
+  epochs: 40
+  num_workers: 8
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  warmup_epochs: 2
+  minimum_learning_rate_factor: 0.05
+  grad_clip_norm: 1.0
+  auxiliary_weight: 0.25
+  overfit_steps: 800
+  overfit_batch_size: 8
+  overfit_max_loss_ratio: 0.1
+  log_every_steps: 20

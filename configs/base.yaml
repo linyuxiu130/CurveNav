@@ -1,0 +1,69 @@
+data:
+  training_sources:
+    - root: ../datasets/sandplanner
+      split: train
+      weight: 1.0
+  validation_sources:
+    - root: ../datasets/sandplanner
+      split: val
+      weight: 1.0
+  sequence_length: 4
+  frame_skip: 2
+  min_gap: 5
+  max_gap: 42
+  image_height: 168
+  image_width: 224
+  depth_units_per_m: 1000.0
+  max_depth_m: 8.0
+
+model:
+  trajectory:
+    num_control_points: 12
+    degree: 3
+    num_path_points: 64
+    scale_xy: [5.6, 2.5]
+  depth_encoder:
+    model_dim: 256
+    frame_tokens_per_side: 4
+    dropout: 0.0
+  goal_encoder:
+    model_dim: 256
+    hidden_dim: 256
+  motion_encoder:
+    model_dim: 256
+    hidden_dim: 256
+  condition_encoder:
+    model_dim: 256
+    transformer_layers: 4
+    transformer_heads: 4
+    dropout: 0.0
+  field:
+    model_dim: 256
+    transformer_layers: 4
+    transformer_heads: 4
+    dropout: 0.0
+  rectified_flow:
+    inference_steps: 8
+    source_std_xy: [0.04, 0.12]
+
+training:
+  device: cuda
+  seed: 42
+  batch_size: 256
+  samples_per_epoch: 38400
+  epochs: 200
+  num_workers: 8
+  prefetch_factor: 2
+  warmup_epochs: 5
+  min_learning_rate_factor: 0.01
+  overfit_steps: 1000
+  overfit_batch_size: 8
+  overfit_max_loss_ratio: 0.1
+  log_every_steps: 20
+  checkpoint_every_epochs: 20
+  output_dir: outputs/train_v3_sand_goal_aligned
+  checkpoint_path: outputs/train_v3_sand_goal_aligned/overfit.pt
+  learning_rate: 0.0004
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  ema_decay: 0.9999

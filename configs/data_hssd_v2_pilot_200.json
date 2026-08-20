@@ -1,0 +1,59 @@
+{
+  "asset_root": "/mnt/data/huangshibo/H/navigation_three_projects/curvenav/data/scene_assets/hssd-hab",
+  "descriptor_seed": 20260819,
+  "output_root": "/mnt/data/huangshibo/H/navigation_three_projects/curvenav/outputs/hssd_curvenav_v2_pilot_200",
+  "runs_per_scene": 20,
+  "selected_scenes": [
+    {
+      "scene_id": "102344193",
+      "source_split": "train",
+      "split": "train"
+    },
+    {
+      "scene_id": "102817053",
+      "source_split": "train",
+      "split": "train"
+    },
+    {
+      "scene_id": "104348037_171512898",
+      "source_split": "train",
+      "split": "train"
+    },
+    {
+      "scene_id": "104862681_172226874",
+      "source_split": "train",
+      "split": "train"
+    },
+    {
+      "scene_id": "106366173_174226431",
+      "source_split": "train",
+      "split": "train"
+    },
+    {
+      "scene_id": "106878945_174887058",
+      "source_split": "train",
+      "split": "train"
+    },
+    {
+      "scene_id": "107733912_175999623",
+      "source_split": "train",
+      "split": "train"
+    },
+    {
+      "scene_id": "108294465_176709960",
+      "source_split": "train",
+      "split": "train"
+    },
+    {
+      "scene_id": "102816036",
+      "source_split": "validation",
+      "split": "validation"
+    },
+    {
+      "scene_id": "105515211_173104185",
+      "source_split": "validation",
+      "split": "validation"
+    }
+  ],
+  "source_root": "/mnt/data/huangshibo/H/navigation_three_projects/curvenav/outputs/hssd_1000_v1"
+}

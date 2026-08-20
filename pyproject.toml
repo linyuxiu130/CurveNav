@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "curvenav-navigation"
+version = "1.0.0"
+description = "CurveNav: PointGoal-aligned B-spline Rectified Flow for planar local navigation"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.2",
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "Pillow>=9.5",
+  "opencv-python>=4.8",
+  "PyYAML>=6.0",
+  "accelerate>=1.14",
+]
+
+[project.scripts]
+curvenav-overfit = "curvenav.training.overfit:main"
+curvenav-train = "curvenav.training.train:main"
+curvenav-critic-overfit = "curvenav.critic.overfit:main"
+curvenav-critic-train = "curvenav.critic.train:main"
+curvenav-evaluate = "curvenav.evaluation.sand:main"
+curvenav-build-expert-manifest = "curvenav.data_generation.cli:main"
+curvenav-download-xnavdp-metadata = "curvenav.data_generation.download_metadata:main"
+curvenav-audit-expert-manifest = "curvenav.data_generation.audit_manifest:main"
+curvenav-generate-hssd-pilot = "curvenav.data_generation.hssd_pilot:main"
+curvenav-audit-hssd-runs = "curvenav.data_generation.audit_hssd_runs:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
