@@ -208,7 +208,7 @@ SanD 轨迹文件给出的相机高度恒为 `0.40 m`、pitch 恒为 0；缓存�
 
 ```text
 HSSD generation + SanD source -> calibrated prepared dataset
-                              -> fixed-batch overfit -> DDP mixed-precision training -> EMA
+                              -> fixed-batch overfit diagnostic -> DDP mixed-precision training -> EMA
                  -> offline geometry metrics -> official closed-loop benchmark
 ```
 

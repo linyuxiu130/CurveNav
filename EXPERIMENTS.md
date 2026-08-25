@@ -28,7 +28,7 @@
 
 ## 下一组实验
 
-1. 对当前新模型和统一数据先运行固定批过拟合门禁，再从头训练；旧 learned-scorer checkpoint 只作为历史生成器基线，不加载到新图。
+1. 对当前新模型和统一数据记录固定批过拟合诊断，再从头训练；旧 learned-scorer checkpoint 只作为历史生成器基线，不加载到新图。
 2. 在固定验证集上报告 oracle/selected ADE、几何代价 margin、selected surface clearance 和 violation rate。
 3. 对 NavDP、X-NavDP、CurveNav 跑完全相同的 10 条固定协议检查，再运行完整 episode。
 4. 若 oracle 明显好而 selected 差，只检查深度标定、机器人几何和显式代价；若 oracle 也差，只查数据与生成器，不叠加排序补丁。

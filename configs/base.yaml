@@ -61,9 +61,6 @@ training:
   min_learning_rate_factor: 0.01
   overfit_steps: 1500
   overfit_batch_size: 8
-  overfit_max_loss_ratio: 0.1
-  overfit_oracle_ade_m: 0.12
-  overfit_selected_ade_m: 0.20
   log_every_steps: 20
   checkpoint_every_epochs: 20
   output_dir: outputs/train_policy

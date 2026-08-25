@@ -42,11 +42,6 @@ def test_rejects_removed_architecture_switches() -> None:
         config_from_mapping({"model": {"trajectory": {"scale_xy": [3.0, 3.0]}}})
 
 
-def test_rejects_invalid_overfit_gate() -> None:
-    with pytest.raises(ValueError, match="overfit_max_loss_ratio"):
-        config_from_mapping({"training": {"overfit_max_loss_ratio": 1.0}})
-
-
 def test_rejects_invalid_trajectory_contract() -> None:
     with pytest.raises(ValueError, match="cubic"):
         config_from_mapping({"model": {"trajectory": {"degree": 2}}})

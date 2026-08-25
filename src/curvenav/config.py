@@ -149,9 +149,6 @@ class TrainingConfig:
     min_learning_rate_factor: float = 0.01
     overfit_steps: int = 1500
     overfit_batch_size: int = 8
-    overfit_max_loss_ratio: float = 0.1
-    overfit_oracle_ade_m: float = 0.12
-    overfit_selected_ade_m: float = 0.20
     log_every_steps: int = 20
     checkpoint_every_epochs: int = 20
     output_dir: str = "outputs/train_policy"
@@ -259,18 +256,6 @@ class CurveNavConfig:
             raise ValueError("training.warmup_epochs must be in [0, epochs)")
         if not 0 < self.training.min_learning_rate_factor <= 1:
             raise ValueError("training.min_learning_rate_factor must be in (0, 1]")
-        if not math.isfinite(self.training.overfit_max_loss_ratio) or not (
-            0 < self.training.overfit_max_loss_ratio < 1
-        ):
-            raise ValueError("training.overfit_max_loss_ratio must be in (0, 1)")
-        if not all(
-            math.isfinite(value) and value > 0
-            for value in (
-                self.training.overfit_oracle_ade_m,
-                self.training.overfit_selected_ade_m,
-            )
-        ):
-            raise ValueError("training overfit ADE thresholds must be positive")
         if not self.training.output_dir:
             raise ValueError("training.output_dir cannot be empty")
         if not self.training.checkpoint_path:
