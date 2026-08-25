@@ -18,10 +18,8 @@ def main() -> None:
     data = load_config(args.config).data
     manifest = prepare_depth_cache(
         args.dataset,
-        height=data.image_height,
-        width=data.image_width,
+        data=data,
         depth_units_per_m=1000.0,
-        max_depth_m=data.max_depth_m,
         workers=args.workers,
     )
     print(

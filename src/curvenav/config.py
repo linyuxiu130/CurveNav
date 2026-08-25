@@ -17,7 +17,7 @@ class DataConfig:
     canonical_focal_x_px: float = 166.80851063829786
     canonical_focal_y_px: float = 166.80851063829786
     camera_forward_offset_m: float = 0.0
-    camera_height_m: float = 0.30
+    camera_height_m: float = 0.40
     camera_downward_pitch_degrees: float = 0.0
 
     def validate(self) -> None:
@@ -38,7 +38,7 @@ class DataConfig:
             166.80851063829786,
             166.80851063829786,
             0.0,
-            0.30,
+            0.40,
             0.0,
         ):
             raise ValueError("CurveNav uses the fixed generated-depth camera calibration")

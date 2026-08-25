@@ -9,7 +9,8 @@ import pytest
 
 from curvenav.data_generation import assets
 from curvenav.data_generation.assets import selected_asset_paths
-from curvenav.data_generation.generate import route_bands, validate_config
+from curvenav.data_generation.generate import camera_contract, route_bands, validate_config
+from curvenav.config_io import load_config
 from curvenav.data_generation.geometry import (
     Grid,
     path_length,
@@ -49,6 +50,27 @@ def test_clearance_aware_planner_is_safe_and_deterministic() -> None:
 
 def test_source_family_is_stable() -> None:
     assert source_family("106366323_174226647") == "106366"
+
+
+def test_hssd_generator_uses_the_model_camera_contract() -> None:
+    project = Path(__file__).resolve().parents[1]
+    generation = json.loads(
+        (project / "configs/hssd_dataset.json").read_text(encoding="utf-8")
+    )
+    data = load_config(project / "configs/base.yaml").data
+    camera = camera_contract(generation["camera"])
+
+    assert camera["image"]["K"] == [
+        [data.canonical_focal_x_px, 0.0, data.image_width / 2],
+        [0.0, data.canonical_focal_y_px, data.image_height / 2],
+        [0.0, 0.0, 1.0],
+    ]
+    assert camera["body_from_camera_optical"] == [
+        [0.0, 0.0, 1.0, data.camera_forward_offset_m],
+        [-1.0, 0.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0, data.camera_height_m],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
 
 
 def test_config_rejects_family_leakage(base_config: dict) -> None:
@@ -152,4 +174,13 @@ def base_config() -> dict:
         "route_sample_spacing_m": 0.15,
         "workers": 4,
         "gpu_device": 0,
+        "camera": {
+            "image_width": 224,
+            "image_height": 126,
+            "focal_x_px": 166.80851063829786,
+            "focal_y_px": 166.80851063829786,
+            "forward_offset_m": 0.0,
+            "height_m": 0.40,
+            "downward_pitch_degrees": 0.0,
+        },
     }

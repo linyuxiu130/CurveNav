@@ -18,6 +18,7 @@ import torch
 
 from curvenav.config import CurveNavConfig, DataConfig
 from curvenav.config_io import load_config
+from curvenav.data.depth import depth_camera_contract
 from curvenav.data.prepared import (
     policy_dataset_contract,
 )
@@ -168,11 +169,10 @@ def _sand_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
     data = config.data
     cache = root / f"curvenav_depth_{data.image_height}x{data.image_width}_float16"
     manifest = json.loads((cache / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("dtype") != "float16" or (
-        manifest.get("height"),
-        manifest.get("width"),
-        manifest.get("max_depth_m"),
-    ) != (data.image_height, data.image_width, data.max_depth_m):
+    if (
+        manifest.get("dtype") != "float16"
+        or manifest.get("target_camera") != depth_camera_contract(data)
+    ):
         raise ValueError("SanD depth cache does not match the CurveNav data contract")
     output: dict[str, list[_Example]] = {"train": [], "validation": []}
     for run_dir in sorted(root.glob("dataset_*/run_*")):
@@ -186,6 +186,13 @@ def _sand_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
         pitch = np.load(run_dir / "traj_pitch.npy").astype(np.float32)
         if not (len(xyz) == len(yaw) == len(pitch) == int(manifest["runs"][run_key])):
             raise ValueError(f"SanD route/depth length mismatch: {run_key}")
+        expected_pitch = math.radians(data.camera_downward_pitch_degrees)
+        if (
+            data.camera_forward_offset_m != 0.0
+            or not np.allclose(xyz[:, 2], data.camera_height_m, atol=1e-5)
+            or not np.allclose(pitch, expected_pitch, atol=1e-5)
+        ):
+            raise ValueError(f"SanD camera calibration does not match CurveNav: {run_key}")
         depth = _DepthRun(
             source=cache / run_dir.parent.name / f"{run_dir.name}.npy",
             frames=len(xyz),
@@ -273,11 +280,10 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
         raise ValueError("HSSD camera calibration does not match CurveNav")
     cache = root / f"curvenav_hssd_depth_{data.image_height}x{data.image_width}_float16"
     manifest = json.loads((cache / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("dtype") != "float16" or (
-        manifest.get("height"),
-        manifest.get("width"),
-        manifest.get("max_depth_m"),
-    ) != (data.image_height, data.image_width, data.max_depth_m):
+    if (
+        manifest.get("dtype") != "float16"
+        or manifest.get("target_camera") != depth_camera_contract(data)
+    ):
         raise ValueError("HSSD depth cache does not match the CurveNav data contract")
     records = [
         json.loads(line)

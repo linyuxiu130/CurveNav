@@ -8,6 +8,15 @@
   "candidate_limit": 64,
   "routes_per_scene": 25,
   "route_sample_spacing_m": 0.15,
+  "camera": {
+    "image_width": 224,
+    "image_height": 126,
+    "focal_x_px": 166.80851063829786,
+    "focal_y_px": 166.80851063829786,
+    "forward_offset_m": 0.0,
+    "height_m": 0.40,
+    "downward_pitch_degrees": 0.0
+  },
   "endpoint_distance_bands_m": {
     "near": [3.0, 7.0],
     "middle": [7.0, 11.0],

@@ -6,7 +6,7 @@
 
 - 深度：`224×126`，光轴距离，最大值 `5 m`
 - 内参：`fx=fy=166.80851, cx=112, cy=63`
-- 外参：无前移、高度 `0.30 m`、水平安装
+- 外参：无前移、高度 `0.40 m`、水平安装
 - 显式评价器：只使用当前帧，按上述参数反投影可见障碍表面
 
 ## 官方 wheeled PointGoal 口径
@@ -36,7 +36,7 @@
 
 每次结果至少保存逐 episode 的 `success`、`spl`、`distance` 和 `episode_idx`。先跑 10 条固定 episode 验证协议，再跑官方完整 episode；不得把旧 NavDP benchmark、修改后的成功阈值或不同 MPC 的结果混在同一表格。
 
-当前 `0.30 m` 相机结果不能与官方 Dingo D455 结果直接横向比较。正式对比前必须让 CurveNav、NavDP 和 X-NavDP 共同使用同一相机重新评测；仅对深度图做二维缩放不等价于修改相机外参。
+当前 `0.40 m` 相机结果不能与官方 Dingo D455 结果直接横向比较。正式对比前必须让 CurveNav、NavDP 和 X-NavDP 共同使用同一相机重新评测；仅对深度图做二维缩放不等价于修改相机外参。
 
 CurveNav 每个规划周期生成十六条候选，并且只按当前深度构成的显式 `clearance + length + goal` 几何代价选择。闭环主结果不得混入 learned scorer、oracle ADE 选轨、标签轨迹或额外启发式碰撞 mask；离线同时报告 oracle ADE 是为了诊断生成覆盖，不参与实际选择。
 

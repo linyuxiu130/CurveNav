@@ -38,10 +38,6 @@ from curvenav.data_generation.geometry import (
 GRID_CELL_M = 0.05
 ROBOT_RADIUS_M = 0.25
 ROBOT_HEIGHT_M = 0.70
-DEPTH_HEIGHT = 126
-DEPTH_WIDTH = 224
-DEPTH_FOCAL_PX = 1.4 / 1.88 * DEPTH_WIDTH
-CAMERA_HEIGHT_M = 0.30
 SCHEMA = "curvenav_hssd_expert_routes"
 
 
@@ -69,8 +65,16 @@ def stable_seed(seed: int, *parts: object) -> int:
     return int.from_bytes(hashlib.sha256(value).digest()[:8], "little")
 
 
-def camera_contract() -> dict[str, Any]:
-    horizontal_fov = math.degrees(2 * math.atan(DEPTH_WIDTH / (2 * DEPTH_FOCAL_PX)))
+def camera_contract(camera: dict[str, float | int]) -> dict[str, Any]:
+    width = int(camera["image_width"])
+    height = int(camera["image_height"])
+    focal_x = float(camera["focal_x_px"])
+    focal_y = float(camera["focal_y_px"])
+    forward_offset = float(camera["forward_offset_m"])
+    camera_height = float(camera["height_m"])
+    pitch = math.radians(float(camera["downward_pitch_degrees"]))
+    sine, cosine = math.sin(pitch), math.cos(pitch)
+    horizontal_fov = math.degrees(2 * math.atan(width / (2 * focal_x)))
     return {
         "sensor": "Habitat-Sim pinhole depth camera",
         "measurement_type": "distance_to_image_plane",
@@ -82,25 +86,30 @@ def camera_contract() -> dict[str, Any]:
             "far_m": 100.0,
         },
         "image": {
-            "width": DEPTH_WIDTH,
-            "height": DEPTH_HEIGHT,
+            "width": width,
+            "height": height,
             "horizontal_fov_degrees": horizontal_fov,
             "K": [
-                [DEPTH_FOCAL_PX, 0.0, DEPTH_WIDTH / 2],
-                [0.0, DEPTH_FOCAL_PX, DEPTH_HEIGHT / 2],
+                [focal_x, 0.0, width / 2],
+                [0.0, focal_y, height / 2],
                 [0.0, 0.0, 1.0],
             ],
         },
         "body_from_camera_optical": [
-            [0.0, 0.0, 1.0, 0.0],
+            [0.0, -sine, cosine, forward_offset],
             [-1.0, 0.0, 0.0, 0.0],
-            [0.0, -1.0, 0.0, CAMERA_HEIGHT_M],
+            [0.0, -cosine, -sine, camera_height],
             [0.0, 0.0, 0.0, 1.0],
         ],
     }
 
 
-def create_simulator(asset_root: Path, scene_id: str, gpu: int):
+def create_simulator(
+    asset_root: Path,
+    scene_id: str,
+    gpu: int,
+    camera: dict[str, float | int],
+):
     import habitat_sim
 
     settings = habitat_sim.SimulatorConfiguration()
@@ -112,12 +121,12 @@ def create_simulator(asset_root: Path, scene_id: str, gpu: int):
     depth = habitat_sim.CameraSensorSpec()
     depth.uuid, depth.sensor_type = "depth", habitat_sim.SensorType.DEPTH
     depth.resolution, depth.hfov, depth.near, depth.far = (
-        [DEPTH_HEIGHT, DEPTH_WIDTH],
-        camera_contract()["image"]["horizontal_fov_degrees"],
+        [int(camera["image_height"]), int(camera["image_width"])],
+        camera_contract(camera)["image"]["horizontal_fov_degrees"],
         0.01,
         100.0,
     )
-    depth.position = [0.0, CAMERA_HEIGHT_M, 0.0]
+    depth.position = [0.0, float(camera["height_m"]), 0.0]
     agent = habitat_sim.agent.AgentConfiguration()
     agent.height, agent.radius, agent.sensor_specifications = (
         ROBOT_HEIGHT_M,
@@ -178,26 +187,31 @@ def set_pose(simulator: Any, position: np.ndarray, heading: float) -> None:
 
 
 def render_depth(
-    simulator: Any, xyz: np.ndarray, yaw: np.ndarray, path: Path
+    simulator: Any,
+    xyz: np.ndarray,
+    yaw: np.ndarray,
+    path: Path,
+    image_height: int,
+    image_width: int,
 ) -> tuple[str, float]:
     frames = len(xyz)
     stack = np.lib.format.open_memmap(
         path,
         mode="w+",
         dtype=np.float32,
-        shape=(frames, DEPTH_HEIGHT, DEPTH_WIDTH),
+        shape=(frames, image_height, image_width),
     )
     invalid = 0
     for index, (position, heading) in enumerate(zip(xyz, yaw, strict=True)):
         set_pose(simulator, position, float(heading))
         depth = np.asarray(simulator.get_sensor_observations()["depth"])
-        if depth.dtype != np.float32 or depth.shape != (DEPTH_HEIGHT, DEPTH_WIDTH):
+        if depth.dtype != np.float32 or depth.shape != (image_height, image_width):
             raise RuntimeError("Habitat returned an unexpected depth tensor")
         stack[index] = depth
         invalid += int((~np.isfinite(depth) | (depth <= 0)).sum())
     stack.flush()
     del stack
-    return sha256_file(path), invalid / (frames * DEPTH_HEIGHT * DEPTH_WIDTH)
+    return sha256_file(path), invalid / (frames * image_height * image_width)
 
 
 def sampled_route(
@@ -279,7 +293,12 @@ def generate_route(
             np.save(directory / "traj_xy.npy", route_xy, allow_pickle=False)
             np.save(directory / "traj_yaw.npy", route_yaw, allow_pickle=False)
             depth_sha, invalid_fraction = render_depth(
-                simulator, habitat_xyz, route_yaw, directory / "depth_m.npy"
+                simulator,
+                habitat_xyz,
+                route_yaw,
+                directory / "depth_m.npy",
+                int(config["camera"]["image_height"]),
+                int(config["camera"]["image_width"]),
             )
             route_id = f"{scene['split']}/dataset_hssd_{scene['scene_id']}/{route_name}"
             record = {
@@ -328,7 +347,12 @@ def generate_scene(
     scene_dir = root_path / scene["split"] / f"dataset_hssd_{scene['scene_id']}"
     scene_dir.mkdir(parents=True, exist_ok=False)
     seed = stable_seed(config["seed"], scene["scene_id"]) % (2**31 - 1)
-    simulator = create_simulator(Path(config["asset_root"]), scene["scene_id"], gpu)
+    simulator = create_simulator(
+        Path(config["asset_root"]),
+        scene["scene_id"],
+        gpu,
+        config["camera"],
+    )
     try:
         grid, floor = build_grid(simulator, seed)
         np.savez_compressed(
@@ -407,6 +431,21 @@ def validate_config(config: dict[str, Any]) -> None:
         )
     if config["workers"] < 1 or config["gpu_device"] < 0:
         raise ValueError("workers must be positive and gpu_device must be non-negative")
+    camera = config["camera"]
+    numeric_camera = (
+        camera["image_width"],
+        camera["image_height"],
+        camera["focal_x_px"],
+        camera["focal_y_px"],
+        camera["height_m"],
+    )
+    if not all(math.isfinite(float(value)) and float(value) > 0 for value in numeric_camera):
+        raise ValueError("camera dimensions, focal lengths and height must be positive")
+    if (
+        float(camera["forward_offset_m"]) != 0.0
+        or float(camera["downward_pitch_degrees"]) != 0.0
+    ):
+        raise ValueError("HSSD generation uses the canonical level camera at the robot origin")
 
 
 def generate(config_path: Path) -> dict[str, Any]:
@@ -462,7 +501,7 @@ def generate(config_path: Path) -> dict[str, Any]:
             "routes": len(records),
             "frames": sum(item["frames"] for item in records),
             "scenes": config["selected_scenes"],
-            "camera": camera_contract(),
+            "camera": camera_contract(config["camera"]),
             "route_contract": {
                 "unperturbed": True,
                 "sample_spacing_m": config["route_sample_spacing_m"],

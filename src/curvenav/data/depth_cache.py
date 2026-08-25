@@ -9,9 +9,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from curvenav.config import DataConfig
 from curvenav.data.depth import (
     CANONICAL_INTRINSICS,
     SAND_INTRINSICS,
+    depth_camera_contract,
     preprocess_metric_depth,
 )
 
@@ -104,15 +106,16 @@ def _prepare_hssd_run(
 
 def prepare_depth_cache(
     dataset_root: str | Path,
-    height: int,
-    width: int,
+    *,
+    data: DataConfig,
     depth_units_per_m: float,
-    max_depth_m: float,
     workers: int,
 ) -> dict[str, object]:
     """Pack every SanD run into the exact FP16 tensor precision seen by AMP."""
     if workers < 1:
         raise ValueError("workers must be positive")
+    height, width = data.image_height, data.image_width
+    max_depth_m = data.max_depth_m
     source_root = Path(dataset_root).resolve()
     destination_root = depth_cache_root(source_root, height, width)
     building_root = destination_root.with_name(destination_root.name + ".building")
@@ -165,8 +168,15 @@ def prepare_depth_cache(
             "dtype": "float16",
             "depth_units_per_m": depth_units_per_m,
             "max_depth_m": max_depth_m,
-            "source_camera": "sand_640x480_fx389.551",
-            "target_camera": "curvenav_224x126_benchmark_fov",
+            "source_camera": {
+                "image_height": SAND_INTRINSICS.height,
+                "image_width": SAND_INTRINSICS.width,
+                "focal_x_px": SAND_INTRINSICS.fx,
+                "focal_y_px": SAND_INTRINSICS.fy,
+                "principal_x_px": SAND_INTRINSICS.cx,
+                "principal_y_px": SAND_INTRINSICS.cy,
+            },
+            "target_camera": depth_camera_contract(data),
             "total_frames": sum(run_counts.values()),
             "runs": dict(sorted(run_counts.items())),
             "excluded_runs": dict(sorted(excluded_runs.items())),
@@ -185,14 +195,14 @@ def prepare_depth_cache(
 def prepare_hssd_depth_cache(
     dataset_root: str | Path,
     *,
-    height: int,
-    width: int,
-    max_depth_m: float,
+    data: DataConfig,
     workers: int,
 ) -> dict[str, object]:
     """Normalize each generated continuous HSSD route into FP16 depth."""
     if workers < 1:
         raise ValueError("workers must be positive")
+    height, width = data.image_height, data.image_width
+    max_depth_m = data.max_depth_m
     if (height, width) != (CANONICAL_INTRINSICS.height, CANONICAL_INTRINSICS.width):
         raise ValueError("packed depth must use the canonical camera")
     source_root = Path(dataset_root).resolve()
@@ -242,8 +252,7 @@ def prepare_hssd_depth_cache(
             "dtype": "float16",
             "source_dtype": "float32_metric_m",
             "max_depth_m": max_depth_m,
-            "source_camera": "curvenav_224x126_benchmark_fov",
-            "target_camera": "curvenav_224x126_benchmark_fov",
+            "target_camera": depth_camera_contract(data),
             "total_frames": sum(int(item["frames"]) for item in runs.values()),
             "runs": dict(sorted(runs.items())),
         }

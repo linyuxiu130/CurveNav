@@ -28,7 +28,7 @@ def test_checkpoint_records_the_flow_and_geometric_evaluator_contract() -> None:
     assert contract["trajectory_safe_center_distance_m"] == pytest.approx(0.35)
     assert contract["camera_extrinsics"] == {
         "forward_offset_m": pytest.approx(0.0),
-        "height_m": pytest.approx(0.30),
+        "height_m": pytest.approx(0.40),
         "downward_pitch_degrees": pytest.approx(0.0),
     }
     assert contract["num_control_points"] == 8

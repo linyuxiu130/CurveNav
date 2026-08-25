@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 
 from curvenav.config import CurveNavConfig
+from curvenav.data.depth import depth_camera_contract
 from curvenav.data.depth_cache import (
     depth_cache_root,
     hssd_depth_cache_root,
@@ -26,15 +27,14 @@ def test_sand_depth_cache_records_empty_upstream_runs(tmp_path) -> None:
 
     manifest = prepare_depth_cache(
         tmp_path,
-        height=126,
-        width=224,
+        data=CurveNavConfig().data,
         depth_units_per_m=1000.0,
-        max_depth_m=5.0,
         workers=1,
     )
 
     assert manifest["runs"] == {"dataset_avoid/run_0000": 1}
     assert manifest["excluded_runs"] == {"dataset_avoid/run_0001": "no_depth_frames"}
+    assert manifest["target_camera"] == depth_camera_contract(CurveNavConfig().data)
     assert (depth_cache_root(tmp_path, 126, 224) / "manifest.json").is_file()
 
 
@@ -91,15 +91,14 @@ def test_hssd_route_cache_and_local_slicing_share_depth_frames(tmp_path) -> None
 
     manifest = prepare_hssd_depth_cache(
         tmp_path,
-        height=126,
-        width=224,
-        max_depth_m=5.0,
+        data=data,
         workers=1,
     )
 
     cached = manifest["runs"][route_id]
     packed = np.load(hssd_depth_cache_root(tmp_path, 126, 224) / cached["file"])
     assert manifest["max_depth_m"] == 5.0
+    assert manifest["target_camera"] == depth_camera_contract(data)
     assert packed.shape == (5, 126, 224)
     np.testing.assert_allclose(packed, 0.8, atol=3e-4)
 

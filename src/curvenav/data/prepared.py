@@ -13,6 +13,7 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from curvenav.config import DataConfig, TrajectoryConfig
+from curvenav.data.depth import depth_camera_contract
 from curvenav.data.depth_bank import PackedDepthBankSpec, PackedDepthRun
 from curvenav.trajectory import BSPLINE_BENDING_REGULARIZATION_M4
 
@@ -38,14 +39,7 @@ def policy_dataset_contract(
         "expert_waypoint_spacing_m": data.expert_waypoint_spacing_m,
         "future_steps": data.future_steps,
         "observation_to_current_semantics": "planar_rigid_transform_from_observation_to_current_frame",
-        "image_height": data.image_height,
-        "image_width": data.image_width,
-        "max_depth_m": data.max_depth_m,
-        "canonical_focal_x_px": data.canonical_focal_x_px,
-        "canonical_focal_y_px": data.canonical_focal_y_px,
-        "camera_forward_offset_m": data.camera_forward_offset_m,
-        "camera_height_m": data.camera_height_m,
-        "camera_downward_pitch_degrees": data.camera_downward_pitch_degrees,
+        **depth_camera_contract(data),
         "num_control_points": trajectory.num_control_points,
         "num_path_points": trajectory.num_path_points,
         "bspline_bending_regularization_m4": BSPLINE_BENDING_REGULARIZATION_M4,

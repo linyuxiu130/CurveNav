@@ -18,9 +18,7 @@ def main() -> None:
     data = load_config(args.config).data
     manifest = prepare_hssd_depth_cache(
         args.dataset,
-        height=data.image_height,
-        width=data.image_width,
-        max_depth_m=data.max_depth_m,
+        data=data,
         workers=args.workers,
     )
     print(

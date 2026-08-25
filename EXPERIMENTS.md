@@ -22,13 +22,13 @@
 - 不再用直线候选、镜像候选、反转惩罚或部署 stop-threshold 掩盖生成与兼容度学习问题。
 - 固定未来窗口必须先按原始序列截取；先去重再截取会让静止片段之后的样本偷看更远未来。
 - 未收敛模型的曲率和闭环结果不能拿来判断最终架构，但能用于发现协议或数值 bug。
-- 当前 HSSD 深度是 `224×126, fx=fy=166.8085`、`0.30 m` 水平相机；SanD 轨迹相机高度为 `0.40 m`。旧混合集只做了内参重投影，没有统一外参，不能用于新的度量反投影模型。
-- 官方 Dingo 评测相机前移 `0.28618 m`、高度 `0.62532 m`、下俯 `10°`；当前 `0.30 m` 相机结果不能冒充官方 Dingo 对齐结果。
+- SanD 轨迹相机高度恒为 `0.40 m`、pitch 恒为 0。canonical camera 因而固定为 `224×126, fx=fy=166.8085`、`0.40 m` 水平相机，HSSD 从生成器根源按同一外参重新渲染。
+- 统一数据已重新生成并通过门禁：SanD `151` runs / `23176` 帧，HSSD `500` routes / `39102` 帧，最终 train/validation 为 `50929/10698` 个样本；两类 cache 与 prepared manifest 的相机合同完全一致。
+- 官方 Dingo 评测相机前移 `0.28618 m`、高度 `0.62532 m`、下俯 `10°`；当前 `0.40 m` 相机结果不能冒充官方 Dingo 对齐结果。
 
 ## 下一组实验
 
-1. 先把 SanD 深度三维重投影到当前 `0.30 m` canonical camera，再整体编译唯一训练集；这是新模型训练的必要前置，不在模型或评价器中增加来源分支。
-2. 完成当前旧合同训练后，仅将其作为生成器基线，不加载旧 learned scorer。
-3. 在固定验证集上报告 oracle/selected ADE、几何代价 margin、selected surface clearance 和 violation rate。
-4. 对 NavDP、X-NavDP、CurveNav 跑完全相同的 10 条固定协议检查，再运行完整 episode。
-5. 若 oracle 明显好而 selected 差，只检查深度标定、机器人几何和显式代价；若 oracle 也差，只查数据与生成器，不叠加排序补丁。
+1. 对当前新模型和统一数据先运行固定批过拟合门禁，再从头训练；旧 learned-scorer checkpoint 只作为历史生成器基线，不加载到新图。
+2. 在固定验证集上报告 oracle/selected ADE、几何代价 margin、selected surface clearance 和 violation rate。
+3. 对 NavDP、X-NavDP、CurveNav 跑完全相同的 10 条固定协议检查，再运行完整 episode。
+4. 若 oracle 明显好而 selected 差，只检查深度标定、机器人几何和显式代价；若 oracle 也差，只查数据与生成器，不叠加排序补丁。

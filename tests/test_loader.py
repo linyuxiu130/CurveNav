@@ -33,7 +33,7 @@ def _write_dataset(root, count: int = 4) -> None:
         "canonical_focal_x_px": 166.80851063829786,
         "canonical_focal_y_px": 166.80851063829786,
         "camera_forward_offset_m": 0.0,
-        "camera_height_m": 0.30,
+        "camera_height_m": 0.40,
         "camera_downward_pitch_degrees": 0.0,
         "num_control_points": 8,
         "num_path_points": 64,

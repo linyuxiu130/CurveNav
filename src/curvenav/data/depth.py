@@ -6,6 +6,8 @@ from functools import lru_cache
 import cv2
 import numpy as np
 
+from curvenav.config import DataConfig
+
 
 @dataclass(frozen=True)
 class PinholeIntrinsics:
@@ -41,6 +43,20 @@ CANONICAL_INTRINSICS = PinholeIntrinsics(
     cx=112.0,
     cy=63.0,
 )
+
+
+def depth_camera_contract(data: DataConfig) -> dict[str, int | float]:
+    """Return the one metric-depth calibration used by every data source."""
+    return {
+        "image_height": data.image_height,
+        "image_width": data.image_width,
+        "max_depth_m": data.max_depth_m,
+        "canonical_focal_x_px": data.canonical_focal_x_px,
+        "canonical_focal_y_px": data.canonical_focal_y_px,
+        "camera_forward_offset_m": data.camera_forward_offset_m,
+        "camera_height_m": data.camera_height_m,
+        "camera_downward_pitch_degrees": data.camera_downward_pitch_degrees,
+    }
 
 
 @lru_cache(maxsize=8)

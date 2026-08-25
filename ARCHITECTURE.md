@@ -13,7 +13,7 @@ observation_to_current float [B,4,4]  每帧到当前帧的 (x,y,sin Δyaw,cos �
 observation_valid bool [B,4]          逐帧有效位；最后一个当前帧必须有效
 ```
 
-深度相机合同固定为当前 HSSD 生成深度：`224×126, fx=fy=166.80851, cx=112, cy=63`；相机位于机器人平面原点正上方 `0.30 m`，无前移且光轴水平。内外参同时用于视觉 token 的度量反投影和显式评价器，并进入 dataset 与 checkpoint 合同。
+深度相机合同固定为 SanD 原始轨迹相机：`224×126, fx=fy=166.80851, cx=112, cy=63`；相机位于机器人平面原点正上方 `0.40 m`，无前移且光轴水平。HSSD 由生成器直接使用相同外参渲染。内外参同时用于视觉 token 的度量反投影和显式评价器，并进入 source cache、dataset 与 checkpoint 合同。
 
 训练目标 `TrajectoryTarget`：
 
@@ -202,7 +202,7 @@ L = 1.0 L_flow + 0.5 L_path + 0.1 L_tangent.
 
 每条 HSSD route 沿 clearance-aware 路径按 0.15 m 等弧长采样，保存连续平面位姿以及逐位置 `224×126` metric depth，最终位置就是该 route 的任务 PointGoal。HSSD 相机内外参必须与上述当前深度合同完全一致，否则编译立即拒绝。编译阶段在每个非终点位置切出一个监督样本：历史四帧按 `[-1.35,-0.90,-0.45,0] m` 索引，未来最多 24 步作为局部路径，并计算 `observation_to_current=(x,y,sin Δyaw,cos Δyaw)`。同一 route 的深度只保存一次，局部样本通过索引共享。生成门禁验证数量、连续 clearance、0.15 m 间距、距离分布、深度/位姿对齐、split 无泄漏、原子提交和最终 SHA。
 
-HSSD 深度直接按当前合同渲染并归一化到 5 m。SanD 原始相机同为水平安装、无前移，但轨迹文件表明相机高度为 `0.40 m`；仅做二维内参重投影不能消除这 `0.10 m` 外参差异。因此当前已编译的 SanD+HSSD 混合 prepared dataset 不满足唯一外参合同，不能用于新的度量反投影模型。后续若保留 SanD，必须在深度缓存阶段完成三维重投影到 `0.30 m` canonical camera 后整体重编译，不提供运行时来源分支。
+SanD 轨迹文件给出的相机高度恒为 `0.40 m`、pitch 恒为 0；缓存阶段验证该外参，并只把原始 `640×480` 内参重投影到 canonical `224×126`。HSSD 从根源使用同一个 `0.40 m` 水平相机渲染。两类 cache manifest 与最终 dataset manifest 都记录并严格校验同一标定，训练期 loader 因而只读取统一张量，不保留来源分支。
 
 唯一链路：
 
