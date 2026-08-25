@@ -24,14 +24,14 @@ scripts/build_dataset.sh /path/to/data-root
 
 当前唯一相机合同与 SanD 原始轨迹相机一致：`224×126`、`fx=fy=166.80851`、相机位于机器人原点上方 `0.40 m`、水平安装。HSSD 直接按该外参渲染；数据、模型反投影、显式评价器与 checkpoint 共用该合同。
 
-测试、过拟合、训练与离线评估：
+测试、固定批诊断、训练与离线评估：
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
   ../.venvs/curvenav/bin/python -m pytest -q -p no:cacheprovider
 GPU_ID=0
 GPU_IDS=0,1
-CUDA_VISIBLE_DEVICES="${GPU_ID}" scripts/overfit_policy.sh configs/base.yaml
+CUDA_VISIBLE_DEVICES="${GPU_ID}" scripts/diagnose_policy.sh configs/base.yaml
 CUDA_VISIBLE_DEVICES="${GPU_IDS}" scripts/train_policy.sh configs/base.yaml
 CUDA_VISIBLE_DEVICES="${GPU_ID}" scripts/evaluate_policy.sh configs/base.yaml outputs/train_policy/checkpoint.pt
 ```
@@ -49,7 +49,7 @@ src/curvenav/conditioning/ 多帧视觉压缩、逐帧位姿与目标融合
 src/curvenav/models/       flow、显式几何评价器与 policy
 src/curvenav/trajectory/   B-spline 和几何
 src/curvenav/training/     DDP、AMP、EMA 与 checkpoint
-src/curvenav/evaluation/   固定离线门禁
+src/curvenav/evaluation/   固定离线评测
 src/curvenav/deployment/   多帧观测状态与严格推理接口
 tests/                     数学、数据、模型和部署合同
 ```

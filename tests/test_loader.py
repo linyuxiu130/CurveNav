@@ -7,7 +7,7 @@ import torch
 from curvenav.config import DataConfig, TrajectoryConfig
 from curvenav.data.depth_bank import gather_depth_observations, load_packed_depth_bank
 from curvenav.data.loader import (
-    build_policy_overfit_loader,
+    build_fixed_batch_loader,
     build_policy_training_loader,
     build_policy_validation_loader,
 )
@@ -115,11 +115,11 @@ def test_prepared_dataset_rejects_geometry_contract_mismatch(tmp_path) -> None:
         )
 
 
-def test_overfit_loader_repeats_only_the_prepared_dataset(tmp_path) -> None:
+def test_fixed_batch_loader_repeats_only_the_prepared_dataset(tmp_path) -> None:
     root = tmp_path / "policy"
     _write_dataset(root, count=2)
     data = DataConfig(root=str(root))
-    bundle = build_policy_overfit_loader(data, TrajectoryConfig(), 8)
+    bundle = build_fixed_batch_loader(data, TrajectoryConfig(), 8)
     batch = next(iter(bundle.loader))
     assert batch["point_goal"].shape == (8, 2)
     assert bundle.samples == 8

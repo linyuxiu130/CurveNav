@@ -147,12 +147,9 @@ class TrainingConfig:
     prefetch_factor: int = 2
     warmup_epochs: int = 5
     min_learning_rate_factor: float = 0.01
-    overfit_steps: int = 1500
-    overfit_batch_size: int = 8
     log_every_steps: int = 20
     checkpoint_every_epochs: int = 20
     output_dir: str = "outputs/train_policy"
-    checkpoint_path: str = "outputs/train_policy/overfit.pt"
     learning_rate: float = 4e-4
     weight_decay: float = 1e-2
     grad_clip_norm: float = 1.0
@@ -244,8 +241,6 @@ class CurveNavConfig:
             "epochs": self.training.epochs,
             "num_workers": self.training.num_workers,
             "prefetch_factor": self.training.prefetch_factor,
-            "overfit_steps": self.training.overfit_steps,
-            "overfit_batch_size": self.training.overfit_batch_size,
             "log_every_steps": self.training.log_every_steps,
             "checkpoint_every_epochs": self.training.checkpoint_every_epochs,
         }
@@ -258,8 +253,6 @@ class CurveNavConfig:
             raise ValueError("training.min_learning_rate_factor must be in (0, 1]")
         if not self.training.output_dir:
             raise ValueError("training.output_dir cannot be empty")
-        if not self.training.checkpoint_path:
-            raise ValueError("training.checkpoint_path cannot be empty")
         if self.training.learning_rate <= 0:
             raise ValueError("training.learning_rate must be positive")
         if self.training.weight_decay < 0:

@@ -42,6 +42,13 @@ def test_rejects_removed_architecture_switches() -> None:
         config_from_mapping({"model": {"trajectory": {"scale_xy": [3.0, 3.0]}}})
 
 
+def test_rejects_removed_diagnostic_training_options() -> None:
+    with pytest.raises(TypeError, match="overfit_steps"):
+        config_from_mapping({"training": {"overfit_steps": 1}})
+    with pytest.raises(TypeError, match="checkpoint_path"):
+        config_from_mapping({"training": {"checkpoint_path": "unused.pt"}})
+
+
 def test_rejects_invalid_trajectory_contract() -> None:
     with pytest.raises(ValueError, match="cubic"):
         config_from_mapping({"model": {"trajectory": {"degree": 2}}})

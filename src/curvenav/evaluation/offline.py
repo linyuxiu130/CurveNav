@@ -15,7 +15,7 @@ from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.loader import build_policy_validation_loader
 from curvenav.factory import build_policy
 from curvenav.models import CurveNavPolicy
-from curvenav.training import validate_policy_contract
+from curvenav.training.checkpoint import validate_policy_contract
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.prefetch import CudaPrefetchLoader
 from curvenav.trajectory import path_arc_length

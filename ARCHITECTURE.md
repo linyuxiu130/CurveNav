@@ -200,24 +200,32 @@ L = 1.0 L_flow + 0.5 L_path + 0.1 L_tangent.
 
 唯一数据入口是 `scripts/build_dataset.sh DATA_ROOT`。它依次下载固定 commit 的 SanD 与 HSSD、生成 HSSD 专家 route、准备两类 route 深度缓存，并原子编译 `data/policy_dataset`；训练与 GPU 调度不属于数据生成链。各阶段只接受空输出，不提供历史版本、恢复模式或已有输出分支。HSSD 生成前从冻结 repository index 推导 20 个场景引用的全部资产，逐项验证文件存在、JSON 可解析及 GLB 头和声明长度正确；缺失物体不能以 Habitat 警告形式静默进入深度数据。20 个冻结场景按 16/4 划分 train/validation，并禁止同源 scene family 跨 split。每个场景生成 25 条无扰动的完整专家 route：近距 5 条、中距 10 条、远距 10 条，共 500 条，train/validation 分别为 400/100 条。
 
-每条 HSSD route 沿 clearance-aware 路径按 0.15 m 等弧长采样，保存连续平面位姿以及逐位置 `224×126` metric depth，最终位置就是该 route 的任务 PointGoal。HSSD 相机内外参必须与上述当前深度合同完全一致，否则编译立即拒绝。编译阶段在每个非终点位置切出一个监督样本：历史四帧按 `[-1.35,-0.90,-0.45,0] m` 索引，未来最多 24 步作为局部路径，并计算 `observation_to_current=(x,y,sin Δyaw,cos Δyaw)`。同一 route 的深度只保存一次，局部样本通过索引共享。生成门禁验证数量、连续 clearance、0.15 m 间距、距离分布、深度/位姿对齐、split 无泄漏、原子提交和最终 SHA。
+每条 HSSD route 沿 clearance-aware 路径按 0.15 m 等弧长采样，保存连续平面位姿以及逐位置 `224×126` metric depth，最终位置就是该 route 的任务 PointGoal。HSSD 相机内外参必须与上述当前深度合同完全一致，否则编译立即拒绝。编译阶段在每个非终点位置切出一个监督样本：历史四帧按 `[-1.35,-0.90,-0.45,0] m` 索引，未来最多 24 步作为局部路径，并计算 `observation_to_current=(x,y,sin Δyaw,cos Δyaw)`。同一 route 的深度只保存一次，局部样本通过索引共享。生成审计验证数量、连续 clearance、0.15 m 间距、距离分布、深度/位姿对齐、split 无泄漏、原子提交和最终 SHA。
 
 SanD 轨迹文件给出的相机高度恒为 `0.40 m`、pitch 恒为 0；缓存阶段验证该外参，并只把原始 `640×480` 内参重投影到 canonical `224×126`。HSSD 从根源使用同一个 `0.40 m` 水平相机渲染。两类 cache manifest 与最终 dataset manifest 都记录并严格校验同一标定，训练期 loader 因而只读取统一张量，不保留来源分支。
 
 唯一链路：
 
 ```text
-HSSD generation + SanD source -> calibrated prepared dataset
-                              -> fixed-batch overfit diagnostic -> DDP mixed-precision training -> EMA
+HSSD generation + SanD source -> calibrated prepared dataset -> DDP mixed-precision training -> EMA
+                                                \
+                                                 -> fixed-batch fitting diagnostic
                  -> offline geometry metrics -> official closed-loop benchmark
 ```
 
+### 训练代码职责
+
+- `data/loader.py` 只负责 prepared dataset 的可复现采样与 CPU loader；`data/batch.py` 是唯一的张量 batch 到 `PolicyCondition`/`TrajectoryTarget` 边界。
+- `training/train.py` 是唯一生产优化入口：DDP、FP16、prefetch、优化器步、EMA 和日志按一个顺序执行。`--resume` 只恢复同一 checkpoint 的 model/optimizer/schedule/EMA/GradScaler 状态，并从对应全局样本偏移继续；它不改变模型图或损失。
+- `training/checkpoint.py` 只构造和恢复正式训练所需的 model、optimizer、schedule、EMA 和 GradScaler 状态；不再为诊断或历史格式保留可选字段。
+- `training/diagnostic.py` 复用相同 factory、数据合同和损失，对固定 8 个样本运行 1500 步并报告数值；它不保存权重、不控制训练是否启动，也不形成第二条训练路线。
+
 checkpoint 严格记录输入标定、编码器与生成器类型、平面反投影对齐、每帧 16 个压缩 token、八控制点、等弧长倍数、损失语义和显式评价器参数；合同不一致时直接拒绝加载，不设置兼容分支。推理不读取标签，也不执行曲率裁剪、直线候选或轨迹反转。
 
-开始完整训练前只保留三类验证：
+训练链路不依赖额外门禁；保留三类独立验证：
 
 1. 数学与接口单测：B-spline、等弧长、逐帧 mask、平面反投影、learned-query token 数、显式几何代价和 checkpoint；
 2. 前向/反向：所有输出形状正确，全部可训练参数具有有限梯度；
-3. 固定批过拟合及同协议离线/闭环评测：selected/oracle ADE、几何代价 margin、selected surface clearance、clearance violation、候选多样性、延迟、SR/SPL。
+3. 固定批拟合诊断及同协议离线/闭环评测：selected/oracle ADE、几何代价 margin、selected surface clearance、clearance violation、候选多样性、延迟、SR/SPL。
 
 离线 ADE 不能替代闭环 SR/SPL；可见表面 clearance 不能解释为完整 ESDF 或碰撞概率；未进行 X-NavDP 在线 RL 时不得使用“Q 后训练”表述。

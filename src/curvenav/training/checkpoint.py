@@ -1,10 +1,11 @@
-"""Checkpoint metadata that prevents silent policy-contract mismatches."""
+"""Resumable state for the single CurveNav production training route."""
 
 from dataclasses import asdict
 from typing import Any, Mapping
 
 from torch import nn
 from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
 
 from curvenav.config import CurveNavConfig
 from curvenav.conditioning import CONDITION_ENCODER_TYPE
@@ -21,7 +22,7 @@ from curvenav.trajectory import (
 CHECKPOINT_TYPE = "curvenav_local_policy"
 
 
-def policy_contract(config: CurveNavConfig) -> dict[str, Any]:
+def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
     data = config.data
     trajectory = config.trajectory
     return {
@@ -81,28 +82,29 @@ def policy_contract(config: CurveNavConfig) -> dict[str, Any]:
     }
 
 
-def checkpoint_state(
+def build_training_checkpoint(
     model: nn.Module,
+    optimizer: Optimizer,
+    scheduler: LRScheduler,
+    ema: ExponentialMovingAverage,
+    grad_scaler: Any,
     config: CurveNavConfig,
     step: int,
-    optimizer: Optimizer | None = None,
-    extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build, but do not write, a complete portable training checkpoint."""
+    """Build the complete state required to resume FP16 optimizer updates."""
     if step < 0:
         raise ValueError("checkpoint step cannot be negative")
-    state: dict[str, Any] = {
+    return {
         "checkpoint_type": CHECKPOINT_TYPE,
         "step": step,
         "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "ema": ema.state_dict(),
+        "grad_scaler": grad_scaler.state_dict(),
         "config": asdict(config),
-        "policy_contract": policy_contract(config),
+        "policy_contract": build_policy_contract(config),
     }
-    if optimizer is not None:
-        state["optimizer"] = optimizer.state_dict()
-    if extra is not None:
-        state["extra"] = dict(extra)
-    return state
 
 
 def validate_policy_contract(
@@ -115,7 +117,7 @@ def validate_policy_contract(
     saved = checkpoint.get("policy_contract")
     if not isinstance(saved, Mapping):
         raise ValueError("checkpoint has no CurveNav policy contract")
-    expected = policy_contract(config)
+    expected = build_policy_contract(config)
     mismatches = {
         key: (saved.get(key), value)
         for key, value in expected.items()
@@ -136,11 +138,11 @@ def restore_training_state(
     scheduler: Any,
     ema: ExponentialMovingAverage,
     config: CurveNavConfig,
-    grad_scaler: Any | None = None,
+    grad_scaler: Any,
 ) -> int:
     """Restore the complete state needed to continue optimizer updates."""
     validate_policy_contract(checkpoint, config)
-    required = {"step", "model", "optimizer", "scheduler", "ema"}
+    required = {"step", "model", "optimizer", "scheduler", "ema", "grad_scaler"}
     missing = sorted(required.difference(checkpoint))
     if missing:
         raise ValueError(f"training checkpoint is missing state: {missing}")
@@ -148,10 +150,7 @@ def restore_training_state(
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     ema.load_state_dict(checkpoint["ema"])
-    if grad_scaler is not None:
-        if "grad_scaler" not in checkpoint:
-            raise ValueError("FP16 training checkpoint has no gradient scaler state")
-        grad_scaler.load_state_dict(checkpoint["grad_scaler"])
+    grad_scaler.load_state_dict(checkpoint["grad_scaler"])
     step = int(checkpoint["step"])
     if step < 0:
         raise ValueError("checkpoint step cannot be negative")

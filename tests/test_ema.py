@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from curvenav.training import ExponentialMovingAverage
+from curvenav.training.ema import ExponentialMovingAverage
 
 
 def test_ema_warmup_tracks_early_updates_and_roundtrips_state() -> None:

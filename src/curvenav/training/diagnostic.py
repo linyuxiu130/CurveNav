@@ -1,4 +1,4 @@
-"""Fixed-batch overfit diagnostic for the only CurveNav training chain."""
+"""Fixed-batch fitting diagnostic for CurveNav's one policy graph."""
 
 import argparse
 import json
@@ -13,17 +13,17 @@ from torch import Tensor
 from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
 from curvenav.data.batch import PreparedPolicyBatch, unpack_policy_batch
-from curvenav.data.loader import build_policy_overfit_loader
+from curvenav.data.loader import build_fixed_batch_loader
 from curvenav.factory import build_policy
 from curvenav.models import CurveNavPolicy
-from curvenav.training.checkpoint import checkpoint_state
-from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.optimizer import build_optimizer
 from curvenav.training.prefetch import CudaPrefetchLoader
 from curvenav.training.runtime import configure_cuda_training_backend
 from curvenav.trajectory import path_scale_summary
 
 
+FIXED_BATCH_SIZE = 8
+FIXED_BATCH_STEPS = 1_500
 FIXED_LOSS_DRAWS = 8
 
 
@@ -57,19 +57,19 @@ def _fixed_loss(
     return torch.stack(losses).mean()
 
 
-def run_overfit(config: CurveNavConfig) -> dict[str, float]:
-    """Overfit one immutable prepared batch and save a diagnostic checkpoint."""
+def run_fixed_batch_diagnostic(config: CurveNavConfig) -> dict[str, float]:
+    """Fit one immutable prepared batch and report the resulting diagnostics."""
     config.validate()
     if not torch.cuda.is_available():
-        raise RuntimeError("CurveNav overfit validation requires CUDA")
+        raise RuntimeError("CurveNav fixed-batch diagnostic requires CUDA")
     device = torch.device("cuda")
     configure_cuda_training_backend()
     _seed_everything(config.training.seed)
 
-    loader_bundle = build_policy_overfit_loader(
+    loader_bundle = build_fixed_batch_loader(
         config.data,
         config.trajectory,
-        batch_size=config.training.overfit_batch_size,
+        batch_size=FIXED_BATCH_SIZE,
         seed=config.training.seed,
     )
     loader = CudaPrefetchLoader(
@@ -87,19 +87,14 @@ def run_overfit(config: CurveNavConfig) -> dict[str, float]:
         learning_rate=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
-    ema = ExponentialMovingAverage(policy, decay=config.training.ema_decay)
+    scaler = torch.amp.GradScaler("cuda", enabled=True)
     policy.train()
 
     training_draw_seed = config.training.seed + 100
     initial_loss = _fixed_loss(policy, prepared, training_draw_seed).item()
-    for step in range(1, config.training.overfit_steps + 1):
+    for step in range(1, FIXED_BATCH_STEPS + 1):
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(
-            device_type=device.type,
-            dtype=torch.float16,
-            enabled=device.type == "cuda",
-        ):
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
             losses = policy(prepared.condition, prepared.target)
         scaler.scale(losses.loss).backward()
         scaler.unscale_(optimizer)
@@ -110,8 +105,6 @@ def run_overfit(config: CurveNavConfig) -> dict[str, float]:
         scaler.step(optimizer)
         scaler.update()
         optimizer_step_skipped = scaler.get_scale() < scale_before_step
-        if not optimizer_step_skipped:
-            ema.update()
         if step == 1 or step % config.training.log_every_steps == 0:
             print(
                 json.dumps(
@@ -131,12 +124,8 @@ def run_overfit(config: CurveNavConfig) -> dict[str, float]:
 
     final_loss = _fixed_loss(policy, prepared, training_draw_seed).item()
     policy.eval()
-    loss_ratio = final_loss / max(initial_loss, 1e-12)
-    with torch.no_grad(), torch.autocast(
-        device_type=device.type,
-        dtype=torch.float16,
-        enabled=device.type == "cuda",
-    ):
+    loss_ratio = final_loss / initial_loss
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
         prediction = policy.sample(prepared.condition)
     with torch.no_grad():
         reference_path = prepared.target.reference_path.float()
@@ -165,26 +154,17 @@ def run_overfit(config: CurveNavConfig) -> dict[str, float]:
     }
     if not all(math.isfinite(value) for value in metrics.values()):
         raise FloatingPointError(f"fixed-batch diagnostics contain non-finite values: {metrics}")
-    state = checkpoint_state(
-        policy,
-        config,
-        step=config.training.overfit_steps,
-        optimizer=optimizer,
-        extra=metrics,
-    )
-    state["ema"] = ema.state_dict()
-    checkpoint_path = Path(config.training.checkpoint_path)
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(state, checkpoint_path)
-    print(json.dumps({"checkpoint": str(checkpoint_path), **metrics}, ensure_ascii=False))
+    print(json.dumps(metrics, ensure_ascii=False), flush=True)
     return metrics
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Overfit the single CurveNav training batch")
+    parser = argparse.ArgumentParser(
+        description="Run CurveNav's fixed-batch fitting diagnostic"
+    )
     parser.add_argument("config", type=Path, help="CurveNav YAML configuration")
     args = parser.parse_args()
-    run_overfit(load_config(args.config))
+    run_fixed_batch_diagnostic(load_config(args.config))
 
 
 if __name__ == "__main__":

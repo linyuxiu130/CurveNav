@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-curvenav-overfit = "curvenav.training.overfit:main"
+curvenav-diagnose = "curvenav.training.diagnostic:main"
 curvenav-train = "curvenav.training.train:main"
 curvenav-prepare-data = "curvenav.data.prepare:main"
 curvenav-evaluate = "curvenav.evaluation.offline:main"

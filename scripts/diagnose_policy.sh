@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Fixed-batch gate for the prepared policy dataset.
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,5 +16,5 @@ CONFIG_PATH="${1:-configs/base.yaml}"
 
 cd "${PROJECT_ROOT}"
 exec "${ENV_ROOT}/curvenav/bin/python" \
-    -m curvenav.training.overfit \
+    -m curvenav.training.diagnostic \
     "${CONFIG_PATH}"

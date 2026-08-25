@@ -4,6 +4,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 from accelerate import Accelerator
@@ -15,7 +16,7 @@ from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.loader import build_policy_training_loader
 from curvenav.factory import build_policy
 from curvenav.training.checkpoint import (
-    checkpoint_state,
+    build_training_checkpoint,
     restore_training_state,
     validate_policy_contract,
 )
@@ -31,8 +32,8 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     ema: ExponentialMovingAverage,
+    grad_scaler: Any,
     config: CurveNavConfig,
-    epoch: int,
     step: int,
 ) -> None:
     accelerator.wait_for_everyone()
@@ -40,37 +41,30 @@ def _save_checkpoint(
         return
     output_dir = Path(config.training.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    state = checkpoint_state(
+    state = build_training_checkpoint(
         accelerator.unwrap_model(policy),
+        optimizer,
+        scheduler,
+        ema,
+        grad_scaler,
         config,
-        step=step,
-        optimizer=optimizer,
-        extra={
-            "epoch": epoch,
-            "world_size": accelerator.num_processes,
-            "mixed_precision": accelerator.mixed_precision,
-        },
+        step,
     )
-    state["scheduler"] = scheduler.state_dict()
-    state["ema"] = ema.state_dict()
-    if accelerator.scaler is not None:
-        state["grad_scaler"] = accelerator.scaler.state_dict()
     checkpoint_path = output_dir / "checkpoint.pt"
     temporary_path = output_dir / ".checkpoint.tmp.pt"
     accelerator.save(state, temporary_path)
     temporary_path.replace(checkpoint_path)
 
 
-def _advance_optimizer_state(
+def _advance_schedule_and_ema(
     accelerator: Accelerator,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     ema: ExponentialMovingAverage,
-) -> bool:
+) -> None:
     if accelerator.optimizer_step_was_skipped:
-        return False
+        return
     scheduler.step()
     ema.update()
-    return True
 
 
 def run_training(
@@ -147,6 +141,9 @@ def run_training(
         scheduler,
         device_placement=[True, True, False, True],
     )
+    if accelerator.scaler is None:
+        raise RuntimeError("CurveNav FP16 training requires a gradient scaler")
+    grad_scaler = accelerator.scaler
     loader = CudaPrefetchLoader(
         loader,
         loader_bundle.depth_bank,
@@ -167,7 +164,7 @@ def run_training(
             scheduler,
             ema,
             config,
-            accelerator.scaler,
+            grad_scaler,
         )
 
     accelerator.print(
@@ -200,7 +197,7 @@ def run_training(
         accelerator.backward(losses.loss)
         accelerator.clip_grad_norm_(policy.parameters(), config.training.grad_clip_norm)
         optimizer.step()
-        _advance_optimizer_state(accelerator, scheduler, ema)
+        _advance_schedule_and_ema(accelerator, scheduler, ema)
 
         step += 1
         epoch = (step - 1) // steps_per_epoch + 1
@@ -246,8 +243,8 @@ def run_training(
                 optimizer,
                 scheduler,
                 ema,
+                grad_scaler,
                 config,
-                epoch=step // steps_per_epoch,
                 step=step,
             )
 
@@ -258,8 +255,8 @@ def run_training(
             optimizer,
             scheduler,
             ema,
+            grad_scaler,
             config,
-            epoch=(step - 1) // steps_per_epoch + 1,
             step=step,
         )
     accelerator.print(

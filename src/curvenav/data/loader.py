@@ -84,7 +84,7 @@ def build_policy_training_loader(
     )
 
 
-def build_policy_overfit_loader(
+def build_fixed_batch_loader(
     data: DataConfig,
     trajectory: TrajectoryConfig,
     batch_size: int,

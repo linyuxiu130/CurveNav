@@ -10,7 +10,7 @@
 | 同口径的旧 CurveNav 活动链 | SR 90%，SPL 79.71% | 训练数据与部署协议曾经能支撑基本闭环 |
 | 被废弃的确定性 Transformer 路线 | SR 10%，SPL 8.79% | 低离线 ADE 不代表闭环有效；目标直线偏置与训练/部署条件错配是严重风险 |
 | 旧 3 m 标签上的多候选 Flow 短训 | selected/oracle ADE 0.1905/0.0826 m | 候选覆盖优于选择，但数据合同已废弃，数值不能作为新链路基线 |
-| 旧 3 m 标签上的固定批过拟合 | loss ratio 0.0424 | 基本反传曾可工作；新 fixed-future 合同必须重新通过门禁 |
+| 旧 3 m 标签上的固定批拟合 | loss ratio 0.0424 | 基本反传曾可工作；新 fixed-future 合同需要重新记录同协议诊断 |
 
 ## 失败经验
 
@@ -23,12 +23,12 @@
 - 固定未来窗口必须先按原始序列截取；先去重再截取会让静止片段之后的样本偷看更远未来。
 - 未收敛模型的曲率和闭环结果不能拿来判断最终架构，但能用于发现协议或数值 bug。
 - SanD 轨迹相机高度恒为 `0.40 m`、pitch 恒为 0。canonical camera 因而固定为 `224×126, fx=fy=166.8085`、`0.40 m` 水平相机，HSSD 从生成器根源按同一外参重新渲染。
-- 统一数据已重新生成并通过门禁：先验证 HSSD `9258` 个选中资产，生成日志无 Habitat asset error；SanD `151` runs / `23176` 帧，HSSD `500` routes / `39102` 帧，最终 train/validation 为 `50929/10698` 个样本。两类 cache 与 prepared manifest 的相机合同完全一致，HSSD 数据 SHA-256 为 `272bc237760f0e7616194c736f5a2ca06c235a1251e6b3b69c734217d5e67075`。
+- 统一数据已重新生成并通过审计：先验证 HSSD `9258` 个选中资产，生成日志无 Habitat asset error；SanD `151` runs / `23176` 帧，HSSD `500` routes / `39102` 帧，最终 train/validation 为 `50929/10698` 个样本。两类 cache 与 prepared manifest 的相机合同完全一致，HSSD 数据 SHA-256 为 `272bc237760f0e7616194c736f5a2ca06c235a1251e6b3b69c734217d5e67075`。
 - 官方 Dingo 评测相机前移 `0.28618 m`、高度 `0.62532 m`、下俯 `10°`；当前 `0.40 m` 相机结果不能冒充官方 Dingo 对齐结果。
 
 ## 下一组实验
 
-1. 对当前新模型和统一数据记录固定批过拟合诊断，再从头训练；旧 learned-scorer checkpoint 只作为历史生成器基线，不加载到新图。
+1. 对当前新模型和统一数据记录固定批拟合诊断，再从头训练；旧 learned-scorer checkpoint 只作为历史生成器基线，不加载到新图。
 2. 在固定验证集上报告 oracle/selected ADE、几何代价 margin、selected surface clearance 和 violation rate。
 3. 对 NavDP、X-NavDP、CurveNav 跑完全相同的 10 条固定协议检查，再运行完整 episode。
 4. 若 oracle 明显好而 selected 差，只检查深度标定、机器人几何和显式代价；若 oracle 也差，只查数据与生成器，不叠加排序补丁。

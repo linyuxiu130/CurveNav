@@ -59,12 +59,9 @@ training:
   prefetch_factor: 2
   warmup_epochs: 5
   min_learning_rate_factor: 0.01
-  overfit_steps: 1500
-  overfit_batch_size: 8
   log_every_steps: 20
   checkpoint_every_epochs: 20
   output_dir: outputs/train_policy
-  checkpoint_path: outputs/train_policy/overfit.pt
   learning_rate: 0.0004
   weight_decay: 0.01
   grad_clip_norm: 1.0
