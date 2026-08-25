@@ -27,21 +27,6 @@ class DataConfig:
             raise ValueError("observation frames and future steps must be positive")
         if (self.image_height, self.image_width) != (126, 224):
             raise ValueError("CurveNav uses one calibrated 224x126 depth camera")
-        camera_contract = (
-            self.canonical_focal_x_px,
-            self.canonical_focal_y_px,
-            self.camera_forward_offset_m,
-            self.camera_height_m,
-            self.camera_downward_pitch_degrees,
-        )
-        if camera_contract != (
-            166.80851063829786,
-            166.80851063829786,
-            0.28618,
-            0.62532,
-            10.0,
-        ):
-            raise ValueError("CurveNav uses the frozen X-NavDP Dingo camera calibration")
         if not all(
             math.isfinite(value) and value > 0
             for value in (

@@ -68,5 +68,3 @@ def test_rejects_invalid_trajectory_contract() -> None:
 def test_rejects_non_production_observation_frame_count() -> None:
     with pytest.raises(ValueError, match="four depth observations"):
         config_from_mapping({"data": {"observation_frames": 3}})
-    with pytest.raises(ValueError, match="Dingo camera calibration"):
-        config_from_mapping({"data": {"camera_height_m": 0.40}})

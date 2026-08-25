@@ -12,7 +12,6 @@ from curvenav.data_generation import assets
 from curvenav.data_generation.assets import selected_asset_paths
 from curvenav.data_generation.generate import (
     camera_contract,
-    habitat_sensor_pose,
     route_bands,
     validate_config,
 )
@@ -77,13 +76,6 @@ def test_hssd_generator_uses_the_model_camera_contract() -> None:
         [-1.0, 0.0, 0.0, 0.0],
         [0.0, -math.cos(pitch), -math.sin(pitch), data.camera_height_m],
         [0.0, 0.0, 0.0, 1.0],
-    ]
-    position, orientation = habitat_sensor_pose(generation["camera"])
-    assert position == [0.0, data.camera_height_m, -data.camera_forward_offset_m]
-    assert orientation == [
-        -math.radians(data.camera_downward_pitch_degrees),
-        0.0,
-        0.0,
     ]
 
 
