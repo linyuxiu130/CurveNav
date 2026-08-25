@@ -83,8 +83,8 @@ class DepthObservationEncoder(nn.Module):
         max_depth_m: float = 5.0,
         focal_x_px: float = 166.80851063829786,
         focal_y_px: float = 166.80851063829786,
-        camera_forward_offset_m: float = 0.28618,
-        camera_downward_pitch_degrees: float = 10.0,
+        camera_forward_offset_m: float = 0.0,
+        camera_downward_pitch_degrees: float = 0.0,
     ) -> None:
         super().__init__()
         if model_dim % 4:

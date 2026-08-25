@@ -2,7 +2,7 @@
 
 CurveNav 是高效的 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal，生成短距离平滑 B-spline，并由当前深度上的显式几何代价选择一条执行轨迹。
 
-当前目标只有一个：在 X-NavDP 官方 PointGoal 评测中，以完全相同的 episode、相机、异步 MPC 和指标口径对比 NavDP 与 X-NavDP。局部基线成立前不专项扩展长距离或脱困能力。
+当前目标只有一个：先在现有深度合同下验证 PointGoal 局部规划，再在完全相同的 episode、相机、异步 MPC 和指标口径下对比 NavDP 与 X-NavDP。局部基线成立前不专项扩展长距离或脱困能力。
 
 架构合同见 `ARCHITECTURE.md`，评测合同见 `EVALUATION.md`，保留的实验结论见 `EXPERIMENTS.md`。
 
@@ -22,7 +22,7 @@ scripts/build_dataset.sh /path/to/data-root
 
 该入口面向空的数据目录执行一次；内部阶段不提供历史版本、恢复模式或已有输出分支。训练只读取最终的 `data/policy_dataset`。
 
-当前模型合同使用官方 Dingo D455 的内外参；旧 `0.30 m` 水平相机生成的数据会被严格拒绝，不能直接用于新模型训练。
+当前唯一相机合同与已生成 HSSD 深度一致：`224×126`、`fx=fy=166.80851`、相机位于机器人原点上方 `0.30 m`、水平安装。数据、模型反投影、显式评价器与 checkpoint 共用该合同。
 
 测试、过拟合、训练与离线评估：
 
