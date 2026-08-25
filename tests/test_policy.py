@@ -70,6 +70,10 @@ def test_policy_trains_every_module_and_returns_geometry_selected_candidate() ->
         losses.tangent_loss,
     ):
         assert value.ndim == 0 and torch.isfinite(value)
+    torch.testing.assert_close(
+        losses.loss,
+        losses.flow_loss + 0.5 * losses.path_loss + 0.1 * losses.tangent_loss,
+    )
     losses.loss.backward()
     gradients = [
         parameter.grad for parameter in policy.parameters() if parameter.requires_grad
