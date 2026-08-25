@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-  echo "usage: $0 DATA_ROOT" >&2
+if [[ $# -ne 0 ]]; then
+  echo "usage: $0" >&2
   exit 2
 fi
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 workspace_root=$(cd "$project_root/.." && pwd)
-data_root=$(realpath -m "$1")
 export PYTHONPATH="$project_root/src"
 cd "$project_root"
 

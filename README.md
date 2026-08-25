@@ -17,7 +17,7 @@ CurveNav 是高效的 PointGoal 条件二维局部规划器。模型读取三帧
 从固定上游 commit 下载 HSSD、用官方 Dingo 相机生成观测并编译唯一训练集：
 
 ```bash
-scripts/build_dataset.sh /path/to/data-root
+scripts/build_dataset.sh
 ```
 
 该入口面向空的数据目录执行一次；内部阶段不提供历史版本、恢复模式或已有输出分支。训练只读取最终的 `data/policy_dataset`。
