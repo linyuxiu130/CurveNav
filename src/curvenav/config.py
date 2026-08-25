@@ -48,22 +48,9 @@ class DataConfig:
                 self.frame_spacing_m,
                 self.expert_waypoint_spacing_m,
                 self.max_depth_m,
-                self.canonical_focal_x_px,
-                self.canonical_focal_y_px,
-                self.camera_height_m,
             )
         ):
             raise ValueError("data spatial scales must be positive")
-        if (
-            not math.isfinite(self.camera_forward_offset_m)
-            or self.camera_forward_offset_m < 0
-        ):
-            raise ValueError("camera_forward_offset_m must be finite and nonnegative")
-        if (
-            not math.isfinite(self.camera_downward_pitch_degrees)
-            or not -90 < self.camera_downward_pitch_degrees < 90
-        ):
-            raise ValueError("camera downward pitch must be between -90 and 90 degrees")
 
 
 @dataclass(frozen=True)

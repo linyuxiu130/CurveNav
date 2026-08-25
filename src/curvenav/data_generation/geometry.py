@@ -241,7 +241,7 @@ def _smooth(grid: Grid, path: np.ndarray, spacing_m: float) -> np.ndarray:
     candidates: list[np.ndarray] = []
     if len(path) >= 3:
         segment = np.linalg.norm(np.diff(path, axis=0), axis=1)
-        parameter = np.concatenate([[0.0], np.cumsum(segment)]) / max(length, 1e-9)
+        parameter = np.concatenate([[0.0], np.cumsum(segment)]) / length
         weights = np.ones(len(path))
         weights[[0, -1]] = 1e3
         for tolerance in (0.05, 0.025, 0.0):
@@ -334,9 +334,8 @@ def plan_route(
         clear, curve = grid.clearance(path), curvature(path)
         metrics = {
             "length_m": length,
-            "reference_length_ratio": length / max(reference_length, 1e-6),
-            "geodesic_ratio": length
-            / max(float(np.linalg.norm(path[-1] - path[0])), 1e-6),
+            "reference_length_ratio": length / reference_length,
+            "geodesic_ratio": length / float(np.linalg.norm(path[-1] - path[0])),
             "minimum_clearance_m": float(clear.min()),
             "clearance_p05_m": float(np.percentile(clear, 5)),
             "risk_density": float(np.mean(np.exp(-clear / preferred_m))),

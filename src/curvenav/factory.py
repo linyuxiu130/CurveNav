@@ -1,4 +1,4 @@
-"""Composition root for the one CurveNav generate-score-select graph."""
+"""Composition root for the one CurveNav generate-select graph."""
 
 from curvenav.config import CurveNavConfig
 from curvenav.conditioning import PolicyConditionEncoder

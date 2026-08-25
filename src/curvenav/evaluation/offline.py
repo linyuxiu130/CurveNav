@@ -1,4 +1,4 @@
-"""Held-out evaluation for CurveNav's generate-score-select policy."""
+"""Held-out evaluation for CurveNav's generate-select policy."""
 
 import argparse
 from dataclasses import dataclass
@@ -11,7 +11,8 @@ from torch import Tensor
 
 from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
-from curvenav.data import build_policy_validation_loader, unpack_policy_batch
+from curvenav.data.batch import unpack_policy_batch
+from curvenav.data.loader import build_policy_validation_loader
 from curvenav.factory import build_policy
 from curvenav.models import CurveNavPolicy
 from curvenav.training import validate_policy_contract

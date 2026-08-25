@@ -85,10 +85,4 @@ class PlanarDepthProjector(nn.Module):
         y_current = sine[..., None, None] * points[..., 0] + cosine[..., None, None] * points[..., 1]
         points = torch.stack((x_current, y_current), dim=-1)
         points = points + translation[..., None, None, :]
-        points = torch.nan_to_num(
-            points,
-            nan=0.0,
-            posinf=self.max_depth_m,
-            neginf=-self.max_depth_m,
-        )
         return points.flatten(2, 3), pooled_depth.flatten(2)

@@ -9,7 +9,7 @@
 ```text
 depth       float [B,4,1,126,224]  3 帧过去观测 + 1 帧当前观测；1 表示 5 m
 point_goal  float [B,2]            当前机器人坐标系 PointGoal (x,y)
-observation_to_current float [B,4,4]  每帧到当前帧的 (x,y,sin Δyaw,cos Δyaw)
+observation_to_current float [B,F,4]  每帧到当前帧的 (x,y,sin Δyaw,cos Δyaw)，此合同固定 F=4
 observation_valid bool [B,4]          逐帧有效位；最后一个当前帧必须有效
 ```
 

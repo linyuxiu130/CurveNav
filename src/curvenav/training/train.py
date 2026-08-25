@@ -11,7 +11,8 @@ from accelerate.utils import DistributedDataParallelKwargs, set_seed
 
 from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
-from curvenav.data import build_policy_training_loader, unpack_policy_batch
+from curvenav.data.batch import unpack_policy_batch
+from curvenav.data.loader import build_policy_training_loader
 from curvenav.factory import build_policy
 from curvenav.training.checkpoint import (
     checkpoint_state,
@@ -75,7 +76,6 @@ def _advance_optimizer_state(
 def run_training(
     config: CurveNavConfig,
     resume_path: Path | None = None,
-    stop_after_steps: int | None = None,
 ) -> None:
     """Train with one process per GPU and one globally sharded policy loader."""
     config.validate()
@@ -115,12 +115,7 @@ def run_training(
             raise ValueError(
                 f"resume step must be in [0, {total_steps}), got {start_step}"
             )
-    end_step = total_steps if stop_after_steps is None else stop_after_steps
-    if not start_step < end_step <= total_steps:
-        raise ValueError(
-            f"stop_after_steps must be in ({start_step}, {total_steps}], got {end_step}"
-        )
-    remaining_steps = end_step - start_step
+    remaining_steps = total_steps - start_step
     loader_bundle = build_policy_training_loader(
         config.data,
         config.trajectory,
@@ -184,7 +179,6 @@ def run_training(
                 "global_batch_size": global_batch_size,
                 "steps_per_epoch": steps_per_epoch,
                 "total_steps": total_steps,
-                "end_step": end_step,
                 "resume_step": start_step,
                 "precision": accelerator.mixed_precision,
             },
@@ -284,13 +278,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train the CurveNav policy")
     parser.add_argument("config", type=Path, help="CurveNav YAML configuration")
     parser.add_argument("--resume", type=Path, help="complete checkpoint to continue")
-    parser.add_argument(
-        "--stop-after-steps",
-        type=int,
-        help="bounded diagnostic endpoint on the unchanged production schedule",
-    )
     args = parser.parse_args()
-    run_training(load_config(args.config), args.resume, args.stop_after_steps)
+    run_training(load_config(args.config), args.resume)
 
 
 if __name__ == "__main__":

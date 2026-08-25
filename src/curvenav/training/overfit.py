@@ -12,7 +12,8 @@ from torch import Tensor
 
 from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
-from curvenav.data import PreparedPolicyBatch, build_policy_overfit_loader, unpack_policy_batch
+from curvenav.data.batch import PreparedPolicyBatch, unpack_policy_batch
+from curvenav.data.loader import build_policy_overfit_loader
 from curvenav.factory import build_policy
 from curvenav.models import CurveNavPolicy
 from curvenav.training.checkpoint import checkpoint_state

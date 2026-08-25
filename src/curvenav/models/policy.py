@@ -1,4 +1,4 @@
-"""One conditional-flow generate, geometry-score, spline-select policy."""
+"""One conditional-flow generation and geometric-selection policy."""
 
 from dataclasses import dataclass
 

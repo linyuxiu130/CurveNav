@@ -22,10 +22,10 @@ class _FakeRuntime:
     def step(self, point_goals, depth, positions, quaternions):
         del depth, positions, quaternions
         batch = len(point_goals)
-        candidate_values = np.zeros((batch, 8), np.float32)
+        candidate_values = np.zeros((batch, 16), np.float32)
         return RuntimePrediction(
             path=np.zeros((batch, 64, 3), np.float32),
-            candidate_paths=np.zeros((batch, 8, 64, 3), np.float32),
+            candidate_paths=np.zeros((batch, 16, 64, 3), np.float32),
             candidate_costs=candidate_values,
             candidate_clearance_costs=candidate_values,
             candidate_length_costs=candidate_values,
@@ -59,9 +59,9 @@ def test_npz_interface_has_one_strict_request_and_response_contract() -> None:
     with np.load(BytesIO(response), allow_pickle=False) as archive:
         assert frozenset(archive.files) == RESPONSE_FIELDS
         assert archive["path"].shape == (2, 64, 3)
-        assert archive["candidate_paths"].shape == (2, 8, 64, 3)
-        assert archive["candidate_costs"].shape == (2, 8)
-        assert archive["candidate_minimum_clearance_m"].shape == (2, 8)
+        assert archive["candidate_paths"].shape == (2, 16, 64, 3)
+        assert archive["candidate_costs"].shape == (2, 16)
+        assert archive["candidate_minimum_clearance_m"].shape == (2, 16)
         assert all(archive[name].dtype == np.float32 for name in RESPONSE_FIELDS)
 
 

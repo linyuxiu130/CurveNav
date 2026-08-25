@@ -5,19 +5,18 @@ import pytest
 import torch
 
 from curvenav.config import DataConfig, TrajectoryConfig
-from curvenav.data import (
-    PreparedPolicyDataset,
+from curvenav.data.depth_bank import gather_depth_observations, load_packed_depth_bank
+from curvenav.data.loader import (
     build_policy_overfit_loader,
     build_policy_training_loader,
     build_policy_validation_loader,
 )
-from curvenav.data.depth_bank import gather_depth_observations, load_packed_depth_bank
 from curvenav.data.prepare import (
     _cumulative_distance,
     _frame_indices,
     _fixed_future,
 )
-from curvenav.data.prepared import RepeatedPolicyDataset
+from curvenav.data.prepared import PreparedPolicyDataset, RepeatedPolicyDataset
 
 
 def _write_dataset(root, count: int = 4) -> None:

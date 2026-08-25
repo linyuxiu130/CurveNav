@@ -166,7 +166,7 @@ def build_grid(simulator: Any, seed: int) -> tuple[Grid, float]:
     sizes = np.bincount(components.ravel())
     sizes[0] = 0
     free = components == int(sizes.argmax())
-    if free.sum() / max(all_free.sum(), 1) < 0.8:
+    if free.sum() / all_free.sum() < 0.8:
         raise RuntimeError("dominant navigable component is below 80 percent")
     clearance = (
         distance_transform_edt(np.pad(free, 1, constant_values=False))[1:-1, 1:-1]
