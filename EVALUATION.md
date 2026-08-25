@@ -6,10 +6,11 @@ CurveNav、NavDP 和 X-NavDP 必须直接使用官方仓库 `baselines/x-navdp/e
 
 - 场景：`cluttered_easy`、`cluttered_hard`、`internscenes_home`、`internscenes_commercial`
 - 机器人：Dingo
-- 输入：PointGoal、RGB 历史、当前深度；CurveNav 当前策略只消费 PointGoal、深度和机器人位姿
+- 输入：PointGoal、RGB 历史、当前深度；CurveNav 当前策略只消费 PointGoal、四帧深度和逐帧相对变换
 - 图像尺寸：224
 - RGB 历史样本：easy/hard/commercial 为 8，home 为 7
 - 当前深度样本：1
+- Dingo depth：`640×360` D455，`fx=fy=326.39856`，相机前移 `0.28618 m`、高度 `0.62532 m`、下俯 `10°`
 - 到达阈值：1.0 m
 - nominal speed：0.5 m/s
 - MPC：`N=30, ref_gap=3, T=0.1, v_max=0.5, w_max=0.5`
@@ -27,6 +28,8 @@ CurveNav、NavDP 和 X-NavDP 必须直接使用官方仓库 `baselines/x-navdp/e
 ```
 
 每次结果至少保存逐 episode 的 `success`、`spl`、`distance` 和 `episode_idx`。先跑 10 条固定 episode 验证协议，再跑官方完整 episode；不得把旧 NavDP benchmark、修改后的成功阈值或不同 MPC 的结果混在同一表格。
+
+CurveNav 每个规划周期生成十六条候选，并且只按当前深度构成的显式 `clearance + length + goal` 几何代价选择。闭环主结果不得混入 learned scorer、oracle ADE 选轨、标签轨迹或额外启发式碰撞 mask；离线同时报告 oracle ADE 是为了诊断生成覆盖，不参与实际选择。
 
 上游评测真源位于：
 

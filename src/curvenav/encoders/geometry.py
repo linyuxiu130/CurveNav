@@ -1,4 +1,6 @@
-"""Metric planar geometry for canonical depth observations."""
+"""Metric planar geometry for the canonical calibrated depth camera."""
+
+import math
 
 import torch
 from torch import Tensor, nn
@@ -14,16 +16,24 @@ class PlanarDepthProjector(nn.Module):
         token_width: int,
         max_depth_m: float,
         focal_x_px: float,
+        focal_y_px: float,
+        camera_forward_offset_m: float,
+        camera_downward_pitch_degrees: float,
     ) -> None:
         super().__init__()
         if token_height < 1 or token_width < 1:
             raise ValueError("planar token dimensions must be positive")
-        if max_depth_m <= 0 or focal_x_px <= 0:
+        if max_depth_m <= 0 or focal_x_px <= 0 or focal_y_px <= 0:
             raise ValueError("depth scale and focal length must be positive")
         self.token_height = token_height
         self.token_width = token_width
         self.max_depth_m = float(max_depth_m)
         self.focal_x_px = float(focal_x_px)
+        self.focal_y_px = float(focal_y_px)
+        self.camera_forward_offset_m = float(camera_forward_offset_m)
+        pitch = math.radians(camera_downward_pitch_degrees)
+        self.pitch_sine = math.sin(pitch)
+        self.pitch_cosine = math.cos(pitch)
 
     def forward(
         self,
@@ -50,11 +60,22 @@ class PlanarDepthProjector(nn.Module):
             device=depth.device,
             dtype=depth.dtype,
         )
-        ray_x = (column[None, :] - width / 2.0) / (
-            self.focal_x_px * width / 224.0
+        row = torch.linspace(
+            0.5 * height / self.token_height - 0.5,
+            height - 0.5 * height / self.token_height,
+            self.token_height,
+            device=depth.device,
+            dtype=depth.dtype,
         )
-        forward = pooled_depth
-        lateral = -pooled_depth * ray_x[None, None]
+        ray_x = (column - width / 2.0) / self.focal_x_px
+        ray_y = (row - height / 2.0) / self.focal_y_px
+        optical_y = pooled_depth * ray_y[None, None, :, None]
+        forward = (
+            self.camera_forward_offset_m
+            + self.pitch_cosine * pooled_depth
+            - self.pitch_sine * optical_y
+        )
+        lateral = -pooled_depth * ray_x[None, None, None, :]
         points = torch.stack((forward, lateral), dim=-1)
 
         translation = observation_to_current[..., :2].float()

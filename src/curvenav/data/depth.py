@@ -20,10 +20,10 @@ class PinholeIntrinsics:
 BENCHMARK_INTRINSICS = PinholeIntrinsics(
     width=640,
     height=360,
-    fx=1.4 / 1.88 * 640.0,
-    fy=1.4 / 1.88 * 640.0,
-    cx=320.0,
-    cy=180.0,
+    fx=326.398559570312,
+    fy=326.398559570312,
+    cx=321.792145,
+    cy=181.007690,
 )
 SAND_INTRINSICS = PinholeIntrinsics(
     width=640,
@@ -36,8 +36,8 @@ SAND_INTRINSICS = PinholeIntrinsics(
 CANONICAL_INTRINSICS = PinholeIntrinsics(
     width=224,
     height=126,
-    fx=BENCHMARK_INTRINSICS.fx * 224.0 / 640.0,
-    fy=BENCHMARK_INTRINSICS.fy * 224.0 / 640.0,
+    fx=166.80851063829786,
+    fy=166.80851063829786,
     cx=112.0,
     cy=63.0,
 )

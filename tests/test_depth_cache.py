@@ -1,4 +1,5 @@
 import json
+import math
 
 import cv2
 import numpy as np
@@ -38,6 +39,9 @@ def test_sand_depth_cache_records_empty_upstream_runs(tmp_path) -> None:
 
 
 def test_hssd_route_cache_and_local_slicing_share_depth_frames(tmp_path) -> None:
+    config = CurveNavConfig()
+    data = config.data
+    pitch = math.radians(data.camera_downward_pitch_degrees)
     route_id = "train/dataset_hssd_scene/run_0001"
     route_directory = tmp_path / route_id
     route_directory.mkdir(parents=True)
@@ -66,6 +70,21 @@ def test_hssd_route_cache_and_local_slicing_share_depth_frames(tmp_path) -> None
             {
                 "schema": "curvenav_hssd_expert_routes",
                 "routes": 1,
+                "camera": {
+                    "image": {
+                        "K": [
+                            [data.canonical_focal_x_px, 0.0, data.image_width / 2],
+                            [0.0, data.canonical_focal_y_px, data.image_height / 2],
+                            [0.0, 0.0, 1.0],
+                        ]
+                    },
+                    "body_from_camera_optical": [
+                        [0.0, -math.sin(pitch), math.cos(pitch), data.camera_forward_offset_m],
+                        [-1.0, 0.0, 0.0, 0.0],
+                        [0.0, -math.cos(pitch), -math.sin(pitch), data.camera_height_m],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
+                },
             }
         )
     )
@@ -84,7 +103,7 @@ def test_hssd_route_cache_and_local_slicing_share_depth_frames(tmp_path) -> None
     assert packed.shape == (5, 126, 224)
     np.testing.assert_allclose(packed, 0.8, atol=3e-4)
 
-    examples = _hssd_examples(tmp_path, CurveNavConfig())
+    examples = _hssd_examples(tmp_path, config)
     assert len(examples["train"]) == 4
     np.testing.assert_array_equal(examples["train"][0].depth_indices, [0, 0, 0, 0])
     np.testing.assert_array_equal(

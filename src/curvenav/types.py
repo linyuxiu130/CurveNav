@@ -73,4 +73,8 @@ class TrajectoryPrediction:
     curvature: Tensor
     candidate_control_points: Tensor
     candidate_paths: Tensor
-    candidate_log_probabilities: Tensor
+    candidate_costs: Tensor
+    candidate_clearance_costs: Tensor
+    candidate_length_costs: Tensor
+    candidate_goal_costs: Tensor
+    candidate_minimum_clearance_m: Tensor

@@ -35,7 +35,7 @@ def test_rejects_removed_source_specific_data_config() -> None:
 
 
 def test_rejects_removed_architecture_switches() -> None:
-    for key in ("generator", "fusion", "flow_matching"):
+    for key in ("generator", "fusion", "flow_matching", "trajectory_scorer"):
         with pytest.raises(ValueError, match="unknown model config keys"):
             config_from_mapping({"model": {key: {}}})
     with pytest.raises(TypeError, match="scale_xy"):
@@ -66,3 +66,5 @@ def test_rejects_invalid_trajectory_contract() -> None:
 def test_rejects_non_production_observation_frame_count() -> None:
     with pytest.raises(ValueError, match="four depth observations"):
         config_from_mapping({"data": {"observation_frames": 3}})
+    with pytest.raises(ValueError, match="Dingo camera calibration"):
+        config_from_mapping({"data": {"camera_height_m": 0.30}})

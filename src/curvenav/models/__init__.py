@@ -1,13 +1,18 @@
 """CurveNav model components."""
 
+from .evaluator import (
+    GeometricTrajectoryEvaluator,
+    TRAJECTORY_EVALUATOR_TYPE,
+    TrajectoryCosts,
+)
 from .flow import SplineControlFlow, TRAJECTORY_FLOW_TYPE
 from .policy import CurveNavPolicy
-from .scorer import TRAJECTORY_SCORER_TYPE, TrajectoryScorer
 
 __all__ = [
     "CurveNavPolicy",
+    "GeometricTrajectoryEvaluator",
     "SplineControlFlow",
+    "TRAJECTORY_EVALUATOR_TYPE",
     "TRAJECTORY_FLOW_TYPE",
-    "TRAJECTORY_SCORER_TYPE",
-    "TrajectoryScorer",
+    "TrajectoryCosts",
 ]

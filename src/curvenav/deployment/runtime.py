@@ -142,6 +142,17 @@ class DepthContext:
     observation_valid: np.ndarray
 
 
+@dataclass(frozen=True)
+class RuntimePrediction:
+    path: np.ndarray
+    candidate_paths: np.ndarray
+    candidate_costs: np.ndarray
+    candidate_clearance_costs: np.ndarray
+    candidate_length_costs: np.ndarray
+    candidate_goal_costs: np.ndarray
+    candidate_minimum_clearance_m: np.ndarray
+
+
 class CurveNavRuntime:
     """Batched policy state with one spatial observation timeline per environment."""
 
@@ -172,7 +183,7 @@ class CurveNavRuntime:
         depth_m: np.ndarray,
         positions: np.ndarray,
         quaternions: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> RuntimePrediction:
         point_goals = np.asarray(point_goals, dtype=np.float32)
         depth_m = np.asarray(depth_m, dtype=np.float32)
         positions = np.asarray(positions, dtype=np.float32)
@@ -207,7 +218,6 @@ class CurveNavRuntime:
         self.request_seconds += time.perf_counter() - started
         path_xy = prediction.path.float().cpu().numpy()
         candidate_xy = prediction.candidate_paths.float().cpu().numpy()
-        log_probabilities = prediction.candidate_log_probabilities.float().cpu().numpy()
         candidates = np.concatenate(
             [candidate_xy, np.zeros((*candidate_xy.shape[:-1], 1), dtype=np.float32)], axis=-1
         )
@@ -215,4 +225,20 @@ class CurveNavRuntime:
             [path_xy, np.zeros((*path_xy.shape[:-1], 1), dtype=np.float32)],
             axis=-1,
         )
-        return selected, candidates, log_probabilities
+        return RuntimePrediction(
+            path=selected,
+            candidate_paths=candidates,
+            candidate_costs=prediction.candidate_costs.float().cpu().numpy(),
+            candidate_clearance_costs=(
+                prediction.candidate_clearance_costs.float().cpu().numpy()
+            ),
+            candidate_length_costs=(
+                prediction.candidate_length_costs.float().cpu().numpy()
+            ),
+            candidate_goal_costs=(
+                prediction.candidate_goal_costs.float().cpu().numpy()
+            ),
+            candidate_minimum_clearance_m=(
+                prediction.candidate_minimum_clearance_m.float().cpu().numpy()
+            ),
+        )

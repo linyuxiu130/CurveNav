@@ -13,6 +13,8 @@ observation_to_current float [B,4,4]  每帧到当前帧的 (x,y,sin Δyaw,cos �
 observation_valid bool [B,4]          逐帧有效位；最后一个当前帧必须有效
 ```
 
+深度相机合同固定为目标评测的 Dingo D455：原始 `640×360` 内参 `fx=fy=326.39856, cx=321.792145, cy=181.007690`，重投影到 `224×126, fx=fy=166.80851, cx=112, cy=63`；相机相对机器人基座前移 `0.28618 m`、高度 `0.62532 m`、光轴下俯 `10°`。内外参都进入 dataset 与 checkpoint 合同。
+
 训练目标 `TrajectoryTarget`：
 
 ```text
@@ -20,7 +22,7 @@ control_points float [B,8,2]   当前机器人坐标系的三次 B-spline 控制
 reference_path float [B,64,2]  同一路径的 64 点等弧长训练参考
 ```
 
-输出 `TrajectoryPrediction` 包含选中的 `[B,64,2]` 路径、解析 heading/curvature，以及八条候选控制点、候选路径和组内对数概率。参考路径保留来源的真实局部 horizon：SanD 与 HSSD 都最多取未来 24 个 0.15 m 专家步，真正到达 PointGoal 时自然缩短；二者都不缩放到固定长度。
+输出 `TrajectoryPrediction` 包含选中的 `[B,64,2]` 路径、解析 heading/curvature，以及十六条候选控制点、候选路径、总几何代价和 clearance/length/goal 分项。参考路径保留来源的真实局部 horizon：SanD 与 HSSD 都最多取未来 24 个 0.15 m 专家步，真正到达 PointGoal 时自然缩短；二者都不缩放到固定长度。
 
 ## 唯一模型图
 
@@ -39,9 +41,9 @@ PointGoal ----> direction + log-range -> 1 goal token
                                       |
                 +---------------------+--------------------+
                 v                                          v
-     conditional rectified flow                  trajectory scorer
-       8 B-spline candidates                    same-context log-softmax
-                +--------------------- argmax ----------------+
+     conditional rectified flow             explicit geometry evaluator
+      16 B-spline candidates             current depth + robot footprint
+                +--------------------- argmin ----------------+
                                       v
                         64-point equal-arc path
 ```
@@ -60,10 +62,17 @@ Z = Attn(Q, V + P2D + Pslot, V + P2D + Pslot),   |Q| = 4×16.
 
 无效历史深度先被确定性置零，避免其数值经 ResNet BatchNorm 影响有效帧，再在 cross-attention 的 key/value 侧完全 mask。该压缩方式来自 NavDP 的 learned-query RGB-D memory compressor；查询可从全部历史中提取任务相关统计，而计算量从后续层的 `O(384²)` 降为 `O(64×384 + 64²)`。
 
-每个 `8×12` token 还显式携带一个度量平面点，而不是把整帧变换广播成特征。令归一化深度恢复为光轴距离 `z`，像素射线为 `x/z=(u-c_x)/f_x`，则相机水平平面点定义为
+每个 `8×12` token 还显式携带一个度量平面点，而不是把整帧变换广播成特征。令归一化深度恢复为光轴距离 `z`，光学坐标为
 
 ```text
-p_t(u,v) = (z, -z (u-c_x)/f_x).
+x_o = z(u-c_x)/f_x,
+y_o = z(v-c_y)/f_y.
+```
+
+对相机前移 `a`、下俯角 `α`，反投影到机器人平面的点是
+
+```text
+p_t(u,v) = (a + cos(α)z - sin(α)y_o, -x_o).
 ```
 
 `observation_to_current=(t_x,t_y,sin Δθ,cos Δθ)` 按刚体变换映射到当前坐标：
@@ -74,7 +83,7 @@ p_current = R(Δθ) p_t + (t_x,t_y).
 
 平面点和 pooled depth 经过三维输入 MLP，与 SanD 的视觉 token 相加，再交给 NavDP 风格 query compressor。这样历史运动直接作用于每个空间 token，后续模块不再维护单独的 pose-token 分支。最后将一个 PointGoal token 和 64 个压缩视觉 token 拼接，经两层联合 self-attention 得到 65 个目标相关条件 token。
 
-该投影只使用数据合同中存在的 pinhole 内参和二维相对运动，数学上是标准的深度反投影加平面刚体变换；它不是完整 BEV/地面交点投影，也不声称恢复相机高度或俯仰。`observation_to_current` 是数据变换的名字，不使用含糊的刚体状态缩写；frame-slot embedding 只编码序列槽位，不重复编码几何。
+该投影使用合同中的完整 pinhole 内参、固定相机外参和二维相对运动，数学上是标准深度反投影、camera-to-body 刚体变换与逐帧平面对齐；它不是地面交点投影。`observation_to_current` 是数据变换的名字，不使用含糊的刚体状态缩写；frame-slot embedding 只编码序列槽位，不重复编码几何。
 
 SanD 源码中还有上一条选中轨迹的 initial-turn token，但当前 prepared dataset 没有“因果上的上一条已选轨迹”。用当前专家轨迹首段构造会泄漏标签；训练永远给 null、推理再给历史值又会造成分布偏移。因此当前合同不采用它，待数据明确保存上一决策周期的已选轨迹后再整体引入和验证。
 
@@ -117,7 +126,7 @@ u_t = x_1 - ε
 L_flow = E ||v_θ(x_t,t,C)-u_t||².
 ```
 
-轨迹 Transformer 先在八个控制点上做双向 self-attention，再 cross-attend 65 个条件 token。推理从固定种子的八个独立 Gaussian noise 出发，以八步 Heun 积分 `dx/dt=v_θ(x,t,C)`，确定性地产生八条候选。Heun 的预测-校正步在相同步数下比左端 Euler 更准确；它替代 SanD/NavDP 的 DDPM，但不是来自 X-NavDP 的 RL 后训练。
+轨迹 Transformer 先在八个控制点上做双向 self-attention，再 cross-attend 65 个条件 token。推理从固定种子的十六个独立 Gaussian noise 出发，以八步 Heun 积分 `dx/dt=v_θ(x,t,C)`，确定性地产生十六条候选。候选数对齐 SanD 部署合同，并低于 NavDP 默认的 32 条；Heun 的预测-校正步在相同步数下比左端 Euler 更准确。它替代 SanD/NavDP 的 DDPM，但不是来自 X-NavDP 的 RL 后训练。
 
 训练时的一步数据估计
 
@@ -127,45 +136,61 @@ x_hat_1 = x_t + (1-t)v_θ(x_t,t,C)
 
 直接经 B-spline 和等弧长解码接受路径与切向监督，使最终可执行路径的误差能传回 Flow。
 
-### 5. 轨迹组质量评分
+### 5. 显式几何轨迹评价
 
-当前数据没有 NavDP 的全局 ESDF 正负轨迹标签，也没有 X-NavDP 的在线 reward/Q target。把专家 ADE 称为 safety value 或 Q 在数学上不成立，因此 `TrajectoryScorer` 学习的是观测条件下的组内质量分布，而不是碰撞概率或 Q 值。每个 batch 组由本样本专家和其它样本的经验边缘轨迹组成；每个候选都由其等弧长路径对参考路径的 Smooth-L1 误差得到软目标：
+候选选择采用 SanD 的解析代价结构，不训练额外 scorer。评价器只读取当前帧 metric depth、相机标定、机器人尺寸、PointGoal 和十六条同状态候选。
 
-对 batch 中观测 `C_i`，匹配专家 `Q_i` 是正样本，其他样本的专家轨迹是经验边缘负样本：
+当前深度先按完整 pinhole 模型反投影。对像素 `(u,v)` 和光轴深度 `z`：
 
 ```text
-q_{ij} = softmax_j(-ADE_{ij}),
-L_rank = -E_i Σ_j q_{ij} log softmax_j(S(C_i,Q_{ij})).
+x_optical = (u-cx) z / fx,
+y_optical = (v-cy) z / fy,
+p_body.x = a + cos(α)z - sin(α)y_optical,
+p_body.y = -x_optical,
+h_body = h_camera - sin(α)z - cos(α)y_optical.
 ```
 
-这是 NavDP critic 的“候选生成后评价”结构和 X-NavDP 组内重加权思想在离线监督条件下的严格对应：目标分布不再假设专家位于第 0 个候选，且不伪装成在线 Q。推理时只在同一观测的八条 Flow 候选内计算 `candidate_log_probabilities=log_softmax(S)`，并选择最大质量 logit。
+只保留 `0.05 m <= h_body <= 0.70 m` 的可见表面，过滤地面和高于机器人本体的表面。候选等弧长点 `x_j` 到这些平面障碍点的最小欧氏距离记为 `d_j`；超出当前水平视场、位于相机后方或超过 5 m 观测距离的点没有几何证据，令 `d_j=0`。机器人当前已占据的原点邻域（半径取机器人半径与相机前移量的较大值）保留点云距离，避免把轨迹必经的当前本体区域错误标成未知。安全中心距为机器人半径与余量之和：
 
-NavDP 的 privileged critic 和 X-NavDP 的 GQRM/RTC 仍需要 ESDF、碰撞 reward 或在线交互；当前实现只吸收其候选组排序接口，不把离线路径误差冒充安全值。要得到显式安全置信度，后续必须提供真实 ESDF/碰撞标签，或补齐相机外参和机器人 footprint 后实现 SanD 的解析几何评价。
+```text
+d_safe = r_robot + m_safe = 0.25 m + 0.10 m = 0.35 m.
+```
+
+十六条候选分别计算：
+
+```text
+J_clear = Σ_j γ^j max(0, d_safe-d_j) / Σ_j γ^j,  γ=0.95
+J_length = Σ_j ||x_{j+1}-x_j||₂
+J_goal = ||x_last-g||₂
+J = 10 J_clear + J_length + J_goal.
+```
+
+选择 `argmin J`。`J_length+J_goal >= ||g||₂` 来自三角不等式，因此两项同权时不会奖励原地停止，同时会惩罚相对目标直达距离的额外绕行；十倍 clearance 权重和近端折扣取自 SanD 默认解析 critic。评价器无可训练参数、无标签输入，也不进入训练损失。
+
+这里的 `d_j` 是当前可见深度表面点集的距离近似，不是完整占据图的有符号 ESDF；代码和指标均使用 `surface clearance` 命名。未知视场按不安全处理使选择保持保守，但单帧遮挡后的自由空间不会被虚构出来。NavDP 的 learned critic 需要 privileged ESDF 正负轨迹，X-NavDP 的 GQRM/RTC 需要在线 reward/Q target；当前数据没有这些监督，因此不引入语义不成立的 learned safety/Q 分支。
 
 ## 总损失
 
 唯一训练目标是
 
 ```text
-L = 1.0 L_flow + 0.5 L_path + 0.1 L_tangent + 0.1 L_rank.
+L = 1.0 L_flow + 0.5 L_path + 0.1 L_tangent.
 ```
 
 - `L_path`：`x_hat_1` 解码路径与等弧长 `reference_path` 的逐点 Smooth-L1。权重 `0.25+exp(-4s)` 归一化到均值 1，强调 receding-horizon 即将执行的近端。
 - `L_tangent`：有效目标段上的 `1-cos(Δx_hat,Δx*)`，使用同一近端权重，约束初始转向和局部跟踪方向。
-- `L_rank`：上述组内质量软标签交叉熵。
-
 不对不同自由控制点设置手工 Flow 权重。B-spline 已保证连续性，路径和切向损失负责将执行几何质量传回 Flow。
 
 ## 参考设计吸收边界
 
 | 参考 | 当前已吸收 | 当前未采用及原因 |
 |---|---|---|
-| SanD | shared depth spatial tokens、2-D/frame-slot 编码、8 点三次 B-spline、等弧长输出 | DDPM 被标准 CFM 替代；initial-turn 缺少因果训练字段；解析 ESDF 缺外参/footprint |
-| NavDP | learned-query 多帧压缩、条件生成后候选评价 | 输入合同没有 RGB；没有 privileged ESDF 正负标签，故不冒充 safety critic |
-| X-NavDP | PointGoal 的尺度边界；保留同状态候选归一化语义 | GQRM、twin Q、RTC 和 embodiment FiLM 都依赖在线 RL/执行历史/多本体数据 |
+| SanD | shared depth spatial tokens、2-D/frame-slot 编码、8 点三次 B-spline、等弧长输出、当前深度显式几何评价与 clearance/length/goal 代价 | DDPM 被标准 CFM 替代；initial-turn 缺少因果训练字段；当前深度表面距离不冒充全局 ESDF |
+| NavDP | learned-query 多帧压缩、同状态多候选生成后评价 | 输入合同没有 RGB；没有 privileged ESDF 正负标签，故不采用 learned safety critic |
+| X-NavDP | PointGoal 的 25 m 编码边界 | GQRM、twin Q、RTC 和 embodiment FiLM 都依赖在线 RL、执行历史或多本体数据 |
 | FlowNav | 标准 conditional flow matching 与少步 ODE 推理 | 不预设其 NFE 优势会自动转化为 CurveNav 闭环增益 |
 
-因此当前模型是“SanD 轨迹表示与深度时空 token + NavDP learned-query 压缩与 generate/rank 结构 + 标准 CFM”，而不是把三篇论文中监督条件互不兼容的模块机械叠加。
+因此当前模型是“SanD 轨迹表示、深度时空 token 与显式候选评价 + NavDP learned-query 压缩与同状态多候选接口 + 标准 CFM”，而不是把监督条件互不兼容的 learned critic 或在线 RL 模块机械叠加。
 
 主要来源：[SanD-Planner](https://arxiv.org/abs/2602.00923)、[SanD 官方源码](https://github.com/WangJinCheng1998/sandplanner)、[NavDP](https://arxiv.org/abs/2505.08712)、[NavDP 官方源码](https://github.com/InternRobotics/NavDP)、[X-NavDP](https://arxiv.org/abs/2607.28560)、[FlowNav](https://arxiv.org/abs/2411.09524)、[Implicit Behavioral Cloning](https://arxiv.org/abs/2109.00137)。显式几何对照：[Semantic MapNet](https://arxiv.org/abs/2010.01191)、[PETRv2](https://arxiv.org/abs/2206.01256)、[BEVDet4D](https://arxiv.org/abs/2203.17054)、[LoGoPlanner](https://arxiv.org/abs/2512.19629)。
 
@@ -175,9 +200,9 @@ L = 1.0 L_flow + 0.5 L_path + 0.1 L_tangent + 0.1 L_rank.
 
 唯一数据入口是 `scripts/build_dataset.sh DATA_ROOT`。它依次下载固定 commit 的 SanD 与 HSSD、生成 HSSD 专家 route、准备两类 route 深度缓存，并原子编译 `data/policy_dataset`；训练与 GPU 调度不属于数据生成链。各阶段只接受空输出，不提供历史版本、恢复模式或已有输出分支。HSSD 的 20 个冻结场景按 16/4 划分 train/validation，并禁止同源 scene family 跨 split。每个场景生成 25 条无扰动的完整专家 route：近距 5 条、中距 10 条、远距 10 条，共 500 条，train/validation 分别为 400/100 条。
 
-每条 HSSD route 沿 clearance-aware 路径按 0.15 m 等弧长采样，保存连续平面位姿以及逐位置 `224×126` metric depth，最终位置就是该 route 的任务 PointGoal。编译阶段在每个非终点位置切出一个监督样本：历史四帧按 `[-1.35,-0.90,-0.45,0] m` 索引，未来最多 24 步作为局部路径，并计算 `observation_to_current=(x,y,sin Δyaw,cos Δyaw)`。同一 route 的深度只保存一次，局部样本通过索引共享。生成门禁验证数量、连续 clearance、0.15 m 间距、距离分布、深度/位姿对齐、split 无泄漏、原子提交和最终 SHA。
+每条 HSSD route 沿 clearance-aware 路径按 0.15 m 等弧长采样，保存连续平面位姿以及逐位置 `224×126` metric depth，最终位置就是该 route 的任务 PointGoal。HSSD 相机内外参必须与上述 Dingo canonical camera 完全一致，否则编译立即拒绝。编译阶段在每个非终点位置切出一个监督样本：历史四帧按 `[-1.35,-0.90,-0.45,0] m` 索引，未来最多 24 步作为局部路径，并计算 `observation_to_current=(x,y,sin Δyaw,cos Δyaw)`。同一 route 的深度只保存一次，局部样本通过索引共享。生成门禁验证数量、连续 clearance、0.15 m 间距、距离分布、深度/位姿对齐、split 无泄漏、原子提交和最终 SHA。
 
-SanD 深度由原始 `640×480` 相机重投影到 `224×126`；HSSD 直接用同一标定相机渲染。两者都归一化到 5 m 并按 route 打包，再编译成唯一 `data/policy_dataset`。训练期 loader 只读取统一张量和深度索引，不保留来源分支。
+SanD 深度由原始 `640×480` 相机重投影到 `224×126`；HSSD 直接用同一标定相机渲染。两者都归一化到 5 m 并按 route 打包，再编译成唯一 `data/policy_dataset`。训练期 loader 只读取统一张量和深度索引，不保留来源分支。旧 `0.30 m` 水平相机生成的 prepared dataset 不满足当前外参合同，必须重建，代码不提供兼容分支。
 
 唯一链路：
 
@@ -187,12 +212,12 @@ HSSD generation + SanD source -> calibrated prepared dataset
                  -> offline geometry metrics -> official closed-loop benchmark
 ```
 
-checkpoint 严格记录输入标定、编码器与生成器类型、平面反投影对齐、每帧 16 个压缩 token、八控制点、等弧长倍数和损失语义；合同不一致时直接拒绝加载，不设置兼容分支。推理不读取标签，也不执行曲率裁剪、碰撞 mask、直线候选或轨迹反转。
+checkpoint 严格记录输入标定、编码器与生成器类型、平面反投影对齐、每帧 16 个压缩 token、八控制点、等弧长倍数、损失语义和显式评价器参数；合同不一致时直接拒绝加载，不设置兼容分支。推理不读取标签，也不执行曲率裁剪、直线候选或轨迹反转。
 
 开始完整训练前只保留三类验证：
 
-1. 数学与接口单测：B-spline、等弧长、逐帧 mask、平面反投影、learned-query token 数、组内质量损失和 checkpoint；
+1. 数学与接口单测：B-spline、等弧长、逐帧 mask、平面反投影、learned-query token 数、显式几何代价和 checkpoint；
 2. 前向/反向：所有输出形状正确，全部可训练参数具有有限梯度；
-3. 固定批过拟合及同协议离线/闭环评测：selected/oracle ADE、弧长、曲率、反转率、候选多样性、延迟、SR/SPL。
+3. 固定批过拟合及同协议离线/闭环评测：selected/oracle ADE、几何代价 margin、selected surface clearance、clearance violation、候选多样性、延迟、SR/SPL。
 
-离线 ADE 不能替代闭环 SR/SPL；候选组质量不能解释为安全概率；未进行 X-NavDP 在线 RL 时不得使用“Q 后训练”表述。
+离线 ADE 不能替代闭环 SR/SPL；可见表面 clearance 不能解释为完整 ESDF 或碰撞概率；未进行 X-NavDP 在线 RL 时不得使用“Q 后训练”表述。

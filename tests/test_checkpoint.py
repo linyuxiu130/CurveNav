@@ -7,24 +7,30 @@ from curvenav.config import CurveNavConfig
 from curvenav.training import checkpoint_state, policy_contract, validate_policy_contract
 
 
-def test_checkpoint_records_the_flow_and_scorer_contract() -> None:
+def test_checkpoint_records_the_flow_and_geometric_evaluator_contract() -> None:
     config = CurveNavConfig()
     checkpoint = checkpoint_state(nn.Linear(2, 2), config, step=0)
     contract = checkpoint["policy_contract"]
     assert checkpoint["checkpoint_type"] == "curvenav_local_policy"
-    assert contract["trajectory_flow_candidates"] == 8
+    assert contract["trajectory_flow_candidates"] == 16
     assert (
         contract["trajectory_flow_type"]
         == "conditional_bspline_rectified_flow_heun"
     )
     assert (
-        contract["trajectory_scorer_type"]
-        == "conditional_trajectory_group_quality"
+        contract["trajectory_evaluator_type"]
+        == "depth_surface_clearance_length_goal"
     )
     assert (
         contract["training_objective"]
-        == "rectified_flow_plus_arc_path_tangent_and_group_quality"
+        == "rectified_flow_plus_arc_path_and_tangent"
     )
+    assert contract["trajectory_safe_center_distance_m"] == pytest.approx(0.35)
+    assert contract["camera_extrinsics"] == {
+        "forward_offset_m": pytest.approx(0.28618),
+        "height_m": pytest.approx(0.62532),
+        "downward_pitch_degrees": pytest.approx(10.0),
+    }
     assert contract["num_control_points"] == 8
     assert contract["path_sampling"] == "uniform_metric_arc_progress"
     assert contract["visual_compression"] == "learned_queries_16_tokens_per_depth_frame"

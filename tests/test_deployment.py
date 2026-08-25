@@ -9,7 +9,7 @@ from curvenav.deployment.runtime import (
 
 def test_invalid_depth_is_encoded_as_sensor_limit():
     depth = np.full((360, 640), 4.0, dtype=np.float32)
-    depth[180, 320] = np.nan
+    depth[round(BENCHMARK_INTRINSICS.cy), round(BENCHMARK_INTRINSICS.cx)] = np.nan
 
     normalized = preprocess_metric_depth(
         depth, source_intrinsics=BENCHMARK_INTRINSICS, maximum_m=5.0

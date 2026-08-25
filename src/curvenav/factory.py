@@ -1,12 +1,12 @@
-"""Composition root for the one CurveNav generate-rank-select graph."""
+"""Composition root for the one CurveNav generate-score-select graph."""
 
 from curvenav.config import CurveNavConfig
 from curvenav.conditioning import PolicyConditionEncoder
 from curvenav.encoders import DepthObservationEncoder, PointGoalEncoder
 from curvenav.models import (
     CurveNavPolicy,
+    GeometricTrajectoryEvaluator,
     SplineControlFlow,
-    TrajectoryScorer,
 )
 from curvenav.trajectory import PlanarBSplineCodec, PlanarScaleNormalizer
 
@@ -19,7 +19,7 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
     point_goal = config.point_goal_encoder
     condition = config.condition_encoder
     trajectory_flow_config = config.trajectory_flow
-    scorer = config.trajectory_scorer
+    evaluator = config.trajectory_evaluator
 
     depth_encoder = DepthObservationEncoder(
         model_dim=depth.model_dim,
@@ -28,6 +28,11 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         dropout=depth.dropout,
         max_depth_m=config.data.max_depth_m,
         focal_x_px=config.data.canonical_focal_x_px,
+        focal_y_px=config.data.canonical_focal_y_px,
+        camera_forward_offset_m=config.data.camera_forward_offset_m,
+        camera_downward_pitch_degrees=(
+            config.data.camera_downward_pitch_degrees
+        ),
     )
     point_goal_encoder = PointGoalEncoder(
         model_dim=point_goal.model_dim,
@@ -52,12 +57,25 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         inference_candidates=trajectory_flow_config.inference_candidates,
         inference_seed=trajectory_flow_config.inference_seed,
     )
-    trajectory_scorer = TrajectoryScorer(
-        num_control_points=trajectory.num_control_points,
-        model_dim=scorer.model_dim,
-        layers=scorer.transformer_layers,
-        heads=scorer.transformer_heads,
-        dropout=scorer.dropout,
+    trajectory_evaluator = GeometricTrajectoryEvaluator(
+        image_height=config.data.image_height,
+        image_width=config.data.image_width,
+        focal_x_px=config.data.canonical_focal_x_px,
+        focal_y_px=config.data.canonical_focal_y_px,
+        max_depth_m=config.data.max_depth_m,
+        camera_forward_offset_m=config.data.camera_forward_offset_m,
+        camera_height_m=config.data.camera_height_m,
+        camera_downward_pitch_degrees=(
+            config.data.camera_downward_pitch_degrees
+        ),
+        minimum_obstacle_height_m=evaluator.minimum_obstacle_height_m,
+        robot_height_m=evaluator.robot_height_m,
+        robot_radius_m=evaluator.robot_radius_m,
+        safety_margin_m=evaluator.safety_margin_m,
+        discount_factor=evaluator.discount_factor,
+        clearance_weight=evaluator.clearance_weight,
+        length_weight=evaluator.length_weight,
+        goal_weight=evaluator.goal_weight,
     )
     codec = PlanarBSplineCodec(
         num_control_points=trajectory.num_control_points,
@@ -68,7 +86,7 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         depth_encoder=depth_encoder,
         condition_encoder=condition_encoder,
         trajectory_flow=trajectory_flow,
-        trajectory_scorer=trajectory_scorer,
+        trajectory_evaluator=trajectory_evaluator,
         codec=codec,
         normalizer=PlanarScaleNormalizer(
             (trajectory.normalization_scale_m, trajectory.normalization_scale_m)

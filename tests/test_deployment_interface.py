@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from curvenav.deployment.interface import CurveNavNpzInterface, RESPONSE_FIELDS
+from curvenav.deployment.runtime import RuntimePrediction
 
 
 class _FakeRuntime:
@@ -21,10 +22,15 @@ class _FakeRuntime:
     def step(self, point_goals, depth, positions, quaternions):
         del depth, positions, quaternions
         batch = len(point_goals)
-        return (
-            np.zeros((batch, 64, 3), np.float32),
-            np.zeros((batch, 8, 64, 3), np.float32),
-            np.zeros((batch, 8), np.float32),
+        candidate_values = np.zeros((batch, 8), np.float32)
+        return RuntimePrediction(
+            path=np.zeros((batch, 64, 3), np.float32),
+            candidate_paths=np.zeros((batch, 8, 64, 3), np.float32),
+            candidate_costs=candidate_values,
+            candidate_clearance_costs=candidate_values,
+            candidate_length_costs=candidate_values,
+            candidate_goal_costs=candidate_values,
+            candidate_minimum_clearance_m=candidate_values,
         )
 
 
@@ -54,7 +60,8 @@ def test_npz_interface_has_one_strict_request_and_response_contract() -> None:
         assert frozenset(archive.files) == RESPONSE_FIELDS
         assert archive["path"].shape == (2, 64, 3)
         assert archive["candidate_paths"].shape == (2, 8, 64, 3)
-        assert archive["candidate_log_probabilities"].shape == (2, 8)
+        assert archive["candidate_costs"].shape == (2, 8)
+        assert archive["candidate_minimum_clearance_m"].shape == (2, 8)
         assert all(archive[name].dtype == np.float32 for name in RESPONSE_FIELDS)
 
 

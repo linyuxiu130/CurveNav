@@ -9,7 +9,7 @@ from curvenav.config import (
     CurveNavConfig,
     DataConfig,
     DepthEncoderConfig,
-    TrajectoryScorerConfig,
+    TrajectoryEvaluatorConfig,
     TrajectoryFlowConfig,
     ConditionEncoderConfig,
     PointGoalEncoderConfig,
@@ -34,7 +34,7 @@ def config_from_mapping(raw: Mapping[str, Any]) -> CurveNavConfig:
         "point_goal_encoder",
         "condition_encoder",
         "trajectory_flow",
-        "trajectory_scorer",
+        "trajectory_evaluator",
     }
     unknown_model = set(model) - allowed_model
     if unknown_model:
@@ -50,8 +50,8 @@ def config_from_mapping(raw: Mapping[str, Any]) -> CurveNavConfig:
         ),
         condition_encoder=ConditionEncoderConfig(**model.get("condition_encoder", {})),
         trajectory_flow=TrajectoryFlowConfig(**model.get("trajectory_flow", {})),
-        trajectory_scorer=TrajectoryScorerConfig(
-            **model.get("trajectory_scorer", {})
+        trajectory_evaluator=TrajectoryEvaluatorConfig(
+            **model.get("trajectory_evaluator", {})
         ),
         training=TrainingConfig(**raw.get("training", {})),
     )

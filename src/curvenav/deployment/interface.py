@@ -6,14 +6,22 @@ from io import BytesIO
 
 import numpy as np
 
-from curvenav.deployment.runtime import CurveNavRuntime, load_policy
+from curvenav.deployment.runtime import CurveNavRuntime, RuntimePrediction, load_policy
 
 
 REQUEST_FIELDS = frozenset(
     {"point_goal", "depth_m", "robot_position", "robot_quaternion", "reset"}
 )
 RESPONSE_FIELDS = frozenset(
-    {"path", "candidate_paths", "candidate_log_probabilities"}
+    {
+        "path",
+        "candidate_paths",
+        "candidate_costs",
+        "candidate_clearance_costs",
+        "candidate_length_costs",
+        "candidate_goal_costs",
+        "candidate_minimum_clearance_m",
+    }
 )
 
 
@@ -33,11 +41,9 @@ def _read_request(payload: bytes) -> dict[str, np.ndarray]:
     return request
 
 
-def _write_response(
-    path: np.ndarray,
-    candidate_paths: np.ndarray,
-    candidate_log_probabilities: np.ndarray,
-) -> bytes:
+def _write_response(prediction: RuntimePrediction) -> bytes:
+    path = prediction.path
+    candidate_paths = prediction.candidate_paths
     if path.ndim != 3 or path.shape[-1] != 3:
         raise ValueError("path must have shape [B,P,3]")
     batch, path_points, _ = path.shape
@@ -47,16 +53,24 @@ def _write_response(
         or candidate_paths.shape[2:] != (path_points, 3)
     ):
         raise ValueError("candidate_paths must have shape [B,C,P,3]")
-    if candidate_log_probabilities.shape != candidate_paths.shape[:2]:
-        raise ValueError("candidate_log_probabilities must have shape [B,C]")
+    costs = {
+        "candidate_costs": prediction.candidate_costs,
+        "candidate_clearance_costs": prediction.candidate_clearance_costs,
+        "candidate_length_costs": prediction.candidate_length_costs,
+        "candidate_goal_costs": prediction.candidate_goal_costs,
+        "candidate_minimum_clearance_m": prediction.candidate_minimum_clearance_m,
+    }
+    if any(value.shape != candidate_paths.shape[:2] for value in costs.values()):
+        raise ValueError("candidate costs must have shape [B,C]")
     stream = BytesIO()
     np.savez(
         stream,
         path=np.asarray(path, dtype=np.float32),
         candidate_paths=np.asarray(candidate_paths, dtype=np.float32),
-        candidate_log_probabilities=np.asarray(
-            candidate_log_probabilities, dtype=np.float32
-        ),
+        **{
+            name: np.asarray(value, dtype=np.float32)
+            for name, value in costs.items()
+        },
     )
     return stream.getvalue()
 
@@ -77,13 +91,13 @@ class CurveNavNpzInterface:
             self.runtime.reset(batch_size)
         for env_id in np.flatnonzero(reset):
             self.runtime.reset_env(int(env_id))
-        path, candidate_paths, candidate_log_probabilities = self.runtime.step(
+        prediction = self.runtime.step(
             request["point_goal"],
             request["depth_m"],
             request["robot_position"],
             request["robot_quaternion"],
         )
-        return _write_response(path, candidate_paths, candidate_log_probabilities)
+        return _write_response(prediction)
 
 
 def load_npz_interface(

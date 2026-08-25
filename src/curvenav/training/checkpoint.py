@@ -10,7 +10,7 @@ from curvenav.config import CurveNavConfig
 from curvenav.conditioning import CONDITION_ENCODER_TYPE
 from curvenav.encoders.depth import DEPTH_ENCODER_TYPE
 from curvenav.encoders import POINT_GOAL_ENCODER_TYPE
-from curvenav.models import TRAJECTORY_FLOW_TYPE, TRAJECTORY_SCORER_TYPE
+from curvenav.models import TRAJECTORY_EVALUATOR_TYPE, TRAJECTORY_FLOW_TYPE
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.trajectory import (
     ARC_LENGTH_OVERSAMPLE_FACTOR,
@@ -32,6 +32,11 @@ def policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "depth_image_size": [data.image_height, data.image_width],
         "max_depth_m": data.max_depth_m,
         "canonical_focal_px": [data.canonical_focal_x_px, data.canonical_focal_y_px],
+        "camera_extrinsics": {
+            "forward_offset_m": data.camera_forward_offset_m,
+            "height_m": data.camera_height_m,
+            "downward_pitch_degrees": data.camera_downward_pitch_degrees,
+        },
         "depth_encoder_type": DEPTH_ENCODER_TYPE,
         "trajectory_dimensions": 2,
         "point_goal_semantics": "mission_destination_in_current_robot_xy",
@@ -43,9 +48,21 @@ def policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "arc_length_policy": "learned_metric_length_without_rescaling_or_meter_cap",
         "trajectory_endpoint_policy": "implicit_local_subgoal_origin_only",
         "trajectory_flow_type": TRAJECTORY_FLOW_TYPE,
-        "trajectory_scorer_type": TRAJECTORY_SCORER_TYPE,
-        "training_objective": "rectified_flow_plus_arc_path_tangent_and_group_quality",
-        "trajectory_scorer_supervision": "quality_distribution_over_expert_and_marginal_trajectory_groups",
+        "trajectory_evaluator_type": TRAJECTORY_EVALUATOR_TYPE,
+        "training_objective": "rectified_flow_plus_arc_path_and_tangent",
+        "trajectory_selection": "analytic_current_depth_clearance_length_goal_cost",
+        "trajectory_safe_center_distance_m": (
+            config.trajectory_evaluator.robot_radius_m
+            + config.trajectory_evaluator.safety_margin_m
+        ),
+        "trajectory_clearance_discount_factor": (
+            config.trajectory_evaluator.discount_factor
+        ),
+        "trajectory_cost_weights": [
+            config.trajectory_evaluator.clearance_weight,
+            config.trajectory_evaluator.length_weight,
+            config.trajectory_evaluator.goal_weight,
+        ],
         "trajectory_flow_candidates": config.trajectory_flow.inference_candidates,
         "trajectory_flow_integration_steps": config.trajectory_flow.integration_steps,
         "condition_encoder_type": CONDITION_ENCODER_TYPE,

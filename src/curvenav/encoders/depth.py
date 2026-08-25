@@ -82,6 +82,9 @@ class DepthObservationEncoder(nn.Module):
         dropout: float = 0.0,
         max_depth_m: float = 5.0,
         focal_x_px: float = 166.80851063829786,
+        focal_y_px: float = 166.80851063829786,
+        camera_forward_offset_m: float = 0.28618,
+        camera_downward_pitch_degrees: float = 10.0,
     ) -> None:
         super().__init__()
         if model_dim % 4:
@@ -107,6 +110,9 @@ class DepthObservationEncoder(nn.Module):
             frame_tokens_width,
             max_depth_m,
             focal_x_px,
+            focal_y_px,
+            camera_forward_offset_m,
+            camera_downward_pitch_degrees,
         )
         self.geometry_projection = nn.Sequential(
             nn.Linear(3, model_dim),

@@ -120,7 +120,6 @@ def run_overfit(config: CurveNavConfig) -> dict[str, float]:
                         "flow_loss": losses.flow_loss.detach().float().item(),
                         "path_loss": losses.path_loss.detach().float().item(),
                         "tangent_loss": losses.tangent_loss.detach().float().item(),
-                        "ranking_loss": losses.ranking_loss.detach().float().item(),
                         "grad_norm": grad_norm.detach().float().item(),
                         "optimizer_step_skipped": optimizer_step_skipped,
                     },
@@ -174,7 +173,7 @@ def run_overfit(config: CurveNavConfig) -> dict[str, float]:
         raise RuntimeError(f"fixed-batch flow candidates did not memorize targets: {metrics}")
     if metrics["selected_ade_m"] > config.training.overfit_selected_ade_m:
         raise RuntimeError(
-            f"fixed-batch trajectory scorer did not select a memorized target: {metrics}"
+            f"fixed-batch geometric evaluator did not select a memorized target: {metrics}"
         )
     state = checkpoint_state(
         policy,

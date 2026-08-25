@@ -194,7 +194,7 @@ def run_training(
 
     policy.train()
     step = start_step
-    window_losses = torch.zeros(5, device=accelerator.device)
+    window_losses = torch.zeros(4, device=accelerator.device)
     window_steps = 0
     window_start = time.perf_counter()
     checkpoint_interval = config.training.checkpoint_every_epochs * steps_per_epoch
@@ -217,7 +217,6 @@ def run_training(
                 losses.flow_loss,
                 losses.path_loss,
                 losses.tangent_loss,
-                losses.ranking_loss,
             )
         ).detach().float()
         if step == 1 or step % config.training.log_every_steps == 0:
@@ -235,7 +234,6 @@ def run_training(
                         "flow_loss": mean_losses[1],
                         "path_loss": mean_losses[2],
                         "tangent_loss": mean_losses[3],
-                        "ranking_loss": mean_losses[4],
                         "learning_rate": scheduler.get_last_lr()[0],
                         "samples_per_second": global_batch_size * window_steps / elapsed,
                     },

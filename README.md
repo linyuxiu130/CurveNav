@@ -1,6 +1,6 @@
 # CurveNav
 
-CurveNav 是高效的 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对位姿和当前 PointGoal，生成短距离平滑 B-spline，并通过条件兼容度选择一条执行轨迹。
+CurveNav 是高效的 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal，生成短距离平滑 B-spline，并由当前深度上的显式几何代价选择一条执行轨迹。
 
 当前目标只有一个：在 X-NavDP 官方 PointGoal 评测中，以完全相同的 episode、相机、异步 MPC 和指标口径对比 NavDP 与 X-NavDP。局部基线成立前不专项扩展长距离或脱困能力。
 
@@ -21,6 +21,8 @@ scripts/build_dataset.sh /path/to/data-root
 ```
 
 该入口面向空的数据目录执行一次；内部阶段不提供历史版本、恢复模式或已有输出分支。训练只读取最终的 `data/policy_dataset`。
+
+当前模型合同使用官方 Dingo D455 的内外参；旧 `0.30 m` 水平相机生成的数据会被严格拒绝，不能直接用于新模型训练。
 
 测试、过拟合、训练与离线评估：
 
@@ -44,7 +46,7 @@ src/curvenav/data/         标定深度、统一数据编译与 loader
 src/curvenav/data_generation/ HSSD 资产、几何、生成与正式审计
 src/curvenav/encoders/     深度与 PointGoal 编码
 src/curvenav/conditioning/ 多帧视觉压缩、逐帧位姿与目标融合
-src/curvenav/models/       flow、轨迹兼容度评分器与 policy
+src/curvenav/models/       flow、显式几何评价器与 policy
 src/curvenav/trajectory/   B-spline 和几何
 src/curvenav/training/     DDP、AMP、EMA 与 checkpoint
 src/curvenav/evaluation/   固定离线门禁

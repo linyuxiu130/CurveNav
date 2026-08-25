@@ -9,6 +9,9 @@ data:
   max_depth_m: 5.0
   canonical_focal_x_px: 166.80851063829786
   canonical_focal_y_px: 166.80851063829786
+  camera_forward_offset_m: 0.28618
+  camera_height_m: 0.62532
+  camera_downward_pitch_degrees: 10.0
 
 model:
   trajectory:
@@ -34,15 +37,19 @@ model:
     model_dim: 256
     transformer_layers: 3
     transformer_heads: 4
-    inference_candidates: 8
+    inference_candidates: 16
     integration_steps: 8
     inference_seed: 20260821
     dropout: 0.0
-  trajectory_scorer:
-    model_dim: 256
-    transformer_layers: 2
-    transformer_heads: 4
-    dropout: 0.0
+  trajectory_evaluator:
+    minimum_obstacle_height_m: 0.05
+    robot_height_m: 0.70
+    robot_radius_m: 0.25
+    safety_margin_m: 0.10
+    discount_factor: 0.95
+    clearance_weight: 10.0
+    length_weight: 1.0
+    goal_weight: 1.0
 training:
   seed: 42
   per_device_batch_size: 256

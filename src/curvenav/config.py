@@ -16,6 +16,9 @@ class DataConfig:
     max_depth_m: float = 5.0
     canonical_focal_x_px: float = 166.80851063829786
     canonical_focal_y_px: float = 166.80851063829786
+    camera_forward_offset_m: float = 0.28618
+    camera_height_m: float = 0.62532
+    camera_downward_pitch_degrees: float = 10.0
 
     def validate(self) -> None:
         if not self.root:
@@ -24,6 +27,21 @@ class DataConfig:
             raise ValueError("observation frames and future steps must be positive")
         if (self.image_height, self.image_width) != (126, 224):
             raise ValueError("CurveNav uses one calibrated 224x126 depth camera")
+        camera_contract = (
+            self.canonical_focal_x_px,
+            self.canonical_focal_y_px,
+            self.camera_forward_offset_m,
+            self.camera_height_m,
+            self.camera_downward_pitch_degrees,
+        )
+        if camera_contract != (
+            166.80851063829786,
+            166.80851063829786,
+            0.28618,
+            0.62532,
+            10.0,
+        ):
+            raise ValueError("CurveNav uses the fixed canonical Dingo camera calibration")
         if not all(
             math.isfinite(value) and value > 0
             for value in (
@@ -32,9 +50,20 @@ class DataConfig:
                 self.max_depth_m,
                 self.canonical_focal_x_px,
                 self.canonical_focal_y_px,
+                self.camera_height_m,
             )
         ):
             raise ValueError("data spatial scales must be positive")
+        if (
+            not math.isfinite(self.camera_forward_offset_m)
+            or self.camera_forward_offset_m < 0
+        ):
+            raise ValueError("camera_forward_offset_m must be finite and nonnegative")
+        if (
+            not math.isfinite(self.camera_downward_pitch_degrees)
+            or not -90 < self.camera_downward_pitch_degrees < 90
+        ):
+            raise ValueError("camera downward pitch must be between -90 and 90 degrees")
 
 
 @dataclass(frozen=True)
@@ -86,18 +115,39 @@ class TrajectoryFlowConfig:
     model_dim: int = 256
     transformer_layers: int = 3
     transformer_heads: int = 4
-    inference_candidates: int = 8
+    inference_candidates: int = 16
     integration_steps: int = 8
     inference_seed: int = 20260821
     dropout: float = 0.0
 
 
 @dataclass(frozen=True)
-class TrajectoryScorerConfig:
-    model_dim: int = 256
-    transformer_layers: int = 2
-    transformer_heads: int = 4
-    dropout: float = 0.0
+class TrajectoryEvaluatorConfig:
+    minimum_obstacle_height_m: float = 0.05
+    robot_height_m: float = 0.70
+    robot_radius_m: float = 0.25
+    safety_margin_m: float = 0.10
+    discount_factor: float = 0.95
+    clearance_weight: float = 10.0
+    length_weight: float = 1.0
+    goal_weight: float = 1.0
+
+    def validate(self) -> None:
+        positive = (
+            self.minimum_obstacle_height_m,
+            self.robot_height_m,
+            self.robot_radius_m,
+            self.safety_margin_m,
+            self.clearance_weight,
+            self.length_weight,
+            self.goal_weight,
+        )
+        if not all(math.isfinite(value) and value > 0 for value in positive):
+            raise ValueError("trajectory evaluator metric values must be positive")
+        if self.minimum_obstacle_height_m >= self.robot_height_m:
+            raise ValueError("minimum obstacle height must be below robot height")
+        if not math.isfinite(self.discount_factor) or not 0 < self.discount_factor <= 1:
+            raise ValueError("trajectory evaluator discount_factor must be in (0, 1]")
 
 
 @dataclass(frozen=True)
@@ -139,14 +189,15 @@ class CurveNavConfig:
     trajectory_flow: TrajectoryFlowConfig = dataclass_field(
         default_factory=TrajectoryFlowConfig
     )
-    trajectory_scorer: TrajectoryScorerConfig = dataclass_field(
-        default_factory=TrajectoryScorerConfig
+    trajectory_evaluator: TrajectoryEvaluatorConfig = dataclass_field(
+        default_factory=TrajectoryEvaluatorConfig
     )
     training: TrainingConfig = dataclass_field(default_factory=TrainingConfig)
 
     def validate(self) -> None:
         self.data.validate()
         self.trajectory.validate()
+        self.trajectory_evaluator.validate()
         if self.data.observation_frames != 4:
             raise ValueError(
                 "CurveNav uses four depth observations: three past and one current"
@@ -168,7 +219,6 @@ class CurveNavConfig:
             self.point_goal_encoder.model_dim,
             self.condition_encoder.model_dim,
             self.trajectory_flow.model_dim,
-            self.trajectory_scorer.model_dim,
         }
         if len(dims) != 1:
             raise ValueError("all policy model dimensions must match")
@@ -178,7 +228,6 @@ class CurveNavConfig:
         for name, heads in (
             ("condition_encoder", self.condition_encoder.transformer_heads),
             ("trajectory_flow", self.trajectory_flow.transformer_heads),
-            ("trajectory_scorer", self.trajectory_scorer.transformer_heads),
         ):
             if heads < 1:
                 raise ValueError(f"{name}.transformer_heads must be positive")
@@ -187,7 +236,6 @@ class CurveNavConfig:
         for name, layers in (
             ("condition_encoder", self.condition_encoder.transformer_layers),
             ("trajectory_flow", self.trajectory_flow.transformer_layers),
-            ("trajectory_scorer", self.trajectory_scorer.transformer_layers),
         ):
             if layers < 1:
                 raise ValueError(f"{name}.transformer_layers must be positive")
@@ -195,19 +243,11 @@ class CurveNavConfig:
             ("depth_encoder", self.depth_encoder.dropout),
             ("condition_encoder", self.condition_encoder.dropout),
             ("trajectory_flow", self.trajectory_flow.dropout),
-            ("trajectory_scorer", self.trajectory_scorer.dropout),
         ):
             if not 0 <= dropout < 1:
                 raise ValueError(f"{name}.dropout must be in [0, 1)")
-        if self.trajectory_flow.inference_candidates != 8:
-            raise ValueError("CurveNav uses exactly eight flow candidates")
-        if min(
-            self.training.per_device_batch_size,
-            self.training.overfit_batch_size,
-        ) < self.trajectory_flow.inference_candidates:
-            raise ValueError(
-                "training batch sizes must cover all scorer negatives"
-            )
+        if self.trajectory_flow.inference_candidates != 16:
+            raise ValueError("CurveNav uses exactly sixteen flow candidates")
         if self.trajectory_flow.integration_steps < 1:
             raise ValueError("trajectory_flow.integration_steps must be positive")
         if not 0 <= self.trajectory_flow.inference_seed < 2**32:

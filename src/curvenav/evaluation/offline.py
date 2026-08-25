@@ -1,4 +1,4 @@
-"""Held-out evaluation for CurveNav's generate-rank-select policy."""
+"""Held-out evaluation for CurveNav's generate-score-select policy."""
 
 import argparse
 from dataclasses import dataclass
@@ -85,17 +85,19 @@ def _sample(policy: CurveNavPolicy, batch: dict[str, Tensor]):
 
 def candidate_batch_metrics(
     candidate_paths: Tensor,
-    candidate_log_probabilities: Tensor,
+    candidate_costs: Tensor,
+    candidate_minimum_clearance_m: Tensor,
     reference_path: Tensor,
+    safe_center_distance_m: float,
 ) -> dict[str, Tensor]:
-    """Measure diversity, scorer separation, and the best available candidate."""
+    """Measure candidate diversity, oracle quality, and geometric selection margin."""
     if candidate_paths.ndim != 4:
         raise ValueError("candidate_paths must have shape [B, C, P, 2]")
     candidates = candidate_paths.shape[1]
-    if candidates < 2 or candidate_log_probabilities.shape != candidate_paths.shape[:2]:
-        raise ValueError(
-            "candidate_log_probabilities must match at least two candidate paths"
-        )
+    if candidates < 2 or candidate_costs.shape != candidate_paths.shape[:2]:
+        raise ValueError("candidate_costs must match at least two candidate paths")
+    if candidate_minimum_clearance_m.shape != candidate_paths.shape[:2]:
+        raise ValueError("candidate minimum clearance must have shape [B,C]")
     candidate_error = torch.linalg.vector_norm(
         candidate_paths - reference_path[:, None], dim=-1
     ).mean(dim=-1)
@@ -105,15 +107,16 @@ def candidate_batch_metrics(
         torch.ones(candidates, candidates, device=pairwise.device, dtype=torch.bool),
         diagonal=1,
     )
-    sorted_log_probabilities = candidate_log_probabilities.sort(
-        dim=1, descending=True
-    ).values
+    sorted_costs = candidate_costs.sort(dim=1).values
+    selected = candidate_costs.argmin(dim=1)
+    batch = torch.arange(len(selected), device=selected.device)
+    selected_clearance = candidate_minimum_clearance_m[batch, selected]
     return {
         "oracle_ade_m": candidate_error.min(dim=1).values,
         "candidate_endpoint_diversity_m": pairwise[:, upper].mean(dim=1),
-        "quality_top1_margin": (
-            sorted_log_probabilities[:, 0] - sorted_log_probabilities[:, 1]
-        ),
+        "geometric_cost_margin": sorted_costs[:, 1] - sorted_costs[:, 0],
+        "selected_minimum_clearance_m": selected_clearance,
+        "selected_clearance_violation": selected_clearance < safe_center_distance_m,
     }
 
 
@@ -169,8 +172,10 @@ def measure_policy(
         metrics.update(
             candidate_batch_metrics(
                 prediction.candidate_paths.float(),
-                prediction.candidate_log_probabilities.float(),
+                prediction.candidate_costs.float(),
+                prediction.candidate_minimum_clearance_m.float(),
                 prepared.target.reference_path.float(),
+                policy.trajectory_evaluator.safe_center_distance_m,
             )
         )
         for name, value in metrics.items():
@@ -212,9 +217,16 @@ def summarize_policy_metrics(metrics: dict[str, Tensor]) -> dict[str, float]:
         "candidate_endpoint_diversity_m": metrics[
             "candidate_endpoint_diversity_m"
         ].mean().item(),
-        "quality_top1_margin": metrics[
-            "quality_top1_margin"
+        "geometric_cost_margin": metrics["geometric_cost_margin"].mean().item(),
+        "selected_minimum_clearance_m_mean": metrics[
+            "selected_minimum_clearance_m"
         ].mean().item(),
+        "selected_minimum_clearance_m_p05": torch.quantile(
+            metrics["selected_minimum_clearance_m"], 0.05
+        ).item(),
+        "selected_clearance_violation_fraction": metrics[
+            "selected_clearance_violation"
+        ].float().mean().item(),
     }
     if not all(torch.isfinite(torch.tensor(value)) for value in result.values()):
         raise FloatingPointError(f"validation metrics are non-finite: {result}")

@@ -238,6 +238,39 @@ def _sand_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
 
 def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Example]]:
     data = config.data
+    source_manifest = json.loads(
+        (root / "dataset_manifest.json").read_text(encoding="utf-8")
+    )
+    pitch = math.radians(data.camera_downward_pitch_degrees)
+    sine, cosine = math.sin(pitch), math.cos(pitch)
+    expected_camera_transform = np.asarray(
+        [
+            [0.0, -sine, cosine, data.camera_forward_offset_m],
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, -cosine, -sine, data.camera_height_m],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    camera = source_manifest.get("camera", {})
+    intrinsic = np.asarray(camera.get("image", {}).get("K", ()), dtype=np.float64)
+    body_from_camera = np.asarray(
+        camera.get("body_from_camera_optical", ()), dtype=np.float64
+    )
+    expected_intrinsic = np.asarray(
+        [
+            [data.canonical_focal_x_px, 0.0, data.image_width / 2.0],
+            [0.0, data.canonical_focal_y_px, data.image_height / 2.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    if (
+        intrinsic.shape != (3, 3)
+        or body_from_camera.shape != (4, 4)
+        or not np.allclose(intrinsic, expected_intrinsic, atol=1e-6)
+        or not np.allclose(body_from_camera, expected_camera_transform, atol=1e-6)
+    ):
+        raise ValueError("HSSD camera calibration does not match CurveNav")
     cache = root / f"curvenav_hssd_depth_{data.image_height}x{data.image_width}_float16"
     manifest = json.loads((cache / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("dtype") != "float16" or (
