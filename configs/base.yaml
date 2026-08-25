@@ -9,9 +9,9 @@ data:
   max_depth_m: 5.0
   canonical_focal_x_px: 166.80851063829786
   canonical_focal_y_px: 166.80851063829786
-  camera_forward_offset_m: 0.0
-  camera_height_m: 0.40
-  camera_downward_pitch_degrees: 0.0
+  camera_forward_offset_m: 0.28618
+  camera_height_m: 0.62532
+  camera_downward_pitch_degrees: 10.0
 
 model:
   trajectory:

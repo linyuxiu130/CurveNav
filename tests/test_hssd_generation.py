@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import struct
 
@@ -65,10 +66,11 @@ def test_hssd_generator_uses_the_model_camera_contract() -> None:
         [0.0, data.canonical_focal_y_px, data.image_height / 2],
         [0.0, 0.0, 1.0],
     ]
+    pitch = math.radians(data.camera_downward_pitch_degrees)
     assert camera["body_from_camera_optical"] == [
-        [0.0, 0.0, 1.0, data.camera_forward_offset_m],
+        [0.0, -math.sin(pitch), math.cos(pitch), data.camera_forward_offset_m],
         [-1.0, 0.0, 0.0, 0.0],
-        [0.0, -1.0, 0.0, data.camera_height_m],
+        [0.0, -math.cos(pitch), -math.sin(pitch), data.camera_height_m],
         [0.0, 0.0, 0.0, 1.0],
     ]
 
@@ -180,8 +182,8 @@ def base_config() -> dict:
             "image_height": 126,
             "focal_x_px": 166.80851063829786,
             "focal_y_px": 166.80851063829786,
-            "forward_offset_m": 0.0,
-            "height_m": 0.40,
-            "downward_pitch_degrees": 0.0,
+            "forward_offset_m": 0.28618,
+            "height_m": 0.62532,
+            "downward_pitch_degrees": 10.0,
         },
     }

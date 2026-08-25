@@ -27,14 +27,6 @@ BENCHMARK_INTRINSICS = PinholeIntrinsics(
     cx=321.792145,
     cy=181.007690,
 )
-SAND_INTRINSICS = PinholeIntrinsics(
-    width=640,
-    height=480,
-    fx=389.551,
-    fy=389.551,
-    cx=324.211,
-    cy=235.656,
-)
 CANONICAL_INTRINSICS = PinholeIntrinsics(
     width=224,
     height=126,

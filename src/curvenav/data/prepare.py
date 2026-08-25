@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from dataclasses import dataclass
-import hashlib
 import json
 import math
 import os
@@ -66,7 +65,7 @@ def _cumulative_distance(positions: np.ndarray) -> np.ndarray:
     return np.concatenate(
         (
             np.zeros(1, dtype=np.float64),
-            np.cumsum(np.linalg.vector_norm(np.diff(positions, axis=0), axis=1)),
+            np.cumsum(np.linalg.norm(np.diff(positions, axis=0), axis=1)),
         )
     )
 
@@ -126,33 +125,6 @@ def _observation_to_current(
     ).astype(np.float32)
 
 
-def _sand_local(
-    points: np.ndarray,
-    origin: np.ndarray,
-    yaw: float,
-    pitch: float,
-) -> np.ndarray:
-    delta = np.asarray(points, dtype=np.float32) - np.asarray(origin, dtype=np.float32)
-    cos_yaw = np.cos(-yaw)
-    sin_yaw = np.sin(-yaw)
-    cos_pitch = np.cos(-pitch)
-    sin_pitch = np.sin(-pitch)
-    forward = delta[..., 0] * cos_pitch + delta[..., 2] * sin_pitch
-    lateral = delta[..., 1]
-    return np.stack(
-        (
-            forward * cos_yaw - lateral * sin_yaw,
-            forward * sin_yaw + lateral * cos_yaw,
-        ),
-        axis=-1,
-    ).astype(np.float32, copy=False)
-
-
-def _stable_sand_split(run_name: str, seed: int) -> str:
-    digest = hashlib.sha256(f"{seed}:{run_name}".encode()).digest()
-    return "train" if int.from_bytes(digest[:8], "little") % 10 else "validation"
-
-
 def _planar_local(points: np.ndarray, origin: np.ndarray, yaw: float) -> np.ndarray:
     delta = np.asarray(points, dtype=np.float32) - np.asarray(origin, dtype=np.float32)
     cosine, sine = np.cos(-yaw), np.sin(-yaw)
@@ -163,84 +135,6 @@ def _planar_local(points: np.ndarray, origin: np.ndarray, yaw: float) -> np.ndar
         ),
         axis=-1,
     ).astype(np.float32, copy=False)
-
-
-def _sand_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Example]]:
-    data = config.data
-    cache = root / f"curvenav_depth_{data.image_height}x{data.image_width}_float16"
-    manifest = json.loads((cache / "manifest.json").read_text(encoding="utf-8"))
-    if (
-        manifest.get("dtype") != "float16"
-        or manifest.get("target_camera") != depth_camera_contract(data)
-    ):
-        raise ValueError("SanD depth cache does not match the CurveNav data contract")
-    output: dict[str, list[_Example]] = {"train": [], "validation": []}
-    for run_dir in sorted(root.glob("dataset_*/run_*")):
-        run_key = run_dir.relative_to(root).as_posix()
-        if run_key in manifest.get("excluded_runs", {}):
-            continue
-        if run_key not in manifest["runs"]:
-            raise ValueError(f"SanD run is missing from the depth cache: {run_key}")
-        xyz = np.load(run_dir / "traj_xyz.npy").astype(np.float32)
-        yaw = np.load(run_dir / "traj_yaw.npy").astype(np.float32)
-        pitch = np.load(run_dir / "traj_pitch.npy").astype(np.float32)
-        if not (len(xyz) == len(yaw) == len(pitch) == int(manifest["runs"][run_key])):
-            raise ValueError(f"SanD route/depth length mismatch: {run_key}")
-        expected_pitch = math.radians(data.camera_downward_pitch_degrees)
-        if (
-            data.camera_forward_offset_m != 0.0
-            or not np.allclose(xyz[:, 2], data.camera_height_m, atol=1e-5)
-            or not np.allclose(pitch, expected_pitch, atol=1e-5)
-        ):
-            raise ValueError(f"SanD camera calibration does not match CurveNav: {run_key}")
-        depth = _DepthRun(
-            source=cache / run_dir.parent.name / f"{run_dir.name}.npy",
-            frames=len(xyz),
-            name=f"sand/{run_key}",
-        )
-        split = _stable_sand_split(run_key, config.training.seed)
-        scene = f"sand/{run_dir.parent.name}"
-        cumulative_distance = _cumulative_distance(xyz)
-        route_spacing = np.linalg.vector_norm(np.diff(xyz, axis=0), axis=1)
-        moving_spacing = route_spacing[route_spacing > 1e-5]
-        if len(moving_spacing) and not math.isclose(
-            float(np.median(moving_spacing)),
-            data.expert_waypoint_spacing_m,
-            abs_tol=0.03,
-        ):
-            raise ValueError(
-                f"SanD waypoint spacing does not match CurveNav: {run_key}"
-            )
-        for anchor in range(len(xyz) - 1):
-            frame_indices = _frame_indices(anchor, cumulative_distance, data)
-            transform: Callable[[np.ndarray], np.ndarray] = (
-                lambda points, anchor=anchor: _sand_local(
-                    points, xyz[anchor], float(yaw[anchor]), float(pitch[anchor])
-                )
-            )
-            full_local = transform(xyz[anchor:])
-            local_path, reached_goal = _fixed_future(full_local, data.future_steps)
-            output[split].append(
-                _Example(
-                    depth_run=depth,
-                    depth_indices=frame_indices,
-                    point_goal=full_local[-1],
-                    observation_to_current=_observation_to_current(
-                        transform(xyz[frame_indices]),
-                        yaw[frame_indices],
-                        float(yaw[anchor]),
-                        data.observation_frames,
-                    ),
-                    observation_valid=_observation_valid(
-                        frame_indices,
-                        data.observation_frames,
-                    ),
-                    metric_path=local_path,
-                    scene=scene,
-                    reached_goal=reached_goal,
-                )
-            )
-    return output
 
 
 def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Example]]:
@@ -305,7 +199,7 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
             or len(xy) != len(yaw)
         ):
             raise ValueError(f"HSSD route is missing from the depth cache: {route_id}")
-        spacing = np.linalg.vector_norm(np.diff(xy, axis=0), axis=1)
+        spacing = np.linalg.norm(np.diff(xy, axis=0), axis=1)
         if not math.isclose(
             float(np.median(spacing)),
             data.expert_waypoint_spacing_m,
@@ -512,13 +406,11 @@ def _compile_split(
 
 
 def compile_policy_dataset(
-    sand_root: Path,
     hssd_root: Path,
     output_root: Path,
     config: CurveNavConfig,
 ) -> None:
     config.validate()
-    sand = _sand_examples(sand_root.expanduser().resolve(), config)
     hssd = _hssd_examples(hssd_root.expanduser().resolve(), config)
     output_root = output_root.expanduser().resolve()
     building_root = output_root.with_name(output_root.name + ".building")
@@ -528,7 +420,7 @@ def compile_policy_dataset(
     try:
         split_manifests = {}
         for index, split in enumerate(("train", "validation")):
-            examples = sand[split] + hssd[split]
+            examples = hssd[split]
             if not examples:
                 raise ValueError(f"compiled split has no examples: {split}")
             split_manifests[split] = _compile_split(
@@ -565,13 +457,12 @@ def compile_policy_dataset(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compile the CurveNav policy dataset")
-    parser.add_argument("--sand-root", type=Path, required=True)
     parser.add_argument("--hssd-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
     compile_policy_dataset(
-        args.sand_root, args.hssd_root, args.output, load_config(args.config)
+        args.hssd_root, args.output, load_config(args.config)
     )
 
 

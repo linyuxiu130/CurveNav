@@ -445,11 +445,6 @@ def validate_config(config: dict[str, Any]) -> None:
     )
     if not all(math.isfinite(float(value)) and float(value) > 0 for value in numeric_camera):
         raise ValueError("camera dimensions, focal lengths and height must be positive")
-    if (
-        float(camera["forward_offset_m"]) != 0.0
-        or float(camera["downward_pitch_degrees"]) != 0.0
-    ):
-        raise ValueError("HSSD generation uses the canonical level camera at the robot origin")
 
 
 def generate(config_path: Path) -> dict[str, Any]:

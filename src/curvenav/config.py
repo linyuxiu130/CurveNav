@@ -16,9 +16,9 @@ class DataConfig:
     max_depth_m: float = 5.0
     canonical_focal_x_px: float = 166.80851063829786
     canonical_focal_y_px: float = 166.80851063829786
-    camera_forward_offset_m: float = 0.0
-    camera_height_m: float = 0.40
-    camera_downward_pitch_degrees: float = 0.0
+    camera_forward_offset_m: float = 0.28618
+    camera_height_m: float = 0.62532
+    camera_downward_pitch_degrees: float = 10.0
 
     def validate(self) -> None:
         if not self.root:
@@ -37,11 +37,11 @@ class DataConfig:
         if camera_contract != (
             166.80851063829786,
             166.80851063829786,
-            0.0,
-            0.40,
-            0.0,
+            0.28618,
+            0.62532,
+            10.0,
         ):
-            raise ValueError("CurveNav uses the fixed generated-depth camera calibration")
+            raise ValueError("CurveNav uses the frozen X-NavDP Dingo camera calibration")
         if not all(
             math.isfinite(value) and value > 0
             for value in (

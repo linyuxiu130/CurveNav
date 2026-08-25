@@ -14,7 +14,7 @@ CurveNav 是高效的 PointGoal 条件二维局部规划器。模型读取三帧
 ../.venvs/curvenav
 ```
 
-从固定上游 commit 下载 SanD/HSSD、生成 HSSD 观测并编译唯一训练集：
+从固定上游 commit 下载 HSSD、用官方 Dingo 相机生成观测并编译唯一训练集：
 
 ```bash
 scripts/build_dataset.sh /path/to/data-root
@@ -22,7 +22,11 @@ scripts/build_dataset.sh /path/to/data-root
 
 该入口面向空的数据目录执行一次；内部阶段不提供历史版本、恢复模式或已有输出分支。训练只读取最终的 `data/policy_dataset`。
 
-当前唯一相机合同与 SanD 原始轨迹相机一致：`224×126`、`fx=fy=166.80851`、相机位于机器人原点上方 `0.40 m`、水平安装。HSSD 直接按该外参渲染；数据、模型反投影、显式评价器与 checkpoint 共用该合同。
+当前唯一相机合同与 X-NavDP Dingo 测评相机一致：原始深度为 `640×360`，
+经固定内参裁切到 `224×126, fx=fy=166.80851`；相机在机器人系前向
+`0.28618 m`、高度 `0.62532 m`、下俯 `10°`。HSSD 直接按该外参渲染；数据、
+模型反投影、显式评价器与 checkpoint 共用该合同。旧 SanD `0/0.40/0°`
+深度不再进入训练，因为单张深度无法无损改造成不同视点。
 
 测试、固定批诊断、训练与离线评估：
 

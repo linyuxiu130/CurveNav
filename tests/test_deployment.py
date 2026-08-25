@@ -17,7 +17,7 @@ def test_invalid_depth_is_encoded_as_sensor_limit():
 
     assert normalized.shape == (126, 224)
     assert normalized[63, 112] == 1.0
-    assert normalized[0, 0] == 0.8
+    np.testing.assert_allclose(normalized[0, 0], 0.8)
 
 
 def test_depth_context_uses_expert_spatial_offsets():

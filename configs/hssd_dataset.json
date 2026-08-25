@@ -13,9 +13,9 @@
     "image_height": 126,
     "focal_x_px": 166.80851063829786,
     "focal_y_px": 166.80851063829786,
-    "forward_offset_m": 0.0,
-    "height_m": 0.40,
-    "downward_pitch_degrees": 0.0
+    "forward_offset_m": 0.28618,
+    "height_m": 0.62532,
+    "downward_pitch_degrees": 10.0
   },
   "endpoint_distance_bands_m": {
     "near": [3.0, 7.0],
