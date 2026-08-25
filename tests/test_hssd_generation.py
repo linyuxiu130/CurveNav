@@ -156,6 +156,7 @@ def test_hssd_asset_download_is_atomic_and_commit_pinned(
     assert manifest["commit"] == assets.HSSD_COMMIT
     assert manifest["files"] == len(repository_paths)
     assert (project / "data/hssd/download_manifest.json").is_file()
+    assert (project / "data/hssd/repository_files.json").is_file()
     assert not (project / "data/hssd.building").exists()
 
 

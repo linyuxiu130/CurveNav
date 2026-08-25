@@ -94,6 +94,24 @@ def _validate_glb(path: Path) -> None:
         raise ValueError(f"truncated GLB: {path}")
 
 
+def validate_assets(root: Path, scene_ids: list[str]) -> int:
+    """Verify every frozen asset referenced by the selected HSSD scenes."""
+    repository = _read_json(root / "repository_files.json")
+    if repository.get("revision") != HSSD_COMMIT:
+        raise ValueError("HSSD repository index does not match the frozen commit")
+    selected = selected_asset_paths(root, repository["files"], scene_ids)
+    missing = sorted(path for path in selected if not (root / path).is_file())
+    if missing:
+        raise FileNotFoundError(f"HSSD selected assets are missing: {missing}")
+    for path in sorted(selected):
+        asset = root / path
+        if path.endswith(".json"):
+            _read_json(asset)
+        elif path.endswith(".glb"):
+            _validate_glb(asset)
+    return len(selected)
+
+
 def download_assets(config_path: Path) -> dict[str, Any]:
     config_path = config_path.resolve()
     config = _read_json(config_path)
@@ -105,16 +123,18 @@ def download_assets(config_path: Path) -> dict[str, Any]:
     building.mkdir(parents=True)
     scene_ids = [scene["scene_id"] for scene in config["selected_scenes"]]
     repository_paths = _repository_paths()
+    (building / "repository_files.json").write_text(
+        json.dumps(
+            {"revision": HSSD_COMMIT, "files": repository_paths},
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     scene_paths = {f"scenes/{scene_id}.scene_instance.json" for scene_id in scene_ids}
     _download_paths(building, scene_paths)
     selected = selected_asset_paths(building, repository_paths, scene_ids)
     _download_paths(building, selected)
-    for path in sorted(selected):
-        asset = building / path
-        if path.endswith(".json"):
-            _read_json(asset)
-        elif path.endswith(".glb"):
-            _validate_glb(asset)
+    validate_assets(building, scene_ids)
     manifest = {
         "repository": HSSD_REPOSITORY,
         "commit": HSSD_COMMIT,

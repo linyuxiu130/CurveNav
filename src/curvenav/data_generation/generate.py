@@ -16,7 +16,11 @@ from typing import Any
 import numpy as np
 from scipy.ndimage import distance_transform_edt, label
 
-from curvenav.data_generation.assets import HSSD_COMMIT, HSSD_REPOSITORY
+from curvenav.data_generation.assets import (
+    HSSD_COMMIT,
+    HSSD_REPOSITORY,
+    validate_assets,
+)
 from curvenav.data_generation.geometry import (
     ENDPOINT_CLEARANCE_M,
     MAX_SNAP_M,
@@ -463,6 +467,7 @@ def generate(config_path: Path) -> dict[str, Any]:
         or not selected_scene_ids.issubset(asset_manifest.get("scenes", []))
     ):
         raise ValueError("HSSD assets do not match the frozen source contract")
+    validate_assets(asset_root, sorted(selected_scene_ids))
     if output.exists():
         raise FileExistsError(output)
     partial = output.with_name(output.name + f".partial.{os.getpid()}")
