@@ -1,54 +1,129 @@
-"""Joint Transformer encoder for depth-history, PointGoal, and motion tokens."""
+"""SanD visual tokens and NavDP learned-query multi-frame compression."""
 
 import torch
 from torch import Tensor, nn
 
-from curvenav.layers import EncoderBlock, RMSNorm
-from curvenav.types import EncodedCondition
+from curvenav.layers import EncoderBlock, RMSNorm, SwiGLU
+from curvenav.types import ConditionFeatures, DepthFeatures
 
 
-class ConditionTransformer(nn.Module):
+COMPRESSED_TOKENS_PER_FRAME = 16
+CONDITION_ENCODER_TYPE = "sand_geometry_aligned_navdp_query_memory"
+
+
+class CrossAttentionBlock(nn.Module):
+    """Pre-norm cross-attention followed by one SwiGLU residual update."""
+
+    def __init__(self, model_dim: int, heads: int, dropout: float) -> None:
+        super().__init__()
+        self.query_norm = RMSNorm(model_dim)
+        self.memory_norm = RMSNorm(model_dim)
+        self.attention = nn.MultiheadAttention(
+            model_dim,
+            heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.feed_forward_norm = RMSNorm(model_dim)
+        self.feed_forward = SwiGLU(model_dim, dropout)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        query: Tensor,
+        memory: Tensor,
+        memory_padding_mask: Tensor | None = None,
+    ) -> Tensor:
+        normalized_memory = self.memory_norm(memory)
+        attended = self.attention(
+            self.query_norm(query),
+            normalized_memory,
+            normalized_memory,
+            key_padding_mask=memory_padding_mask,
+            need_weights=False,
+        )[0]
+        query = query + self.dropout(attended)
+        return query + self.dropout(
+            self.feed_forward(self.feed_forward_norm(query))
+        )
+
+
+class PolicyConditionEncoder(nn.Module):
+    """Compress geometry-aligned depth tokens and fuse the PointGoal token."""
+
     def __init__(
         self,
+        point_goal_encoder: nn.Module,
+        *,
+        observation_frames: int,
+        spatial_tokens: int,
         model_dim: int = 256,
-        transformer_layers: int = 4,
+        transformer_layers: int = 2,
         transformer_heads: int = 4,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.goal_type = nn.Parameter(torch.zeros(1, 1, model_dim))
-        self.motion_type = nn.Parameter(torch.zeros(1, 1, model_dim))
-        self.observation_type = nn.Parameter(torch.zeros(1, 1, model_dim))
-        self.blocks = nn.ModuleList(
+        self.point_goal_encoder = point_goal_encoder
+        self.observation_frames = observation_frames
+        self.spatial_tokens = spatial_tokens
+        self.compressed_tokens = observation_frames * COMPRESSED_TOKENS_PER_FRAME
+
+        self.frame_slot_embedding = nn.Parameter(
+            torch.zeros(1, observation_frames, 1, model_dim)
+        )
+        self.compression_queries = nn.Parameter(
+            torch.zeros(1, self.compressed_tokens, model_dim)
+        )
+        self.visual_compressor = CrossAttentionBlock(
+            model_dim,
+            transformer_heads,
+            dropout,
+        )
+        self.condition_blocks = nn.ModuleList(
             EncoderBlock(model_dim, transformer_heads, dropout)
             for _ in range(transformer_layers)
         )
         self.output_norm = RMSNorm(model_dim)
-        for parameter in (self.goal_type, self.motion_type, self.observation_type):
-            nn.init.trunc_normal_(parameter, std=0.02)
+        nn.init.trunc_normal_(self.frame_slot_embedding, std=0.02)
+        nn.init.trunc_normal_(self.compression_queries, std=0.02)
 
     def forward(
         self,
-        observation_tokens: Tensor,
-        goal_token: Tensor,
-        motion_token: Tensor,
-    ) -> EncodedCondition:
-        if any(token.ndim != 3 for token in (observation_tokens, goal_token, motion_token)):
-            raise ValueError("condition inputs must be token tensors shaped [B, S, D]")
-        if not (
-            observation_tokens.shape[0]
-            == goal_token.shape[0]
-            == motion_token.shape[0]
-        ):
-            raise ValueError("condition token batch sizes must match")
-        tokens = torch.cat(
-            [
-                goal_token + self.goal_type,
-                motion_token + self.motion_type,
-                observation_tokens + self.observation_type,
-            ],
-            dim=1,
+        observation: DepthFeatures,
+        point_goal: Tensor,
+        observation_valid: Tensor,
+    ) -> ConditionFeatures:
+        batch = point_goal.shape[0]
+        expected = (batch, self.observation_frames, self.spatial_tokens)
+        if observation.tokens.ndim != 4 or observation.tokens.shape[:3] != expected:
+            raise ValueError(
+                "observation tokens must have shape "
+                f"[B, {self.observation_frames}, {self.spatial_tokens}, D]"
+            )
+        if observation_valid.shape != (batch, self.observation_frames):
+            raise ValueError("observation_valid must have shape [B, F]")
+        if observation_valid.dtype != torch.bool:
+            raise TypeError("observation_valid must be boolean")
+        if not observation_valid[:, -1].all():
+            raise ValueError("the current observation must always be valid")
+
+        visual = observation.tokens + self.frame_slot_embedding
+        visual_memory = visual.flatten(1, 2)
+        visual_padding_mask = (
+            (~observation_valid)
+            .unsqueeze(-1)
+            .expand(-1, -1, self.spatial_tokens)
+            .flatten(1)
         )
-        for block in self.blocks:
+        queries = self.compression_queries.expand(batch, -1, -1)
+        compressed_visual = self.visual_compressor(
+            queries,
+            visual_memory,
+            visual_padding_mask,
+        )
+
+        goal_token = self.point_goal_encoder(point_goal).unsqueeze(1)
+        tokens = torch.cat((goal_token, compressed_visual), dim=1)
+        for block in self.condition_blocks:
             tokens = block(tokens)
-        return EncodedCondition(tokens=self.output_norm(tokens))
+        return ConditionFeatures(tokens=self.output_norm(tokens))

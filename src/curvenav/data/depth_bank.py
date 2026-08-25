@@ -39,12 +39,12 @@ def load_packed_depth_bank(
     return bank
 
 
-def gather_depth_sequences(bank: Tensor, indices: Tensor) -> Tensor:
-    """Materialize ``[B,T,1,H,W]`` depth without CPU image copies or H2D payloads."""
-    batch_size, sequence_length = indices.shape
-    return bank.index_select(0, indices.flatten()).view(
+def gather_depth_observations(bank: Tensor, indices: Tensor) -> Tensor:
+    """Materialize ``[B,F,1,H,W]`` depth without CPU copies or H2D payloads."""
+    batch_size, observation_frames = indices.shape
+    return bank.index_select(0, indices.flatten().long()).view(
         batch_size,
-        sequence_length,
+        observation_frames,
         1,
         bank.shape[1],
         bank.shape[2],

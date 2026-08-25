@@ -1,4 +1,4 @@
-"""Multi-GPU FP16 training for the single CurveNav SanD route."""
+"""Multi-GPU FP16 training for the single CurveNav policy route."""
 
 import argparse
 import json
@@ -11,7 +11,7 @@ from accelerate.utils import DistributedDataParallelKwargs, set_seed
 
 from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
-from curvenav.data import build_sand_training_loader, unpack_prepared_sand_batch
+from curvenav.data import build_policy_training_loader, unpack_policy_batch
 from curvenav.factory import build_policy
 from curvenav.training.checkpoint import (
     checkpoint_state,
@@ -75,8 +75,9 @@ def _advance_optimizer_state(
 def run_training(
     config: CurveNavConfig,
     resume_path: Path | None = None,
+    stop_after_steps: int | None = None,
 ) -> None:
-    """Train with one process per GPU and one globally sharded SanD loader."""
+    """Train with one process per GPU and one globally sharded policy loader."""
     config.validate()
     if not torch.cuda.is_available():
         raise RuntimeError("CurveNav production training requires CUDA")
@@ -97,7 +98,9 @@ def run_training(
 
     configure_cuda_training_backend()
     set_seed(config.training.seed)
-    global_batch_size = config.training.batch_size * accelerator.num_processes
+    global_batch_size = (
+        config.training.per_device_batch_size * accelerator.num_processes
+    )
     if config.training.samples_per_epoch % global_batch_size:
         raise ValueError("samples_per_epoch must be divisible by the global batch size")
     steps_per_epoch = config.training.samples_per_epoch // global_batch_size
@@ -112,16 +115,21 @@ def run_training(
             raise ValueError(
                 f"resume step must be in [0, {total_steps}), got {start_step}"
             )
-    remaining_steps = total_steps - start_step
-    loader_bundle = build_sand_training_loader(
+    end_step = total_steps if stop_after_steps is None else stop_after_steps
+    if not start_step < end_step <= total_steps:
+        raise ValueError(
+            f"stop_after_steps must be in ({start_step}, {total_steps}], got {end_step}"
+        )
+    remaining_steps = end_step - start_step
+    loader_bundle = build_policy_training_loader(
         config.data,
         config.trajectory,
-        batch_size=config.training.batch_size,
+        batch_size=config.training.per_device_batch_size,
         samples_per_epoch=remaining_steps * global_batch_size,
         num_workers=config.training.num_workers,
         prefetch_factor=config.training.prefetch_factor,
-        split_seed=config.training.seed,
-        worker_seed=config.training.seed + 10_007 * accelerator.process_index,
+        seed=config.training.seed,
+        sample_offset=start_step * global_batch_size,
     )
     loader = loader_bundle.loader
     policy = build_policy(config)
@@ -172,10 +180,11 @@ def run_training(
             {
                 "event": "training_start",
                 "world_size": accelerator.num_processes,
-                "per_device_batch_size": config.training.batch_size,
+                "per_device_batch_size": config.training.per_device_batch_size,
                 "global_batch_size": global_batch_size,
                 "steps_per_epoch": steps_per_epoch,
                 "total_steps": total_steps,
+                "end_step": end_step,
                 "resume_step": start_step,
                 "precision": accelerator.mixed_precision,
             },
@@ -185,16 +194,16 @@ def run_training(
 
     policy.train()
     step = start_step
-    window_loss = torch.zeros((), device=accelerator.device)
+    window_losses = torch.zeros(5, device=accelerator.device)
     window_steps = 0
     window_start = time.perf_counter()
     checkpoint_interval = config.training.checkpoint_every_epochs * steps_per_epoch
     for batch in loader:
-        prepared = unpack_prepared_sand_batch(batch)
+        prepared = unpack_policy_batch(batch)
         optimizer.zero_grad(set_to_none=True)
         with accelerator.autocast():
-            loss = policy(prepared.condition, prepared.target)
-        accelerator.backward(loss)
+            losses = policy(prepared.condition, prepared.target)
+        accelerator.backward(losses.loss)
         accelerator.clip_grad_norm_(policy.parameters(), config.training.grad_clip_norm)
         optimizer.step()
         _advance_optimizer_state(accelerator, scheduler, ema)
@@ -202,19 +211,31 @@ def run_training(
         step += 1
         epoch = (step - 1) // steps_per_epoch + 1
         window_steps += 1
-        window_loss += loss.detach().float()
+        window_losses += torch.stack(
+            (
+                losses.loss,
+                losses.flow_loss,
+                losses.path_loss,
+                losses.tangent_loss,
+                losses.ranking_loss,
+            )
+        ).detach().float()
         if step == 1 or step % config.training.log_every_steps == 0:
             accelerator.wait_for_everyone()
             elapsed = time.perf_counter() - window_start
-            mean_loss = accelerator.reduce(
-                window_loss / window_steps, reduction="mean"
-            ).item()
+            mean_losses = accelerator.reduce(
+                window_losses / window_steps, reduction="mean"
+            ).tolist()
             accelerator.print(
                 json.dumps(
                     {
                         "epoch": epoch,
                         "step": step,
-                        "loss": mean_loss,
+                        "loss": mean_losses[0],
+                        "flow_loss": mean_losses[1],
+                        "path_loss": mean_losses[2],
+                        "tangent_loss": mean_losses[3],
+                        "ranking_loss": mean_losses[4],
                         "learning_rate": scheduler.get_last_lr()[0],
                         "samples_per_second": global_batch_size * window_steps / elapsed,
                     },
@@ -222,7 +243,7 @@ def run_training(
                 ),
                 flush=True,
             )
-            window_loss.zero_()
+            window_losses.zero_()
             window_steps = 0
             window_start = time.perf_counter()
 
@@ -246,19 +267,32 @@ def run_training(
             scheduler,
             ema,
             config,
-            epoch=config.training.epochs,
+            epoch=(step - 1) // steps_per_epoch + 1,
             step=step,
         )
-    accelerator.print(json.dumps({"event": "training_complete", "step": step}))
+    accelerator.print(
+        json.dumps(
+            {
+                "event": "training_complete",
+                "step": step,
+                "production_total_steps": total_steps,
+            }
+        )
+    )
     accelerator.end_training()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train CurveNav on the public SanD dataset")
+    parser = argparse.ArgumentParser(description="Train the CurveNav policy")
     parser.add_argument("config", type=Path, help="CurveNav YAML configuration")
     parser.add_argument("--resume", type=Path, help="complete checkpoint to continue")
+    parser.add_argument(
+        "--stop-after-steps",
+        type=int,
+        help="bounded diagnostic endpoint on the unchanged production schedule",
+    )
     args = parser.parse_args()
-    run_training(load_config(args.config), args.resume)
+    run_training(load_config(args.config), args.resume, args.stop_after_steps)
 
 
 if __name__ == "__main__":

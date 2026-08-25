@@ -1,26 +1,63 @@
-"""Data adapters for CurveNav training batches."""
-
-from .loader import (
-    build_sand_overfit_loader,
-    build_sand_training_loader,
-    build_sand_validation_loader,
-)
-from .hssd import (
-    CurveNavHssdV2Dataset,
-    HssdLoaderBundle,
-    build_hssd_v2_loader,
-    v2a_motion_context,
-)
-from .sand import PreparedSandBatch, unpack_prepared_sand_batch
+"""Source-agnostic CurveNav data contracts with lazy training imports."""
 
 __all__ = [
-    "PreparedSandBatch",
-    "CurveNavHssdV2Dataset",
-    "HssdLoaderBundle",
-    "build_hssd_v2_loader",
-    "build_sand_overfit_loader",
-    "build_sand_training_loader",
-    "build_sand_validation_loader",
-    "unpack_prepared_sand_batch",
-    "v2a_motion_context",
+    "PolicyLoaderBundle",
+    "PreparedPolicyBatch",
+    "PreparedPolicyDataset",
+    "build_policy_loader",
+    "build_policy_overfit_loader",
+    "build_policy_training_loader",
+    "build_policy_validation_loader",
+    "policy_dataset_contract",
+    "read_policy_manifest",
+    "unpack_policy_batch",
 ]
+
+
+def __getattr__(name: str):
+    if name in {"PreparedPolicyBatch", "unpack_policy_batch"}:
+        from .batch import PreparedPolicyBatch, unpack_policy_batch
+
+        return {
+            "PreparedPolicyBatch": PreparedPolicyBatch,
+            "unpack_policy_batch": unpack_policy_batch,
+        }[name]
+    if name in {
+        "PolicyLoaderBundle",
+        "build_policy_loader",
+        "build_policy_overfit_loader",
+        "build_policy_training_loader",
+        "build_policy_validation_loader",
+    }:
+        from .loader import (
+            PolicyLoaderBundle,
+            build_policy_loader,
+            build_policy_overfit_loader,
+            build_policy_training_loader,
+            build_policy_validation_loader,
+        )
+
+        return {
+            "PolicyLoaderBundle": PolicyLoaderBundle,
+            "build_policy_loader": build_policy_loader,
+            "build_policy_overfit_loader": build_policy_overfit_loader,
+            "build_policy_training_loader": build_policy_training_loader,
+            "build_policy_validation_loader": build_policy_validation_loader,
+        }[name]
+    if name in {
+        "PreparedPolicyDataset",
+        "policy_dataset_contract",
+        "read_policy_manifest",
+    }:
+        from .prepared import (
+            PreparedPolicyDataset,
+            policy_dataset_contract,
+            read_policy_manifest,
+        )
+
+        return {
+            "PreparedPolicyDataset": PreparedPolicyDataset,
+            "policy_dataset_contract": policy_dataset_contract,
+            "read_policy_manifest": read_policy_manifest,
+        }[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

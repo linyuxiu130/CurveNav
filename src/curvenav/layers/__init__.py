@@ -1,5 +1,5 @@
-"""Small transformer primitives shared by CurveNav encoders and flow field."""
+"""Small Transformer primitives shared by the CurveNav policy."""
 
-from .transformer import EncoderBlock, RMSNorm, TrajectoryFlowBlock
+from .transformer import EncoderBlock, RMSNorm, SwiGLU
 
-__all__ = ["EncoderBlock", "RMSNorm", "TrajectoryFlowBlock"]
+__all__ = ["EncoderBlock", "RMSNorm", "SwiGLU"]

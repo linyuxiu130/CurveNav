@@ -1,7 +1,12 @@
-"""Observation and goal encoders."""
+"""Depth-observation and PointGoal encoders."""
 
-from .depth import DepthSequenceEncoder
-from .goal import TaskGoalEncoder
-from .motion import MotionContextEncoder
+from .depth import DepthObservationEncoder
+from .geometry import PlanarDepthProjector
+from .goal import POINT_GOAL_ENCODER_TYPE, PointGoalEncoder
 
-__all__ = ["DepthSequenceEncoder", "MotionContextEncoder", "TaskGoalEncoder"]
+__all__ = [
+    "DepthObservationEncoder",
+    "PlanarDepthProjector",
+    "POINT_GOAL_ENCODER_TYPE",
+    "PointGoalEncoder",
+]

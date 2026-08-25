@@ -1,66 +1,45 @@
+from dataclasses import replace
+
 import pytest
 
+from curvenav.config import CurveNavConfig
 from curvenav.config_io import config_from_mapping
 
 
-def test_base_mapping_is_planar() -> None:
-    config = config_from_mapping(
-        {
-            "model": {
-                "trajectory": {"scale_xy": [5.6, 2.5]},
-                "rectified_flow": {
-                    "inference_steps": 4,
-                    "source_std_xy": [0.04, 0.12],
-                },
-            }
-        }
-    )
-    assert config.rectified_flow.inference_steps == 4
-    assert config.trajectory.scale_xy == (5.6, 2.5)
-    assert config.rectified_flow.source_std_xy == (0.04, 0.12)
-
-
-def test_explicit_data_sources_are_typed_and_weighted() -> None:
+def test_base_mapping_has_one_prepared_dataset_and_fixed_future_contract() -> None:
     config = config_from_mapping(
         {
             "data": {
-                "training_sources": [
-                    {"root": "sand", "split": "train", "weight": 0.5},
-                    {"root": "hssd/train", "split": "all", "weight": 0.5},
-                ],
-                "validation_sources": [
-                    {"root": "hssd/validation", "split": "all", "weight": 1.0}
-                ],
-            }
+                "root": "data/policy_dataset",
+                "frame_spacing_m": 0.45,
+                "future_steps": 24,
+            },
+            "model": {
+                "trajectory": {"normalization_scale_m": 4.0},
+                "trajectory_flow": {"transformer_layers": 3},
+            },
         }
     )
-    assert tuple(source.root for source in config.data.training_sources) == (
-        "sand",
-        "hssd/train",
-    )
-    assert tuple(source.weight for source in config.data.training_sources) == (
-        0.5,
-        0.5,
-    )
+    assert config.data.root == "data/policy_dataset"
+    assert config.data.frame_spacing_m == 0.45
+    assert config.data.future_steps == 24
+    assert config.trajectory.normalization_scale_m == 4.0
+    assert config.trajectory_flow.transformer_layers == 3
+
+
+def test_rejects_removed_source_specific_data_config() -> None:
+    with pytest.raises(TypeError, match="training_sources"):
+        config_from_mapping({"data": {"training_sources": []}})
+    with pytest.raises(TypeError, match="frame_skip"):
+        config_from_mapping({"data": {"frame_skip": 2}})
 
 
 def test_rejects_removed_architecture_switches() -> None:
-    with pytest.raises(ValueError, match="unknown model config keys"):
-        config_from_mapping({"model": {"generator": {"backend": "ddpm"}}})
-
-    with pytest.raises(ValueError, match="unknown model config keys"):
-        config_from_mapping({"model": {"fusion": {"transformer_layers": 2}}})
-
-    with pytest.raises(ValueError, match="unknown model config keys"):
-        config_from_mapping({"model": {"flow_matching": {"inference_steps": 8}}})
-
-    with pytest.raises(TypeError, match="control_scale_xy"):
-        config_from_mapping(
-            {"model": {"trajectory": {"control_scale_xy": [5.6, 2.5]}}}
-        )
-
-    with pytest.raises(TypeError, match="goal_scale_xy"):
-        config_from_mapping({"model": {"trajectory": {"goal_scale_xy": [5.6, 2.5]}}})
+    for key in ("generator", "fusion", "flow_matching"):
+        with pytest.raises(ValueError, match="unknown model config keys"):
+            config_from_mapping({"model": {key: {}}})
+    with pytest.raises(TypeError, match="scale_xy"):
+        config_from_mapping({"model": {"trajectory": {"scale_xy": [3.0, 3.0]}}})
 
 
 def test_rejects_invalid_overfit_gate() -> None:
@@ -68,27 +47,22 @@ def test_rejects_invalid_overfit_gate() -> None:
         config_from_mapping({"training": {"overfit_max_loss_ratio": 1.0}})
 
 
-def test_rejects_invalid_source_scale() -> None:
-    with pytest.raises(ValueError, match="source_std_xy"):
-        config_from_mapping(
-            {"model": {"rectified_flow": {"source_std_xy": [0.04, 0.0]}}}
-        )
-
-
-def test_rejects_non_cubic_or_underdetermined_trajectory_contract() -> None:
+def test_rejects_invalid_trajectory_contract() -> None:
     with pytest.raises(ValueError, match="cubic"):
         config_from_mapping({"model": {"trajectory": {"degree": 2}}})
     with pytest.raises(ValueError, match="num_path_points"):
         config_from_mapping(
-            {"model": {"trajectory": {"num_control_points": 12, "num_path_points": 8}}}
+            {"model": {"trajectory": {"num_control_points": 8, "num_path_points": 4}}}
         )
+    with pytest.raises(ValueError, match="normalization_scale_m"):
+        replace(CurveNavConfig(), trajectory=replace(CurveNavConfig().trajectory, normalization_scale_m=0)).validate()
+    with pytest.raises(ValueError, match="exactly eight"):
+        replace(
+            CurveNavConfig(),
+            trajectory=replace(CurveNavConfig().trajectory, num_control_points=5),
+        ).validate()
 
 
-def test_rejects_non_production_depth_sequence_length() -> None:
-    with pytest.raises(ValueError, match="exactly four"):
-        config_from_mapping({"data": {"sequence_length": 3}})
-
-
-def test_rejects_removed_max_frames_switch() -> None:
-    with pytest.raises(TypeError, match="max_frames"):
-        config_from_mapping({"model": {"depth_encoder": {"max_frames": 8}}})
+def test_rejects_non_production_observation_frame_count() -> None:
+    with pytest.raises(ValueError, match="four depth observations"):
+        config_from_mapping({"data": {"observation_frames": 3}})

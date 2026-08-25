@@ -8,7 +8,7 @@ from torch import Tensor
 
 from curvenav.data.depth_bank import (
     PackedDepthBankSpec,
-    gather_depth_sequences,
+    gather_depth_observations,
     load_packed_depth_bank,
 )
 
@@ -73,5 +73,5 @@ class CudaPrefetchLoader:
             for name, value in batch.items()
         }
         indices = moved.pop("depth_indices")
-        moved["depth"] = gather_depth_sequences(self._depth_bank, indices)  # type: ignore[arg-type]
+        moved["depth"] = gather_depth_observations(self._depth_bank, indices)  # type: ignore[arg-type]
         return moved

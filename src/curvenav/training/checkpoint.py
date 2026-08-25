@@ -7,35 +7,60 @@ from torch import nn
 from torch.optim import Optimizer
 
 from curvenav.config import CurveNavConfig
-from curvenav.encoders.depth import DEPTH_ENCODER_REVISION
+from curvenav.conditioning import CONDITION_ENCODER_TYPE
+from curvenav.encoders.depth import DEPTH_ENCODER_TYPE
+from curvenav.encoders import POINT_GOAL_ENCODER_TYPE
+from curvenav.models import TRAJECTORY_FLOW_TYPE, TRAJECTORY_SCORER_TYPE
 from curvenav.training.ema import ExponentialMovingAverage
+from curvenav.trajectory import (
+    ARC_LENGTH_OVERSAMPLE_FACTOR,
+    BSPLINE_BENDING_REGULARIZATION_M4,
+)
+
+
+CHECKPOINT_TYPE = "curvenav_local_policy"
 
 
 def policy_contract(config: CurveNavConfig) -> dict[str, Any]:
     data = config.data
     trajectory = config.trajectory
     return {
-        "depth_sequence_length": data.sequence_length,
-        "depth_frame_stride": data.frame_skip + 1,
+        "observation_frames": data.observation_frames,
+        "frame_spacing_m": data.frame_spacing_m,
+        "expert_waypoint_spacing_m": data.expert_waypoint_spacing_m,
+        "future_steps": data.future_steps,
         "depth_image_size": [data.image_height, data.image_width],
-        "depth_units_per_m": data.depth_units_per_m,
         "max_depth_m": data.max_depth_m,
-        "depth_encoder_revision": DEPTH_ENCODER_REVISION,
-        "dimensions": 2,
-        "goal_semantics": "sampled_future_point_goal_robot_xy",
-        "sand_supervision": "target_endpoint_equals_point_goal",
-        "arc_length_policy": "learned_unconstrained",
-        "endpoint_policy": "learned_local_endpoint_origin_only",
-        "flow_source": "task_goal_capped_greville_line_origin_conditioned_rbf_gp",
-        "flow_path": "linear_source_to_data",
-        "integration_method": "euler",
-        "inference_steps": config.rectified_flow.inference_steps,
-        "motion_context": "executed_unit_xy_plus_valid_v2a",
+        "canonical_focal_px": [data.canonical_focal_x_px, data.canonical_focal_y_px],
+        "depth_encoder_type": DEPTH_ENCODER_TYPE,
+        "trajectory_dimensions": 2,
+        "point_goal_semantics": "mission_destination_in_current_robot_xy",
+        "point_goal_encoder_type": POINT_GOAL_ENCODER_TYPE,
+        "point_goal_features": "direction_plus_log_range",
+        "point_goal_clip_distance_m": config.point_goal_encoder.goal_clip_distance_m,
+        "trajectory_supervision": "fixed_future_expert_waypoints_or_true_goal",
+        "bspline_bending_regularization_m4": BSPLINE_BENDING_REGULARIZATION_M4,
+        "arc_length_policy": "learned_metric_length_without_rescaling_or_meter_cap",
+        "trajectory_endpoint_policy": "implicit_local_subgoal_origin_only",
+        "trajectory_flow_type": TRAJECTORY_FLOW_TYPE,
+        "trajectory_scorer_type": TRAJECTORY_SCORER_TYPE,
+        "training_objective": "rectified_flow_plus_arc_path_tangent_and_group_quality",
+        "trajectory_scorer_supervision": "quality_distribution_over_expert_and_marginal_trajectory_groups",
+        "trajectory_flow_candidates": config.trajectory_flow.inference_candidates,
+        "trajectory_flow_integration_steps": config.trajectory_flow.integration_steps,
+        "condition_encoder_type": CONDITION_ENCODER_TYPE,
+        "visual_context": "masked_spatial_tokens_with_frame_slots_and_planar_backprojection",
+        "observation_to_current": "planar_rigid_transform_used_for_depth_token_alignment",
+        "visual_compression": "learned_queries_16_tokens_per_depth_frame",
         "num_control_points": trajectory.num_control_points,
         "degree": trajectory.degree,
         "num_path_points": trajectory.num_path_points,
-        "scale_xy": list(trajectory.scale_xy),
-        "source_std_xy": list(config.rectified_flow.source_std_xy),
+        "path_sampling": "uniform_metric_arc_progress",
+        "arc_length_oversample_factor": ARC_LENGTH_OVERSAMPLE_FACTOR,
+        "trajectory_scale_xy": [
+            trajectory.normalization_scale_m,
+            trajectory.normalization_scale_m,
+        ],
     }
 
 
@@ -50,7 +75,7 @@ def checkpoint_state(
     if step < 0:
         raise ValueError("checkpoint step cannot be negative")
     state: dict[str, Any] = {
-        "format_version": 11,
+        "checkpoint_type": CHECKPOINT_TYPE,
         "step": step,
         "model": model.state_dict(),
         "config": asdict(config),
@@ -68,8 +93,8 @@ def validate_policy_contract(
     config: CurveNavConfig,
 ) -> None:
     """Fail before loading weights when units, shape, or scales differ."""
-    if checkpoint.get("format_version") != 11:
-        raise ValueError("CurveNav requires checkpoint format_version 11")
+    if checkpoint.get("checkpoint_type") != CHECKPOINT_TYPE:
+        raise ValueError(f"CurveNav requires checkpoint_type {CHECKPOINT_TYPE!r}")
     saved = checkpoint.get("policy_contract")
     if not isinstance(saved, Mapping):
         raise ValueError("checkpoint has no CurveNav policy contract")

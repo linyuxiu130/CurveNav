@@ -1,31 +1,34 @@
-"""One-time packed depth preparation for the fixed CurveNav SanD route."""
+"""One-time calibrated depth preparation for CurveNav route datasets."""
 
 import json
 import os
+import shutil
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-import shutil
 
 import cv2
 import numpy as np
 
-from curvenav.data.depth import preprocess_metric_depth
-
-
-CACHE_SCHEMA_VERSION = 2
-HSSD_CACHE_SCHEMA_VERSION = 1
+from curvenav.data.depth import (
+    BENCHMARK_INTRINSICS,
+    CANONICAL_INTRINSICS,
+    SAND_INTRINSICS,
+    preprocess_metric_depth,
+)
 
 
 def depth_cache_root(dataset_root: str | Path, height: int, width: int) -> Path:
     return Path(dataset_root) / f"curvenav_depth_{height}x{width}_float16"
 
 
-def hssd_depth_cache_root(dataset_root: str | Path, height: int, width: int) -> Path:
+def hssd_depth_cache_root(
+    dataset_root: str | Path, height: int, width: int
+) -> Path:
     return Path(dataset_root) / f"curvenav_hssd_depth_{height}x{width}_float16"
 
 
 def _prepare_run(
-    task: tuple[str, tuple[str, ...], str, int, int, float, float],
+    task: tuple[str, tuple[str, ...], str, int, int, float, float, str],
 ) -> tuple[str, int]:
     (
         run_key,
@@ -35,6 +38,7 @@ def _prepare_run(
         width,
         depth_units_per_m,
         max_depth_m,
+        source_camera,
     ) = task
     cv2.setNumThreads(0)
     destination = Path(destination_string)
@@ -46,23 +50,59 @@ def _prepare_run(
         dtype=np.float16,
         shape=(len(source_paths), height, width),
     )
+    source_intrinsics = {
+        "sand": SAND_INTRINSICS,
+        "benchmark": BENCHMARK_INTRINSICS,
+    }[source_camera]
     for frame_index, source_path in enumerate(source_paths):
         image = cv2.imread(source_path, cv2.IMREAD_UNCHANGED)
         if image is None or image.ndim != 2 or image.dtype != np.uint16:
             raise ValueError(f"invalid uint16 depth image: {source_path}")
-        if image.shape != (height, width):
-            image = cv2.resize(
-                image,
-                (width, height),
-                interpolation=cv2.INTER_NEAREST,
-            )
-        normalized = image.astype(np.float32) / depth_units_per_m
-        normalized = np.clip(normalized, 0, max_depth_m) / max_depth_m
+        if (height, width) != (CANONICAL_INTRINSICS.height, CANONICAL_INTRINSICS.width):
+            raise ValueError("packed depth must use the canonical camera")
+        normalized = preprocess_metric_depth(
+            image.astype(np.float32) / depth_units_per_m,
+            source_intrinsics=source_intrinsics,
+            maximum_m=max_depth_m,
+        )
         packed[frame_index] = normalized.astype(np.float16)
     packed.flush()
     del packed
     os.replace(temporary, destination)
     return run_key, len(source_paths)
+
+
+def _prepare_hssd_sample(
+    task: tuple[str, str, str, int, int, float],
+) -> tuple[str, dict[str, object]]:
+    sample_id, source_string, destination_string, height, width, max_depth_m = task
+    cv2.setNumThreads(0)
+    source = Path(source_string)
+    destination = Path(destination_string)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    depth = np.load(source, mmap_mode="r")
+    if depth.dtype != np.float32 or depth.ndim != 3 or depth.shape[0] != 4:
+        raise ValueError(f"invalid HSSD depth tensor: {source}")
+    temporary = destination.with_suffix(".tmp.npy")
+    packed = np.lib.format.open_memmap(
+        temporary,
+        mode="w+",
+        dtype=np.float16,
+        shape=(4, height, width),
+    )
+    for frame_index in range(4):
+        packed[frame_index] = preprocess_metric_depth(
+            np.asarray(depth[frame_index]),
+            source_intrinsics=BENCHMARK_INTRINSICS,
+            maximum_m=max_depth_m,
+        ).astype(np.float16)
+    packed.flush()
+    del packed
+    os.replace(temporary, destination)
+    return sample_id, {
+        "file": destination.name,
+        "frames": 4,
+    }
 
 
 def prepare_depth_cache(
@@ -78,14 +118,20 @@ def prepare_depth_cache(
         raise ValueError("workers must be positive")
     source_root = Path(dataset_root).resolve()
     destination_root = depth_cache_root(source_root, height, width)
+    building_root = destination_root.with_name(destination_root.name + ".building")
+    if destination_root.exists() or building_root.exists():
+        raise FileExistsError(f"SanD depth cache already exists: {destination_root}")
     tasks = []
+    excluded_runs: dict[str, str] = {}
     for dataset_directory in sorted(source_root.glob("dataset_*")):
         if not dataset_directory.is_dir():
-            continue
+            raise ValueError(f"SanD dataset entry is not a directory: {dataset_directory}")
         for run_directory in sorted(dataset_directory.glob("run_*")):
+            run_key = f"{dataset_directory.name}/{run_directory.name}"
             depth_directory = run_directory / "depth"
             source_paths = tuple(sorted(depth_directory.glob("depth_*.png")))
             if not source_paths:
+                excluded_runs[run_key] = "no_depth_frames"
                 continue
             expected_names = tuple(
                 f"depth_{frame_index:04d}.png"
@@ -93,10 +139,7 @@ def prepare_depth_cache(
             )
             if tuple(path.name for path in source_paths) != expected_names:
                 raise ValueError(f"non-contiguous depth sequence: {depth_directory}")
-            run_key = f"{dataset_directory.name}/{run_directory.name}"
-            destination = (
-                destination_root / dataset_directory.name / f"{run_directory.name}.npy"
-            )
+            destination = building_root / dataset_directory.name / f"{run_directory.name}.npy"
             tasks.append(
                 (
                     run_key,
@@ -106,74 +149,40 @@ def prepare_depth_cache(
                     width,
                     depth_units_per_m,
                     max_depth_m,
+                    "sand",
                 )
             )
     if not tasks:
         raise ValueError(f"no SanD depth sequences found under {source_root}")
 
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        run_counts = dict(executor.map(_prepare_run, tasks))
-    manifest: dict[str, object] = {
-        "schema_version": CACHE_SCHEMA_VERSION,
-        "height": height,
-        "width": width,
-        "dtype": "float16",
-        "depth_units_per_m": depth_units_per_m,
-        "max_depth_m": max_depth_m,
-        "total_frames": sum(run_counts.values()),
-        "runs": dict(sorted(run_counts.items())),
-    }
-    destination_root.mkdir(parents=True, exist_ok=True)
-    temporary_manifest = destination_root / "manifest.tmp.json"
-    temporary_manifest.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary_manifest, destination_root / "manifest.json")
-    return manifest
+    building_root.mkdir(parents=True)
+    try:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            run_counts = dict(executor.map(_prepare_run, tasks))
+        manifest: dict[str, object] = {
+            "height": height,
+            "width": width,
+            "dtype": "float16",
+            "depth_units_per_m": depth_units_per_m,
+            "max_depth_m": max_depth_m,
+            "source_camera": "sand_640x480_fx389.551",
+            "target_camera": "curvenav_224x126_benchmark_fov",
+            "total_frames": sum(run_counts.values()),
+            "runs": dict(sorted(run_counts.items())),
+            "excluded_runs": dict(sorted(excluded_runs.items())),
+        }
+        (building_root / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(building_root, destination_root)
+        return manifest
+    except BaseException:
+        shutil.rmtree(building_root, ignore_errors=True)
+        raise
 
 
-def _prepare_hssd_episode(
-    task: tuple[str, str, str, int, int, float, int, str],
-) -> tuple[str, dict[str, object]]:
-    (
-        run_key,
-        source_string,
-        destination_string,
-        height,
-        width,
-        max_depth_m,
-        expected_frames,
-        source_sha256,
-    ) = task
-    cv2.setNumThreads(0)
-    source = np.load(source_string, mmap_mode="r")
-    if source.dtype != np.float32 or source.ndim != 3 or len(source) != expected_frames:
-        raise ValueError(f"invalid HSSD physical depth array: {source_string}")
-    destination = Path(destination_string)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    packed = np.lib.format.open_memmap(
-        destination,
-        mode="w+",
-        dtype=np.float16,
-        shape=(expected_frames, height, width),
-    )
-    for frame_index in range(expected_frames):
-        packed[frame_index] = preprocess_metric_depth(
-            source[frame_index],
-            height=height,
-            width=width,
-            maximum_m=max_depth_m,
-        ).astype(np.float16)
-    packed.flush()
-    del packed
-    return run_key, {
-        "frames": expected_frames,
-        "source_depth_sha256": source_sha256,
-    }
-
-
-def prepare_hssd_v2_depth_cache(
+def prepare_hssd_depth_cache(
     dataset_root: str | Path,
     *,
     height: int,
@@ -181,47 +190,59 @@ def prepare_hssd_v2_depth_cache(
     max_depth_m: float,
     workers: int,
 ) -> dict[str, object]:
-    """Build the only training/inference frame bank for physical HSSD v2 depth."""
+    """Calibrate each generated HSSD observation into the model camera."""
     if workers < 1:
         raise ValueError("workers must be positive")
+    if (height, width) != (CANONICAL_INTRINSICS.height, CANONICAL_INTRINSICS.width):
+        raise ValueError("packed depth must use the canonical camera")
     source_root = Path(dataset_root).resolve()
     destination_root = hssd_depth_cache_root(source_root, height, width)
     building_root = destination_root.with_name(destination_root.name + ".building")
     if destination_root.exists() or building_root.exists():
-        raise FileExistsError(f"HSSD packed depth cache already exists: {destination_root}")
+        raise FileExistsError(f"HSSD depth cache already exists: {destination_root}")
+    dataset_manifest = json.loads(
+        (source_root / "dataset_manifest.json").read_text(encoding="utf-8")
+    )
+    if dataset_manifest.get("schema") != "curvenav_hssd_policy_dataset":
+        raise ValueError("HSSD dataset schema does not match CurveNav")
+    records = [
+        json.loads(line)
+        for line in (source_root / "samples.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    if len(records) != int(dataset_manifest.get("samples", -1)):
+        raise ValueError("HSSD manifest and sample index disagree")
     tasks = []
-    for split in ("train", "validation"):
-        for episode_dir in sorted((source_root / split).glob("dataset_hssd_*/run_*")):
-            metadata = json.loads((episode_dir / "metadata.json").read_text())
-            relative = episode_dir.relative_to(source_root)
-            run_key = relative.as_posix()
-            tasks.append(
-                (
-                    run_key,
-                    str(episode_dir / "depth_m.npy"),
-                    str(building_root / relative.parent / f"{relative.name}.npy"),
-                    height,
-                    width,
-                    max_depth_m,
-                    int(metadata["frames"]),
-                    str(metadata["depth_sha256"]),
-                )
+    for index, record in enumerate(records):
+        sample_id = str(record["sample_id"])
+        sample_directory = source_root / str(record["sample_directory"])
+        destination = building_root / str(record["split"]) / f"{index:05d}.npy"
+        tasks.append(
+            (
+                sample_id,
+                str(sample_directory / "depth_m.npy"),
+                str(destination),
+                height,
+                width,
+                max_depth_m,
             )
-    if not tasks:
-        raise ValueError(f"no HSSD v2 episodes found under {source_root}")
+        )
+
     building_root.mkdir(parents=True)
     try:
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            runs = dict(executor.map(_prepare_hssd_episode, tasks))
+            samples = dict(executor.map(_prepare_hssd_sample, tasks))
         manifest: dict[str, object] = {
-            "schema_version": HSSD_CACHE_SCHEMA_VERSION,
-            "dataset_schema_version": "curvenav_hssd_v2.0",
             "height": height,
             "width": width,
             "dtype": "float16",
+            "source_dtype": "float32_metric_m",
             "max_depth_m": max_depth_m,
-            "total_frames": sum(int(value["frames"]) for value in runs.values()),
-            "runs": dict(sorted(runs.items())),
+            "source_camera": "benchmark_640x360",
+            "target_camera": "curvenav_224x126_benchmark_fov",
+            "total_frames": 4 * len(samples),
+            "samples": dict(sorted(samples.items())),
         }
         (building_root / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",

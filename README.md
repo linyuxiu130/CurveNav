@@ -1,106 +1,55 @@
 # CurveNav
 
-CurveNav 是面向二维局部导航的 PointGoal-conditioned Rectified Flow。当前唯一训练链为 `v3`：从每条
-SanD 专家 run 随机采样未来点作为 PointGoal，并监督机器人到同一未来点的完整可变长度路径。模型不使用
-固定 2.1 m 轨迹，也不把预测终点硬投影到 PointGoal；B-spline/Flow 只固定机器人原点。
+CurveNav 是高效的 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对位姿和当前 PointGoal，生成短距离平滑 B-spline，并通过条件兼容度选择一条执行轨迹。
 
-当前结构与数学协议见 [ARCHITECTURE.md](ARCHITECTURE.md)，实验结果、失败经验和 keep/discard 决策见
-[EXPERIMENTS.md](EXPERIMENTS.md)。
+当前目标只有一个：在 X-NavDP 官方 PointGoal 评测中，以完全相同的 episode、相机、异步 MPC 和指标口径对比 NavDP 与 X-NavDP。局部基线成立前不专项扩展长距离或脱困能力。
+
+架构合同见 `ARCHITECTURE.md`，评测合同见 `EVALUATION.md`，保留的实验结论见 `EXPERIMENTS.md`。
+
+## 唯一工作流
+
+项目环境：
 
 ```text
-4-frame depth + sampled PointGoal + executed motion
-  -> condition Transformer
-variable-length expert local path
-  -> 12-control planar cubic B-spline
-PointGoal-directed prior + origin-conditioned RBF-GP
-  -> Rectified Flow + 8-step Euler
-  -> learned metric path / heading / curvature
+../.venvs/curvenav
 ```
 
-## 当前固定合同
+从固定上游 commit 下载 SanD/HSSD、生成 HSSD 观测并编译唯一训练集：
 
-- `depth [B,4,1,168,224]`，从旧到新。
-- `task_goal [B,2]`，采样未来点在当前机器人坐标系中的米制 XY。
-- `motion_context [B,3] = [executed_unit_dx, executed_unit_dy, valid]`。
-- target 为真实可变长度专家局部前缀，拟合成 `control_points [B,12,2]`。
-- target 的末端对应 PointGoal；预测 `Q11` 仍属于完整 Flow 随机变量，不做终点硬投影。
-- 不存在 2.1 m 或其他固定输出弧长。
-- 推理固定 8-step Euler，并使用 EMA checkpoint。
-- checkpoint format 为 11；旧 format-10/更早权重不会静默加载到 v3。
+```bash
+scripts/build_dataset.sh /path/to/data-root
+```
+
+该入口面向空的数据目录执行一次；内部阶段不提供历史版本、恢复模式或已有输出分支。训练只读取最终的 `data/policy_dataset`。
+
+测试、过拟合、训练与离线评估：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
+  ../.venvs/curvenav/bin/python -m pytest -q -p no:cacheprovider
+GPU_ID=0
+GPU_IDS=0,1
+CUDA_VISIBLE_DEVICES="${GPU_ID}" scripts/overfit_policy.sh configs/base.yaml
+CUDA_VISIBLE_DEVICES="${GPU_IDS}" scripts/train_policy.sh configs/base.yaml
+CUDA_VISIBLE_DEVICES="${GPU_ID}" scripts/evaluate_policy.sh configs/base.yaml outputs/train_policy/checkpoint.pt
+```
 
 ## 目录
 
 ```text
-configs/                 唯一训练配置与数据配方
-src/curvenav/
-  data/                  packed depth bank 与 batch contract
-  encoders/              depth / PointGoal / motion encoder
-  conditioning/          condition Transformer
-  models/                policy 与 trajectory field
-  generative/            origin-fixed Rectified Flow
-  trajectory/            planar B-spline、normalization、geometry
-  training/              DDP/AMP、EMA、optimizer、checkpoint
-  evaluation/            held-out trajectory evaluation
-  deployment/            history、candidate selector、runtime
-  data_generation/       独立 privileged expert data pipeline
-scripts/                 数据、训练、评测与传输工具
-tests/                   数学和端到端 contract 测试
+configs/base.yaml          唯一模型与训练配置
+configs/hssd_dataset.json  唯一 HSSD 生成配置
+scripts/build_dataset.sh   唯一数据构建入口
+src/curvenav/data/         标定深度、统一数据编译与 loader
+src/curvenav/data_generation/ HSSD 资产、几何、生成与正式审计
+src/curvenav/encoders/     深度与 PointGoal 编码
+src/curvenav/conditioning/ 多帧视觉压缩、逐帧位姿与目标融合
+src/curvenav/models/       flow、轨迹兼容度评分器与 policy
+src/curvenav/trajectory/   B-spline 和几何
+src/curvenav/training/     DDP、AMP、EMA 与 checkpoint
+src/curvenav/evaluation/   固定离线门禁
+src/curvenav/deployment/   多帧观测状态与严格推理接口
+tests/                     数学、数据、模型和部署合同
 ```
 
-## 环境
-
-固定 Python 环境：
-
-```text
-/mnt/data/huangshibo/H/navigation_three_projects/.venvs/curvenav
-```
-
-SanD 公开数据：
-
-```text
-/mnt/data/huangshibo/H/navigation_three_projects/datasets/sandplanner
-```
-
-## 测试
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 \
-PYTHONPATH=src \
-  ../.venvs/curvenav/bin/python -m pytest -q -p no:cacheprovider
-```
-
-正式训练前必须先通过固定单批过拟合：
-
-```bash
-mkdir -p outputs/train_v3_sand_goal_aligned
-scripts/overfit_sand.sh configs/train_sand_official.yaml | \
-  tee outputs/train_v3_sand_goal_aligned/overfit.log
-```
-
-## 训练
-
-训练使用唯一双卡 DDP/FP16/compiled policy/fused AdamW/EMA 链。当前宿主的 NCCL P2P collective 已由
-最小复现确认会自旋，因此启动脚本固定使用验证通过的 SHM collective。配置和 checkpoint contract 均为
-v3/format-11；旧 checkpoint 不能用于 `--resume`。
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 scripts/train_sand.sh configs/train_sand_official.yaml
-```
-
-当前通过离线门禁的 format-11 EMA checkpoint：
-
-```text
-outputs/train_v3_sand_goal_aligned/checkpoint.pt
-SHA256 410f184e64d0b25b5ad13efbeefb03fa45880376f981ae092b1d3787ae922b86
-```
-
-## 评测闭环
-
-开发比较使用 9998 上固定的 100 episodes。目标是同协议达到 NavDP，而不是优化单一训练 loss。每个新
-checkpoint 必须经历：contract/EMA 检查、1-episode smoke、固定 quick-100、matched failure 与 oracle
-candidate diagnosis。
-
-benchmark 现在只接受 `[B,H,W,1]` float32 米制 raw depth，NaN 保留，并只返回 NPZ。旧的有损请求链和
-其结果已删除，不属于当前基线。数据生成保存同语义的无损物理深度。
-
-旧 format-10 及更早权重不兼容当前源码，也不能作为 resume checkpoint。相关结论只保留在实验记录中。
+仓库不保存生成结果、权重或日志，也不提供旧协议分支。

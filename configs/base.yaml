@@ -1,68 +1,66 @@
 data:
-  training_sources:
-    - root: ../datasets/sandplanner
-      split: train
-      weight: 1.0
-  validation_sources:
-    - root: ../datasets/sandplanner
-      split: val
-      weight: 1.0
-  sequence_length: 4
-  frame_skip: 2
-  min_gap: 5
-  max_gap: 42
-  image_height: 168
+  root: data/policy_dataset
+  observation_frames: 4
+  frame_spacing_m: 0.45
+  expert_waypoint_spacing_m: 0.15
+  future_steps: 24
+  image_height: 126
   image_width: 224
-  depth_units_per_m: 1000.0
-  max_depth_m: 8.0
+  max_depth_m: 5.0
+  canonical_focal_x_px: 166.80851063829786
+  canonical_focal_y_px: 166.80851063829786
 
 model:
   trajectory:
-    num_control_points: 12
+    num_control_points: 8
     degree: 3
     num_path_points: 64
-    scale_xy: [5.6, 2.5]
+    normalization_scale_m: 4.0
   depth_encoder:
     model_dim: 256
-    frame_tokens_per_side: 4
+    frame_tokens_height: 8
+    frame_tokens_width: 12
     dropout: 0.0
-  goal_encoder:
+  point_goal_encoder:
     model_dim: 256
     hidden_dim: 256
-  motion_encoder:
-    model_dim: 256
-    hidden_dim: 256
+    goal_clip_distance_m: 25.0
   condition_encoder:
     model_dim: 256
-    transformer_layers: 4
+    transformer_layers: 2
     transformer_heads: 4
     dropout: 0.0
-  field:
+  trajectory_flow:
     model_dim: 256
-    transformer_layers: 4
+    transformer_layers: 3
+    transformer_heads: 4
+    inference_candidates: 8
+    integration_steps: 8
+    inference_seed: 20260821
+    dropout: 0.0
+  trajectory_scorer:
+    model_dim: 256
+    transformer_layers: 2
     transformer_heads: 4
     dropout: 0.0
-  rectified_flow:
-    inference_steps: 8
-    source_std_xy: [0.04, 0.12]
-
 training:
-  device: cuda
   seed: 42
-  batch_size: 256
+  per_device_batch_size: 256
   samples_per_epoch: 38400
   epochs: 200
   num_workers: 8
   prefetch_factor: 2
   warmup_epochs: 5
   min_learning_rate_factor: 0.01
-  overfit_steps: 1000
+  overfit_steps: 1500
   overfit_batch_size: 8
   overfit_max_loss_ratio: 0.1
+  overfit_oracle_ade_m: 0.12
+  overfit_selected_ade_m: 0.20
   log_every_steps: 20
   checkpoint_every_epochs: 20
-  output_dir: outputs/train_v3_sand_goal_aligned
-  checkpoint_path: outputs/train_v3_sand_goal_aligned/overfit.pt
+  output_dir: outputs/train_policy
+  checkpoint_path: outputs/train_policy/overfit.pt
   learning_rate: 0.0004
   weight_decay: 0.01
   grad_clip_norm: 1.0

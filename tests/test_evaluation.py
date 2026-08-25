@@ -1,23 +1,34 @@
 import torch
 
-from curvenav.evaluation.sand import trajectory_batch_metrics
+from curvenav.evaluation.offline import (
+    candidate_batch_metrics,
+    trajectory_batch_metrics,
+)
 
 
-def test_trajectory_metrics_select_the_best_candidate() -> None:
-    target = torch.tensor([[[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]]])
-    shifted = torch.tensor([[[0.0, 0.0], [0.5, 0.4], [1.0, 0.0]]])
-    paths = torch.stack((target, shifted), dim=1)
-    curvature = torch.zeros(1, 2, 3)
+def test_deterministic_trajectory_metrics() -> None:
+    target = torch.tensor([[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]])
+    path = target.clone()
+    curvature = torch.zeros(1, 3)
     metrics = trajectory_batch_metrics(
-        paths,
+        path,
         curvature,
         target,
         torch.zeros(1, 3),
-        selected_indices=torch.tensor([1], dtype=torch.int64),
+        torch.tensor([[3.0, 0.0]]),
     )
-    assert metrics["oracle_ade_m"].item() == 0
-    assert metrics["oracle_rmse_m"].item() == 0
-    assert metrics["target_endpoint_error_m"].item() == 0
-    assert metrics["candidate_pairwise_ade_m"].item() > 0
-    assert metrics["selector_ade_m"].item() > 0
-    assert metrics["selector_arc_length_error_m"].item() > 0
+    assert metrics["ade_m"].item() == 0
+    assert metrics["goal_progress_m"].item() == 2
+
+
+def test_candidate_metrics_expose_oracle_diversity_and_margin() -> None:
+    target = torch.zeros(1, 3, 2)
+    candidates = torch.zeros(1, 8, 3, 2)
+    candidates[0, :, -1, 0] = torch.arange(8)
+    log_probabilities = torch.arange(8, dtype=torch.float32).unsqueeze(0)
+
+    metrics = candidate_batch_metrics(candidates, log_probabilities, target)
+
+    assert metrics["oracle_ade_m"].item() == 0.0
+    assert metrics["candidate_endpoint_diversity_m"].item() > 0.0
+    assert metrics["quality_top1_margin"].item() == 1.0

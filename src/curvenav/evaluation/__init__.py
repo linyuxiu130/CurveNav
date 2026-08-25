@@ -1,1 +1,1 @@
-"""Fixed offline evaluation for the CurveNav policy."""
+"""Fixed offline evaluation for the CurveNav local policy."""

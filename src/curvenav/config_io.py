@@ -1,4 +1,4 @@
-"""YAML-to-dataclass loading with an explicit, reviewable schema."""
+"""YAML-to-dataclass loading with an explicit, reviewable contract."""
 
 from pathlib import Path
 from typing import Any, Mapping
@@ -7,14 +7,12 @@ import yaml
 
 from curvenav.config import (
     CurveNavConfig,
-    ConditionEncoderConfig,
     DataConfig,
-    DataSourceConfig,
     DepthEncoderConfig,
-    FieldConfig,
-    GoalEncoderConfig,
-    MotionEncoderConfig,
-    RectifiedFlowConfig,
+    TrajectoryScorerConfig,
+    TrajectoryFlowConfig,
+    ConditionEncoderConfig,
+    PointGoalEncoderConfig,
     TrainingConfig,
     TrajectoryConfig,
 )
@@ -33,40 +31,28 @@ def config_from_mapping(raw: Mapping[str, Any]) -> CurveNavConfig:
     allowed_model = {
         "trajectory",
         "depth_encoder",
-        "goal_encoder",
-        "motion_encoder",
+        "point_goal_encoder",
         "condition_encoder",
-        "field",
-        "rectified_flow",
+        "trajectory_flow",
+        "trajectory_scorer",
     }
     unknown_model = set(model) - allowed_model
     if unknown_model:
         raise ValueError(f"unknown model config keys: {sorted(unknown_model)}")
 
     trajectory = dict(model.get("trajectory", {}))
-    if "scale_xy" in trajectory:
-        trajectory["scale_xy"] = tuple(trajectory["scale_xy"])
-    rectified_flow = dict(model.get("rectified_flow", {}))
-    if "source_std_xy" in rectified_flow:
-        rectified_flow["source_std_xy"] = tuple(rectified_flow["source_std_xy"])
-
-    data = dict(raw.get("data", {}))
-    for key in ("training_sources", "validation_sources"):
-        if key in data:
-            sources = data[key]
-            if not isinstance(sources, list):
-                raise TypeError(f"data.{key} must be a list")
-            data[key] = tuple(DataSourceConfig(**source) for source in sources)
-
     config = CurveNavConfig(
-        data=DataConfig(**data),
+        data=DataConfig(**raw.get("data", {})),
         trajectory=TrajectoryConfig(**trajectory),
         depth_encoder=DepthEncoderConfig(**model.get("depth_encoder", {})),
-        goal_encoder=GoalEncoderConfig(**model.get("goal_encoder", {})),
-        motion_encoder=MotionEncoderConfig(**model.get("motion_encoder", {})),
+        point_goal_encoder=PointGoalEncoderConfig(
+            **model.get("point_goal_encoder", {})
+        ),
         condition_encoder=ConditionEncoderConfig(**model.get("condition_encoder", {})),
-        field=FieldConfig(**model.get("field", {})),
-        rectified_flow=RectifiedFlowConfig(**rectified_flow),
+        trajectory_flow=TrajectoryFlowConfig(**model.get("trajectory_flow", {})),
+        trajectory_scorer=TrajectoryScorerConfig(
+            **model.get("trajectory_scorer", {})
+        ),
         training=TrainingConfig(**raw.get("training", {})),
     )
     config.validate()
@@ -76,7 +62,7 @@ def config_from_mapping(raw: Mapping[str, Any]) -> CurveNavConfig:
 def load_config(path: str | Path) -> CurveNavConfig:
     """Load a CurveNav YAML file."""
     with Path(path).open("r", encoding="utf-8") as stream:
-        raw = yaml.safe_load(stream) or {}
+        raw = yaml.safe_load(stream)
     if not isinstance(raw, Mapping):
         raise TypeError("the YAML root must be a mapping")
     return config_from_mapping(raw)

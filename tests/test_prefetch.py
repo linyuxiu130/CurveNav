@@ -23,7 +23,7 @@ def test_cuda_prefetch_preserves_batch_values_and_order(tmp_path) -> None:
             "depth_indices": (
                 torch.arange(index * 8, (index + 1) * 8).view(2, 4).pin_memory()
             ),
-            "task_goal": torch.tensor([[index, -index]], dtype=torch.float32)
+            "point_goal": torch.tensor([[index, -index]], dtype=torch.float32)
             .repeat(2, 1)
             .pin_memory(),
         }
@@ -35,9 +35,9 @@ def test_cuda_prefetch_preserves_batch_values_and_order(tmp_path) -> None:
 
     assert len(actual) == len(cpu_batches)
     for gpu_batch, cpu_batch in zip(actual, cpu_batches, strict=True):
-        assert set(gpu_batch) == {"depth", "task_goal"}
-        assert gpu_batch["task_goal"].device == device
-        assert torch.equal(gpu_batch["task_goal"].cpu(), cpu_batch["task_goal"])
+        assert set(gpu_batch) == {"depth", "point_goal"}
+        assert gpu_batch["point_goal"].device == device
+        assert torch.equal(gpu_batch["point_goal"].cpu(), cpu_batch["point_goal"])
         indices = cpu_batch["depth_indices"].numpy()
         expected_depth = torch.from_numpy(packed[indices]).unsqueeze(2)
         assert gpu_batch["depth"].device == device

@@ -27,11 +27,6 @@ torchinductor/
 /data/**
 !/data/README.md
 /outputs/*
-!/outputs/audits/
-/outputs/audits/*
-!/outputs/audits/hssd_v2_multitopology_design_20260819/
-/outputs/audits/hssd_v2_multitopology_design_20260819/*
-!/outputs/audits/hssd_v2_multitopology_design_20260819/critic_sidecar_schema_v1.json
 *.pt
 *.pth
 *.ckpt

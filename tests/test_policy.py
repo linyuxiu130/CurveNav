@@ -1,177 +1,192 @@
-import copy
+from dataclasses import replace
 
 import torch
 
 from curvenav import PolicyCondition, TrajectoryTarget, build_policy
 from curvenav.config import (
-    ConditionEncoderConfig,
     CurveNavConfig,
     DataConfig,
     DepthEncoderConfig,
-    FieldConfig,
-    GoalEncoderConfig,
-    MotionEncoderConfig,
-    RectifiedFlowConfig,
+    TrajectoryScorerConfig,
+    TrajectoryFlowConfig,
+    ConditionEncoderConfig,
+    PointGoalEncoderConfig,
     TrajectoryConfig,
 )
+from curvenav.models.policy import group_ranking_loss
 
 
 def tiny_config() -> CurveNavConfig:
     return CurveNavConfig(
-        data=DataConfig(sequence_length=4),
-        trajectory=TrajectoryConfig(num_control_points=6, num_path_points=16),
+        data=DataConfig(observation_frames=4),
+        trajectory=TrajectoryConfig(num_control_points=8, num_path_points=16),
         depth_encoder=DepthEncoderConfig(
-            model_dim=32,
-            frame_tokens_per_side=2,
+            model_dim=32, frame_tokens_height=2, frame_tokens_width=2
         ),
-        goal_encoder=GoalEncoderConfig(model_dim=32, hidden_dim=32),
-        motion_encoder=MotionEncoderConfig(model_dim=32, hidden_dim=32),
+        point_goal_encoder=PointGoalEncoderConfig(model_dim=32, hidden_dim=32),
         condition_encoder=ConditionEncoderConfig(
+            model_dim=32, transformer_layers=1, transformer_heads=4
+        ),
+        trajectory_flow=TrajectoryFlowConfig(
             model_dim=32,
             transformer_layers=1,
             transformer_heads=4,
+            inference_candidates=8,
+            integration_steps=2,
         ),
-        field=FieldConfig(model_dim=32, transformer_layers=1, transformer_heads=4),
-        rectified_flow=RectifiedFlowConfig(inference_steps=2),
+        trajectory_scorer=TrajectoryScorerConfig(
+            model_dim=32, transformer_layers=1, transformer_heads=4
+        ),
     )
 
 
-def test_policy_training_and_sampling_contract() -> None:
+def identity_observation_transform(batch: int) -> torch.Tensor:
+    transform = torch.zeros(batch, 4, 4)
+    transform[..., 3] = 1.0
+    return transform
+
+
+def condition(batch: int = 2) -> PolicyCondition:
+    point_goals = torch.stack(
+        (torch.linspace(2.0, 4.0, batch), torch.linspace(-1.0, 1.0, batch)),
+        dim=-1,
+    )
+    return PolicyCondition(
+        depth=torch.rand(batch, 4, 1, 126, 224),
+        point_goal=point_goals,
+        observation_to_current=identity_observation_transform(batch),
+        observation_valid=torch.ones(batch, 4, dtype=torch.bool),
+    )
+
+
+def test_policy_trains_every_module_and_returns_scorer_selected_candidate() -> None:
     torch.manual_seed(0)
     policy = build_policy(tiny_config())
-    condition = PolicyCondition(
-        depth=torch.rand(2, 4, 1, 32, 32),
-        task_goal=torch.tensor([[4.0, 1.0], [3.0, -2.0]]),
-        motion_context=torch.tensor([[1.0, 0.0, 1.0], [0.0, 0.0, 0.0]]),
-    )
-    target_controls = torch.randn(2, 6, 2)
-    target_controls[:, 0] = 0
-    target_controls[:, -1] = torch.tensor([[1.2, 0.6], [0.8, -0.7]])
-    target = TrajectoryTarget(control_points=target_controls)
-    loss = policy(condition, target)
-    assert loss.ndim == 0 and torch.isfinite(loss)
-    loss.backward()
-    assert any(parameter.grad is not None for parameter in policy.parameters())
+    inputs = condition(batch=8)
+    controls = torch.randn(8, 8, 2)
+    controls[:, 0] = 0
+    reference_path = policy.codec.decode_equal_arc(controls)
+    losses = policy(inputs, TrajectoryTarget(controls, reference_path))
+    for value in (
+        losses.loss,
+        losses.flow_loss,
+        losses.path_loss,
+        losses.tangent_loss,
+        losses.ranking_loss,
+    ):
+        assert value.ndim == 0 and torch.isfinite(value)
+    losses.loss.backward()
+    gradients = [
+        parameter.grad for parameter in policy.parameters() if parameter.requires_grad
+    ]
+    assert all(gradient is not None for gradient in gradients)
+    assert all(torch.isfinite(gradient).all() for gradient in gradients if gradient is not None)
 
-    prediction = policy.sample(condition, num_samples=3)
-    assert prediction.control_points.shape == (6, 6, 2)
-    assert prediction.dense_path.shape == (6, 16, 2)
-    assert torch.isfinite(prediction.dense_path).all()
-    assert torch.equal(
-        prediction.control_points[:, 0], torch.zeros_like(prediction.control_points[:, 0])
-    )
-    task_goals = condition.task_goal.repeat_interleave(3, dim=0)
-    assert not torch.allclose(prediction.control_points[:, -1], task_goals)
-
-
-def test_task_goal_only_caps_the_flow_source_prior() -> None:
-    policy = build_policy(tiny_config())
-    task_goal = torch.tensor([[3.0, 4.0], [12.0, 5.0]])
-
-    source = policy.source_mean(task_goal)
-    source_endpoint = policy.normalizer.denormalize(source[:, -1])
-
-    torch.testing.assert_close(source_endpoint[0], task_goal[0])
+    policy.eval()
+    first = policy.sample(inputs)
+    torch.manual_seed(999)
+    second = policy.sample(inputs)
+    assert first.control_points.shape == (8, 8, 2)
+    assert first.path.shape == (8, 16, 2)
+    assert first.candidate_control_points.shape == (8, 8, 8, 2)
+    assert first.candidate_paths.shape == (8, 8, 16, 2)
+    assert first.candidate_log_probabilities.shape == (8, 8)
     torch.testing.assert_close(
-        torch.linalg.vector_norm(source_endpoint[1]),
-        policy.normalizer.scale_xy[0],
+        first.candidate_log_probabilities.exp().sum(dim=1),
+        torch.ones(8),
     )
+    assert torch.equal(first.control_points, second.control_points)
+    selected = first.candidate_log_probabilities.argmax(dim=1)
+    batch = torch.arange(8)
     torch.testing.assert_close(
-        source_endpoint[1] / torch.linalg.vector_norm(source_endpoint[1]),
-        task_goal[1] / torch.linalg.vector_norm(task_goal[1]),
+        first.control_points, first.candidate_control_points[batch, selected]
     )
+    assert torch.equal(first.control_points[:, 0], torch.zeros(8, 2))
 
 
-def test_depth_encoder_uses_the_fixed_stride4_stem() -> None:
+def test_point_goal_encoder_retains_range_until_xnavdp_clip_distance() -> None:
+    encoder = build_policy(tiny_config()).condition_encoder.point_goal_encoder.eval()
+    with torch.no_grad():
+        far = encoder(torch.tensor([[4.0, 0.0], [20.0, 0.0], [40.0, 0.0], [80.0, 0.0]]))
+        near = encoder(torch.tensor([[1.0, 0.0]]))
+    assert not torch.allclose(far[0], far[1])
+    torch.testing.assert_close(far[2], far[3])
+    assert not torch.allclose(far[0], near[0])
+
+
+def test_invalid_padded_frames_cannot_change_the_prediction() -> None:
     policy = build_policy(tiny_config())
-    stem = policy.depth_encoder.backbone[0][0]
-    assert isinstance(stem, torch.nn.Conv2d)
-    assert stem.kernel_size == (5, 5)
-    assert stem.stride == (4, 4)
-    assert stem.in_channels == 4
+    first = condition(batch=1)
+    first.observation_valid[:, :2] = False
+    second = PolicyCondition(
+        depth=first.depth.clone(),
+        point_goal=first.point_goal,
+        observation_to_current=first.observation_to_current.clone(),
+        observation_valid=first.observation_valid,
+    )
+    second.depth[:, :2] = torch.rand_like(second.depth[:, :2]) * 100.0
+    second.observation_to_current[:, :2] = torch.rand_like(
+        second.observation_to_current[:, :2]
+    ) * 100.0
+    first_encoded = policy.encode_condition(first)
+    second_encoded = policy.encode_condition(second)
+    torch.testing.assert_close(first_encoded.tokens, second_encoded.tokens)
 
-    first_residual_stage = policy.depth_encoder.backbone[1]
-    assert first_residual_stage.convolution_1.stride == (2, 2)
-    final_refinement = policy.depth_encoder.backbone[3]
-    assert final_refinement.convolution.kernel_size == (3, 3)
-    assert final_refinement.convolution.dilation == (2, 2)
-    assert final_refinement.convolution.padding == (2, 2)
-    assert len(policy.depth_encoder.backbone) == 5
 
-    tokens = policy.depth_encoder(torch.rand(2, 4, 1, 32, 32))
-    assert tokens.shape == (2, 4, 32)
+def test_eight_control_contract_is_unique() -> None:
+    invalid = replace(
+        tiny_config(), trajectory=replace(tiny_config().trajectory, num_control_points=12)
+    )
+    try:
+        invalid.validate()
+    except ValueError as error:
+        assert "exactly eight" in str(error)
+    else:
+        raise AssertionError("12-control trajectory must be rejected")
 
 
-def test_condition_key_value_cache_matches_cross_attention() -> None:
-    torch.manual_seed(1)
+def test_group_scorer_prefers_the_target_quality_distribution() -> None:
+    correct = torch.tensor([[3.0, 1.0, -1.0]])
+    wrong = torch.tensor([[-1.0, 3.0, 1.0]])
+
+    target = torch.tensor([[1.0, 0.0, 0.0]])
+    assert group_ranking_loss(correct, target) < group_ranking_loss(wrong, target)
+
+
+def test_flow_endpoint_reconstruction_matches_linear_path_identity() -> None:
+    flow = build_policy(tiny_config()).trajectory_flow
+    clean = torch.randn(3, 8, 2)
+    clean[:, 0] = 0
+    noisy, time, velocity = flow.training_pair(clean)
+    reconstructed = flow.reconstruct_clean(noisy, time, velocity)
+    torch.testing.assert_close(reconstructed, clean)
+
+
+def test_sand_spatial_tokens_and_navdp_compression_have_fixed_contract() -> None:
+    policy = build_policy(tiny_config())
+    depth = torch.full((1, 4, 1, 126, 224), 0.4)
+    observation = policy.depth_encoder(
+        depth,
+        identity_observation_transform(1),
+        torch.ones(1, 4, dtype=torch.bool),
+    )
+    assert observation.tokens.shape == (1, 4, 4, 32)
+
+    encoded = policy.encode_condition(condition(batch=1))
+    assert policy.condition_encoder.compressed_tokens == 4 * 16
+    assert encoded.tokens.shape == (1, 1 + 4 * 16, 32)
+
+
+def test_planar_backprojection_uses_observation_transform() -> None:
     policy = build_policy(tiny_config()).eval()
-    reference_block = policy.rectified_flow.field.blocks[0]
-    cached_block = copy.deepcopy(reference_block)
-    reference_query = torch.randn(3, 6, 32, requires_grad=True)
-    reference_memory = torch.randn(3, 6, 32, requires_grad=True)
-    cached_query = reference_query.detach().clone().requires_grad_()
-    cached_memory = reference_memory.detach().clone().requires_grad_()
-
-    normalized_memory = reference_block.memory_norm(reference_memory)
-    reference = reference_block.cross_attention(
-        reference_query,
-        normalized_memory,
-        normalized_memory,
-        need_weights=False,
-    )[0]
-    cached = cached_block._cross_attend(
-        cached_query,
-        cached_block.prepare_memory(cached_memory),
+    depth = torch.full((1, 4, 1, 126, 224), 0.4)
+    identity = identity_observation_transform(1)
+    translated = identity.clone()
+    translated[:, 0, 0] = -1.0
+    with torch.no_grad():
+        first = policy.depth_encoder(depth, identity, torch.ones(1, 4, dtype=torch.bool))
+        second = policy.depth_encoder(depth, translated, torch.ones(1, 4, dtype=torch.bool))
+    torch.testing.assert_close(
+        second.planar_points[:, 0, :, 0],
+        first.planar_points[:, 0, :, 0] - 1.0,
     )
-
-    assert torch.equal(reference, cached)
-    reference_variables = (
-        reference_query,
-        reference_memory,
-        reference_block.memory_norm.weight,
-        reference_block.cross_attention.in_proj_weight,
-        reference_block.cross_attention.in_proj_bias,
-        reference_block.cross_attention.out_proj.weight,
-        reference_block.cross_attention.out_proj.bias,
-    )
-    cached_variables = (
-        cached_query,
-        cached_memory,
-        cached_block.memory_norm.weight,
-        cached_block.cross_attention.in_proj_weight,
-        cached_block.cross_attention.in_proj_bias,
-        cached_block.cross_attention.out_proj.weight,
-        cached_block.cross_attention.out_proj.bias,
-    )
-    reference_gradients = torch.autograd.grad(reference.square().mean(), reference_variables)
-    cached_gradients = torch.autograd.grad(cached.square().mean(), cached_variables)
-    assert all(
-        torch.equal(reference_gradient, cached_gradient)
-        for reference_gradient, cached_gradient in zip(
-            reference_gradients,
-            cached_gradients,
-        )
-    )
-
-
-def test_condition_key_value_is_prepared_once_across_flow_steps() -> None:
-    torch.manual_seed(2)
-    policy = build_policy(tiny_config()).eval()
-    condition = PolicyCondition(
-        depth=torch.rand(1, 4, 1, 32, 32),
-        task_goal=torch.tensor([[0.8, -0.1]]),
-        motion_context=torch.tensor([[1.0, 0.0, 1.0]]),
-    )
-    calls = 0
-
-    def count_memory_normalization(_module, _inputs, _output) -> None:
-        nonlocal calls
-        calls += 1
-
-    handle = policy.rectified_flow.field.blocks[0].memory_norm.register_forward_hook(
-        count_memory_normalization
-    )
-    policy.sample(condition, num_samples=3)
-    handle.remove()
-
-    assert calls == 1

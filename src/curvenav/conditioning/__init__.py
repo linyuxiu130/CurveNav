@@ -1,5 +1,5 @@
-"""Joint multimodal condition encoding."""
+"""PointGoal-aware multi-frame conditioning."""
 
-from .transformer import ConditionTransformer
+from .transformer import CONDITION_ENCODER_TYPE, PolicyConditionEncoder
 
-__all__ = ["ConditionTransformer"]
+__all__ = ["CONDITION_ENCODER_TYPE", "PolicyConditionEncoder"]

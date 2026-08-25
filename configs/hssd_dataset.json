@@ -1,0 +1,52 @@
+{
+  "asset_root": "data/scene_assets/hssd-hab",
+  "output_root": "outputs/hssd_policy_dataset",
+  "seed": 20260822,
+  "workers": 4,
+  "gpu_device": 0,
+  "expected_samples": 1000,
+  "candidate_limit": 64,
+  "source_routes_per_scene": 2,
+  "source_endpoint_distance_range_m": [8.5, 14.0],
+  "anchor_candidate_step_m": 0.25,
+  "minimum_anchor_separation_m": 0.75,
+  "goal_distance_bands": {
+    "near": [0.5, 3.0],
+    "middle": [3.0, 6.0],
+    "far": [6.0, 10.0]
+  },
+  "anchors_per_source_route": {
+    "near": 1,
+    "middle": 2,
+    "far": 2
+  },
+  "trajectory_variants": [
+    {"name": "standard", "lateral_m": 0.0, "yaw_degrees": 0.0},
+    {"name": "left_mild", "lateral_m": 0.25, "yaw_degrees": 15.0},
+    {"name": "right_mild", "lateral_m": -0.25, "yaw_degrees": -15.0},
+    {"name": "left_hard", "lateral_m": 0.45, "yaw_degrees": 25.0},
+    {"name": "right_hard", "lateral_m": -0.45, "yaw_degrees": -25.0}
+  ],
+  "selected_scenes": [
+    {"scene_id": "106366323_174226647", "split": "train"},
+    {"scene_id": "104348181_171513120", "split": "train"},
+    {"scene_id": "104862396_172226349", "split": "train"},
+    {"scene_id": "108294537_176710050", "split": "train"},
+    {"scene_id": "104348160_171513093", "split": "train"},
+    {"scene_id": "104862534_172226625", "split": "train"},
+    {"scene_id": "102815859", "split": "train"},
+    {"scene_id": "108736611_177263226", "split": "train"},
+    {"scene_id": "102817200", "split": "train"},
+    {"scene_id": "106366353_174226695", "split": "train"},
+    {"scene_id": "106365897_174225972", "split": "train"},
+    {"scene_id": "104862681_172226874", "split": "train"},
+    {"scene_id": "104862621_172226772", "split": "train"},
+    {"scene_id": "102817053", "split": "train"},
+    {"scene_id": "102344193", "split": "train"},
+    {"scene_id": "106878945_174887058", "split": "train"},
+    {"scene_id": "107734158_175999998", "split": "validation"},
+    {"scene_id": "102816036", "split": "validation"},
+    {"scene_id": "103997586_171030669", "split": "validation"},
+    {"scene_id": "105515379_173104395", "split": "validation"}
+  ]
+}

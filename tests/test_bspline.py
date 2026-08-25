@@ -1,6 +1,6 @@
 import torch
 
-from curvenav.trajectory import PlanarBSplineCodec
+from curvenav.trajectory import PlanarBSplineCodec, resample_path_by_arc_length
 
 
 def test_basis_is_partition_of_unity_and_clamped() -> None:
@@ -23,13 +23,30 @@ def test_decode_preserves_origin_and_endpoint() -> None:
     assert control_points.grad is not None
 
 
-def test_encode_recovers_decoded_control_points() -> None:
-    codec = PlanarBSplineCodec(num_control_points=8, degree=3, num_path_points=31)
-    control_points = torch.randn(2, 8, 2)
-    control_points[:, 0] = 0
-    dense_path = codec.decode(control_points)
-    recovered = codec.encode(dense_path)
-    assert torch.allclose(recovered, control_points, atol=1e-4)
+def test_executable_decode_has_uniform_arc_progress() -> None:
+    codec = PlanarBSplineCodec(num_control_points=8, degree=3, num_path_points=64)
+    controls = torch.tensor(
+        [[[0.0, 0.0], [0.1, 0.0], [0.3, 0.1], [0.7, 0.4],
+          [1.2, 0.5], [1.8, 0.3], [2.5, 0.1], [3.2, 0.0]]]
+    )
+    path = codec.decode_equal_arc(controls)
+    segment_length = torch.linalg.vector_norm(path[:, 1:] - path[:, :-1], dim=-1)
+
+    assert segment_length.std() / segment_length.mean() < 0.03
+    torch.testing.assert_close(path[:, -1], controls[:, -1])
+
+
+def test_encode_suppresses_short_path_endpoint_ringing() -> None:
+    codec = PlanarBSplineCodec(num_control_points=12, degree=3, num_path_points=64)
+    vertices = torch.tensor([[[0.0, 0.0], [0.118, -0.054], [0.144, -0.106]]])
+    path = resample_path_by_arc_length(vertices, num_samples=64)
+
+    controls = codec.encode(path)
+    reconstructed, _, curvature = codec(controls)
+
+    assert torch.sqrt((reconstructed - path).square().mean()) < 0.005
+    assert curvature.abs().max() < 10.0
+    torch.testing.assert_close(reconstructed[:, -1], path[:, -1])
 
 
 def test_encode_keeps_both_path_endpoints_exact() -> None:
@@ -37,23 +54,6 @@ def test_encode_keeps_both_path_endpoints_exact() -> None:
     path = torch.randn(3, 64, 2).cumsum(dim=1)
     path = path - path[:, :1]
     controls = codec.encode(path)
-    reconstructed = codec.decode(controls)
+    reconstructed = codec.decode_parameter_grid(controls)
     assert torch.equal(controls[:, 0], torch.zeros_like(controls[:, 0]))
     assert torch.allclose(reconstructed[:, -1], path[:, -1], atol=1e-6)
-
-
-def test_greville_controls_decode_to_exact_straight_line() -> None:
-    codec = PlanarBSplineCodec(num_control_points=12, degree=3, num_path_points=64)
-    endpoint = torch.tensor([[3.0, -1.0], [0.7, 0.4]])
-    controls = codec.straight_line_controls(endpoint)
-    expected = torch.linspace(0.0, 1.0, 64).view(1, -1, 1) * endpoint.unsqueeze(1)
-    assert torch.allclose(codec.decode(controls), expected, atol=1e-6)
-
-
-def test_origin_conditioned_source_covariance_is_correlated_and_positive_definite() -> None:
-    codec = PlanarBSplineCodec(num_control_points=12, degree=3, num_path_points=64)
-    factor = codec.origin_conditioned_source_cholesky()
-    covariance = factor @ factor.T
-    assert factor.shape == (11, 11)
-    assert torch.all(torch.diag(factor) > 0)
-    assert covariance[4, 5] > 0

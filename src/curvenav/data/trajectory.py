@@ -20,5 +20,8 @@ def collate_metric_paths(
     padding = torch.arange(padded.shape[1]).unsqueeze(0) >= lengths.unsqueeze(1)
     endpoints = torch.stack([path[-1] for path in metric_paths])
     padded = torch.where(padding.unsqueeze(-1), endpoints.unsqueeze(1), padded)
-    canonical = resample_path_by_arc_length(padded, num_samples=codec.num_path_points)
-    return canonical, codec.encode(canonical)
+    reference_path = resample_path_by_arc_length(
+        padded,
+        num_samples=codec.num_path_points,
+    )
+    return reference_path, codec.encode(reference_path)

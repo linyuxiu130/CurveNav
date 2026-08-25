@@ -1,296 +1,198 @@
-# CurveNav 架构说明（唯一事实来源）
+# CurveNav 二维局部导航架构
 
-状态：`v3` PointGoal—轨迹监督对齐已通过训练与 held-out 门禁，等待 matched 闭环；旧 `v2-A` 仅作冻结基线；stage-2 critic 仍是旧基线的 train-only 原型
-最后更新：2026-08-20
+本文是当前代码的唯一模型合同。CurveNav 模型只负责 PointGoal 条件的二维局部轨迹生成；仓库另含离线 HSSD 数据生成，但不包含仿真评测、服务器、传输、MPC 或机器人动力学适配。代码不保留旧模型兼容、架构分支、实验开关或推理启发式补丁。
 
-本文档是 CurveNav 当前模型、数据和数学协议的唯一事实来源。改变输入字段、坐标系、轨迹边界、Flow
-源分布、采样器或训练阶段时，必须在同一修改中更新代码、测试、本文件与 checkpoint contract。旧实现
-只保留实验结论，不在生产代码中保留兼容开关。
+## 任务与张量合同
 
-## 1. 当前目标
-
-第一目标是在统一、无损且固定的 PointGoal quick-100 闭环协议上达到 NavDP。比较对象必须使用相同场景、
-episode ID、seed、相机、MPC、成功阈值和超时；训练 loss 与离线 ADE 只作为调试信号，不能代替闭环 SR/SPL。
-
-当前只处理地面机器人的二维局部导航：`x` 向前、`y` 向左、位置单位为米。模型根据四帧深度、PointGoal
-和真实执行运动生成多条平滑局部路径。
-
-固定原则：
-
-- 不把 GT 或预测轨迹强制成 2.1 m，也不投影到其他固定弧长。
-- SanD 训练的 `task_goal` 是随机采样的未来轨迹点；监督路径恰好从当前状态走到该 PointGoal。
-- B-spline 只硬固定机器人原点 `Q0=(0,0)`；target 终点对应 PointGoal，但预测 `Q11` 不做硬投影。
-- v3 相对 v2-A 只改变目标—target 监督关系和 checkpoint 合同。CNN、motion、Transformer、Flow、8-step
-  Euler、可变窗口和训练配方保持不变，以便单变量归因。
-- v3 使用 checkpoint format 11；format-10 及更早模型只能用于显式离线基线，生产加载必须严格拒绝。
-
-## 2. 唯一端到端链路
-
-```mermaid
-flowchart LR
-    D["4 帧深度"] --> CNN["四通道 stride-4 residual CNN\n16 spatial tokens"]
-    G["采样未来 PointGoal xy"] --> GE["unit direction + log distance\ngoal token"]
-    M["executed unit xy + valid"] --> ME["motion token"]
-    CNN --> CT["4-layer condition Transformer"]
-    GE --> CT
-    ME --> CT
-    G --> SRC["朝目标的 capped Greville line\n+ origin-conditioned RBF-GP"]
-    P["到同一 PointGoal 的可变长度专家路径"] --> FIT["12-control cubic B-spline\nonly Q0 fixed"]
-    FIT --> FM["4-layer Rectified Flow field"]
-    SRC --> FM
-    CT --> FM
-    FM --> E["8-step Euler"]
-    E --> DEC["metric B-spline path\nheading + curvature"]
-```
-
-源均值朝向 PointGoal，但它只是 ODE 初始分布，不是输出约束。采样后的终点可以停在目标前、向侧面绕障，
-或者在必要时产生与目标直线方向不同的局部动作。
-
-## 3. 张量与坐标协议
-
-| 对象 | 形状 | 当前 v3 语义 |
-| --- | ---: | --- |
-| `depth` | `[B,4,1,168,224]` | 从旧到新；物理深度经唯一预处理归一化 |
-| `task_goal` | `[B,2]` | 采样未来点的当前机器人系米制 XY |
-| `motion_context` | `[B,3]` | `[executed_unit_dx, executed_unit_dy, valid]`；v2-B 前保持不变 |
-| target dense path | `[B,64,2]` | 到该 PointGoal 的真实可执行路径，弧长可变 |
-| target controls | `[B,12,2]` | cubic B-spline，只有 `Q0=(0,0)` 是公共边界 |
-| Flow state/velocity | `[B,12,2]` | 第 1–11 个控制点全部参与随机源、速度损失和积分 |
-| depth tokens | `[B,16,256]` | 四帧仍在第一层卷积融合；v3 不改视觉结构 |
-| condition memory | `[B,18,256]` | goal + motion + 16 depth tokens |
-| prediction | `[B*N,64,2]` | 米制局部路径，终点自由 |
-
-PointGoal 编码令 `r=||g||`，唯一 goal feature 为：
+输入 `PolicyCondition`：
 
 ```text
-[g_x / max(r,eps), g_y / max(r,eps), log(1+r)]
+depth       float [B,4,1,126,224]  3 帧过去观测 + 1 帧当前观测；1 表示 5 m
+point_goal  float [B,2]            当前机器人坐标系 PointGoal (x,y)
+observation_to_current float [B,4,4]  每帧到当前帧的 (x,y,sin Δyaw,cos Δyaw)
+observation_valid bool [B,4]          逐帧有效位；最后一个当前帧必须有效
 ```
 
-`r≈0` 时方向置零。这同时保留目标方向和远近信息，不对距离设置固定目标尺度。
-
-## 4. 数据合同
-
-对任意 anchor `t`，唯一 SanD 采样合同为：
+训练目标 `TrajectoryTarget`：
 
 ```text
-end          ~ Uniform(t + min_gap, ..., min(t + max_gap, run_end))
-task_goal_t  = transform_to_robot_t(expert_route[end])
-target_t     = transform_to_robot_t(expert_route[t : end])
-target_t[-1] = task_goal_t
+control_points float [B,8,2]   当前机器人坐标系的三次 B-spline 控制点
+reference_path float [B,64,2]  同一路径的 64 点等弧长训练参考
 ```
 
-窗口长度仍由 `min_gap=5`、`max_gap=42` 和 run 剩余长度决定，模型自行学习轨迹距离与曲率；不存在 2.1 m
-截断。训练保留 SanD 原有按 worker seed 的随机窗口，held-out validation descriptor 始终固定。本轮除
-`task_goal` 从 run 最终点改成已采样 `end` 点外，不改变样本集合、网络或优化配方。这恢复了 SanD 官方
-`run_train.sh`/loader 的核心合同：随机 `start_idx/end_idx`，`end_relative_pose` 与监督轨迹使用同一个 `end_idx`。
+输出 `TrajectoryPrediction` 包含选中的 `[B,64,2]` 路径、解析 heading/curvature，以及八条候选控制点、候选路径和组内对数概率。参考路径保留来源的真实局部 horizon：SanD 最多取未来 24 个专家步，HSSD 取安全重规划的最多 3 m 前缀；二者都不缩放到固定长度。
 
-旧 v2-A 的“run 最终目标 + 随机局部前缀”已被数据审计否决：目标距离中位数约 17.28 m，目标—target
-方向差中位数约 52.81°，66.27% 样本方向差超过 15°；局部深度无法解释这类监督冲突。旧 HSSD v2 bundle
-仍保留作 critic/数据审计资产，但未转换为上述 v3 合同前，不混入当前 stage-1 policy 训练。它固定输出为：
-
-当前开源 `dataset_avoid` 不是论文完整 500-episode 训练集：loader 只识别 151 条有效 run，其中 135 train、
-16 validation。v3 的 15,000 updates/global batch 512 产生约 7.68M 次样本抽取，但这些重复抽取不会增加
-场景、障碍拓扑或恢复状态覆盖；因此训练 loss 和同分布 held-out ADE 不能证明闭环泛化。
-
-- 200 条完整 episode，约 160 train / 40 validation，scene family 隔离；
-- 无损物理深度、完整相机 K/外参、`distance_to_image_plane` 定义和 invalid 规则；
-- `task_goal_local_xy`、`history_indices[4]`、固定 target descriptor、真实弧长；
-- `motion_se2[4,5] = [dx,dy,sin(dyaw),cos(dyaw),valid]`，供 v2-B 使用；
-- 连续 footprint clearance、曲率、重复与 split 泄漏审计；
-- `alternative_candidates=[]`、`critic_labels=null`，不复制单一路径伪造多模态监督。
-
-HSSD v2 的正式加载只走一条 packed-bank 链路：原始 `float32` 米制 depth 是不可变数据真值；一次性使用与
-部署相同的预处理生成 `float16 [frame,168,224]` 帧库，并用 episode frame count 与原始 depth SHA256 严格
-校验。训练批次只搬运 `depth_indices` 和监督 tensor，GPU 常驻帧库再执行 index-select；不存在逐样本读取、
-resize 或 raw-depth fallback。`sample_index` 是 descriptor 的稳定索引，字符串元数据只在 batch 外解析。
-
-v3 的 `motion_context` 必须从原始相邻姿态 `anchor-1 -> anchor` 计算，在当前 anchor body frame 表达并归一化；
-首帧 valid 为 0。HSSD descriptor 内的 `history_motion_se2` 是间隔 3 个原始步长的 selected-frame SE(2)，只为
-v2-B 时序结构保留，不能代替当前 motion 输入。HSSD、SanD 和部署 runtime 对同一位移的单元测试必须一致。
-
-`curvenav_critic_sidecar_v1` 是独立监督层，不修改上述 observation 数据。它按 `sample_id` 引用 HSSD v2，
-每个状态保存 8 个固定 EMA/seed 的真实 policy 候选、1 个 expert 和 1 个 hold，以及 collision、额外 clearance、
-测地 progress、曲率和运动学 proxy。偏好只在 collision / safety margin / progress / clearance 上形成严格
-Pareto dominance，不写加权总分。当前 policy/expert/hold 都没有经过 corridor graph 认证，因此 topology、
-branch 和 corridor edge 必须保持 null/empty；MPC closed-loop 标签保持 `not_run`，不能拿离线 proxy 冒充。
-sidecar 的 schema、producer revision/seed、candidate ID、ragged offset、源数据 SHA 和 packed-depth SHA 由唯一
-reader/validator 锁定。
-
-下一批正式数据不能靠重复窗口扩大数字，必须同时满足以下合同：
-
-- observation、相机、机器人坐标、最终 task goal 与控制器版本完全匹配；
-- 同一状态保存多条由真实可行 corridor/ordered-edge sequence 区分的路径，不用旋转或噪声伪造拓扑；
-- 保存冻结 policy 在该状态生成的 hard negatives，以及 collision、margin、progress、clearance 原子标签；
-- 纳入闭环偏离专家后的 recovery/DAgger 状态，不能只采专家路径上的干净 anchor；
-- train/validation/test 按 scene family 隔离，任何 sample、depth frame、route 前缀均不能跨 split；
-- observation bundle 是不可变真值，候选/critic 标签只用全局 sample ID 外键引用，不复制 depth；
-- topology 或 closed-loop 标签只有在对应 planner/MPC 确实运行后才能非空，未知值不生成伪监督。
-
-多专家训练的采样单位必须是“状态”而不是“路径”：先均匀采样 state，再在该 state 的真实可行 topology experts
-中均匀采样一个 target。否则候选多的简单状态会隐式获得更大权重，且重复路径会伪装成数据扩容。Flow 仍学习
-单一条件分布，不为 topology 增加类别输入或分支网络；同状态多 target 由随机源表达多模态。
-
-旧 HSSD 约 89° FOV 深度不能用于约 67.757° 的 benchmark，相同路径几何可以复用，但深度必须重渲染。
-数据集和测评端现在统一使用 float32 米制物理 depth 与 NaN invalid。测评请求只允许 raw tensor，响应只
-允许 NPZ；不存在旧量化、fallback 或协议分支。
-
-当前控制器允许 `0 <= v <= 0.5 m/s`、`|omega| <= 0.5 rad/s`，并允许 `v=0` 原地旋转；源码没有给出
-正的最小稳定速度、加速度、jerk、slip 或闭环跟踪误差包络。因此不能把某个固定曲率当作物理可执行性
-硬门禁。pilot 的 `p95<=4`、`max<=10 m^-1` 只保留为数据质量启发式；模型侧必须在 matched 闭环中监控
-曲率、MPC 降速/饱和和跟踪误差。
-
-## 5. 轨迹与 Flow 数学
-
-### 5.1 B-spline
-
-使用 `K=12` 个控制点、次数 `p=3` 的 clamped open-uniform B-spline：
+## 唯一模型图
 
 ```text
-tau(u) = sum_i B_i,3(u) Q_i,  u in [0,1]
-Q0 = (0,0)
-Q11 = learned local endpoint
+4×depth -> shared ResNet-18 stage-3 -> 8×12 spatial tokens/frame
+                     + 2-D sinusoidal position
+                     + metric planar backprojection and current-frame alignment
+                                      |
+                                      v
+                   64 learned queries cross-attend 384 visual tokens
+                                      |
+PointGoal ----> direction + log-range -> 1 goal token
+                                      |
+                                      v
+                       2-layer joint self-attention
+                                      |
+                +---------------------+--------------------+
+                v                                          v
+     conditional rectified flow                  trajectory scorer
+       8 B-spline candidates                    same-context log-softmax
+                +--------------------- argmax ----------------+
+                                      v
+                        64-point equal-arc path
 ```
 
-target 路径先按完整真实弧长重采样为 64 点，再做“以 target 自身末点为边界”的最小二乘拟合。v3 中该
-专家末点就是 PointGoal；解码时只重新置零 `Q0`，不会把预测 `Q11` 覆盖为 PointGoal。
+### 1. 多帧深度与几何对齐
 
-### 5.2 归一化与条件源
+每帧深度由同一个单通道 ResNet-18 编码，取 stage-3 的 stride-16 特征，经 `1×1` 投影后自适应池化为 `8×12=96` 个空间 token。二维正弦位置编码保留行列位置；四个 learned frame-slot embeddings 标识观测槽位。该实现吸收 SanD 官方源码的共享 ResNet-18、stage-3 特征、固定空间 token 网格和二维位置编码；由于 CurveNav 按行驶距离而非固定时间间隔取帧，序列信息由显式 frame-slot embedding 表达。
 
-控制点继续使用唯一 scale-only normalizer `s=(5.6,2.5)`；它不 clamp 预测。给定 PointGoal `g`：
+`observation_frames=4` 表示三个过去观测加一个当前观测，不是“四个历史帧”。这与 SanD 的四帧深度配置对齐。NavDP/X-NavDP 的 `memory_size=8` 是 RGB-D memory 的实现选择；CurveNav 是纯深度输入，当前保留 SanD 的四帧合同，避免无依据地扩展历史长度。
+
+四帧共 384 个视觉 token 过长，因此使用 64 个 learned queries 做一次 masked cross-attention：
 
 ```text
-d       = g / max(||g||, eps)
-h       = min(||g||, 5.6 m)
-g_ref   = h d
-mu_i    = Greville_i * normalize(g_ref)
+Z = Attn(Q, V + P2D + Pslot, V + P2D + Pslot),   |Q| = 4×16.
 ```
 
-所以近目标时源均值到真实目标，远目标时源均值只提供一个 5.6 m 的朝向先验。输出终点不受 `g_ref` 约束。
+无效历史深度先被确定性置零，避免其数值经 ResNet BatchNorm 影响有效帧，再在 cross-attention 的 key/value 侧完全 mask。该压缩方式来自 NavDP 的 learned-query RGB-D memory compressor；查询可从全部历史中提取任务相关统计，而计算量从后续层的 `O(384²)` 降为 `O(64×384 + 64²)`。
 
-RBF-GP 残差只条件化机器人原点为零。设 `O={0}`、`F={1,...,11}`：
+每个 `8×12` token 还显式携带一个度量平面点，而不是把整帧变换广播成特征。令归一化深度恢复为光轴距离 `z`，像素射线为 `x/z=(u-c_x)/f_x`，则相机水平平面点定义为
 
 ```text
-Sigma_F|O = K_FF - K_FO K_OO^-1 K_OF + 1e-6 I
-Z_0       = 0
-Z_F       = mu_F + chol(Sigma_F|O) epsilon * sigma_xy
-sigma_xy  = (0.04, 0.12)
+p_t(u,v) = (z, -z (u-c_x)/f_x).
 ```
 
-v3 保持原轴向标准差，以隔离目标—target 语义变化；pilot 完成后只通过数据统计决定是否单独开展源方差
-实验，不能在推理时调参。
-
-### 5.3 Rectified Flow
-
-归一化专家控制点为 `X`，条件源为 `Z`，二者只共享原点：
+`observation_to_current=(t_x,t_y,sin Δθ,cos Δθ)` 按刚体变换映射到当前坐标：
 
 ```text
-t ~ Uniform(0,1)
-X_t = (1-t) Z + t X
-U_t = X - Z
-L_FM = mean_{i=1..11} ||v_theta(X_t,t,C)_i - U_t_i||^2
+p_current = R(Δθ) p_t + (t_x,t_y).
 ```
 
-网络输出和每个 Euler step 只把第 0 个速度/控制点置零。终点速度属于训练目标，采样终点属于完整随机变量。
+平面点和 pooled depth 经过三维输入 MLP，与 SanD 的视觉 token 相加，再交给 NavDP 风格 query compressor。这样历史运动直接作用于每个空间 token，后续模块不再维护单独的 pose-token 分支。最后将一个 PointGoal token 和 64 个压缩视觉 token 拼接，经两层联合 self-attention 得到 65 个目标相关条件 token。
 
-## 6. 模型结构与训练配方
+该投影只使用数据合同中存在的 pinhole 内参和二维相对运动，数学上是标准的深度反投影加平面刚体变换；它不是完整 BEV/地面交点投影，也不声称恢复相机高度或俯仰。`observation_to_current` 是数据变换的名字，不使用含糊的刚体状态缩写；frame-slot embedding 只编码序列槽位，不重复编码几何。
 
-v3 为严格单变量实验，以下结构保持原样：
+SanD 源码中还有上一条选中轨迹的 initial-turn token，但当前 prepared dataset 没有“因果上的上一条已选轨迹”。用当前专家轨迹首段构造会泄漏标签；训练永远给 null、推理再给历史值又会造成分布偏移。因此当前合同不采用它，待数据明确保存上一决策周期的已选轨迹后再整体引入和验证。
 
-- 四帧作为四个输入 channel 的 residual CNN，输出 `4×4=16` token；
-- goal、motion、depth 进入 4 层 pre-norm condition Transformer；
-- 12 个 trajectory token 进入 4 层 self/cross-attention Flow field；
-- condition K/V 在 8 个 Flow step 中只计算一次；
-- 8-step explicit Euler；几何解码固定 FP32；
-- 两卡 DDP、FP16 GradScaler、fused AdamW、global batch 512、gradient clip 1.0、EMA；
-- 当前宿主的 NCCL P2P collective 经最小复现确认会自旋，训练固定使用已验证通过的 SHM collective；
-- 每配方 15,000 optimizer updates，checkpoint 原子覆盖一个恢复文件。
+### 2. PointGoal 编码
 
-checkpoint format 为 11，contract 至少锁定：
+令 `r=||g||`，目标特征为
 
 ```text
-goal_semantics   = sampled_future_point_goal_robot_xy
-sand_supervision = target_endpoint_equals_point_goal
-endpoint_policy  = learned_local_endpoint_origin_only
-arc_length       = learned_unconstrained
-flow_source      = task_goal_capped_greville_line_origin_conditioned_rbf_gp
-dimensions       = 2
+(g / max(r,ε), log(1 + min(r,25 m)) / log(26)).
 ```
 
-### 6.1 Standalone stage-2 trajectory critic
+零距离时方向显式为零。方向和距离分离避免原始坐标尺度压过角度信息，并保留 25 m 内的距离差异；25 m 与 X-NavDP PointGoal 合同一致。PointGoal 表达任务意图，不直接指定本次局部轨迹长度。
 
-现有 stage-2 实验不改变或反传旧 v2-A policy。冻结 EMA policy 对每个状态产生的 condition memory 只编码一次，并按稳定的
-全局 `sample_index` 缓存为 FP16 token；后续 epoch 的 loader 只搬运 10 组控制点和原子标签。当前 pilot 为
-9,659 train / 2,551 validation states，两卡 global batch 256。这样既严格复用生成候选时的视觉条件，又不在
-40 个 epoch 中重复运行冻结 CNN/Transformer。
+### 3. B-spline 轨迹
 
-每个候选的 12 个米制 B-spline 控制点按 policy 的 `(5.6,2.5)` scale 归一化，加入 trajectory CLS/position
-embedding，经过 2 层 candidate-shared self-attention 与对 condition memory 的 cross-attention。candidate kind、
-producer slot、sample ID 均不进入模型；打乱候选顺序时输出必须同样置换。模型输出：
+模型预测八个夹持三次 B-spline 控制点 `Q_i∈R²`，固定 `Q_0=0`：
 
 ```text
-s_i       = pairwise ranking score
-c_i       = collision logit
-m_i       = safety-margin-violation logit
-p_i       = normalized geodesic progress
-d_i       = minimum extra clearance
+τ(u) = Σ_i B_i,3(u) Q_i.
 ```
 
-sidecar 只存明确的 Pareto pair，不存加权 utility。主损失按状态等权，避免 pair 多的状态支配梯度：
+三次 B-spline 为 `C²` 连续。由于 `B_i,3(u)≥0` 且 `Σ_i B_i,3(u)=1`，曲线位于控制点凸包，并满足控制点扰动不放大界
 
 ```text
-L_pair = mean_b [ mean_(w,l in P_b) softplus(-(s_w-s_l)) ]
-L      = L_pair + 0.25 * mean(L_collision, L_margin, L_progress, L_clearance)
+max_u ||τ_new(u)-τ(u)|| ≤ max_i ||ΔQ_i||.
 ```
 
-四个辅助头分别使用 BCE/BCE/Huber/Huber；progress 只在 geodesic label 有效时计算。E026 已证明单独
-`argmax(s_i)` 会学到 Pareto 排序却牺牲安全，因此最终唯一选择是无权重的严格字典序：
+这直接吸收 SanD 的八控制点、局部支撑和平滑表示。相对 NavDP 的 24 个稠密动作增量，平滑性由表示给出，不依赖部署后处理。
+
+代码先以 `4×64` 个参数点过采样，再按累计弧长反查 64 个等弧长点。训练目标、评价和部署使用相同采样语义；heading 与 curvature 也在近似均匀米制步长上计算。
+
+### 4. Conditional Flow Matching
+
+控制点按 4 m 坐标尺度归一化但不截断；原点不加噪且不计入 Flow 损失。对自由控制点使用标准直线 conditional flow matching：
 
 ```text
-1. 若存在 c_i < 0 的 policy candidate，只保留这些预测 non-collision 候选；
-2. 在剩余候选中若存在 m_i < 0，只保留这些预测 margin-safe 候选；
-3. 返回剩余候选中 argmax(s_i)。
+ε ~ N(0,I),  t ~ U(0,1)
+x_t = (1-t)ε + t x_1
+u_t = x_1 - ε
+L_flow = E ||v_θ(x_t,t,C)-u_t||².
 ```
 
-这不是可调 scalar cost，也没有部署开关。已有 critic checkpoint format 1 严格绑定旧 policy format-10，不能
-与 v3 policy 交叉加载。当前 critic 只保留为历史 train-only 原型；v3 stage-1 达到 SanD 后，必须用冻结的
-format-11 policy 重新生成候选与 condition cache，才允许进入新的 stage-2。
+轨迹 Transformer 先在八个控制点上做双向 self-attention，再 cross-attend 65 个条件 token。推理从固定种子的八个独立 Gaussian noise 出发，以八步 Heun 积分 `dx/dt=v_θ(x,t,C)`，确定性地产生八条候选。Heun 的预测-校正步在相同步数下比左端 Euler 更准确；它替代 SanD/NavDP 的 DDPM，但不是来自 X-NavDP 的 RL 后训练。
 
-## 7. 推理与选择
+训练时的一步数据估计
 
-部署接收 benchmark 给出的机器人系 PointGoal；训练阶段把每个随机未来点视作一个独立 PointGoal episode，
-部署则通过闭环重规划处理更远目标。policy 一次采样 8 条自由终点路径；当前唯一 selector 先按观测深度筛选
-footprint-safe 候选，再最大化候选终点对 PointGoal 的欧氏距离缩减，最后用长度和 bend 破同分。预测终点
-没有硬投影；若路径提前停止，下一控制周期继续重规划。该确定性安全层不宣称能处理未知空间、长墙或死胡同。
+```text
+x_hat_1 = x_t + (1-t)v_θ(x_t,t,C)
+```
 
-后续若同一候选集的 simulator-truth oracle 显著高于当前 selector，应优先改评价；若 oracle 也低，说明生成器
-没有覆盖安全拓扑，应先生成同状态多拓扑专家数据。critic 不以可选开关形式塞进当前监督模型。
+直接经 B-spline 和等弧长解码接受路径与切向监督，使最终可执行路径的误差能传回 Flow。
 
-现有 HSSD sidecar 和固定批门禁已证明 critic 数据链可用，scene-heldout 训练用于验证结构，但它仍不是“已启用
-critic”：当前部署只有确定性 depth selector。只有用 v3 policy 重建数据且离线安全/排序指标和 matched
-closed-loop 都通过，才允许用唯一 critic selection contract 原子替换现有 selector；否则 sidecar 只用于生成
-覆盖与失败分布诊断，不改变 v3 stage-1 policy。
+### 5. 轨迹组质量评分
 
-使用原始 `360×640 float32` 当前帧重放现有 `DepthSafetySelector` 的离线审计显示：12,210 个 HSSD 状态中，
-28.59% 的选择被另一条 policy 候选严格 Pareto 支配；16.67% 的全部状态在存在非碰撞 policy 候选时仍选中
-碰撞路径，17.00% 在存在 margin-safe 候选时仍选中 violation。该结果只证明 selector 存在可学习空间；HSSD
-navigation grid 不是 simulator truth，也没有 MPC 执行标签，因此不能据此跳过 matched quick-100 门禁。
+当前数据没有 NavDP 的全局 ESDF 正负轨迹标签，也没有 X-NavDP 的在线 reward/Q target。把专家 ADE 称为 safety value 或 Q 在数学上不成立，因此 `TrajectoryScorer` 学习的是观测条件下的组内质量分布，而不是碰撞概率或 Q 值。每个 batch 组由本样本专家和其它样本的经验边缘轨迹组成；每个候选都由其等弧长路径对参考路径的 Smooth-L1 误差得到软目标：
 
-当前 `hard_0` episode 0–9 的诊断闭环为 SR 40%、SPL 0.3546、碰撞率 20%、stuck 6/10。该 10 条样本只
-证明完整 format-10/EMA/Flow/selector/MPC 链可以成功，也暴露主要失败终止为 stuck；它不足以单独区分
-“候选覆盖不足”和“存在好候选但 selector 选错”。这是旧 format-10/v2-A 基线证据；最终归因必须读取候选级
-trace 或 simulator-truth oracle，不能用总体 SR 代替。
+对 batch 中观测 `C_i`，匹配专家 `Q_i` 是正样本，其他样本的专家轨迹是经验边缘负样本：
 
-## 8. 单变量迭代门禁
+```text
+q_{ij} = softmax_j(-ADE_{ij}),
+L_rank = -E_i Σ_j q_{ij} log softmax_j(S(C_i,Q_{ij})).
+```
 
-每一轮都按以下顺序，结果与失败经验写入 `EXPERIMENTS.md`：
+这是 NavDP critic 的“候选生成后评价”结构和 X-NavDP 组内重加权思想在离线监督条件下的严格对应：目标分布不再假设专家位于第 0 个候选，且不伪装成在线 Q。推理时只在同一观测的八条 Flow 候选内计算 `candidate_log_probabilities=log_softmax(S)`，并选择最大质量 logit。
 
-1. schema、坐标、相机、连续 footprint、split 泄漏审计；
-2. 全量单元测试；
-3. 固定 8-sample batch 过拟合，证明数据—Flow—梯度链可学；
-4. 固定时间预算 pilot training，比较 held-out loss、ADE、候选多样性、吞吐和显存；
-5. 只有前四项通过才训练完整权重；
-6. EMA/contract smoke 后跑完全相同的 quick-100；
-7. paired episode 比较 SR/SPL、碰撞、stuck 和 oracle gap，决定 keep/discard。
+NavDP 的 privileged critic 和 X-NavDP 的 GQRM/RTC 仍需要 ESDF、碰撞 reward 或在线交互；当前实现只吸收其候选组排序接口，不把离线路径误差冒充安全值。要得到显式安全置信度，后续必须提供真实 ESDF/碰撞标签，或补齐相机外参和机器人 footprint 后实现 SanD 的解析几何评价。
 
-quick-100 只有 100 条，SR 的随机误差不小。保留决定必须优先看同 episode 的配对改善，并要求安全指标不显著
-退化；最终“达到 NavDP”以同一修复协议下 SR/SPL 不低于 NavDP 为准。
+## 总损失
+
+唯一训练目标是
+
+```text
+L = 1.0 L_flow + 0.5 L_path + 0.1 L_tangent + 0.1 L_rank.
+```
+
+- `L_path`：`x_hat_1` 解码路径与等弧长 `reference_path` 的逐点 Smooth-L1。权重 `0.25+exp(-4s)` 归一化到均值 1，强调 receding-horizon 即将执行的近端。
+- `L_tangent`：有效目标段上的 `1-cos(Δx_hat,Δx*)`，使用同一近端权重，约束初始转向和局部跟踪方向。
+- `L_rank`：上述组内质量软标签交叉熵。
+
+不对不同自由控制点设置手工 Flow 权重。B-spline 已保证连续性，路径和切向损失负责将执行几何质量传回 Flow。
+
+## 参考设计吸收边界
+
+| 参考 | 当前已吸收 | 当前未采用及原因 |
+|---|---|---|
+| SanD | shared depth spatial tokens、2-D/frame-slot 编码、8 点三次 B-spline、等弧长输出 | DDPM 被标准 CFM 替代；initial-turn 缺少因果训练字段；解析 ESDF 缺外参/footprint |
+| NavDP | learned-query 多帧压缩、条件生成后候选评价 | 输入合同没有 RGB；没有 privileged ESDF 正负标签，故不冒充 safety critic |
+| X-NavDP | PointGoal 的尺度边界；保留同状态候选归一化语义 | GQRM、twin Q、RTC 和 embodiment FiLM 都依赖在线 RL/执行历史/多本体数据 |
+| FlowNav | 标准 conditional flow matching 与少步 ODE 推理 | 不预设其 NFE 优势会自动转化为 CurveNav 闭环增益 |
+
+因此当前模型是“SanD 轨迹表示与深度时空 token + NavDP learned-query 压缩与 generate/rank 结构 + 标准 CFM”，而不是把三篇论文中监督条件互不兼容的模块机械叠加。
+
+主要来源：[SanD-Planner](https://arxiv.org/abs/2602.00923)、[SanD 官方源码](https://github.com/WangJinCheng1998/sandplanner)、[NavDP](https://arxiv.org/abs/2505.08712)、[NavDP 官方源码](https://github.com/InternRobotics/NavDP)、[X-NavDP](https://arxiv.org/abs/2607.28560)、[FlowNav](https://arxiv.org/abs/2411.09524)、[Implicit Behavioral Cloning](https://arxiv.org/abs/2109.00137)。显式几何对照：[Semantic MapNet](https://arxiv.org/abs/2010.01191)、[PETRv2](https://arxiv.org/abs/2206.01256)、[BEVDet4D](https://arxiv.org/abs/2203.17054)、[LoGoPlanner](https://arxiv.org/abs/2512.19629)。
+
+## 训练、推理与验证
+
+### 数据合同
+
+唯一数据入口是 `scripts/build_dataset.sh DATA_ROOT`。它依次下载固定 commit 的 SanD 与 HSSD、生成 HSSD 样本、按相机内参准备两类深度缓存，并原子编译 `data/policy_dataset`；训练与 GPU 调度不属于数据生成链。各阶段只接受空输出，不提供历史版本、恢复模式或已有输出分支。HSSD 的 20 个冻结场景按 16/4 划分 train/validation，并禁止同源 scene family 跨 split。每条 source route 固定近/中/远五个 anchor，每个 anchor 物理重渲染 standard、左右 mild、左右 hard 五种观测，共 1000 个样本。
+
+每个 HSSD 样本直接保存四帧 metric depth、`observation_to_current`、当前坐标系 PointGoal 和 clearance-aware 局部路径。四帧沿实际轨迹按 `[-1.35,-0.90,-0.45,0] m` 取样；`observation_to_current=(x,y,sin Δyaw,cos Δyaw)` 用于逐 token 平面反投影对齐。生成门禁验证连续 clearance、目标/历史/轨迹几何、字段完整性、split 无泄漏、深度有效性、原子提交和最终 SHA。
+
+数据编译先将 SanD 与 HSSD 深度按各自内参重投影到同一 `224×126` 相机并归一化到 5 m，再将两个来源编译成唯一 `data/policy_dataset`。训练期 loader 只读取统一张量和深度索引，不保留来源分支。
+
+唯一链路：
+
+```text
+HSSD generation + SanD source -> calibrated prepared dataset
+                              -> fixed-batch overfit -> DDP mixed-precision training -> EMA
+                 -> offline geometry metrics -> official closed-loop benchmark
+```
+
+checkpoint 严格记录输入标定、编码器与生成器类型、平面反投影对齐、每帧 16 个压缩 token、八控制点、等弧长倍数和损失语义；合同不一致时直接拒绝加载，不设置兼容分支。推理不读取标签，也不执行曲率裁剪、碰撞 mask、直线候选或轨迹反转。
+
+开始完整训练前只保留三类验证：
+
+1. 数学与接口单测：B-spline、等弧长、逐帧 mask、平面反投影、learned-query token 数、组内质量损失和 checkpoint；
+2. 前向/反向：所有输出形状正确，全部可训练参数具有有限梯度；
+3. 固定批过拟合及同协议离线/闭环评测：selected/oracle ADE、弧长、曲率、反转率、候选多样性、延迟、SR/SPL。
+
+离线 ADE 不能替代闭环 SR/SPL；候选组质量不能解释为安全概率；未进行 X-NavDP 在线 RL 时不得使用“Q 后训练”表述。
