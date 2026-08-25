@@ -108,6 +108,15 @@ def camera_contract(camera: dict[str, float | int]) -> dict[str, Any]:
     }
 
 
+def habitat_sensor_pose(
+    camera: dict[str, float | int],
+) -> tuple[list[float], list[float]]:
+    return (
+        [0.0, float(camera["height_m"]), -float(camera["forward_offset_m"])],
+        [-math.radians(float(camera["downward_pitch_degrees"])), 0.0, 0.0],
+    )
+
+
 def create_simulator(
     asset_root: Path,
     scene_id: str,
@@ -130,7 +139,7 @@ def create_simulator(
         0.01,
         100.0,
     )
-    depth.position = [0.0, float(camera["height_m"]), 0.0]
+    depth.position, depth.orientation = habitat_sensor_pose(camera)
     agent = habitat_sim.agent.AgentConfiguration()
     agent.height, agent.radius, agent.sensor_specifications = (
         ROBOT_HEIGHT_M,
