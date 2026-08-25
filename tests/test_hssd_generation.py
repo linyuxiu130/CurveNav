@@ -9,56 +9,22 @@ import pytest
 
 from curvenav.data_generation import assets
 from curvenav.data_generation.assets import selected_asset_paths
-from curvenav.data_generation.generate import anchor_candidates, validate_config
+from curvenav.data_generation.generate import route_bands, validate_config
 from curvenav.data_generation.geometry import (
     Grid,
-    observation_to_current,
     path_length,
     plan_route,
-    prefix,
-    route_turn,
     source_family,
-    variant_history,
 )
 
 
-def test_observation_transform_is_expressed_in_current_body_frame() -> None:
-    xy = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]])
-    yaw = np.array([0.0, np.pi / 4, np.pi / 2])
-    pose = observation_to_current(xy, yaw)
+def test_route_distance_schedule_is_exact_and_unperturbed(base_config: dict) -> None:
+    bands = route_bands(base_config)
 
-    assert pose.shape == (3, 4)
-    assert np.allclose(pose[-1], [0.0, 0.0, 0.0, 1.0])
-    assert np.allclose(pose[0, :2], [-1.0, 1.0])
-
-
-def test_prefix_caps_arc_and_naturally_shortens() -> None:
-    long_path = np.array([[0.0, 0.0], [5.0, 0.0]])
-    short_path = np.array([[0.0, 0.0], [1.2, 0.0]])
-
-    assert path_length(prefix(long_path, 3.0)) == pytest.approx(3.0)
-    assert path_length(prefix(short_path, 3.0)) == pytest.approx(1.2)
-
-
-def test_anchor_candidates_include_near_middle_and_far() -> None:
-    route = np.column_stack((np.arange(0.0, 12.05, 0.05), np.zeros(241)))
-    bands = {"near": [0.5, 3.0], "middle": [3.0, 6.0], "far": [6.0, 10.0]}
-    values = anchor_candidates(route, np.array([12.0, 0.0]), bands, 0.25, 17)
-
-    assert len(values["near"]) >= 1
-    assert len(values["middle"]) >= 2
-    assert len(values["far"]) >= 2
-    assert values["near"].max() > path_length(route) - 3.5
-
-
-def test_variant_history_uses_physical_four_frame_profile() -> None:
-    route = np.column_stack((np.arange(0.0, 8.05, 0.05), np.zeros(161)))
-    history = variant_history(route, 4.0, 0.45, 25.0)
-
-    assert history["world_xy"].shape == (4, 2)
-    assert history["world_xy"][0, 1] == pytest.approx(0.0)
-    assert history["world_xy"][-1, 1] == pytest.approx(0.45)
-    assert np.rad2deg(history["yaw"][-1]) == pytest.approx(25.0)
+    assert len(bands) == 25
+    assert bands.count("near") == 5
+    assert bands.count("middle") == 10
+    assert bands.count("far") == 10
 
 
 def test_clearance_aware_planner_is_safe_and_deterministic() -> None:
@@ -66,7 +32,10 @@ def test_clearance_aware_planner_is_safe_and_deterministic() -> None:
     free[25:55, 36:44] = False
     from scipy.ndimage import distance_transform_edt
 
-    clearance = distance_transform_edt(np.pad(free, 1, constant_values=False))[1:-1, 1:-1] * 0.05
+    clearance = (
+        distance_transform_edt(np.pad(free, 1, constant_values=False))[1:-1, 1:-1]
+        * 0.05
+    )
     clearance[~free] = 0.0
     grid = Grid(free, clearance.astype(np.float32), np.zeros(2), 0.05)
 
@@ -78,12 +47,7 @@ def test_clearance_aware_planner_is_safe_and_deterministic() -> None:
     assert path_length(first.path_xy) < 4.5
 
 
-def test_route_turn_and_source_family_are_stable() -> None:
-    left = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 2.0]])
-    right = left * np.array([1.0, -1.0])
-
-    assert route_turn(left, 0.0)[1] == "left"
-    assert route_turn(right, 0.0)[1] == "right"
+def test_source_family_is_stable() -> None:
     assert source_family("106366323_174226647") == "106366"
 
 
@@ -91,7 +55,9 @@ def test_config_rejects_family_leakage(base_config: dict) -> None:
     config = dict(base_config)
     config["selected_scenes"] = [
         {"scene_id": f"{index + 100000}_a", "split": "train"} for index in range(16)
-    ] + [{"scene_id": f"{index + 200000}_b", "split": "validation"} for index in range(4)]
+    ] + [
+        {"scene_id": f"{index + 200000}_b", "split": "validation"} for index in range(4)
+    ]
     validate_config(config)
     config["selected_scenes"][-1]["scene_id"] = "100000_b"
     with pytest.raises(ValueError, match="source-family"):
@@ -175,24 +141,15 @@ def test_hssd_asset_download_is_atomic_and_commit_pinned(
 def base_config() -> dict:
     return {
         "selected_scenes": [],
-        "trajectory_variants": [
-            {"name": name}
-            for name in (
-                "standard",
-                "left_mild",
-                "right_mild",
-                "left_hard",
-                "right_hard",
-            )
-        ],
-        "goal_distance_bands": {
-            "near": [0.5, 3.0],
-            "middle": [3.0, 6.0],
-            "far": [6.0, 10.0],
+        "endpoint_distance_bands_m": {
+            "near": [3.0, 7.0],
+            "middle": [7.0, 11.0],
+            "far": [11.0, 15.0],
         },
-        "anchors_per_source_route": {"near": 1, "middle": 2, "far": 2},
-        "source_routes_per_scene": 2,
-        "expected_samples": 1000,
+        "routes_per_scene_by_distance": {"near": 5, "middle": 10, "far": 10},
+        "routes_per_scene": 25,
+        "expected_routes": 500,
+        "route_sample_spacing_m": 0.15,
         "workers": 4,
         "gpu_device": 0,
     }

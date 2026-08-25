@@ -10,7 +10,6 @@ import cv2
 import numpy as np
 
 from curvenav.data.depth import (
-    BENCHMARK_INTRINSICS,
     CANONICAL_INTRINSICS,
     SAND_INTRINSICS,
     preprocess_metric_depth,
@@ -21,14 +20,12 @@ def depth_cache_root(dataset_root: str | Path, height: int, width: int) -> Path:
     return Path(dataset_root) / f"curvenav_depth_{height}x{width}_float16"
 
 
-def hssd_depth_cache_root(
-    dataset_root: str | Path, height: int, width: int
-) -> Path:
+def hssd_depth_cache_root(dataset_root: str | Path, height: int, width: int) -> Path:
     return Path(dataset_root) / f"curvenav_hssd_depth_{height}x{width}_float16"
 
 
 def _prepare_run(
-    task: tuple[str, tuple[str, ...], str, int, int, float, float, str],
+    task: tuple[str, tuple[str, ...], str, int, int, float, float],
 ) -> tuple[str, int]:
     (
         run_key,
@@ -38,7 +35,6 @@ def _prepare_run(
         width,
         depth_units_per_m,
         max_depth_m,
-        source_camera,
     ) = task
     cv2.setNumThreads(0)
     destination = Path(destination_string)
@@ -50,10 +46,6 @@ def _prepare_run(
         dtype=np.float16,
         shape=(len(source_paths), height, width),
     )
-    source_intrinsics = {
-        "sand": SAND_INTRINSICS,
-        "benchmark": BENCHMARK_INTRINSICS,
-    }[source_camera]
     for frame_index, source_path in enumerate(source_paths):
         image = cv2.imread(source_path, cv2.IMREAD_UNCHANGED)
         if image is None or image.ndim != 2 or image.dtype != np.uint16:
@@ -62,7 +54,7 @@ def _prepare_run(
             raise ValueError("packed depth must use the canonical camera")
         normalized = preprocess_metric_depth(
             image.astype(np.float32) / depth_units_per_m,
-            source_intrinsics=source_intrinsics,
+            source_intrinsics=SAND_INTRINSICS,
             maximum_m=max_depth_m,
         )
         packed[frame_index] = normalized.astype(np.float16)
@@ -72,36 +64,41 @@ def _prepare_run(
     return run_key, len(source_paths)
 
 
-def _prepare_hssd_sample(
+def _prepare_hssd_run(
     task: tuple[str, str, str, int, int, float],
 ) -> tuple[str, dict[str, object]]:
-    sample_id, source_string, destination_string, height, width, max_depth_m = task
+    route_id, source_string, destination_string, height, width, max_depth_m = task
     cv2.setNumThreads(0)
     source = Path(source_string)
     destination = Path(destination_string)
     destination.parent.mkdir(parents=True, exist_ok=True)
     depth = np.load(source, mmap_mode="r")
-    if depth.dtype != np.float32 or depth.ndim != 3 or depth.shape[0] != 4:
+    if (
+        depth.dtype != np.float32
+        or depth.ndim != 3
+        or depth.shape[1:] != (height, width)
+        or len(depth) < 3
+    ):
         raise ValueError(f"invalid HSSD depth tensor: {source}")
     temporary = destination.with_suffix(".tmp.npy")
     packed = np.lib.format.open_memmap(
         temporary,
         mode="w+",
         dtype=np.float16,
-        shape=(4, height, width),
+        shape=depth.shape,
     )
-    for frame_index in range(4):
+    for frame_index in range(len(depth)):
         packed[frame_index] = preprocess_metric_depth(
             np.asarray(depth[frame_index]),
-            source_intrinsics=BENCHMARK_INTRINSICS,
+            source_intrinsics=CANONICAL_INTRINSICS,
             maximum_m=max_depth_m,
         ).astype(np.float16)
     packed.flush()
     del packed
     os.replace(temporary, destination)
-    return sample_id, {
-        "file": destination.name,
-        "frames": 4,
+    return route_id, {
+        "file": destination.as_posix(),
+        "frames": len(depth),
     }
 
 
@@ -125,7 +122,9 @@ def prepare_depth_cache(
     excluded_runs: dict[str, str] = {}
     for dataset_directory in sorted(source_root.glob("dataset_*")):
         if not dataset_directory.is_dir():
-            raise ValueError(f"SanD dataset entry is not a directory: {dataset_directory}")
+            raise ValueError(
+                f"SanD dataset entry is not a directory: {dataset_directory}"
+            )
         for run_directory in sorted(dataset_directory.glob("run_*")):
             run_key = f"{dataset_directory.name}/{run_directory.name}"
             depth_directory = run_directory / "depth"
@@ -139,7 +138,9 @@ def prepare_depth_cache(
             )
             if tuple(path.name for path in source_paths) != expected_names:
                 raise ValueError(f"non-contiguous depth sequence: {depth_directory}")
-            destination = building_root / dataset_directory.name / f"{run_directory.name}.npy"
+            destination = (
+                building_root / dataset_directory.name / f"{run_directory.name}.npy"
+            )
             tasks.append(
                 (
                     run_key,
@@ -149,7 +150,6 @@ def prepare_depth_cache(
                     width,
                     depth_units_per_m,
                     max_depth_m,
-                    "sand",
                 )
             )
     if not tasks:
@@ -190,7 +190,7 @@ def prepare_hssd_depth_cache(
     max_depth_m: float,
     workers: int,
 ) -> dict[str, object]:
-    """Calibrate each generated HSSD observation into the model camera."""
+    """Normalize each generated continuous HSSD route into FP16 depth."""
     if workers < 1:
         raise ValueError("workers must be positive")
     if (height, width) != (CANONICAL_INTRINSICS.height, CANONICAL_INTRINSICS.width):
@@ -203,25 +203,26 @@ def prepare_hssd_depth_cache(
     dataset_manifest = json.loads(
         (source_root / "dataset_manifest.json").read_text(encoding="utf-8")
     )
-    if dataset_manifest.get("schema") != "curvenav_hssd_policy_dataset":
+    if dataset_manifest.get("schema") != "curvenav_hssd_expert_routes":
         raise ValueError("HSSD dataset schema does not match CurveNav")
     records = [
         json.loads(line)
-        for line in (source_root / "samples.jsonl")
+        for line in (source_root / "routes.jsonl")
         .read_text(encoding="utf-8")
         .splitlines()
     ]
-    if len(records) != int(dataset_manifest.get("samples", -1)):
-        raise ValueError("HSSD manifest and sample index disagree")
+    if len(records) != int(dataset_manifest.get("routes", -1)):
+        raise ValueError("HSSD manifest and route index disagree")
     tasks = []
     for index, record in enumerate(records):
-        sample_id = str(record["sample_id"])
-        sample_directory = source_root / str(record["sample_directory"])
-        destination = building_root / str(record["split"]) / f"{index:05d}.npy"
+        route_id = str(record["route_id"])
+        route_directory = source_root / str(record["route_directory"])
+        relative_destination = Path(record["split"]) / f"{index:05d}.npy"
+        destination = building_root / relative_destination
         tasks.append(
             (
-                sample_id,
-                str(sample_directory / "depth_m.npy"),
+                route_id,
+                str(route_directory / "depth_m.npy"),
                 str(destination),
                 height,
                 width,
@@ -232,17 +233,19 @@ def prepare_hssd_depth_cache(
     building_root.mkdir(parents=True)
     try:
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            samples = dict(executor.map(_prepare_hssd_sample, tasks))
+            runs = dict(executor.map(_prepare_hssd_run, tasks))
+        for value in runs.values():
+            value["file"] = str(Path(value["file"]).relative_to(building_root))
         manifest: dict[str, object] = {
             "height": height,
             "width": width,
             "dtype": "float16",
             "source_dtype": "float32_metric_m",
             "max_depth_m": max_depth_m,
-            "source_camera": "benchmark_640x360",
+            "source_camera": "curvenav_224x126_benchmark_fov",
             "target_camera": "curvenav_224x126_benchmark_fov",
-            "total_frames": 4 * len(samples),
-            "samples": dict(sorted(samples.items())),
+            "total_frames": sum(int(item["frames"]) for item in runs.values()),
+            "runs": dict(sorted(runs.items())),
         }
         (building_root / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",

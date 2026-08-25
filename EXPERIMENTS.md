@@ -25,7 +25,7 @@
 
 ## 下一组实验
 
-1. 用唯一 HSSD 链生成 1000 个物理重渲染样本，并与 SanD 重新编译统一数据集。
+1. 用唯一 HSSD 链生成 500 条连续、无扰动的完整专家 route，并与 SanD 重新编译统一数据集。
 2. 在清理后的唯一代码链上运行固定批门禁和固定预算短训。
 3. 将它接入 X-NavDP 官方 wheeled PointGoal server 接口。
 4. 对 NavDP、X-NavDP、CurveNav 跑完全相同的 10 条固定协议检查。

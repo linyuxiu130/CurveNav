@@ -4,29 +4,16 @@
   "seed": 20260822,
   "workers": 4,
   "gpu_device": 0,
-  "expected_samples": 1000,
+  "expected_routes": 500,
   "candidate_limit": 64,
-  "source_routes_per_scene": 2,
-  "source_endpoint_distance_range_m": [8.5, 14.0],
-  "anchor_candidate_step_m": 0.25,
-  "minimum_anchor_separation_m": 0.75,
-  "goal_distance_bands": {
-    "near": [0.5, 3.0],
-    "middle": [3.0, 6.0],
-    "far": [6.0, 10.0]
+  "routes_per_scene": 25,
+  "route_sample_spacing_m": 0.15,
+  "endpoint_distance_bands_m": {
+    "near": [3.0, 7.0],
+    "middle": [7.0, 11.0],
+    "far": [11.0, 15.0]
   },
-  "anchors_per_source_route": {
-    "near": 1,
-    "middle": 2,
-    "far": 2
-  },
-  "trajectory_variants": [
-    {"name": "standard", "lateral_m": 0.0, "yaw_degrees": 0.0},
-    {"name": "left_mild", "lateral_m": 0.25, "yaw_degrees": 15.0},
-    {"name": "right_mild", "lateral_m": -0.25, "yaw_degrees": -15.0},
-    {"name": "left_hard", "lateral_m": 0.45, "yaw_degrees": 25.0},
-    {"name": "right_hard", "lateral_m": -0.45, "yaw_degrees": -25.0}
-  ],
+  "routes_per_scene_by_distance": {"near": 5, "middle": 10, "far": 10},
   "selected_scenes": [
     {"scene_id": "106366323_174226647", "split": "train"},
     {"scene_id": "104348181_171513120", "split": "train"},

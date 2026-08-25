@@ -79,9 +79,7 @@ def _frame_indices(
     cumulative_distance = np.asarray(cumulative_distance, dtype=np.float64)
     if cumulative_distance.ndim != 1 or not 0 <= anchor < len(cumulative_distance):
         raise ValueError("invalid route cumulative distance or anchor")
-    offsets = (
-        np.arange(data.observation_frames - 1, -1, -1) * data.frame_spacing_m
-    )
+    offsets = np.arange(data.observation_frames - 1, -1, -1) * data.frame_spacing_m
     targets = cumulative_distance[anchor] - offsets
     available = cumulative_distance[: anchor + 1]
     upper = np.searchsorted(available, targets, side="right")
@@ -154,15 +152,27 @@ def _stable_sand_split(run_name: str, seed: int) -> str:
     return "train" if int.from_bytes(digest[:8], "little") % 10 else "validation"
 
 
+def _planar_local(points: np.ndarray, origin: np.ndarray, yaw: float) -> np.ndarray:
+    delta = np.asarray(points, dtype=np.float32) - np.asarray(origin, dtype=np.float32)
+    cosine, sine = np.cos(-yaw), np.sin(-yaw)
+    return np.stack(
+        (
+            delta[..., 0] * cosine - delta[..., 1] * sine,
+            delta[..., 0] * sine + delta[..., 1] * cosine,
+        ),
+        axis=-1,
+    ).astype(np.float32, copy=False)
+
+
 def _sand_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Example]]:
     data = config.data
     cache = root / f"curvenav_depth_{data.image_height}x{data.image_width}_float16"
     manifest = json.loads((cache / "manifest.json").read_text(encoding="utf-8"))
-    if (
-        manifest.get("dtype") != "float16"
-        or (manifest.get("height"), manifest.get("width"), manifest.get("max_depth_m"))
-        != (data.image_height, data.image_width, data.max_depth_m)
-    ):
+    if manifest.get("dtype") != "float16" or (
+        manifest.get("height"),
+        manifest.get("width"),
+        manifest.get("max_depth_m"),
+    ) != (data.image_height, data.image_width, data.max_depth_m):
         raise ValueError("SanD depth cache does not match the CurveNav data contract")
     output: dict[str, list[_Example]] = {"train": [], "validation": []}
     for run_dir in sorted(root.glob("dataset_*/run_*")):
@@ -191,7 +201,9 @@ def _sand_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
             data.expert_waypoint_spacing_m,
             abs_tol=0.03,
         ):
-            raise ValueError(f"SanD waypoint spacing does not match CurveNav: {run_key}")
+            raise ValueError(
+                f"SanD waypoint spacing does not match CurveNav: {run_key}"
+            )
         for anchor in range(len(xyz) - 1):
             frame_indices = _frame_indices(anchor, cumulative_distance, data)
             transform: Callable[[np.ndarray], np.ndarray] = (
@@ -228,54 +240,75 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
     data = config.data
     cache = root / f"curvenav_hssd_depth_{data.image_height}x{data.image_width}_float16"
     manifest = json.loads((cache / "manifest.json").read_text(encoding="utf-8"))
-    if (
-        manifest.get("dtype") != "float16"
-        or (
-            manifest.get("height"),
-            manifest.get("width"),
-            manifest.get("max_depth_m"),
-        )
-        != (data.image_height, data.image_width, data.max_depth_m)
-    ):
+    if manifest.get("dtype") != "float16" or (
+        manifest.get("height"),
+        manifest.get("width"),
+        manifest.get("max_depth_m"),
+    ) != (data.image_height, data.image_width, data.max_depth_m):
         raise ValueError("HSSD depth cache does not match the CurveNav data contract")
     records = [
         json.loads(line)
-        for line in (root / "samples.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (root / "routes.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     output: dict[str, list[_Example]] = {"train": [], "validation": []}
     for record in records:
         split = str(record["split"])
         if split not in output:
             raise ValueError(f"invalid HSSD split: {split}")
-        sample_id = str(record["sample_id"])
-        cached = manifest.get("samples", {}).get(sample_id)
-        if not isinstance(cached, dict) or int(cached.get("frames", -1)) != data.observation_frames:
-            raise ValueError(f"HSSD sample is missing from the depth cache: {sample_id}")
-        with np.load(root / str(record["sample_directory"]) / "geometry.npz") as values:
-            point_goal = values["task_goal_local_xy"].astype(np.float32)
-            observation_to_current = values["observation_to_current"].astype(np.float32)
-            metric_path = values["target_path_local_xy"].astype(np.float32)
-        if observation_to_current.shape != (data.observation_frames, 4):
-            raise ValueError(f"HSSD observation transform does not match CurveNav: {sample_id}")
-        if point_goal.shape != (2,) or metric_path.ndim != 2 or metric_path.shape[1] != 2:
-            raise ValueError(f"invalid HSSD navigation geometry: {sample_id}")
-        reached_goal = bool(np.linalg.norm(metric_path[-1] - point_goal) <= 0.05)
-        output[split].append(
-            _Example(
-                depth_run=_DepthRun(
-                    source=cache / split / str(cached["file"]),
-                    frames=data.observation_frames,
-                    name=sample_id,
-                ),
-                depth_indices=np.arange(4, dtype=np.uint32),
-                point_goal=point_goal,
-                observation_to_current=observation_to_current,
-                observation_valid=np.ones(data.observation_frames, dtype=np.bool_),
-                metric_path=metric_path,
-                scene=f"hssd/{record['scene_id']}",
-                reached_goal=reached_goal,
+        route_id = str(record["route_id"])
+        cached = manifest.get("runs", {}).get(route_id)
+        route_root = root / str(record["route_directory"])
+        xy = np.load(route_root / "traj_xy.npy").astype(np.float32)
+        yaw = np.load(route_root / "traj_yaw.npy").astype(np.float32)
+        if (
+            not isinstance(cached, dict)
+            or int(cached.get("frames", -1)) != len(xy)
+            or len(xy) != len(yaw)
+        ):
+            raise ValueError(f"HSSD route is missing from the depth cache: {route_id}")
+        spacing = np.linalg.vector_norm(np.diff(xy, axis=0), axis=1)
+        if not math.isclose(
+            float(np.median(spacing)),
+            data.expert_waypoint_spacing_m,
+            abs_tol=0.01,
+        ):
+            raise ValueError(
+                f"HSSD waypoint spacing does not match CurveNav: {route_id}"
             )
+        depth = _DepthRun(
+            source=cache / str(cached["file"]),
+            frames=len(xy),
+            name=f"hssd/{route_id}",
         )
+        cumulative_distance = _cumulative_distance(xy)
+        for anchor in range(len(xy) - 1):
+            frame_indices = _frame_indices(anchor, cumulative_distance, data)
+            transform: Callable[[np.ndarray], np.ndarray] = (
+                lambda points, anchor=anchor: _planar_local(
+                    points, xy[anchor], float(yaw[anchor])
+                )
+            )
+            full_local = transform(xy[anchor:])
+            local_path, reached_goal = _fixed_future(full_local, data.future_steps)
+            output[split].append(
+                _Example(
+                    depth_run=depth,
+                    depth_indices=frame_indices,
+                    point_goal=full_local[-1],
+                    observation_to_current=_observation_to_current(
+                        transform(xy[frame_indices]),
+                        yaw[frame_indices],
+                        float(yaw[anchor]),
+                        data.observation_frames,
+                    ),
+                    observation_valid=_observation_valid(
+                        frame_indices, data.observation_frames
+                    ),
+                    metric_path=local_path,
+                    scene=f"hssd/{record['scene_id']}",
+                    reached_goal=reached_goal,
+                )
+            )
     return output
 
 
@@ -318,9 +351,14 @@ def _compile_split(
     order = generator.permutation(len(examples))
     examples = [examples[int(index)] for index in order]
     depth_indices = np.stack(
-        [example.depth_indices + depth_offsets[example.depth_run.name] for example in examples]
+        [
+            example.depth_indices + depth_offsets[example.depth_run.name]
+            for example in examples
+        ]
     ).astype(np.uint32)
-    point_goal = np.stack([example.point_goal for example in examples]).astype(np.float32)
+    point_goal = np.stack([example.point_goal for example in examples]).astype(
+        np.float32
+    )
     observation_to_current = np.stack(
         [example.observation_to_current for example in examples]
     ).astype(np.float32)
@@ -493,7 +531,9 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
-    compile_policy_dataset(args.sand_root, args.hssd_root, args.output, load_config(args.config))
+    compile_policy_dataset(
+        args.sand_root, args.hssd_root, args.output, load_config(args.config)
+    )
 
 
 if __name__ == "__main__":

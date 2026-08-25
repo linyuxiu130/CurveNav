@@ -20,7 +20,7 @@ control_points float [B,8,2]   当前机器人坐标系的三次 B-spline 控制
 reference_path float [B,64,2]  同一路径的 64 点等弧长训练参考
 ```
 
-输出 `TrajectoryPrediction` 包含选中的 `[B,64,2]` 路径、解析 heading/curvature，以及八条候选控制点、候选路径和组内对数概率。参考路径保留来源的真实局部 horizon：SanD 最多取未来 24 个专家步，HSSD 取安全重规划的最多 3 m 前缀；二者都不缩放到固定长度。
+输出 `TrajectoryPrediction` 包含选中的 `[B,64,2]` 路径、解析 heading/curvature，以及八条候选控制点、候选路径和组内对数概率。参考路径保留来源的真实局部 horizon：SanD 与 HSSD 都最多取未来 24 个 0.15 m 专家步，真正到达 PointGoal 时自然缩短；二者都不缩放到固定长度。
 
 ## 唯一模型图
 
@@ -173,11 +173,11 @@ L = 1.0 L_flow + 0.5 L_path + 0.1 L_tangent + 0.1 L_rank.
 
 ### 数据合同
 
-唯一数据入口是 `scripts/build_dataset.sh DATA_ROOT`。它依次下载固定 commit 的 SanD 与 HSSD、生成 HSSD 样本、按相机内参准备两类深度缓存，并原子编译 `data/policy_dataset`；训练与 GPU 调度不属于数据生成链。各阶段只接受空输出，不提供历史版本、恢复模式或已有输出分支。HSSD 的 20 个冻结场景按 16/4 划分 train/validation，并禁止同源 scene family 跨 split。每条 source route 固定近/中/远五个 anchor，每个 anchor 物理重渲染 standard、左右 mild、左右 hard 五种观测，共 1000 个样本。
+唯一数据入口是 `scripts/build_dataset.sh DATA_ROOT`。它依次下载固定 commit 的 SanD 与 HSSD、生成 HSSD 专家 route、准备两类 route 深度缓存，并原子编译 `data/policy_dataset`；训练与 GPU 调度不属于数据生成链。各阶段只接受空输出，不提供历史版本、恢复模式或已有输出分支。HSSD 的 20 个冻结场景按 16/4 划分 train/validation，并禁止同源 scene family 跨 split。每个场景生成 25 条无扰动的完整专家 route：近距 5 条、中距 10 条、远距 10 条，共 500 条，train/validation 分别为 400/100 条。
 
-每个 HSSD 样本直接保存四帧 metric depth、`observation_to_current`、当前坐标系 PointGoal 和 clearance-aware 局部路径。四帧沿实际轨迹按 `[-1.35,-0.90,-0.45,0] m` 取样；`observation_to_current=(x,y,sin Δyaw,cos Δyaw)` 用于逐 token 平面反投影对齐。生成门禁验证连续 clearance、目标/历史/轨迹几何、字段完整性、split 无泄漏、深度有效性、原子提交和最终 SHA。
+每条 HSSD route 沿 clearance-aware 路径按 0.15 m 等弧长采样，保存连续平面位姿以及逐位置 `224×126` metric depth，最终位置就是该 route 的任务 PointGoal。编译阶段在每个非终点位置切出一个监督样本：历史四帧按 `[-1.35,-0.90,-0.45,0] m` 索引，未来最多 24 步作为局部路径，并计算 `observation_to_current=(x,y,sin Δyaw,cos Δyaw)`。同一 route 的深度只保存一次，局部样本通过索引共享。生成门禁验证数量、连续 clearance、0.15 m 间距、距离分布、深度/位姿对齐、split 无泄漏、原子提交和最终 SHA。
 
-数据编译先将 SanD 与 HSSD 深度按各自内参重投影到同一 `224×126` 相机并归一化到 5 m，再将两个来源编译成唯一 `data/policy_dataset`。训练期 loader 只读取统一张量和深度索引，不保留来源分支。
+SanD 深度由原始 `640×480` 相机重投影到 `224×126`；HSSD 直接用同一标定相机渲染。两者都归一化到 5 m 并按 route 打包，再编译成唯一 `data/policy_dataset`。训练期 loader 只读取统一张量和深度索引，不保留来源分支。
 
 唯一链路：
 

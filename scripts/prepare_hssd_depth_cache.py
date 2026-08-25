@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare CurveNav's calibrated HSSD sample-depth cache."""
+"""Prepare CurveNav's normalized HSSD expert-route depth cache."""
 
 import argparse
 import json
@@ -31,7 +31,7 @@ def main() -> None:
                         args.dataset, data.image_height, data.image_width
                     ).resolve()
                 ),
-                "samples": len(manifest["samples"]),
+                "routes": len(manifest["runs"]),
                 "frames": manifest["total_frames"],
             },
             ensure_ascii=False,
