@@ -101,7 +101,7 @@ class TrajectoryFlowConfig:
 class TrainingConfig:
     seed: int = 42
     global_batch_size: int = 1_024
-    per_device_batch_size: int = 64
+    per_device_batch_size: int = 112
     samples_per_epoch: int = 40_960
     epochs: int = 200
     num_workers: int = 2
