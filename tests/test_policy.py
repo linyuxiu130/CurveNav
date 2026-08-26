@@ -310,7 +310,14 @@ def test_sand_spatial_tokens_and_geometry_query_compression_have_fixed_contract(
     assert observation.tokens.shape == (1, 4, 4, 32)
 
     encoded = policy.encode_condition(condition(batch=1))
-    assert policy.condition_encoder.geometry_query_embedding.shape == (1, 64, 32)
+    encoder = policy.condition_encoder
+    assert encoder.current_geometry_query_embedding.shape == (1, 32, 32)
+    assert encoder.context_geometry_query_embedding.shape == (1, 32, 32)
+    mask = encoder.geometry_attention_mask
+    assert mask.shape == (64, 16)
+    assert torch.all(mask[:32, :12])
+    assert not torch.any(mask[:32, 12:])
+    assert not torch.any(mask[32:])
     assert encoded.tokens.shape == (1, 1 + 1 + 4 + 64, 32)
     torch.testing.assert_close(encoded.tokens[:, 0], encoded.route_token)
     assert torch.linalg.vector_norm(encoded.local_subgoal, dim=-1).max() <= 3.6

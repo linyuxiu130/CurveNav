@@ -30,7 +30,9 @@ from curvenav.trajectory import (
 )
 
 
-CHECKPOINT_TYPE = "curvenav_gaussian_flow_zero_mode_bounded_curvature_policy"
+CHECKPOINT_TYPE = (
+    "curvenav_current_context_gaussian_flow_zero_mode_bounded_curvature_policy"
+)
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
 
@@ -119,12 +121,12 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "trajectory_flow_integration_steps": config.trajectory_flow.integration_steps,
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
         "visual_context": (
-            "goal_agnostic_metric_geometry_queries_plus_explicit_ego_state_and_"
-            "supervised_route_query"
+            "dedicated_current_plus_full_context_metric_geometry_queries_and_"
+            "explicit_ego_state_supervised_route_query"
         ),
         "depth_token_pooling": "nearest_surface",
         "observation_to_current": "planar_rigid_transform_used_for_depth_token_alignment",
-        "visual_compression": "64_goal_independent_metric_geometry_queries",
+        "visual_compression": "32_current_plus_32_full_context_metric_geometry_queries",
         "goal_conditioning": "pointgoal_direction_range_and_metric_local_scale",
         "temporal_modeling": "executed_metric_observation_history",
         "num_curve_tokens": trajectory.num_curvature_control_points + 1,

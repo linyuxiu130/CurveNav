@@ -7,10 +7,12 @@ from curvenav.layers import EncoderBlock, RMSNorm, SwiGLU
 from curvenav.types import ConditionFeatures, DepthFeatures
 
 
-GEOMETRY_QUERY_COUNT = 64
+CURRENT_GEOMETRY_QUERY_COUNT = 32
+CONTEXT_GEOMETRY_QUERY_COUNT = 32
+GEOMETRY_QUERY_COUNT = CURRENT_GEOMETRY_QUERY_COUNT + CONTEXT_GEOMETRY_QUERY_COUNT
 ROUTE_QUERY_LAYERS = 2
 CONDITION_ENCODER_TYPE = (
-    "metric_geometry_queries_supervised_route_bottleneck_explicit_state"
+    "current_context_metric_geometry_queries_supervised_route_bottleneck_explicit_state"
 )
 
 
@@ -36,6 +38,7 @@ class CrossAttentionBlock(nn.Module):
         query: Tensor,
         memory: Tensor,
         memory_padding_mask: Tensor | None = None,
+        attention_mask: Tensor | None = None,
     ) -> Tensor:
         normalized_memory = self.memory_norm(memory)
         attended = self.attention(
@@ -43,6 +46,7 @@ class CrossAttentionBlock(nn.Module):
             normalized_memory,
             normalized_memory,
             key_padding_mask=memory_padding_mask,
+            attn_mask=attention_mask,
             need_weights=False,
         )[0]
         query = query + self.dropout(attended)
@@ -77,8 +81,25 @@ class PolicyConditionEncoder(nn.Module):
         self.frame_slot_embedding = nn.Parameter(
             torch.zeros(1, observation_frames, 1, model_dim)
         )
-        self.geometry_query_embedding = nn.Parameter(
-            torch.zeros(1, GEOMETRY_QUERY_COUNT, model_dim)
+        self.current_geometry_query_embedding = nn.Parameter(
+            torch.zeros(1, CURRENT_GEOMETRY_QUERY_COUNT, model_dim)
+        )
+        self.context_geometry_query_embedding = nn.Parameter(
+            torch.zeros(1, CONTEXT_GEOMETRY_QUERY_COUNT, model_dim)
+        )
+        geometry_attention_mask = torch.zeros(
+            GEOMETRY_QUERY_COUNT,
+            observation_frames * spatial_tokens,
+            dtype=torch.bool,
+        )
+        geometry_attention_mask[
+            :CURRENT_GEOMETRY_QUERY_COUNT,
+            : (observation_frames - 1) * spatial_tokens,
+        ] = True
+        self.register_buffer(
+            "geometry_attention_mask",
+            geometry_attention_mask,
+            persistent=True,
         )
         self.geometry_compressor = CrossAttentionBlock(
             model_dim,
@@ -115,7 +136,8 @@ class PolicyConditionEncoder(nn.Module):
         )
         self.route_output_norm = RMSNorm(model_dim)
         nn.init.trunc_normal_(self.frame_slot_embedding, std=0.02)
-        nn.init.trunc_normal_(self.geometry_query_embedding, std=0.02)
+        nn.init.trunc_normal_(self.current_geometry_query_embedding, std=0.02)
+        nn.init.trunc_normal_(self.context_geometry_query_embedding, std=0.02)
         nn.init.trunc_normal_(self.invalid_state_embedding, std=0.02)
         nn.init.trunc_normal_(self.route_query_embedding, std=0.02)
 
@@ -153,10 +175,18 @@ class PolicyConditionEncoder(nn.Module):
             .expand(-1, -1, self.spatial_tokens)
             .flatten(1)
         )
+        geometry_queries = torch.cat(
+            (
+                self.current_geometry_query_embedding,
+                self.context_geometry_query_embedding,
+            ),
+            dim=1,
+        ).expand(batch, -1, -1)
         geometry = self.geometry_compressor(
-            self.geometry_query_embedding.expand(batch, -1, -1),
+            geometry_queries,
             visual_memory,
             visual_padding_mask,
+            self.geometry_attention_mask,
         )
 
         state_input = observation_to_current.clone()

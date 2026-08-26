@@ -20,8 +20,8 @@ prediction geometry    heading/curvature [B,64]
 
 ```text
 4× metric depth
-  └─ shared GroupNorm ResNet-18 stage-3 ── 4×96 spatial/metric tokens ─┐
-                                                                      ├─ 64 geometry queries
+  └─ shared GroupNorm ResNet-18 stage-3 ── current 96 tokens ── 32 current queries ─┐
+                                      └── all 4×96 tokens ── 32 context queries ───┤
 4× (x,y,sin Δyaw,cos Δyaw) ──────────────── 4 explicit state tokens ──┤
 PointGoal direction + log range ─────────────────────── goal token ───┤
                                                                       ↓
@@ -39,7 +39,7 @@ PointGoal direction + log range ────────────────
           PointGoal-scaled arc-length/curvature decoder → metric local path
 ```
 
-训练和部署只组装这一张图。checkpoint 类型为 `curvenav_gaussian_flow_zero_mode_bounded_curvature_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
+训练和部署只组装这一张图。checkpoint 类型为 `curvenav_current_context_gaussian_flow_zero_mode_bounded_curvature_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
 
 ## 2. 视觉几何、历史状态与路线融合
 
@@ -68,7 +68,7 @@ p_current = R(Δyaw) p_body + (tx,ty).
 
 每个 token 图像格取最近可见表面而不是平均深度，避免把近障碍和远背景平均成不存在的中间表面。无效历史帧在 depth backbone 前置零，并在 geometry cross-attention 的 key/value 侧屏蔽。
 
-四帧一共 384 个视觉 token。64 个与目标无关的 learned geometry query cross-attend 这组 memory，将后续条件序列压缩到固定长度。这里刻意不在视觉压缩前注入 PointGoal：障碍、通道和可通行边界是目标无关的场景事实；让目标过早控制压缩会丢掉当前路线之外、但绕障时可能需要的几何信息。这保留 NavDP 的 query compression 效率，同时吸收 LoGoPlanner 将 geometry query 与 planning query 分工的做法。
+四帧一共 384 个视觉 token。单个 cross-attention 压缩器使用 64 个与目标无关的 learned geometry query：前 32 个通过固定 attention mask 只读取当前帧的 96 个 token，后 32 个读取全部有效时序 token。输出仍是固定 64 token，没有第二个视觉编码器、条件分支或额外参数。这个约束保证即时障碍几何不会在 384-token 历史 memory 中被稀释，同时保留对齐历史带来的视野补全；在 episode 冷启动只有当前帧时，两组 query 都自然读取当前帧，不需要 fallback。这里刻意不在视觉压缩前注入 PointGoal：障碍、通道和可通行边界是目标无关的场景事实；让目标过早控制压缩会丢掉当前路线之外、但绕障时可能需要的几何信息。这保留 NavDP 的 query compression 效率，吸收其当前深度与历史 memory 职责分离，以及 LoGoPlanner 将 geometry query 与 planning query 分工的做法。
 
 ### 2.2 显式状态和 PointGoal
 
@@ -229,7 +229,7 @@ L = L_flow + L_path + L_tangent + L_route.
 | 来源 | 吸收的有效设计 | CurveNav 的针对性改进 |
 |---|---|---|
 | SanD | 四帧共享深度 backbone、空间 token、平滑低维轨迹先验、归一化高斯生成 | 教师 B-spline 只做标签平滑；生产输出改为 PointGoal 标度的连续有界曲率曲线；没有 ESDF 评价器时用先验众数生成唯一确定轨迹 |
-| NavDP | `D=384` actor、learned-query 视觉压缩、trajectory-token cross-attention、高斯动作扩散 | query 先保存目标无关 metric geometry，再由独立 route query 融合目标；同一无量纲坐标用于训练和 ODE；无 ESDF 标签时不训练 critic |
+| NavDP | `D=384` actor、当前深度与历史 memory 分工、learned-query 视觉压缩、trajectory-token cross-attention、高斯动作扩散 | 32 个 current query 保证即时几何，32 个 context query 补全历史视野，再由独立 route query 融合目标；同一无量纲坐标用于训练和 ODE；无 ESDF 标签时不训练 critic |
 | X-NavDP | 深层条件生成器、逐层 FiLM 思想、闭环时序一致性 | 用 adaRMS-Zero 做 time-route 调制；真实执行历史承担时序状态；当前阶段不做 GQRM/RL，也不随机执行未经 Q 选择的候选 |
 | LoGoPlanner | geometry/state/route 的任务专用 query | CurveNav 已有标定 metric depth 和真实位姿，不复制重型视频三维重建模型；路线瓶颈直接监督当前局部专家终点 |
 | Past-Token Prediction | 用可观测过去约束未来的思想 | 历史已经由 condition encoder 显式编码；不再联合生成过去，因为过去重建误差不能代表未来轨迹质量 |
