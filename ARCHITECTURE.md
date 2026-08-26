@@ -236,6 +236,8 @@ L = L_flow + L_path + L_tangent + L_route.
 
 唯一训练入口使用 FP16、GPU 常驻 depth bank、异步 prefetch、AdamW、cosine schedule、EMA 和静态 `torch.compile`；多卡时由同一入口启用 DDP。数学 batch 固定为 1024，显存 micro-batch 上限为每卡 64，以适配 11 GiB 2080 Ti。对 world size `W`，每 rank 分配 `floor(1024/W)` 或 `ceil(1024/W)` 个互不重叠样本；局部 batch 均值乘 `W·B_r/1024` 后再经 DDP 求平均，严格得到全局 1024 样本均值。6 卡时分配为 `171×4 + 170×2`，每 rank 执行 `64+64+43/42` 三次前后向，只在末次同步梯度。这样 1–8 卡的每次 optimizer、schedule 与 EMA 更新都保持同一数学合同，不需要 padding、重复样本或改变学习率。唯一部署入口加载 EMA 权重并使用上述单轨迹八步 Heun。没有训练专用生成器或部署 fallback。
 
+部署模型同样使用固定 shape 的 `torch.compile`。`navigator_reset` 已知实际 batch size 后立即使用同合同零张量完成图物化和 CUDA 同步；该步骤发生在 evaluator 的 episode 循环开始前。因此首个真实观测只执行已经编译的图，编译时间不会被计入导航 timeout，也不会让机器人在开局持续执行零动作。
+
 必要验证分三层：
 
 1. 张量/数学单测：相机反投影、历史 mask、geometry/route token、PointGoal 标度、零目标停止、连续曲率硬界、教师 B-spline、checkpoint 和部署接口；

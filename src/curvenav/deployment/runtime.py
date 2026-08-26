@@ -163,9 +163,49 @@ class CurveNavRuntime:
         self.requests = 0
         self.request_seconds = 0.0
 
+    def _warmup_policy(self, batch_size: int) -> None:
+        """Materialize the compiled graph before the simulator starts an episode."""
+        observation_to_current = torch.zeros(
+            batch_size,
+            self.config.data.observation_frames,
+            4,
+            device=self.device,
+        )
+        observation_to_current[..., 3] = 1.0
+        condition = PolicyCondition(
+            depth=torch.zeros(
+                batch_size,
+                self.config.data.observation_frames,
+                1,
+                self.config.data.image_height,
+                self.config.data.image_width,
+                device=self.device,
+            ),
+            point_goal=torch.zeros(batch_size, 2, device=self.device),
+            observation_to_current=observation_to_current,
+            observation_valid=torch.ones(
+                batch_size,
+                self.config.data.observation_frames,
+                dtype=torch.bool,
+                device=self.device,
+            ),
+        )
+        with (
+            torch.inference_mode(),
+            torch.autocast(
+                device_type=self.device.type,
+                dtype=torch.float16,
+                enabled=self.device.type == "cuda",
+            ),
+        ):
+            self.policy(condition)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
     def reset(self, batch_size: int) -> None:
         self.batch_size = batch_size
         self.context_buffer.reset(batch_size)
+        self._warmup_policy(batch_size)
 
     def reset_env(self, env_id: int) -> None:
         self.context_buffer.reset_env(env_id)

@@ -1,11 +1,21 @@
 import numpy as np
 import pytest
+import torch
 
 from curvenav.config import CurveNavConfig
 from curvenav.data.depth import BENCHMARK_INTRINSICS, preprocess_metric_depth
 from curvenav.deployment.runtime import (
+    CurveNavRuntime,
     DepthContextBuffer,
 )
+
+
+class _RecordingPolicy:
+    def __init__(self) -> None:
+        self.conditions = []
+
+    def __call__(self, condition):
+        self.conditions.append(condition)
 
 
 def test_invalid_depth_is_encoded_as_sensor_limit():
@@ -46,6 +56,21 @@ def test_depth_preprocessing_rejects_non_image_input():
             source_intrinsics=BENCHMARK_INTRINSICS,
             maximum_m=5.0,
         )
+
+
+def test_runtime_reset_materializes_the_actual_batch_graph() -> None:
+    policy = _RecordingPolicy()
+    runtime = CurveNavRuntime(CurveNavConfig(), policy, device="cpu")
+
+    runtime.reset(3)
+
+    assert runtime.batch_size == 3
+    assert len(policy.conditions) == 1
+    condition = policy.conditions[0]
+    assert condition.depth.shape == (3, 4, 1, 126, 224)
+    assert condition.point_goal.shape == (3, 2)
+    assert torch.all(condition.observation_valid)
+    assert torch.all(condition.observation_to_current[..., 3] == 1.0)
 
 
 def test_depth_context_uses_expert_spatial_offsets():
