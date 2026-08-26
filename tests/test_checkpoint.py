@@ -263,7 +263,7 @@ def test_training_contract_preserves_global_optimization_across_one_to_eight_gpu
             <= 1024
             <= contract["maximum_per_rank_batch_size"] * world_size
         )
-        assert contract["per_device_batch_size"] == 112
+        assert contract["per_device_batch_size"] == 171
         assert contract["global_batch_size"] == 1024
         assert contract["steps_per_epoch"] == 40
         assert contract["total_steps"] == 8000
@@ -271,7 +271,7 @@ def test_training_contract_preserves_global_optimization_across_one_to_eight_gpu
     six_gpu = build_training_contract(CurveNavConfig(), 6)
     assert six_gpu["minimum_per_rank_batch_size"] == 170
     assert six_gpu["maximum_per_rank_batch_size"] == 171
-    assert six_gpu["micro_batches_per_step"] == 2
+    assert six_gpu["micro_batches_per_step"] == 1
 
     with pytest.raises(ValueError, match="world_size must be one of"):
         build_training_contract(CurveNavConfig(), world_size=9)

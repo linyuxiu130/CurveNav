@@ -45,7 +45,7 @@ model:
 training:
   seed: 42
   global_batch_size: 1024
-  per_device_batch_size: 112
+  per_device_batch_size: 171
   samples_per_epoch: 40960
   epochs: 200
   num_workers: 2
