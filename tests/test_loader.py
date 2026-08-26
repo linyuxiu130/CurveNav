@@ -166,21 +166,21 @@ def test_training_sampler_covers_each_cycle_once_and_resume_continues() -> None:
 
 
 def test_six_rank_batches_cover_exact_global_step_without_padding() -> None:
-    layout = build_distributed_batch_layout(1024, 128, 6)
+    layout = build_distributed_batch_layout(1024, 64, 6)
     assert layout.rank_batch_sizes == (171, 171, 171, 171, 170, 170)
-    assert layout.micro_batches_per_step == 2
+    assert layout.micro_batches_per_step == 3
 
     rank_batches = [
-        list(DistributedStepBatchSampler(1, 1024, 128, rank, 6))
+        list(DistributedStepBatchSampler(1, 1024, 64, rank, 6))
         for rank in range(6)
     ]
     assert [list(map(len, batches)) for batches in rank_batches] == [
-        [128, 43],
-        [128, 43],
-        [128, 43],
-        [128, 43],
-        [128, 42],
-        [128, 42],
+        [64, 64, 43],
+        [64, 64, 43],
+        [64, 64, 43],
+        [64, 64, 43],
+        [64, 64, 42],
+        [64, 64, 42],
     ]
     covered = [index for batches in rank_batches for batch in batches for index in batch]
     assert sorted(covered) == list(range(1024))

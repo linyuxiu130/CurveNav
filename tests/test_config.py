@@ -67,14 +67,14 @@ def test_training_batch_contract_is_global_and_exact() -> None:
         }
     )
     assert config.training.global_batch_size == 1024
-    assert config.training.per_device_batch_size == 128
+    assert config.training.per_device_batch_size == 64
     with pytest.raises(TypeError, match="micro_batch_size"):
         config_from_mapping({"training": {"micro_batch_size": 128}})
     with pytest.raises(ValueError, match="samples_per_epoch"):
         config_from_mapping({"training": {"samples_per_epoch": 40000}})
     with pytest.raises(ValueError, match="cannot exceed"):
         config_from_mapping(
-            {"training": {"global_batch_size": 64, "per_device_batch_size": 128}}
+            {"training": {"global_batch_size": 32, "per_device_batch_size": 64}}
         )
 
 
