@@ -1,13 +1,9 @@
-"""Composition root for the one CurveNav conditional-flow graph."""
+"""Composition root for the one CurveNav policy graph."""
 
 from curvenav.config import CurveNavConfig
 from curvenav.conditioning import PolicyConditionEncoder
 from curvenav.encoders import DepthObservationEncoder, PointGoalEncoder
-from curvenav.models import (
-    ConditionedCurveProposal,
-    CurveNavPolicy,
-    CurvatureTrajectoryFlow,
-)
+from curvenav.models import CurveNavPolicy, OrderedCurveDecoder
 from curvenav.trajectory import (
     BoundedCurvatureTrajectory,
     PlanarBSplineCodec,
@@ -21,7 +17,7 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
     depth = config.depth_encoder
     point_goal = config.point_goal_encoder
     condition = config.condition_encoder
-    trajectory_flow_config = config.trajectory_flow
+    decoder = config.trajectory_decoder
 
     depth_encoder = DepthObservationEncoder(
         model_dim=depth.model_dim,
@@ -65,26 +61,17 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         degree=trajectory.target_spline_degree,
         num_path_points=trajectory.num_path_points,
     )
-    curve_proposal = ConditionedCurveProposal(
+    trajectory_decoder = OrderedCurveDecoder(
         curve_tokens=curve_codec.num_curve_tokens,
-        model_dim=trajectory_flow_config.model_dim,
-        layers=trajectory_flow_config.proposal_layers,
-        heads=trajectory_flow_config.transformer_heads,
-        dropout=trajectory_flow_config.dropout,
-    )
-    trajectory_flow = CurvatureTrajectoryFlow(
-        future_tokens=curve_codec.num_curve_tokens,
-        model_dim=trajectory_flow_config.model_dim,
-        layers=trajectory_flow_config.transformer_layers,
-        heads=trajectory_flow_config.transformer_heads,
-        dropout=trajectory_flow_config.dropout,
+        model_dim=decoder.model_dim,
+        layers=decoder.transformer_layers,
+        heads=decoder.transformer_heads,
+        dropout=decoder.dropout,
     )
     return CurveNavPolicy(
         depth_encoder=depth_encoder,
         condition_encoder=condition_encoder,
-        curve_proposal=curve_proposal,
-        trajectory_flow=trajectory_flow,
+        trajectory_decoder=trajectory_decoder,
         curve_codec=curve_codec,
         target_codec=target_codec,
-        integration_steps=trajectory_flow_config.integration_steps,
     )

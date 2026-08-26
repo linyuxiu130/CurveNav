@@ -61,7 +61,7 @@ def test_optimizer_step_uses_loss_scale_as_the_overflow_signal(
     assert _optimizer_step_succeeded(optimizer, scaler) is succeeded
 
 
-def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
+def test_checkpoint_records_the_direct_bounded_curvature_contract() -> None:
     config = CurveNavConfig()
     model = nn.Linear(2, 2)
     optimizer = AdamW(model.parameters())
@@ -81,45 +81,24 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
     contract = checkpoint["policy_contract"]
     assert (
         checkpoint["checkpoint_type"]
-        == "curvenav_geometry_supervised_proposal_solver_collocated_self_consistent_"
-        "flow_bounded_curvature_policy"
+        == "curvenav_direct_geometry_supervised_bounded_curvature_policy"
     )
     assert {"model", "optimizer", "scheduler", "ema", "grad_scaler"} <= set(checkpoint)
     assert "extra" not in checkpoint
     assert (
-        contract["trajectory_flow_type"]
-        == "conditioned_curve_source_solver_collocated_self_consistent_bounded_"
-        "curvature_rectified_flow_adarmszero_heun"
+        contract["trajectory_decoder_type"]
+        == "ordered_route_conditioned_bounded_curvature_decoder"
     )
-    assert contract["flow_curve_coordinate_scale"] == pytest.approx(8.0)
-    assert (
-        contract["flow_training_source_type"]
-        == "deterministic_conditioned_curve_proposal"
-    )
-    assert contract["flow_inference_source_type"] == "same_conditioned_curve_proposal"
-    assert (
-        contract["curve_proposal_type"]
-        == "ordered_route_conditioned_bounded_curvature_source"
-    )
-    assert contract["flow_source_gradient"] == (
-        "detached_from_flow_and_directly_supervised"
-    )
+    assert contract["curve_coordinate_scale"] == pytest.approx(8.0)
     assert (
         contract["training_objective"]
-        == "conditioned_proposal_coordinates_path_tangent_plus_solver_collocated_"
-        "self_consistent_flow_path_tangent"
+        == "direct_curve_coordinates_plus_metric_path_and_tangent"
     )
-    assert contract["flow_time_sampling"] == (
-        "uniform_stratified_heun_solver_nodes_including_boundaries"
-    )
-    assert contract["flow_prediction_targets"] == (
-        "shared_backbone_velocity_and_data_endpoint"
-    )
-    assert contract["flow_self_consistency_weight"] == pytest.approx(0.1)
     assert (
         contract["trajectory_prediction"]
-        == "single_proposal_initialized_heun_trajectory"
+        == "single_direct_bounded_curvature_trajectory"
     )
+    assert not any("flow" in key for key in contract)
     assert "trajectory_candidate_samples" not in contract
     assert contract["camera_extrinsics"] == {
         "forward_offset_m": pytest.approx(0.28618),
@@ -143,10 +122,9 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
         "condition_layers": 4,
         "condition_heads": 8,
         "condition_dropout": 0.0,
-        "proposal_layers": 2,
-        "flow_layers": 8,
-        "flow_heads": 8,
-        "flow_dropout": 0.0,
+        "trajectory_decoder_layers": 8,
+        "trajectory_decoder_heads": 8,
+        "trajectory_decoder_dropout": 0.0,
     }
     assert (
         contract["visual_compression"]
@@ -162,8 +140,7 @@ def test_checkpoint_contract_catches_geometry_mismatch() -> None:
     config = CurveNavConfig()
     checkpoint = {
         "checkpoint_type": (
-            "curvenav_geometry_supervised_proposal_solver_collocated_self_consistent_"
-            "flow_bounded_curvature_policy"
+            "curvenav_direct_geometry_supervised_bounded_curvature_policy"
         ),
         "policy_contract": build_policy_contract(config),
     }
@@ -177,7 +154,7 @@ def test_checkpoint_contract_catches_geometry_mismatch() -> None:
         depth_encoder=replace(config.depth_encoder, model_dim=512),
         point_goal_encoder=replace(config.point_goal_encoder, model_dim=512),
         condition_encoder=replace(config.condition_encoder, model_dim=512),
-        trajectory_flow=replace(config.trajectory_flow, model_dim=512),
+        trajectory_decoder=replace(config.trajectory_decoder, model_dim=512),
     )
     with pytest.raises(ValueError, match="model_architecture"):
         validate_policy_contract(checkpoint, changed_width)

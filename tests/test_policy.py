@@ -7,14 +7,13 @@ from curvenav.config import (
     CurveNavConfig,
     DataConfig,
     DepthEncoderConfig,
-    TrajectoryFlowConfig,
+    TrajectoryDecoderConfig,
     ConditionEncoderConfig,
     PointGoalEncoderConfig,
     TrajectoryConfig,
 )
 from curvenav.training.optimizer import build_optimizer
-from curvenav.models import FlowPrediction, TRAINING_LOSS_NAMES
-from curvenav.types import ConditionFeatures
+from curvenav.models import TRAINING_LOSS_NAMES
 
 
 def tiny_config() -> CurveNavConfig:
@@ -28,11 +27,10 @@ def tiny_config() -> CurveNavConfig:
         condition_encoder=ConditionEncoderConfig(
             model_dim=32, transformer_layers=1, transformer_heads=4
         ),
-        trajectory_flow=TrajectoryFlowConfig(
+        trajectory_decoder=TrajectoryDecoderConfig(
             model_dim=32,
             transformer_layers=1,
             transformer_heads=4,
-            integration_steps=2,
         ),
     )
 
@@ -69,37 +67,15 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
     losses = policy(inputs, TrajectoryTarget(target_controls, reference_path))
     for value in (
         losses.loss,
-        losses.flow_loss,
-        losses.flow_velocity_loss,
-        losses.flow_endpoint_loss,
-        losses.flow_consistency_loss,
+        losses.coordinate_loss,
         losses.path_loss,
         losses.tangent_loss,
-        losses.proposal_loss,
-        losses.proposal_coordinate_loss,
-        losses.proposal_path_loss,
-        losses.proposal_tangent_loss,
     ):
         assert value.ndim == 0 and torch.isfinite(value)
     assert len(losses.logging_values()) == len(TRAINING_LOSS_NAMES)
     torch.testing.assert_close(
         losses.loss,
-        losses.flow_loss
-        + losses.path_loss
-        + losses.tangent_loss
-        + losses.proposal_loss,
-    )
-    torch.testing.assert_close(
-        losses.flow_loss,
-        losses.flow_velocity_loss
-        + losses.flow_endpoint_loss
-        + 0.1 * losses.flow_consistency_loss,
-    )
-    torch.testing.assert_close(
-        losses.proposal_loss,
-        losses.proposal_coordinate_loss
-        + losses.proposal_path_loss
-        + losses.proposal_tangent_loss,
+        losses.coordinate_loss + losses.path_loss + losses.tangent_loss,
     )
     losses.loss.backward()
     gradients = [
@@ -187,135 +163,47 @@ def test_seven_curvature_control_contract_is_unique() -> None:
         raise AssertionError("an alternate curve token shape must be rejected")
 
 
-def test_flow_endpoint_reconstruction_matches_linear_path_identity() -> None:
-    flow = build_policy(tiny_config()).trajectory_flow
-    clean = torch.randn(3, flow.future_tokens, 2)
-    policy = build_policy(tiny_config())
-    free_mask = policy.curve_codec.free_mask[None].expand(3, -1, -1)
-    clean = clean * free_mask
-    source = torch.randn_like(clean) * free_mask
-    state, time, velocity = flow.training_path(
-        clean,
-        source,
-        free_mask,
-        integration_steps=policy.integration_steps,
-    )
-    torch.testing.assert_close(
-        state,
-        (1.0 - time[:, None, None]) * source + time[:, None, None] * clean,
-    )
-    torch.testing.assert_close(source * free_mask, source)
-    reconstructed = flow.reconstruct_clean(state, time, velocity)
-    torch.testing.assert_close(reconstructed, clean)
-
-
-def test_flow_training_source_is_the_deterministic_conditioned_proposal() -> None:
-    policy = build_policy(tiny_config())
-    assert torch.count_nonzero(policy.trajectory_flow.velocity_projection.weight) > 0
-    assert torch.count_nonzero(policy.trajectory_flow.velocity_projection.bias) == 0
-    assert torch.count_nonzero(policy.trajectory_flow.endpoint_projection.weight) > 0
-    assert torch.count_nonzero(policy.trajectory_flow.endpoint_projection.bias) == 0
-    inputs = condition(batch=4)
-    encoded = policy.encode_condition(inputs)
-    clean = torch.randn(4, 8, 2)
-    mask = policy.curve_codec.free_mask[None].expand_as(clean)
-    source = policy.curve_proposal(encoded, mask)
-    repeated = policy.curve_proposal(encoded, mask)
-    torch.testing.assert_close(source, repeated)
-    _, _, target_velocity = policy.trajectory_flow.training_path(
-        clean,
-        source,
-        mask,
-        integration_steps=policy.integration_steps,
-    )
-    torch.testing.assert_close(clean * mask - target_velocity, source)
-    assert torch.equal(
-        source[:, ~policy.curve_codec.free_mask],
-        torch.zeros_like(source[:, ~policy.curve_codec.free_mask]),
-    )
-
-
-def test_flow_training_times_are_balanced_over_exact_heun_nodes() -> None:
-    policy = build_policy(tiny_config())
-    flow = policy.trajectory_flow
-    batch = 18
-    mask = policy.curve_codec.free_mask[None].expand(batch, -1, -1)
-    clean = torch.randn(batch, flow.future_tokens, 2) * mask
-    source = torch.randn_like(clean) * mask
-    _, time, _ = flow.training_path(
-        clean,
-        source,
-        mask,
-        integration_steps=policy.integration_steps,
-    )
-    expected = torch.arange(policy.integration_steps + 1) / policy.integration_steps
-    torch.testing.assert_close(time.unique(sorted=True), expected)
-    counts = torch.stack([(time == node).sum() for node in expected])
-    assert counts.max() - counts.min() <= 1
-
-
-def test_heun_integration_transports_the_conditioned_proposal() -> None:
-    policy = build_policy(tiny_config())
-    flow = policy.trajectory_flow
-    batch = 2
-    mask = policy.curve_codec.free_mask[None].expand(batch, -1, -1)
-    source = torch.randn(batch, flow.future_tokens, 2) * mask
-    target = torch.randn(batch, flow.future_tokens, 2) * mask
-    velocity = target - source
-    encoded = ConditionFeatures(
-        tokens=torch.zeros(batch, 1, 32),
-        route_token=torch.zeros(batch, 32),
-    )
-
-    def constant_velocity(state, time, condition_tokens, route_token):
-        return FlowPrediction(velocity=velocity, endpoint=target)
-
-    flow.forward = constant_velocity
-    transported = flow.integrate(
-        encoded,
-        source,
-        integration_steps=4,
-        free_mask=mask,
-    )
-    torch.testing.assert_close(transported, target)
-
-
-def test_flow_curve_coordinate_normalization_is_exact_and_order_one() -> None:
-    flow = build_policy(tiny_config()).trajectory_flow
+def test_curve_coordinate_normalization_is_exact_and_order_one() -> None:
+    decoder = build_policy(tiny_config()).trajectory_decoder
     coordinates = torch.tensor([[[0.05, -0.02], [0.08, 0.0], [-0.04, 0.0]]])
-    normalized = flow.normalize_curve_coordinates(coordinates)
+    normalized = decoder.normalize_curve_coordinates(coordinates)
     torch.testing.assert_close(normalized, 8.0 * coordinates)
     torch.testing.assert_close(
-        flow.denormalize_curve_coordinates(normalized),
+        decoder.denormalize_curve_coordinates(normalized),
         coordinates,
     )
     assert normalized.abs().max() >= 0.5
 
 
-def test_conditioned_proposal_decodes_to_one_bounded_curve() -> None:
+def test_conditioned_decoder_returns_one_bounded_curve() -> None:
     policy = build_policy(tiny_config())
     inputs = condition(batch=2)
     encoded = policy.encode_condition(inputs)
     mask = policy.curve_codec.free_mask[None].expand(2, -1, -1)
-    source = policy.curve_proposal(encoded, mask)
+    coordinates = policy.trajectory_decoder(encoded, mask)
+    repeated = policy.trajectory_decoder(encoded, mask)
+    torch.testing.assert_close(coordinates, repeated)
     path, heading, curvature = policy.curve_codec.decode(
-        policy.trajectory_flow.denormalize_curve_coordinates(source),
+        policy.trajectory_decoder.denormalize_curve_coordinates(coordinates),
         inputs.point_goal,
     )
-    assert source.shape == (2, 8, 2)
+    assert coordinates.shape == (2, 8, 2)
+    assert torch.equal(
+        coordinates[:, ~policy.curve_codec.free_mask],
+        torch.zeros_like(coordinates[:, ~policy.curve_codec.free_mask]),
+    )
     assert path.shape == (2, 16, 2)
     assert heading.shape == (2, 16)
     assert curvature.abs().max() < policy.curve_codec.maximum_curvature_inv_m
 
 
-def test_future_flow_has_no_generated_history_or_candidate_set() -> None:
+def test_decoder_has_no_generated_history_candidate_or_second_stage() -> None:
     policy = build_policy(tiny_config())
-    flow = policy.trajectory_flow
-    assert flow.future_tokens == policy.curve_codec.num_curve_tokens
-    assert not hasattr(flow, "history_tokens")
-    assert not hasattr(flow, "total_tokens")
+    decoder = policy.trajectory_decoder
+    assert decoder.curve_tokens == policy.curve_codec.num_curve_tokens
+    assert not hasattr(policy, "trajectory_flow")
+    assert not hasattr(policy, "curve_proposal")
     assert not hasattr(policy, "candidate_bases")
-    assert policy.curve_proposal.curve_tokens == flow.future_tokens
 
 
 def test_straight_target_is_an_exact_curve_projection() -> None:
@@ -365,12 +253,6 @@ def test_curvature_bspline_has_a_hard_continuous_bound() -> None:
     assert not torch.any(codec.free_mask[1:, 1])
 
 
-def test_flow_time_embedding_resolves_the_full_unit_interval() -> None:
-    embedding = build_policy(tiny_config()).trajectory_flow.time_embedding
-    assert embedding.frequency[0].item() == 1.0
-    assert embedding.frequency[-1].item() == 1000.0
-
-
 def test_sand_spatial_tokens_and_geometry_query_compression_have_fixed_contract() -> (
     None
 ):
@@ -394,7 +276,7 @@ def test_sand_spatial_tokens_and_geometry_query_compression_have_fixed_contract(
     assert not torch.any(mask[32:])
     assert encoder.route_query_embedding.shape == (1, 4, 32)
     assert encoded.tokens.shape == (1, 4 + 1 + 4 + 64, 32)
-    assert policy.curve_proposal.token_embedding.shape == (1, 8, 32)
+    assert policy.trajectory_decoder.token_embedding.shape == (1, 8, 32)
 
 
 def test_learned_token_embeddings_are_not_weight_decayed() -> None:

@@ -19,7 +19,7 @@ def test_base_mapping_has_one_prepared_dataset_and_fixed_future_contract() -> No
                     "num_target_control_points": 8,
                     "num_curvature_control_points": 7,
                 },
-                "trajectory_flow": {"transformer_layers": 3},
+                "trajectory_decoder": {"transformer_layers": 3},
             },
         }
     )
@@ -28,7 +28,7 @@ def test_base_mapping_has_one_prepared_dataset_and_fixed_future_contract() -> No
     assert config.data.future_steps == 24
     assert config.trajectory.num_target_control_points == 8
     assert config.trajectory.num_curvature_control_points == 7
-    assert config.trajectory_flow.transformer_layers == 3
+    assert config.trajectory_decoder.transformer_layers == 3
 
 
 def test_rejects_removed_source_specific_data_config() -> None:
@@ -39,7 +39,13 @@ def test_rejects_removed_source_specific_data_config() -> None:
 
 
 def test_rejects_removed_architecture_switches() -> None:
-    for key in ("generator", "fusion", "flow_matching", "trajectory_scorer"):
+    for key in (
+        "generator",
+        "fusion",
+        "flow_matching",
+        "trajectory_flow",
+        "trajectory_scorer",
+    ):
         with pytest.raises(ValueError, match="unknown model config keys"):
             config_from_mapping({"model": {key: {}}})
     with pytest.raises(TypeError, match="scale_xy"):

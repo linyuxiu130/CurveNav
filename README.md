@@ -1,6 +1,6 @@
 # CurveNav
 
-CurveNav 是 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal，通过 geometry/route/state Transformer 先生成一条坐标与 metric geometry 共同监督的确定性有界曲率提案，再在 O(1) 坐标中用 solver-collocated self-consistent rectified flow 联合学习局部速度与专家端点，并以 velocity ODE 细化为唯一一条前向、平滑且连续曲率严格有界的弧长域局部轨迹。训练和部署从同一条件提案、同一组 Heun 时间节点起步；不生成候选集，也不使用轨迹评价头。
+CurveNav 是 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal，通过 geometry/route/state Transformer 与八层有序曲线 Transformer，直接生成唯一一条前向、平滑且连续曲率严格有界的弧长域局部轨迹。生产坐标、metric path 和 tangent 共同监督同一输出；不生成候选集，不使用 Flow/ODE，也不使用轨迹评价头。
 
 当前目标只有一个：先在现有深度合同下验证 PointGoal 局部规划，再在完全相同的 episode、相机、异步 MPC 和指标口径下对比 NavDP 与 X-NavDP。局部基线成立前不专项扩展长距离或脱困能力。
 
@@ -52,7 +52,7 @@ src/curvenav/data/         标定深度、统一数据编译与 loader
 src/curvenav/data_generation/ HSSD 资产、几何、生成与正式审计
 src/curvenav/encoders/     深度与 PointGoal 编码
 src/curvenav/conditioning/ 多帧视觉压缩、逐帧位姿与目标融合
-src/curvenav/models/       conditional flow 与 policy
+src/curvenav/models/       有序曲线 Transformer 与 policy
 src/curvenav/trajectory/   教师样条与有界曲率轨迹几何
 src/curvenav/training/     DDP、AMP、EMA 与 checkpoint
 src/curvenav/evaluation/   固定离线评测

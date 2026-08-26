@@ -35,12 +35,10 @@ model:
     transformer_layers: 4
     transformer_heads: 8
     dropout: 0.0
-  trajectory_flow:
+  trajectory_decoder:
     model_dim: 384
-    proposal_layers: 2
     transformer_layers: 8
     transformer_heads: 8
-    integration_steps: 8
     dropout: 0.0
 training:
   seed: 42

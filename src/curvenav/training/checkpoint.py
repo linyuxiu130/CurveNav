@@ -14,12 +14,8 @@ from curvenav.conditioning import CONDITION_ENCODER_TYPE, ROUTE_QUERY_COUNT
 from curvenav.encoders.depth import DEPTH_ENCODER_TYPE
 from curvenav.encoders import POINT_GOAL_ENCODER_TYPE
 from curvenav.models import (
-    CURVE_PROPOSAL_TYPE,
-    FLOW_CURVE_COORDINATE_SCALE,
-    FLOW_INFERENCE_SOURCE_TYPE,
-    FLOW_SELF_CONSISTENCY_WEIGHT,
-    FLOW_TRAINING_SOURCE_TYPE,
-    TRAJECTORY_FLOW_TYPE,
+    CURVE_COORDINATE_SCALE,
+    TRAJECTORY_DECODER_TYPE,
 )
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.batching import build_distributed_batch_layout
@@ -32,10 +28,7 @@ from curvenav.trajectory import (
 )
 
 
-CHECKPOINT_TYPE = (
-    "curvenav_geometry_supervised_proposal_solver_collocated_self_consistent_flow_"
-    "bounded_curvature_policy"
-)
+CHECKPOINT_TYPE = "curvenav_direct_geometry_supervised_bounded_curvature_policy"
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
 
@@ -74,7 +67,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
     depth = config.depth_encoder
     point_goal = config.point_goal_encoder
     condition = config.condition_encoder
-    flow = config.trajectory_flow
+    decoder = config.trajectory_decoder
     return {
         "observation_frames": data.observation_frames,
         "frame_spacing_m": data.frame_spacing_m,
@@ -100,10 +93,9 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             "condition_layers": condition.transformer_layers,
             "condition_heads": condition.transformer_heads,
             "condition_dropout": condition.dropout,
-            "proposal_layers": flow.proposal_layers,
-            "flow_layers": flow.transformer_layers,
-            "flow_heads": flow.transformer_heads,
-            "flow_dropout": flow.dropout,
+            "trajectory_decoder_layers": decoder.transformer_layers,
+            "trajectory_decoder_heads": decoder.transformer_heads,
+            "trajectory_decoder_dropout": decoder.dropout,
         },
         "trajectory_dimensions": 2,
         "point_goal_semantics": "mission_destination_in_current_robot_xy",
@@ -112,25 +104,12 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "point_goal_clip_distance_m": config.point_goal_encoder.goal_clip_distance_m,
         "trajectory_supervision": "fixed_future_expert_waypoints_or_true_goal",
         "arc_length_policy": "pointgoal_scaled_positive_total_arc_length",
-        "trajectory_endpoint_policy": "conditioned_executable_curve_proposal",
+        "trajectory_endpoint_policy": "direct_conditioned_executable_curve",
         "curve_boundary_conditions": "origin_and_forward_half_plane_initial_heading",
-        "trajectory_flow_type": TRAJECTORY_FLOW_TYPE,
-        "flow_curve_coordinate_scale": FLOW_CURVE_COORDINATE_SCALE,
-        "flow_training_source_type": FLOW_TRAINING_SOURCE_TYPE,
-        "flow_inference_source_type": FLOW_INFERENCE_SOURCE_TYPE,
-        "curve_proposal_type": CURVE_PROPOSAL_TYPE,
-        "flow_source_gradient": "detached_from_flow_and_directly_supervised",
-        "training_objective": (
-            "conditioned_proposal_coordinates_path_tangent_plus_solver_collocated_"
-            "self_consistent_flow_path_tangent"
-        ),
-        "flow_time_sampling": (
-            "uniform_stratified_heun_solver_nodes_including_boundaries"
-        ),
-        "flow_prediction_targets": "shared_backbone_velocity_and_data_endpoint",
-        "flow_self_consistency_weight": FLOW_SELF_CONSISTENCY_WEIGHT,
-        "trajectory_prediction": "single_proposal_initialized_heun_trajectory",
-        "trajectory_flow_integration_steps": config.trajectory_flow.integration_steps,
+        "trajectory_decoder_type": TRAJECTORY_DECODER_TYPE,
+        "curve_coordinate_scale": CURVE_COORDINATE_SCALE,
+        "training_objective": "direct_curve_coordinates_plus_metric_path_and_tangent",
+        "trajectory_prediction": "single_direct_bounded_curvature_trajectory",
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
         "visual_context": (
             "dedicated_current_plus_full_context_metric_geometry_queries_and_"

@@ -89,12 +89,10 @@ class ConditionEncoderConfig:
 
 
 @dataclass(frozen=True)
-class TrajectoryFlowConfig:
+class TrajectoryDecoderConfig:
     model_dim: int = 384
-    proposal_layers: int = 2
     transformer_layers: int = 8
     transformer_heads: int = 8
-    integration_steps: int = 8
     dropout: float = 0.0
 
 
@@ -131,8 +129,8 @@ class CurveNavConfig:
     condition_encoder: ConditionEncoderConfig = dataclass_field(
         default_factory=ConditionEncoderConfig
     )
-    trajectory_flow: TrajectoryFlowConfig = dataclass_field(
-        default_factory=TrajectoryFlowConfig
+    trajectory_decoder: TrajectoryDecoderConfig = dataclass_field(
+        default_factory=TrajectoryDecoderConfig
     )
     training: TrainingConfig = dataclass_field(default_factory=TrainingConfig)
 
@@ -162,7 +160,7 @@ class CurveNavConfig:
             self.depth_encoder.model_dim,
             self.point_goal_encoder.model_dim,
             self.condition_encoder.model_dim,
-            self.trajectory_flow.model_dim,
+            self.trajectory_decoder.model_dim,
         }
         if len(dims) != 1:
             raise ValueError("all policy model dimensions must match")
@@ -171,7 +169,7 @@ class CurveNavConfig:
             raise ValueError("model_dim must be positive and divisible by four")
         for name, heads in (
             ("condition_encoder", self.condition_encoder.transformer_heads),
-            ("trajectory_flow", self.trajectory_flow.transformer_heads),
+            ("trajectory_decoder", self.trajectory_decoder.transformer_heads),
         ):
             if heads < 1:
                 raise ValueError(f"{name}.transformer_heads must be positive")
@@ -181,20 +179,17 @@ class CurveNavConfig:
                 )
         for name, layers in (
             ("condition_encoder", self.condition_encoder.transformer_layers),
-            ("trajectory_proposal", self.trajectory_flow.proposal_layers),
-            ("trajectory_flow", self.trajectory_flow.transformer_layers),
+            ("trajectory_decoder", self.trajectory_decoder.transformer_layers),
         ):
             if layers < 1:
                 raise ValueError(f"{name}.transformer_layers must be positive")
         for name, dropout in (
             ("depth_encoder", self.depth_encoder.dropout),
             ("condition_encoder", self.condition_encoder.dropout),
-            ("trajectory_flow", self.trajectory_flow.dropout),
+            ("trajectory_decoder", self.trajectory_decoder.dropout),
         ):
             if not 0 <= dropout < 1:
                 raise ValueError(f"{name}.dropout must be in [0, 1)")
-        if self.trajectory_flow.integration_steps < 1:
-            raise ValueError("trajectory_flow.integration_steps must be positive")
         if not 0 <= self.training.seed < 2**32:
             raise ValueError("training.seed must be in [0, 2**32)")
         positive_integers = {

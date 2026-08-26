@@ -1,4 +1,4 @@
-"""Adaptive trajectory Transformer blocks for conditional flow."""
+"""Adaptive Transformer blocks for ordered trajectory queries."""
 
 from torch import Tensor, nn
 
@@ -12,7 +12,7 @@ def _modulate(value: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
 class ConditionalTrajectoryBlock(nn.Module):
     """Bidirectional trajectory attention with adaRMS-Zero conditioning.
 
-    Flow time and the supervised route token modulate every residual branch.
+    The supervised route token modulates every residual branch.
     Geometry remains a token sequence and enters through cross-attention, so
     spatial information is not collapsed into the global modulation vector.
     """
