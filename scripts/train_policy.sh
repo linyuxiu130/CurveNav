@@ -22,7 +22,7 @@ fi
 IFS=',' read -r -a GPU_IDS <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_PROCESSES="${#GPU_IDS[@]}"
 cd "${PROJECT_ROOT}"
-exec "${ENV_ROOT}/curvenav/bin/torchrun" \
+exec "${ENV_ROOT}/curvenav/bin/python" -m torch.distributed.run \
     --standalone \
     --nproc-per-node="${NUM_PROCESSES}" \
     -m curvenav.training.train \
