@@ -76,6 +76,9 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
         losses.path_loss,
         losses.tangent_loss,
         losses.proposal_loss,
+        losses.proposal_coordinate_loss,
+        losses.proposal_path_loss,
+        losses.proposal_tangent_loss,
     ):
         assert value.ndim == 0 and torch.isfinite(value)
     assert len(losses.logging_values()) == len(TRAINING_LOSS_NAMES)
@@ -91,6 +94,12 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
         losses.flow_velocity_loss
         + losses.flow_endpoint_loss
         + 0.1 * losses.flow_consistency_loss,
+    )
+    torch.testing.assert_close(
+        losses.proposal_loss,
+        losses.proposal_coordinate_loss
+        + losses.proposal_path_loss
+        + losses.proposal_tangent_loss,
     )
     losses.loss.backward()
     gradients = [
@@ -185,7 +194,12 @@ def test_flow_endpoint_reconstruction_matches_linear_path_identity() -> None:
     free_mask = policy.curve_codec.free_mask[None].expand(3, -1, -1)
     clean = clean * free_mask
     source = torch.randn_like(clean) * free_mask
-    state, time, velocity = flow.training_path(clean, source, free_mask)
+    state, time, velocity = flow.training_path(
+        clean,
+        source,
+        free_mask,
+        integration_steps=policy.integration_steps,
+    )
     torch.testing.assert_close(
         state,
         (1.0 - time[:, None, None]) * source + time[:, None, None] * clean,
@@ -212,12 +226,32 @@ def test_flow_training_source_is_the_deterministic_conditioned_proposal() -> Non
         clean,
         source,
         mask,
+        integration_steps=policy.integration_steps,
     )
     torch.testing.assert_close(clean * mask - target_velocity, source)
     assert torch.equal(
         source[:, ~policy.curve_codec.free_mask],
         torch.zeros_like(source[:, ~policy.curve_codec.free_mask]),
     )
+
+
+def test_flow_training_times_are_balanced_over_exact_heun_nodes() -> None:
+    policy = build_policy(tiny_config())
+    flow = policy.trajectory_flow
+    batch = 18
+    mask = policy.curve_codec.free_mask[None].expand(batch, -1, -1)
+    clean = torch.randn(batch, flow.future_tokens, 2) * mask
+    source = torch.randn_like(clean) * mask
+    _, time, _ = flow.training_path(
+        clean,
+        source,
+        mask,
+        integration_steps=policy.integration_steps,
+    )
+    expected = torch.arange(policy.integration_steps + 1) / policy.integration_steps
+    torch.testing.assert_close(time.unique(sorted=True), expected)
+    counts = torch.stack([(time == node).sum() for node in expected])
+    assert counts.max() - counts.min() <= 1
 
 
 def test_heun_integration_transports_the_conditioned_proposal() -> None:
@@ -248,9 +282,7 @@ def test_heun_integration_transports_the_conditioned_proposal() -> None:
 
 def test_flow_curve_coordinate_normalization_is_exact_and_order_one() -> None:
     flow = build_policy(tiny_config()).trajectory_flow
-    coordinates = torch.tensor(
-        [[[0.05, -0.02], [0.08, 0.0], [-0.04, 0.0]]]
-    )
+    coordinates = torch.tensor([[[0.05, -0.02], [0.08, 0.0], [-0.04, 0.0]]])
     normalized = flow.normalize_curve_coordinates(coordinates)
     torch.testing.assert_close(normalized, 8.0 * coordinates)
     torch.testing.assert_close(

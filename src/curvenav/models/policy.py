@@ -25,6 +25,9 @@ TRAINING_LOSS_NAMES = (
     "path_loss",
     "tangent_loss",
     "proposal_loss",
+    "proposal_coordinate_loss",
+    "proposal_path_loss",
+    "proposal_tangent_loss",
 )
 
 
@@ -38,6 +41,9 @@ class CurveNavLoss:
     path_loss: Tensor
     tangent_loss: Tensor
     proposal_loss: Tensor
+    proposal_coordinate_loss: Tensor
+    proposal_path_loss: Tensor
+    proposal_tangent_loss: Tensor
 
     def logging_values(self) -> tuple[Tensor, ...]:
         return tuple(getattr(self, name) for name in TRAINING_LOSS_NAMES)
@@ -108,10 +114,13 @@ class CurveNavPolicy(nn.Module):
         )
 
     def _path_loss(self, predicted_path: Tensor, reference_path: Tensor) -> Tensor:
-        point_loss = torch.linalg.vector_norm(
-            predicted_path - reference_path,
-            dim=-1,
-        ) / self.planning_horizon_m
+        point_loss = (
+            torch.linalg.vector_norm(
+                predicted_path - reference_path,
+                dim=-1,
+            )
+            / self.planning_horizon_m
+        )
         weights = self.near_path_weights.to(
             device=point_loss.device,
             dtype=point_loss.dtype,
@@ -180,6 +189,7 @@ class CurveNavPolicy(nn.Module):
             clean_future,
             proposal_state.detach(),
             free_mask.to(clean_future.dtype),
+            self.integration_steps,
         )
         flow_prediction = self.trajectory_flow(
             flow_state,
@@ -215,17 +225,28 @@ class CurveNavPolicy(nn.Module):
             + flow_endpoint_loss
             + FLOW_SELF_CONSISTENCY_WEIGHT * flow_consistency_loss
         )
-        predicted_path, _, _ = self.curve_codec.decode(
-            self.trajectory_flow.denormalize_curve_coordinates(reconstructed),
-            condition.point_goal.float(),
+        decoded_path, _, _ = self.curve_codec.decode(
+            self.trajectory_flow.denormalize_curve_coordinates(
+                torch.cat((reconstructed, proposal_state), dim=0)
+            ),
+            torch.cat((condition.point_goal, condition.point_goal), dim=0).float(),
         )
+        predicted_path, proposal_path = decoded_path.chunk(2, dim=0)
         reference_path = target.reference_path.float()
         path_loss = self._path_loss(predicted_path, reference_path)
         tangent_loss = self._tangent_loss(predicted_path, reference_path)
-        proposal_loss = self._coordinate_loss(
+        proposal_coordinate_loss = self._coordinate_loss(
             proposal_state,
             clean_future,
             free_mask,
+        )
+        proposal_path_loss = self._path_loss(proposal_path, smoothed_target_path)
+        proposal_tangent_loss = self._tangent_loss(
+            proposal_path,
+            smoothed_target_path,
+        )
+        proposal_loss = (
+            proposal_coordinate_loss + proposal_path_loss + proposal_tangent_loss
         )
 
         loss = flow_loss + path_loss + tangent_loss + proposal_loss
@@ -238,6 +259,9 @@ class CurveNavPolicy(nn.Module):
             path_loss=path_loss,
             tangent_loss=tangent_loss,
             proposal_loss=proposal_loss,
+            proposal_coordinate_loss=proposal_coordinate_loss,
+            proposal_path_loss=proposal_path_loss,
+            proposal_tangent_loss=proposal_tangent_loss,
         )
 
     @torch.no_grad()

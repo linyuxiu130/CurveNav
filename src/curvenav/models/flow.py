@@ -12,8 +12,8 @@ from curvenav.types import ConditionFeatures
 
 
 TRAJECTORY_FLOW_TYPE = (
-    "conditioned_curve_source_self_consistent_bounded_curvature_rectified_flow_"
-    "adarmszero_heun"
+    "conditioned_curve_source_solver_collocated_self_consistent_bounded_curvature_"
+    "rectified_flow_adarmszero_heun"
 )
 FLOW_CURVE_COORDINATE_SCALE = 8.0
 FLOW_TRAINING_SOURCE_TYPE = "deterministic_conditioned_curve_proposal"
@@ -74,9 +74,7 @@ class CurvatureTrajectoryFlow(nn.Module):
             raise ValueError("future_tokens must be positive")
         self.future_tokens = future_tokens
         self.state_projection = nn.Linear(2, model_dim)
-        self.token_embedding = nn.Parameter(
-            torch.empty(1, future_tokens, model_dim)
-        )
+        self.token_embedding = nn.Parameter(torch.empty(1, future_tokens, model_dim))
         self.time_embedding = FourierTimeEmbedding(model_dim)
         self.blocks = nn.ModuleList(
             ConditionalTrajectoryBlock(model_dim, heads, dropout) for _ in range(layers)
@@ -129,22 +127,28 @@ class CurvatureTrajectoryFlow(nn.Module):
         clean_state: Tensor,
         source_state: Tensor,
         free_mask: Tensor,
+        integration_steps: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        if clean_state.shape != source_state.shape or clean_state.shape != free_mask.shape:
+        if (
+            clean_state.shape != source_state.shape
+            or clean_state.shape != free_mask.shape
+        ):
             raise ValueError(
                 "clean_state, source_state and free_mask must have identical shapes"
             )
-        time = torch.rand(
-            clean_state.shape[0],
-            device=clean_state.device,
-            dtype=clean_state.dtype,
-        )
+        if integration_steps < 1:
+            raise ValueError("integration_steps must be positive")
+        nodes = integration_steps + 1
+        offset = torch.randint(nodes, (), device=clean_state.device)
+        node_index = (
+            torch.arange(clean_state.shape[0], device=clean_state.device) + offset
+        ) % nodes
+        time = node_index.to(clean_state.dtype) / integration_steps
         clean_state = clean_state * free_mask
         source_state = source_state * free_mask
-        state = (
-            (1.0 - time[:, None, None]) * source_state
-            + time[:, None, None] * clean_state
-        )
+        state = (1.0 - time[:, None, None]) * source_state + time[
+            :, None, None
+        ] * clean_state
         return state, time, clean_state - source_state
 
     @staticmethod
@@ -174,10 +178,13 @@ class CurvatureTrajectoryFlow(nn.Module):
         )
         if source_state.shape != mask.shape:
             raise ValueError("source_state must have shape [B,T,2]")
-        state = source_state.to(
-            device=condition.tokens.device,
-            dtype=condition.tokens.dtype,
-        ) * mask
+        state = (
+            source_state.to(
+                device=condition.tokens.device,
+                dtype=condition.tokens.dtype,
+            )
+            * mask
+        )
         step_size = 1.0 / integration_steps
         for index in range(integration_steps):
             time = torch.full(
@@ -187,18 +194,24 @@ class CurvatureTrajectoryFlow(nn.Module):
                 dtype=state.dtype,
             )
             next_time = torch.full_like(time, (index + 1) * step_size)
-            velocity = self(
-                state,
-                time,
-                condition.tokens,
-                condition.route_token,
-            ).velocity * mask
+            velocity = (
+                self(
+                    state,
+                    time,
+                    condition.tokens,
+                    condition.route_token,
+                ).velocity
+                * mask
+            )
             predictor = (state + step_size * velocity) * mask
-            corrected = self(
-                predictor,
-                next_time,
-                condition.tokens,
-                condition.route_token,
-            ).velocity * mask
+            corrected = (
+                self(
+                    predictor,
+                    next_time,
+                    condition.tokens,
+                    condition.route_token,
+                ).velocity
+                * mask
+            )
             state = (state + 0.5 * step_size * (velocity + corrected)) * mask
         return state

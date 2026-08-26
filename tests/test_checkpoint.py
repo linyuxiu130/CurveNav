@@ -81,14 +81,15 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
     contract = checkpoint["policy_contract"]
     assert (
         checkpoint["checkpoint_type"]
-        == "curvenav_conditioned_proposal_self_consistent_flow_bounded_curvature_policy"
+        == "curvenav_geometry_supervised_proposal_solver_collocated_self_consistent_"
+        "flow_bounded_curvature_policy"
     )
     assert {"model", "optimizer", "scheduler", "ema", "grad_scaler"} <= set(checkpoint)
     assert "extra" not in checkpoint
     assert (
         contract["trajectory_flow_type"]
-        == "conditioned_curve_source_self_consistent_bounded_curvature_rectified_"
-        "flow_adarmszero_heun"
+        == "conditioned_curve_source_solver_collocated_self_consistent_bounded_"
+        "curvature_rectified_flow_adarmszero_heun"
     )
     assert contract["flow_curve_coordinate_scale"] == pytest.approx(8.0)
     assert (
@@ -105,8 +106,11 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
     )
     assert (
         contract["training_objective"]
-        == "conditioned_proposal_coordinates_plus_self_consistent_residual_flow_"
-        "path_tangent"
+        == "conditioned_proposal_coordinates_path_tangent_plus_solver_collocated_"
+        "self_consistent_flow_path_tangent"
+    )
+    assert contract["flow_time_sampling"] == (
+        "uniform_stratified_heun_solver_nodes_including_boundaries"
     )
     assert contract["flow_prediction_targets"] == (
         "shared_backbone_velocity_and_data_endpoint"
@@ -158,7 +162,8 @@ def test_checkpoint_contract_catches_geometry_mismatch() -> None:
     config = CurveNavConfig()
     checkpoint = {
         "checkpoint_type": (
-            "curvenav_conditioned_proposal_self_consistent_flow_bounded_curvature_policy"
+            "curvenav_geometry_supervised_proposal_solver_collocated_self_consistent_"
+            "flow_bounded_curvature_policy"
         ),
         "policy_contract": build_policy_contract(config),
     }
