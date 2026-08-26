@@ -33,6 +33,9 @@ class _RecordingPolicy:
     def sample(self, condition, source):
         self.conditions.append(condition)
         self.sources.append(source.clone())
+        path = torch.zeros(len(condition.point_goal), 64, 2)
+        path[..., 0] = torch.arange(64)
+        return SimpleNamespace(path=path)
 
 
 def test_invalid_depth_is_encoded_as_sensor_limit():
@@ -114,6 +117,21 @@ def test_runtime_top_level_reset_restarts_the_episode_source_sequence() -> None:
     runtime.reset(3)
 
     torch.testing.assert_close(runtime.flow_source, first)
+
+
+def test_runtime_sends_only_future_points_to_the_benchmark() -> None:
+    runtime = CurveNavRuntime(CurveNavConfig(), _RecordingPolicy(), device="cpu")
+    runtime.reset(1)
+
+    prediction = runtime.step(
+        np.array([[3.0, 0.0]], dtype=np.float32),
+        np.ones((1, 360, 640, 1), dtype=np.float32),
+        np.zeros((1, 3), dtype=np.float32),
+        np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float32),
+    )
+
+    assert prediction.path.shape == (1, 63, 3)
+    np.testing.assert_array_equal(prediction.path[0, 0], [1.0, 0.0, 0.0])
 
 
 def test_depth_context_uses_expert_spatial_offsets():

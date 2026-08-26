@@ -40,6 +40,8 @@
 
 CurveNav 从 masked isotropic Gaussian 源在固定 `y=8x` 无量纲坐标中做八步 Heun 积分。每个环境在 episode reset 时采样一个源 latent，并在该回合所有规划周期中复用，最终直接得到一条未来轨迹。不存在候选集、候选排序、历史重建打分、learned critic 或碰撞启发式。当前单专家数据没有 NavDP critic 所需的 privileged ESDF 标签，也没有 X-NavDP 的在线 Q target，因此闭环主结果不得混入未训练 scorer、oracle 选轨、标签轨迹或启发式碰撞 mask。离线使用固定 generator 逐样本生成唯一 latent，只报告实际输出轨迹的 ADE、弧长、目标进展、延迟，以及弧长域曲率 B-spline 直接给出的连续曲率；不再用 XY 控制多边形离散转角冒充轨迹曲率界。
 
+模型内部 64 点路径的第 0 点是当前机器人原点。官方 evaluator 会统一在 policy 返回值前追加当前原点，因此 CurveNav 的部署边界只发送内部路径的 `1:64` 共 63 个未来点；MPC 最终仍接收 64 点路径，且只有一个原点。NavDP/X-NavDP 的累积位移输出本来就不含当前点。若 CurveNav 发送内部第 0 点，evaluator 会制造两个连续原点，使 MPC 的起始离散曲率退化。
+
 官方 evaluator 在每个 scene worker 中只创建一次 Isaac 环境，episode 结束后原地 reset 对应 env；同场景 10 回合不得拆成 10 次 Isaac 启动。CurveNav 在线使用 eager FP16，并在初始 `navigator_reset` 内按实际 `num_envs` 完成 CUDA kernel 预热；该过程必须在 episode 计时循环前完成，不得通过放宽 timeout 或首轮零动作来掩盖初始化开销。
 
 上游评测真源是部署时固定 commit 的 benchmark checkout：

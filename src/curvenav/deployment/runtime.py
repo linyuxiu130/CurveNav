@@ -275,9 +275,12 @@ class CurveNavRuntime:
             prediction = self.policy.sample(condition, self.flow_source)
         self.requests += 1
         self.request_seconds += time.perf_counter() - started
-        path_xy = prediction.path.float().cpu().numpy()
-        selected = np.concatenate(
-            [path_xy, np.zeros((*path_xy.shape[:-1], 1), dtype=np.float32)],
+        future_path_xy = prediction.path[:, 1:].float().cpu().numpy()
+        future_path = np.concatenate(
+            [
+                future_path_xy,
+                np.zeros((*future_path_xy.shape[:-1], 1), dtype=np.float32),
+            ],
             axis=-1,
         )
-        return RuntimePrediction(path=selected)
+        return RuntimePrediction(path=future_path)
