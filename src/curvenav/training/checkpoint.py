@@ -13,7 +13,7 @@ from curvenav.config import CurveNavConfig
 from curvenav.conditioning import CONDITION_ENCODER_TYPE
 from curvenav.encoders.depth import DEPTH_ENCODER_TYPE
 from curvenav.encoders import POINT_GOAL_ENCODER_TYPE
-from curvenav.models import TRAJECTORY_FLOW_TYPE
+from curvenav.models import FLOW_CURVE_COORDINATE_SCALE, TRAJECTORY_FLOW_TYPE
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.batching import build_distributed_batch_layout
 from curvenav.trajectory import (
@@ -25,7 +25,7 @@ from curvenav.trajectory import (
 )
 
 
-CHECKPOINT_TYPE = "curvenav_deterministic_bounded_curvature_flow_policy"
+CHECKPOINT_TYPE = "curvenav_normalized_deterministic_bounded_curvature_flow_policy"
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
 
@@ -104,6 +104,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "trajectory_endpoint_policy": "supervised_route_token_local_subgoal",
         "curve_boundary_conditions": "origin_and_forward_half_plane_initial_heading",
         "trajectory_flow_type": TRAJECTORY_FLOW_TYPE,
+        "flow_curve_coordinate_scale": FLOW_CURVE_COORDINATE_SCALE,
         "training_objective": (
             "zero_source_future_flow_plus_metric_path_tangent_subgoal"
         ),

@@ -11,8 +11,9 @@ from curvenav.types import ConditionFeatures
 
 
 TRAJECTORY_FLOW_TYPE = (
-    "zero_source_future_bounded_curvature_rectified_flow_adarmszero_heun"
+    "normalized_zero_source_future_bounded_curvature_rectified_flow_adarmszero_heun"
 )
+FLOW_CURVE_COORDINATE_SCALE = 8.0
 
 
 class FourierTimeEmbedding(nn.Module):
@@ -72,6 +73,16 @@ class CurvatureTrajectoryFlow(nn.Module):
         nn.init.trunc_normal_(self.token_embedding, std=0.02)
         nn.init.zeros_(self.velocity_projection.weight)
         nn.init.zeros_(self.velocity_projection.bias)
+
+    @staticmethod
+    def normalize_curve_coordinates(curve_coordinates: Tensor) -> Tensor:
+        """Map compact geometric coordinates to the O(1) Flow state."""
+        return curve_coordinates * FLOW_CURVE_COORDINATE_SCALE
+
+    @staticmethod
+    def denormalize_curve_coordinates(flow_state: Tensor) -> Tensor:
+        """Recover the exact geometric coordinates consumed by the codec."""
+        return flow_state / FLOW_CURVE_COORDINATE_SCALE
 
     def forward(
         self,

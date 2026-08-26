@@ -141,9 +141,11 @@ class CurveNavPolicy(nn.Module):
         smoothed_target_path = self.target_codec.decode_equal_arc(
             target.control_points.float()
         )
-        clean_future = self.curve_codec.encode_target(
-            smoothed_target_path,
-            condition.point_goal.float(),
+        clean_future = self.trajectory_flow.normalize_curve_coordinates(
+            self.curve_codec.encode_target(
+                smoothed_target_path,
+                condition.point_goal.float(),
+            )
         )
         free_mask = self.curve_codec.free_mask.to(
             device=clean_future.device,
@@ -171,7 +173,7 @@ class CurveNavPolicy(nn.Module):
             predicted_velocity,
         )
         predicted_path, _, _ = self.curve_codec.decode(
-            reconstructed,
+            self.trajectory_flow.denormalize_curve_coordinates(reconstructed),
             condition.point_goal.float(),
         )
         reference_path = target.reference_path.float()
@@ -201,7 +203,7 @@ class CurveNavPolicy(nn.Module):
             free_mask,
         )
         path, heading, curvature = self._decode(
-            curve_coordinates,
+            self.trajectory_flow.denormalize_curve_coordinates(curve_coordinates),
             condition.point_goal,
         )
         return TrajectoryPrediction(

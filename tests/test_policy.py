@@ -176,6 +176,20 @@ def test_flow_endpoint_reconstruction_matches_linear_path_identity() -> None:
     torch.testing.assert_close(reconstructed, clean)
 
 
+def test_flow_curve_coordinate_normalization_is_exact_and_order_one() -> None:
+    flow = build_policy(tiny_config()).trajectory_flow
+    coordinates = torch.tensor(
+        [[[0.05, -0.02], [0.08, 0.0], [-0.04, 0.0]]]
+    )
+    normalized = flow.normalize_curve_coordinates(coordinates)
+    torch.testing.assert_close(normalized, 8.0 * coordinates)
+    torch.testing.assert_close(
+        flow.denormalize_curve_coordinates(normalized),
+        coordinates,
+    )
+    assert normalized.abs().max() >= 0.5
+
+
 def test_future_flow_has_no_generated_history_or_candidate_state() -> None:
     policy = build_policy(tiny_config())
     flow = policy.trajectory_flow

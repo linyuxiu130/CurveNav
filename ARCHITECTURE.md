@@ -30,6 +30,7 @@ PointGoal direction + log range ────────────────
                                       supervised local-route bottleneck
                                                                       ↓
                                       8 future bounded-curvature tokens
+                                      fixed coordinate map y = 8x
                                       8× future Flow Transformer
                                       adaRMS-Zero(time, route)
                                                                       ↓
@@ -38,7 +39,7 @@ PointGoal direction + log range ────────────────
           PointGoal-scaled arc-length/curvature decoder → metric local path
 ```
 
-训练和部署只组装这一张图。checkpoint 类型为 `curvenav_deterministic_bounded_curvature_flow_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
+训练和部署只组装这一张图。checkpoint 类型为 `curvenav_normalized_deterministic_bounded_curvature_flow_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
 
 ## 2. 视觉几何、历史状态与路线融合
 
@@ -156,11 +157,18 @@ r* = atanh(c*/κmax).
 
 ### 4.1 零源条件 Flow Matching
 
-三帧已执行历史已经通过 metric depth alignment 和四个显式 state token 进入条件序列。未来曲线坐标为 `y∈R^(8×2)`；Flow 只生成 `y`，不再把已知历史复制成随机生成目标。
+三帧已执行历史已经通过 metric depth alignment 和四个显式 state token 进入条件序列。几何 decoder 消费的曲线坐标记为 `x∈R^(8×2)`。它们受硬几何尺度约束，当前验证集九个自由维度的标准差只有 `0.014–0.058`；直接把 `x` 当作 FP16 Flow 状态会使速度场长期处于 `10^-2` 量级，并让零初始化网络偏向无需修正的直线。训练和推理因此都使用唯一的固定无量纲坐标变换：
+
+```text
+y = 8x,       x = y/8.
+```
+
+尺度 8 把九个自由维度的典型标准差移到 `0.11–0.47`，同时保持零点、相对维度权重、可表示轨迹集合和曲率硬界完全不变。它对应 SanD/Diffusion Policy 对控制坐标做归一化的必要数值条件，但不读取验证统计、不保存数据集专用 normalizer，也不产生第二套 decoder。Flow 只生成 `y`，不再把已知历史复制成随机生成目标。
 
 当前数据对每个观测只有一条专家局部轨迹，任务输出也要求一条可执行轨迹，因此采用从 Dirac 零源到条件专家目标的直线 Flow：
 
 ```text
+y_1 = 8x_1,
 y_0 = 0,
 t ~ U(0,1),
 y_t = t y_1,
@@ -174,7 +182,7 @@ L_flow = Σ mask·||v_θ(y_t,t,C)-y_1||² / Σ mask.
 y_hat_1 = y_t + (1-t)v_θ(y_t,t,C).
 ```
 
-直接解码 `y_hat_1` 施加 metric path 和 tangent 监督，Flow 学到的不只是内禀坐标均方误差。零源不是推理启发式：它就是训练概率路径的唯一起点，所以训练和部署没有 base-sample 分布差异。
+先用唯一逆变换 `x_hat_1=y_hat_1/8` 解码，再施加 metric path 和 tangent 监督，Flow 学到的不只是内禀坐标均方误差。零源不是推理启发式：它就是训练概率路径的唯一起点，所以训练和部署没有 base-sample 分布差异。
 
 ### 4.2 轨迹 Transformer
 
@@ -199,7 +207,7 @@ y_predict = y + Δt y',
 y_next = y + Δt/2 [y' + v_θ(y_predict,t+Δt,C)].
 ```
 
-输出只有一个 `[B,8,2]` 曲线状态，不存在候选维、随机 base、历史重建分数或 oracle 选择。真实执行历史仍通过条件序列影响每一步速度场，但不会消耗未来 Flow 的监督维度。该结构也避免传播上一周期的错误计划：当前数据没有“上一周期模型已提交计划”字段，用专家未来伪造 previous-plan token 会产生标签泄漏。
+输出只有一个 `[B,8,2]` 归一化 Flow 状态，经固定除 8 后送入曲线 decoder；不存在候选维、随机 base、历史重建分数或 oracle 选择。真实执行历史仍通过条件序列影响每一步速度场，但不会消耗未来 Flow 的监督维度。该结构也避免传播上一周期的错误计划：当前数据没有“上一周期模型已提交计划”字段，用专家未来伪造 previous-plan token 会产生标签泄漏。
 
 ## 5. 唯一训练目标
 
@@ -209,7 +217,7 @@ y_next = y + Δt/2 [y' + v_θ(y_predict,t+Δt,C)].
 L = L_flow + L_path + L_tangent + L_route.
 ```
 
-- `L_flow`：上述 zero-source future masked velocity MSE。
+- `L_flow`：上述 O(1) 归一化 zero-source future masked velocity MSE。
 - `L_path`：每个等弧长位置的欧氏误差 `||p_hat-p*||₂/H`；使用 `0.25+exp(-4s)` 并归一到均值一，强调马上要执行的近端。
 - `L_tangent`：有效相邻路径段的 `1-cos(Δp_hat,Δp*)`，使用相同近端权重。
 - `L_route`：预测局部终点与专家参考终点的欧氏误差 `||s_hat-s*||₂/H`。
@@ -220,12 +228,12 @@ L = L_flow + L_path + L_tangent + L_route.
 
 | 来源 | 吸收的有效设计 | CurveNav 的针对性改进 |
 |---|---|---|
-| SanD | 四帧共享深度 backbone、空间 token、平滑低维轨迹先验 | 教师 B-spline 只做标签平滑；生产输出改为 PointGoal 标度的连续有界曲率曲线；不依赖部署时 ESDF 候选筛选 |
-| NavDP | `D=384` actor、learned-query 视觉压缩、trajectory-token cross-attention | query 先保存目标无关 metric geometry，再由独立 route query 融合目标；无 ESDF 标签时不训练 critic |
+| SanD | 四帧共享深度 backbone、空间 token、平滑低维轨迹先验、控制坐标归一化 | 教师 B-spline 只做标签平滑；生产输出改为 PointGoal 标度的连续有界曲率曲线；固定 O(1) Flow 坐标取代数据集专用 normalizer；不依赖部署时 ESDF 候选筛选 |
+| NavDP | `D=384` actor、learned-query 视觉压缩、trajectory-token cross-attention、归一化动作扩散 | query 先保存目标无关 metric geometry，再由独立 route query 融合目标；同一无量纲坐标用于训练和 ODE；无 ESDF 标签时不训练 critic |
 | X-NavDP | 深层条件生成器、逐层 FiLM 思想、时序一致性的重要性 | 用 adaRMS-Zero 做 time-route 调制；真实历史只作为条件，不让错误旧计划递归传播；当前阶段不做 GQRM/RL |
 | LoGoPlanner | geometry/state/route 的任务专用 query | CurveNav 已有标定 metric depth 和真实位姿，不复制重型视频三维重建模型；路线瓶颈直接监督当前局部专家终点 |
 | Past-Token Prediction | 用可观测过去约束未来的思想 | 历史已经由 condition encoder 显式编码；不再联合生成过去，因为过去重建误差不能代表未来轨迹质量 |
-| Flow Matching / DiT | 直线 CFM、少步 ODE、adaptive normalization zero-init | 对单专家 PointGoal 条件采用零源确定性 Flow，直接作用于弧长/航向/曲率的可执行坐标空间 |
+| Flow Matching / DiT | 直线 CFM、少步 ODE、adaptive normalization zero-init | 对单专家 PointGoal 条件采用零源确定性 Flow，在与可执行坐标严格双射的 O(1) 空间学习速度场 |
 | NoMaD | 生成分布适合多模态局部行为 | 不照搬为 goal-agnostic 统一策略服务的 50% goal mask；CurveNav 始终严格 PointGoal 条件 |
 
 主要来源：[SanD 论文](https://arxiv.org/abs/2602.00923) 与 [官方源码](https://github.com/WangJinCheng1998/sandplanner)、[NavDP 论文](https://arxiv.org/abs/2505.08712) 与 [官方源码](https://github.com/InternRobotics/NavDP)、[X-NavDP](https://arxiv.org/abs/2607.28560)、[LoGoPlanner](https://arxiv.org/abs/2512.19629)、[Past-Token Prediction](https://arxiv.org/abs/2505.09561)、[NoMaD](https://arxiv.org/abs/2310.07896)、[Flow Matching](https://arxiv.org/abs/2209.03003)、[DiT](https://arxiv.org/abs/2212.09748)。
