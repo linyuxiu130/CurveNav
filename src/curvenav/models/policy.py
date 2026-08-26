@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from curvenav.models.flow import FLOW_SELF_CONSISTENCY_WEIGHT
 from curvenav.trajectory import BoundedCurvatureTrajectory, PlanarBSplineCodec
 from curvenav.types import (
     ConditionFeatures,
@@ -15,13 +16,31 @@ from curvenav.types import (
 )
 
 
+TRAINING_LOSS_NAMES = (
+    "loss",
+    "flow_loss",
+    "flow_velocity_loss",
+    "flow_endpoint_loss",
+    "flow_consistency_loss",
+    "path_loss",
+    "tangent_loss",
+    "proposal_loss",
+)
+
+
 @dataclass
 class CurveNavLoss:
     loss: Tensor
     flow_loss: Tensor
+    flow_velocity_loss: Tensor
+    flow_endpoint_loss: Tensor
+    flow_consistency_loss: Tensor
     path_loss: Tensor
     tangent_loss: Tensor
     proposal_loss: Tensor
+
+    def logging_values(self) -> tuple[Tensor, ...]:
+        return tuple(getattr(self, name) for name in TRAINING_LOSS_NAMES)
 
 
 class CurveNavPolicy(nn.Module):
@@ -114,6 +133,15 @@ class CurveNavPolicy(nn.Module):
         weighted = direction_error * weights * valid
         return weighted.sum() / (weights * valid).sum().clamp_min(1.0)
 
+    @staticmethod
+    def _coordinate_loss(
+        predicted: Tensor,
+        target: Tensor,
+        free_mask: Tensor,
+    ) -> Tensor:
+        error = (predicted - target).square() * free_mask
+        return error.sum() / free_mask.sum().clamp_min(1.0)
+
     def training_loss(
         self,
         condition: PolicyCondition,
@@ -142,10 +170,6 @@ class CurveNavPolicy(nn.Module):
             encoded,
             free_mask.to(encoded.tokens.dtype),
         )
-        proposal_path, _, _ = self.curve_codec.decode(
-            self.trajectory_flow.denormalize_curve_coordinates(proposal_state),
-            condition.point_goal.float(),
-        )
         clean_future = self.trajectory_flow.normalize_curve_coordinates(
             self.curve_codec.encode_target(
                 smoothed_target_path,
@@ -157,22 +181,39 @@ class CurveNavPolicy(nn.Module):
             proposal_state.detach(),
             free_mask.to(clean_future.dtype),
         )
-        predicted_velocity = (
-            self.trajectory_flow(
-                flow_state,
-                time,
-                encoded.tokens,
-                encoded.route_token,
-            )
-            * free_mask
+        flow_prediction = self.trajectory_flow(
+            flow_state,
+            time,
+            encoded.tokens,
+            encoded.route_token,
         )
-        flow_error = (predicted_velocity - target_velocity).square()
-        flow_loss = (flow_error * free_mask).sum() / free_mask.sum().clamp_min(1)
+        predicted_velocity = flow_prediction.velocity * free_mask
+        predicted_endpoint = flow_prediction.endpoint * free_mask
+        flow_velocity_loss = self._coordinate_loss(
+            predicted_velocity,
+            target_velocity,
+            free_mask,
+        )
+        flow_endpoint_loss = self._coordinate_loss(
+            predicted_endpoint,
+            clean_future,
+            free_mask,
+        )
 
         reconstructed = self.trajectory_flow.reconstruct_clean(
             flow_state,
             time,
             predicted_velocity,
+        )
+        flow_consistency_loss = self._coordinate_loss(
+            predicted_endpoint,
+            reconstructed,
+            free_mask,
+        )
+        flow_loss = (
+            flow_velocity_loss
+            + flow_endpoint_loss
+            + FLOW_SELF_CONSISTENCY_WEIGHT * flow_consistency_loss
         )
         predicted_path, _, _ = self.curve_codec.decode(
             self.trajectory_flow.denormalize_curve_coordinates(reconstructed),
@@ -181,15 +222,19 @@ class CurveNavPolicy(nn.Module):
         reference_path = target.reference_path.float()
         path_loss = self._path_loss(predicted_path, reference_path)
         tangent_loss = self._tangent_loss(predicted_path, reference_path)
-        proposal_loss = (
-            self._path_loss(proposal_path, smoothed_target_path)
-            + self._tangent_loss(proposal_path, smoothed_target_path)
+        proposal_loss = self._coordinate_loss(
+            proposal_state,
+            clean_future,
+            free_mask,
         )
 
         loss = flow_loss + path_loss + tangent_loss + proposal_loss
         return CurveNavLoss(
             loss=loss,
             flow_loss=flow_loss,
+            flow_velocity_loss=flow_velocity_loss,
+            flow_endpoint_loss=flow_endpoint_loss,
+            flow_consistency_loss=flow_consistency_loss,
             path_loss=path_loss,
             tangent_loss=tangent_loss,
             proposal_loss=proposal_loss,

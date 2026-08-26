@@ -60,7 +60,19 @@ def trajectory_batch_metrics(
     reference_length = path_arc_length(reference_path)
     goal_distance = torch.linalg.vector_norm(point_goal, dim=-1)
     path_delta = path[:, 1:] - path[:, :-1]
+    reference_delta = reference_path[:, 1:] - reference_path[:, :-1]
     tangent_dot = (path_delta[:, 1:] * path_delta[:, :-1]).sum(dim=-1)
+    final_predicted_direction = path_delta[:, -1] / torch.linalg.vector_norm(
+        path_delta[:, -1], dim=-1, keepdim=True
+    ).clamp_min(1e-6)
+    final_reference_direction = reference_delta[:, -1] / torch.linalg.vector_norm(
+        reference_delta[:, -1], dim=-1, keepdim=True
+    ).clamp_min(1e-6)
+    final_dot = (final_predicted_direction * final_reference_direction).sum(dim=-1)
+    final_cross = (
+        final_predicted_direction[:, 0] * final_reference_direction[:, 1]
+        - final_predicted_direction[:, 1] * final_reference_direction[:, 0]
+    )
     return {
         "ade_m": point_error.mean(dim=-1),
         "rmse_m": difference.square().mean(dim=(-1, -2)).sqrt(),
@@ -73,6 +85,7 @@ def trajectory_batch_metrics(
         - torch.linalg.vector_norm(point_goal - reference_path[:, -1], dim=-1),
         "max_abs_curvature_inv_m": curvature.abs().amax(dim=-1),
         "reference_max_abs_curvature_inv_m": reference_curvature.abs().amax(dim=-1),
+        "terminal_heading_error_rad": torch.atan2(final_cross, final_dot).abs(),
         "has_tangent_reversal": (tangent_dot < 0).any(dim=-1),
     }
 
@@ -166,6 +179,11 @@ def measure_policy(
 
 
 def summarize_policy_metrics(metrics: dict[str, Tensor]) -> dict[str, float | int]:
+    reference_curvature = metrics["reference_max_abs_curvature_inv_m"]
+    high_curvature_threshold = torch.quantile(reference_curvature, 0.9)
+    high_curvature = reference_curvature >= high_curvature_threshold
+    predicted_high_curvature = metrics["max_abs_curvature_inv_m"][high_curvature]
+    reference_high_curvature = reference_curvature[high_curvature]
     result = {
         "ade_m": metrics["ade_m"].mean().item(),
         "rmse_m": metrics["rmse_m"].mean().item(),
@@ -184,6 +202,34 @@ def summarize_policy_metrics(metrics: dict[str, Tensor]) -> dict[str, float | in
         "reference_max_abs_curvature_inv_m_p95": torch.quantile(
             metrics["reference_max_abs_curvature_inv_m"], 0.95
         ).item(),
+        "terminal_heading_error_rad": metrics["terminal_heading_error_rad"]
+        .mean()
+        .item(),
+        "high_curvature_threshold_inv_m": high_curvature_threshold.item(),
+        "high_curvature_samples": int(high_curvature.sum().item()),
+        "ade_m_high_curvature_10pct": metrics["ade_m"][high_curvature].mean().item(),
+        "terminal_heading_error_rad_high_curvature_10pct": metrics[
+            "terminal_heading_error_rad"
+        ][high_curvature]
+        .mean()
+        .item(),
+        "predicted_max_abs_curvature_inv_m_high_curvature_10pct": (
+            predicted_high_curvature.mean().item()
+        ),
+        "reference_max_abs_curvature_inv_m_high_curvature_10pct": (
+            reference_high_curvature.mean().item()
+        ),
+        "predicted_to_reference_curvature_ratio_high_curvature_10pct": (
+            predicted_high_curvature.mean() / reference_high_curvature.mean()
+        ).item(),
+        "max_abs_curvature_correlation": torch.corrcoef(
+            torch.stack(
+                (
+                    metrics["max_abs_curvature_inv_m"],
+                    reference_curvature,
+                )
+            )
+        )[0, 1].item(),
         "tangent_reversal_fraction": metrics["has_tangent_reversal"]
         .float()
         .mean()

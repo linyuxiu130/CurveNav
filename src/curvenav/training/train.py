@@ -16,6 +16,7 @@ from curvenav.config_io import load_config
 from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.loader import build_policy_training_loader
 from curvenav.factory import build_policy
+from curvenav.models import TRAINING_LOSS_NAMES
 from curvenav.training.checkpoint import (
     build_training_contract,
     build_training_checkpoint,
@@ -221,7 +222,9 @@ def run_training(
 
     policy.train()
     step = start_step
-    window_losses = torch.zeros(5, device=accelerator.device)
+    window_losses = torch.zeros(
+        len(TRAINING_LOSS_NAMES), device=accelerator.device
+    )
     window_steps = 0
     window_overflow_retries = 0
     window_start = time.perf_counter()
@@ -236,7 +239,7 @@ def run_training(
         while True:
             torch.cuda.set_rng_state(flow_rng_state, accelerator.device)
             optimizer.zero_grad(set_to_none=True)
-            current_losses = torch.zeros(5, device=accelerator.device)
+            current_losses = torch.zeros_like(window_losses)
             for micro_step, batch in enumerate(batches):
                 synchronize = micro_step + 1 == micro_batches_per_step
                 synchronization_context = (
@@ -257,15 +260,7 @@ def run_training(
                     )
                     accelerator.backward(losses.loss * batch_weight)
                 current_losses += (
-                    torch.stack(
-                        (
-                            losses.loss,
-                            losses.flow_loss,
-                            losses.path_loss,
-                            losses.tangent_loss,
-                            losses.proposal_loss,
-                        )
-                    )
+                    torch.stack(losses.logging_values())
                     .detach()
                     .float()
                     * batch_weight
@@ -293,11 +288,7 @@ def run_training(
                     {
                         "epoch": epoch,
                         "step": step,
-                        "loss": mean_losses[0],
-                        "flow_loss": mean_losses[1],
-                        "path_loss": mean_losses[2],
-                        "tangent_loss": mean_losses[3],
-                        "proposal_loss": mean_losses[4],
+                        **dict(zip(TRAINING_LOSS_NAMES, mean_losses, strict=True)),
                         "learning_rate": scheduler.get_last_lr()[0],
                         "gradient_norm": grad_norm.detach().float().item(),
                         "loss_scale": float(grad_scaler.get_scale()),

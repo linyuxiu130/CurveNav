@@ -81,13 +81,14 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
     contract = checkpoint["policy_contract"]
     assert (
         checkpoint["checkpoint_type"]
-        == "curvenav_conditioned_proposal_residual_flow_bounded_curvature_policy"
+        == "curvenav_conditioned_proposal_self_consistent_flow_bounded_curvature_policy"
     )
     assert {"model", "optimizer", "scheduler", "ema", "grad_scaler"} <= set(checkpoint)
     assert "extra" not in checkpoint
     assert (
         contract["trajectory_flow_type"]
-        == "conditioned_curve_source_residual_bounded_curvature_rectified_flow_adarmszero_heun"
+        == "conditioned_curve_source_self_consistent_bounded_curvature_rectified_"
+        "flow_adarmszero_heun"
     )
     assert contract["flow_curve_coordinate_scale"] == pytest.approx(8.0)
     assert (
@@ -104,8 +105,13 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
     )
     assert (
         contract["training_objective"]
-        == "conditioned_proposal_geometry_plus_residual_flow_path_tangent"
+        == "conditioned_proposal_coordinates_plus_self_consistent_residual_flow_"
+        "path_tangent"
     )
+    assert contract["flow_prediction_targets"] == (
+        "shared_backbone_velocity_and_data_endpoint"
+    )
+    assert contract["flow_self_consistency_weight"] == pytest.approx(0.1)
     assert (
         contract["trajectory_prediction"]
         == "single_proposal_initialized_heun_trajectory"
@@ -151,7 +157,9 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
 def test_checkpoint_contract_catches_geometry_mismatch() -> None:
     config = CurveNavConfig()
     checkpoint = {
-        "checkpoint_type": "curvenav_conditioned_proposal_residual_flow_bounded_curvature_policy",
+        "checkpoint_type": (
+            "curvenav_conditioned_proposal_self_consistent_flow_bounded_curvature_policy"
+        ),
         "policy_contract": build_policy_contract(config),
     }
     validate_policy_contract(checkpoint, config)

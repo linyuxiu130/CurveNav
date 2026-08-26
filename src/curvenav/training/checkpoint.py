@@ -17,6 +17,7 @@ from curvenav.models import (
     CURVE_PROPOSAL_TYPE,
     FLOW_CURVE_COORDINATE_SCALE,
     FLOW_INFERENCE_SOURCE_TYPE,
+    FLOW_SELF_CONSISTENCY_WEIGHT,
     FLOW_TRAINING_SOURCE_TYPE,
     TRAJECTORY_FLOW_TYPE,
 )
@@ -32,7 +33,7 @@ from curvenav.trajectory import (
 
 
 CHECKPOINT_TYPE = (
-    "curvenav_conditioned_proposal_residual_flow_bounded_curvature_policy"
+    "curvenav_conditioned_proposal_self_consistent_flow_bounded_curvature_policy"
 )
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
@@ -119,8 +120,11 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "curve_proposal_type": CURVE_PROPOSAL_TYPE,
         "flow_source_gradient": "detached_from_flow_and_directly_supervised",
         "training_objective": (
-            "conditioned_proposal_geometry_plus_residual_flow_path_tangent"
+            "conditioned_proposal_coordinates_plus_self_consistent_residual_flow_"
+            "path_tangent"
         ),
+        "flow_prediction_targets": "shared_backbone_velocity_and_data_endpoint",
+        "flow_self_consistency_weight": FLOW_SELF_CONSISTENCY_WEIGHT,
         "trajectory_prediction": "single_proposal_initialized_heun_trajectory",
         "trajectory_flow_integration_steps": config.trajectory_flow.integration_steps,
         "condition_encoder_type": CONDITION_ENCODER_TYPE,

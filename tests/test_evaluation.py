@@ -30,8 +30,9 @@ def test_validation_ade_is_grouped_by_available_observation_frames() -> None:
         "reference_arc_length_m": torch.ones(3),
         "goal_progress_m": torch.ones(3),
         "reference_goal_progress_m": torch.ones(3),
-        "max_abs_curvature_inv_m": torch.ones(3),
-        "reference_max_abs_curvature_inv_m": torch.ones(3),
+        "max_abs_curvature_inv_m": torch.tensor([0.4, 0.8, 1.2]),
+        "reference_max_abs_curvature_inv_m": torch.tensor([0.5, 1.0, 2.0]),
+        "terminal_heading_error_rad": torch.tensor([0.1, 0.2, 0.3]),
         "has_tangent_reversal": torch.zeros(3, dtype=torch.bool),
         "valid_observation_frames": torch.tensor([1, 4, 1]),
     }
@@ -42,3 +43,5 @@ def test_validation_ade_is_grouped_by_available_observation_frames() -> None:
     assert summary["ade_m_with_1_frames"] == torch.tensor(0.25).item()
     assert summary["samples_with_4_frames"] == 1
     assert summary["ade_m_with_4_frames"] == torch.tensor(0.1).item()
+    assert summary["high_curvature_samples"] == 1
+    assert summary["ade_m_high_curvature_10pct"] == torch.tensor(0.2).item()

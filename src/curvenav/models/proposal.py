@@ -1,4 +1,4 @@
-"""Conditioned executable-curve proposal for residual Flow Matching."""
+"""Conditioned executable-curve source for self-consistent Flow Matching."""
 
 import torch
 from torch import Tensor, nn

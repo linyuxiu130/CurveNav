@@ -13,6 +13,7 @@ from curvenav.config import (
     TrajectoryConfig,
 )
 from curvenav.training.optimizer import build_optimizer
+from curvenav.models import FlowPrediction, TRAINING_LOSS_NAMES
 from curvenav.types import ConditionFeatures
 
 
@@ -69,17 +70,27 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
     for value in (
         losses.loss,
         losses.flow_loss,
+        losses.flow_velocity_loss,
+        losses.flow_endpoint_loss,
+        losses.flow_consistency_loss,
         losses.path_loss,
         losses.tangent_loss,
         losses.proposal_loss,
     ):
         assert value.ndim == 0 and torch.isfinite(value)
+    assert len(losses.logging_values()) == len(TRAINING_LOSS_NAMES)
     torch.testing.assert_close(
         losses.loss,
         losses.flow_loss
         + losses.path_loss
         + losses.tangent_loss
         + losses.proposal_loss,
+    )
+    torch.testing.assert_close(
+        losses.flow_loss,
+        losses.flow_velocity_loss
+        + losses.flow_endpoint_loss
+        + 0.1 * losses.flow_consistency_loss,
     )
     losses.loss.backward()
     gradients = [
@@ -188,6 +199,8 @@ def test_flow_training_source_is_the_deterministic_conditioned_proposal() -> Non
     policy = build_policy(tiny_config())
     assert torch.count_nonzero(policy.trajectory_flow.velocity_projection.weight) > 0
     assert torch.count_nonzero(policy.trajectory_flow.velocity_projection.bias) == 0
+    assert torch.count_nonzero(policy.trajectory_flow.endpoint_projection.weight) > 0
+    assert torch.count_nonzero(policy.trajectory_flow.endpoint_projection.bias) == 0
     inputs = condition(batch=4)
     encoded = policy.encode_condition(inputs)
     clean = torch.randn(4, 8, 2)
@@ -221,7 +234,7 @@ def test_heun_integration_transports_the_conditioned_proposal() -> None:
     )
 
     def constant_velocity(state, time, condition_tokens, route_token):
-        return velocity
+        return FlowPrediction(velocity=velocity, endpoint=target)
 
     flow.forward = constant_velocity
     transported = flow.integrate(

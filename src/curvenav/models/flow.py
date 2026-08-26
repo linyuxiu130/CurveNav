@@ -1,5 +1,6 @@
 """Conditional flow matching over future executable-curve coordinates."""
 
+from dataclasses import dataclass
 import math
 
 import torch
@@ -11,11 +12,21 @@ from curvenav.types import ConditionFeatures
 
 
 TRAJECTORY_FLOW_TYPE = (
-    "conditioned_curve_source_residual_bounded_curvature_rectified_flow_adarmszero_heun"
+    "conditioned_curve_source_self_consistent_bounded_curvature_rectified_flow_"
+    "adarmszero_heun"
 )
 FLOW_CURVE_COORDINATE_SCALE = 8.0
 FLOW_TRAINING_SOURCE_TYPE = "deterministic_conditioned_curve_proposal"
 FLOW_INFERENCE_SOURCE_TYPE = "same_conditioned_curve_proposal"
+FLOW_SELF_CONSISTENCY_WEIGHT = 0.1
+
+
+@dataclass(frozen=True)
+class FlowPrediction:
+    """Local velocity and data endpoint predicted from one shared flow state."""
+
+    velocity: Tensor
+    endpoint: Tensor
 
 
 class FourierTimeEmbedding(nn.Module):
@@ -42,7 +53,7 @@ class FourierTimeEmbedding(nn.Module):
 
 
 class CurvatureTrajectoryFlow(nn.Module):
-    """Refine one conditioned executable curve through a residual flow.
+    """Refine one conditioned executable curve through a self-consistent flow.
 
     For conditioned proposal ``b(c)`` and expert curve coordinates ``x_1``, the
     probability path is ``x_t = (1-t)b(c) + t x_1`` and its exact velocity is
@@ -72,8 +83,10 @@ class CurvatureTrajectoryFlow(nn.Module):
         )
         self.output_norm = RMSNorm(model_dim)
         self.velocity_projection = nn.Linear(model_dim, 2)
+        self.endpoint_projection = nn.Linear(model_dim, 2)
         nn.init.trunc_normal_(self.token_embedding, std=0.02)
         nn.init.zeros_(self.velocity_projection.bias)
+        nn.init.zeros_(self.endpoint_projection.bias)
 
     @staticmethod
     def normalize_curve_coordinates(curve_coordinates: Tensor) -> Tensor:
@@ -91,7 +104,7 @@ class CurvatureTrajectoryFlow(nn.Module):
         time: Tensor,
         condition_tokens: Tensor,
         route_token: Tensor,
-    ) -> Tensor:
+    ) -> FlowPrediction:
         if state.ndim != 3 or state.shape[1:] != (
             self.future_tokens,
             2,
@@ -105,7 +118,11 @@ class CurvatureTrajectoryFlow(nn.Module):
         modulation = self.time_embedding(time) + route_token
         for block in self.blocks:
             trajectory = block(trajectory, condition_tokens, modulation)
-        return self.velocity_projection(self.output_norm(trajectory))
+        trajectory = self.output_norm(trajectory)
+        return FlowPrediction(
+            velocity=self.velocity_projection(trajectory),
+            endpoint=self.endpoint_projection(trajectory),
+        )
 
     def training_path(
         self,
@@ -175,13 +192,13 @@ class CurvatureTrajectoryFlow(nn.Module):
                 time,
                 condition.tokens,
                 condition.route_token,
-            ) * mask
+            ).velocity * mask
             predictor = (state + step_size * velocity) * mask
             corrected = self(
                 predictor,
                 next_time,
                 condition.tokens,
                 condition.route_token,
-            ) * mask
+            ).velocity * mask
             state = (state + 0.5 * step_size * (velocity + corrected)) * mask
         return state
