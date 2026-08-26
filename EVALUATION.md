@@ -38,7 +38,7 @@
 
 当前 prepared dataset、checkpoint 合同和部署输入统一使用上述 Dingo D455 标定。旧 `0.40 m` 水平相机 checkpoint 与当前合同不兼容，必须直接拒绝，不能通过二维缩放或兼容分支继续评测。
 
-CurveNav 训练时从 masked isotropic Gaussian 源学习固定 `y=8x` 无量纲空间中的完整条件 Flow，部署时从该先验的唯一众数 `y0=0` 做八步 Heun 积分并直接得到一条未来轨迹。不存在 episode 随机状态、候选集、候选排序、历史重建打分、learned critic 或碰撞启发式。SanD 的随机候选由 ESDF 评价器选择，NavDP/X-NavDP 的多样候选由 critic/Q 机制约束；当前单专家阶段没有这些监督，因此随机执行一个未评价的样本不构成完整决策链。固定先验众数不改变 Gaussian Flow Matching 的训练分布，只把唯一部署输出定义为确定性中央 transport。离线只报告这条实际部署轨迹的 ADE、弧长、目标进展、延迟，以及弧长域曲率 B-spline 直接给出的连续曲率；不再用 XY 控制多边形离散转角冒充轨迹曲率界。
+CurveNav 训练时从 masked isotropic Gaussian 源学习固定 `y=8x` 无量纲空间中的完整条件 Flow，部署时从该先验的唯一众数 `y0=0` 做八步 Heun 积分并直接得到一条未来轨迹。不存在 episode 随机状态、候选集、候选排序、历史重建打分、learned critic 或碰撞启发式。SanD 的随机候选由 ESDF 评价器选择，NavDP/X-NavDP 的多样候选由 critic/Q 机制约束；当前单专家阶段没有这些监督，因此随机执行一个未评价的样本不构成完整决策链。固定先验众数不改变 Gaussian Flow Matching 的训练分布，只把唯一部署输出定义为确定性中央 transport。离线报告这条实际部署轨迹的 ADE、弧长、目标进展、延迟，以及弧长域曲率 B-spline 直接给出的连续曲率；ADE 同时按 1/2/3/4 帧有效观测分组，直接检查部署冷启动与完整历史条件下的轨迹质量。该分组只读取已有 `observation_valid` 掩码，不参与训练或推理；不再用 XY 控制多边形离散转角冒充轨迹曲率界。
 
 模型内部 64 点路径的第 0 点是当前机器人原点。官方 evaluator 会统一在 policy 返回值前追加当前原点，因此 CurveNav 的部署边界只发送内部路径的 `1:64` 共 63 个未来点；MPC 最终仍接收 64 点路径，且只有一个原点。NavDP/X-NavDP 的累积位移输出本来就不含当前点。若 CurveNav 发送内部第 0 点，evaluator 会制造两个连续原点，使 MPC 的起始离散曲率退化。
 

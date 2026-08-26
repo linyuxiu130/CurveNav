@@ -139,6 +139,9 @@ def measure_policy(
             reference_curvature,
             prepared.condition.point_goal.float(),
         )
+        metrics["valid_observation_frames"] = (
+            prepared.condition.observation_valid.sum(dim=-1)
+        )
         for name, value in metrics.items():
             values.setdefault(name, []).append(value.cpu())
         samples += len(prediction.path)
@@ -159,7 +162,7 @@ def measure_policy(
     )
 
 
-def summarize_policy_metrics(metrics: dict[str, Tensor]) -> dict[str, float]:
+def summarize_policy_metrics(metrics: dict[str, Tensor]) -> dict[str, float | int]:
     result = {
         "ade_m": metrics["ade_m"].mean().item(),
         "rmse_m": metrics["rmse_m"].mean().item(),
@@ -183,6 +186,13 @@ def summarize_policy_metrics(metrics: dict[str, Tensor]) -> dict[str, float]:
         .mean()
         .item(),
     }
+    valid_frames = metrics["valid_observation_frames"]
+    for frame_count in valid_frames.unique(sorted=True).tolist():
+        selected = valid_frames == frame_count
+        result[f"samples_with_{frame_count}_frames"] = int(selected.sum().item())
+        result[f"ade_m_with_{frame_count}_frames"] = (
+            metrics["ade_m"][selected].mean().item()
+        )
     if not all(torch.isfinite(torch.tensor(value)) for value in result.values()):
         raise FloatingPointError(f"validation metrics are non-finite: {result}")
     return result
