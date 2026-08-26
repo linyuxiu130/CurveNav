@@ -45,7 +45,7 @@ class DepthFeatures:
 class ConditionFeatures:
     tokens: Tensor
     route_token: Tensor
-    local_subgoal: Tensor
+    route_anchors: Tensor
 
 
 @dataclass

@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from curvenav.conditioning import ROUTE_ANCHOR_COUNT
 from curvenav.trajectory import BoundedCurvatureTrajectory, PlanarBSplineCodec
 from curvenav.types import (
     ConditionFeatures,
@@ -21,7 +22,7 @@ class CurveNavLoss:
     flow_loss: Tensor
     path_loss: Tensor
     tangent_loss: Tensor
-    subgoal_loss: Tensor
+    route_loss: Tensor
 
 
 class CurveNavPolicy(nn.Module):
@@ -49,6 +50,16 @@ class CurveNavPolicy(nn.Module):
         self.register_buffer(
             "near_path_weights",
             near_weights / near_weights.mean(),
+            persistent=True,
+        )
+        route_anchor_indices = torch.linspace(
+            0,
+            curve_codec.num_path_points - 1,
+            ROUTE_ANCHOR_COUNT + 1,
+        )[1:].round().to(torch.long)
+        self.register_buffer(
+            "route_anchor_indices",
+            route_anchor_indices,
             persistent=True,
         )
 
@@ -110,13 +121,14 @@ class CurveNavPolicy(nn.Module):
         weighted = direction_error * weights * valid
         return weighted.sum() / (weights * valid).sum().clamp_min(1.0)
 
-    def _subgoal_loss(
+    def _route_loss(
         self,
         encoded: ConditionFeatures,
         reference_path: Tensor,
     ) -> Tensor:
+        reference_anchors = reference_path[:, self.route_anchor_indices]
         error = torch.linalg.vector_norm(
-            encoded.local_subgoal - reference_path[:, -1],
+            encoded.route_anchors - reference_anchors,
             dim=-1,
         ) / self.planning_horizon_m
         return error.mean()
@@ -179,15 +191,15 @@ class CurveNavPolicy(nn.Module):
         reference_path = target.reference_path.float()
         path_loss = self._path_loss(predicted_path, reference_path)
         tangent_loss = self._tangent_loss(predicted_path, reference_path)
-        subgoal_loss = self._subgoal_loss(encoded, reference_path)
+        route_loss = self._route_loss(encoded, smoothed_target_path)
 
-        loss = flow_loss + path_loss + tangent_loss + subgoal_loss
+        loss = flow_loss + path_loss + tangent_loss + route_loss
         return CurveNavLoss(
             loss=loss,
             flow_loss=flow_loss,
             path_loss=path_loss,
             tangent_loss=tangent_loss,
-            subgoal_loss=subgoal_loss,
+            route_loss=route_loss,
         )
 
     @torch.no_grad()

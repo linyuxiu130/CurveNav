@@ -25,9 +25,9 @@ prediction geometry    heading/curvature [B,64]
 4× (x,y,sin Δyaw,cos Δyaw) ──────────────── 4 explicit state tokens ──┤
 PointGoal direction + log range ─────────────────────── goal token ───┤
                                                                       ↓
-                                      2× route-query cross-attention
+                                      4 ordered route queries, 2× cross-attention
                                       4× joint condition Transformer
-                                      supervised local-route bottleneck
+                                      4 supervised metric route anchors
                                                                       ↓
                                       8 future bounded-curvature tokens
                                       fixed coordinate map y = 8x
@@ -39,7 +39,7 @@ PointGoal direction + log range ────────────────
           PointGoal-scaled arc-length/curvature decoder → metric local path
 ```
 
-训练和部署只组装这一张图。checkpoint 类型为 `curvenav_current_context_gaussian_flow_zero_mode_bounded_curvature_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
+训练和部署只组装这一张图。checkpoint 类型为 `curvenav_ordered_route_anchors_gaussian_flow_zero_mode_bounded_curvature_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
 
 ## 2. 视觉几何、历史状态与路线融合
 
@@ -83,22 +83,23 @@ feature(g) = [g/max(r,ε), log(1+min(r,25 m))/log(26)].
 
 CurveNav 的任务合同始终提供 PointGoal，因此不采用 NoMaD/NavDP 为统一 goal-conditioned/goal-agnostic 策略而使用的 50% goal mask。对本任务机械照搬该 mask 会无依据地删除一半目标监督。
 
-### 2.3 监督路线瓶颈
+### 2.3 有序监督路线锚点
 
-一个 learned route query 与 goal token 相加后，连续两次 cross-attend `[state, geometry]`；随后 `[route, goal, 4 state, 64 geometry]` 共 70 个 token 经过四层联合 condition Transformer。路线 latent `q_r` 预测当前 3.6 m 规划盘内的专家局部终点：
-
-```text
-a = MLP(q_r),
-s_hat = 3.6 a / sqrt(1 + ||a||²).
-```
-
-这个光滑映射把任意二维向量映到开单位圆盘，零点处导数良好，也不需要预测后裁剪。预测的 `s_hat` 经 MLP 重新注入 route token：
+单个二维局部终点不能区分绕过同一障碍的不同路线形状，也会把近端可执行方向和远端进展压进同一个 latent。CurveNav 使用四个有序 learned route query；每个 query 与 goal token 相加，连续两次 cross-attend `[state, geometry]`。随后 `[4 route, goal, 4 state, 64 geometry]` 共 73 个 token 经过四层联合 condition Transformer。四个 route latent 分别预测平滑专家路径在 `1/4、2/4、3/4、4/4` 等弧长进度处的二维锚点：
 
 ```text
-c_route = RMSNorm(q_r + MLP(s_hat / 3.6)).
+a_i = MLP(q_i),
+r_hat_i = 3.6 a_i / sqrt(1 + ||a_i||²),   i=1..4.
 ```
 
-Flow 同时 cross-attend 全部 70 个条件 token，并在每一层用 `c_route` 调制。训练与部署都使用预测路线，不把真实子目标喂给生成器，因此没有 teacher-forcing 落差。该 head 是生成条件的路线监督，不是对候选打分的评价头。
+该光滑映射把任意二维向量映到 3.6 m 开圆盘，零点处导数良好，也不需要预测后裁剪。每个预测锚点经同一个 MLP 重新注入对应的有序 route token；四个 token 的归一化均值形成逐层调制向量：
+
+```text
+c_i = RMSNorm(q_i + MLP(r_hat_i / 3.6)),
+c_route = RMSNorm(mean_i c_i).
+```
+
+Flow cross-attend 全部 73 个条件 token，因此保留四个锚点的顺序和局部路线形状；`c_route` 只提供全局调制。训练与部署都使用预测锚点，不把真实路线喂给生成器，因此没有 teacher-forcing 落差。这四个 head 共享参数，是唯一轨迹生成器的低频路线骨架，不是候选轨迹的评价头。它吸收 SanD 的结构化低维控制点和 NavDP/X-NavDP 的有序动作 token，但最终执行轨迹仍由同一个连续有界曲率 Flow 产生。
 
 ## 3. PointGoal 标度的有界曲率曲线
 
@@ -189,7 +190,7 @@ y_hat_1 = y_t + (1-t)v_θ(y_t,t,C).
 8 个未来 token 加 learned token-position embedding。八层 Flow block 均包含：
 
 1. 8 token 双向 self-attention，使弧长、初始航向和七个曲率控制直接交换信息；
-2. 对 70 个 condition token 的 cross-attention，保留局部几何的 token 级信息；
+2. 对 73 个 condition token 的 cross-attention，保留局部几何和有序路线锚点的 token 级信息；
 3. SwiGLU feed-forward；
 4. 由 Fourier flow time 与 `c_route` 共同产生的 adaRMS-Zero shift、scale 和 residual gate。
 
@@ -220,7 +221,7 @@ L = L_flow + L_path + L_tangent + L_route.
 - `L_flow`：上述 O(1) 归一化 Gaussian-source future masked velocity MSE。
 - `L_path`：每个等弧长位置的欧氏误差 `||p_hat-p*||₂/H`；使用 `0.25+exp(-4s)` 并归一到均值一，强调马上要执行的近端。
 - `L_tangent`：有效相邻路径段的 `1-cos(Δp_hat,Δp*)`，使用相同近端权重。
-- `L_route`：预测局部终点与专家参考终点的欧氏误差 `||s_hat-s*||₂/H`。
+- `L_route`：四个预测路线锚点与同一平滑专家路径相同等弧长进度点的平均欧氏误差 `mean_i ||r_hat_i-r_i*||₂/H`。
 
 不另加平滑 loss 或后处理：连续曲率界和高阶路径平滑由弧长域参数化直接给出，路径和切向项负责实际 metric 几何。训练日志分别记录四项损失，避免总 loss 掩盖某个子任务失效。
 
@@ -229,9 +230,9 @@ L = L_flow + L_path + L_tangent + L_route.
 | 来源 | 吸收的有效设计 | CurveNav 的针对性改进 |
 |---|---|---|
 | SanD | 四帧共享深度 backbone、空间 token、平滑低维轨迹先验、归一化高斯生成 | 教师 B-spline 只做标签平滑；生产输出改为 PointGoal 标度的连续有界曲率曲线；没有 ESDF 评价器时用先验众数生成唯一确定轨迹 |
-| NavDP | `D=384` actor、当前深度与历史 memory 分工、learned-query 视觉压缩、trajectory-token cross-attention、高斯动作扩散 | 32 个 current query 保证即时几何，32 个 context query 补全历史视野，再由独立 route query 融合目标；同一无量纲坐标用于训练和 ODE；无 ESDF 标签时不训练 critic |
+| NavDP | `D=384` actor、当前深度与历史 memory 分工、learned-query 视觉压缩、trajectory-token cross-attention、高斯动作扩散 | 32 个 current query 保证即时几何，32 个 context query 补全历史视野，四个有序 route query 显式表达局部路线；同一无量纲坐标用于训练和 ODE；无 ESDF 标签时不训练 critic |
 | X-NavDP | 深层条件生成器、逐层 FiLM 思想、闭环时序一致性 | 用 adaRMS-Zero 做 time-route 调制；真实执行历史承担时序状态；当前阶段不做 GQRM/RL，也不随机执行未经 Q 选择的候选 |
-| LoGoPlanner | geometry/state/route 的任务专用 query | CurveNav 已有标定 metric depth 和真实位姿，不复制重型视频三维重建模型；路线瓶颈直接监督当前局部专家终点 |
+| LoGoPlanner | geometry/state/route 的任务专用 query | CurveNav 已有标定 metric depth 和真实位姿，不复制重型视频三维重建模型；四个路线 query 直接监督专家路径的等弧长骨架 |
 | Past-Token Prediction | 用可观测过去约束未来的思想 | 历史已经由 condition encoder 显式编码；不再联合生成过去，因为过去重建误差不能代表未来轨迹质量 |
 | Flow Matching / DiT | Gaussian-to-data 直线 CFM、少步 ODE、adaptive normalization | 在与可执行坐标严格双射的 O(1) 空间学习多模态速度场；只保留残差 gate 零初始化，输出头从第一步传递梯度 |
 | NoMaD | 生成分布适合多模态局部行为 | 不照搬为 goal-agnostic 统一策略服务的 50% goal mask；CurveNav 始终严格 PointGoal 条件 |
@@ -248,7 +249,7 @@ L = L_flow + L_path + L_tangent + L_route.
 
 必要验证分三层：
 
-1. 张量/数学单测：相机反投影、历史 mask、geometry/route token、PointGoal 标度、零目标停止、连续曲率硬界、教师 B-spline、checkpoint 和部署接口；
+1. 张量/数学单测：相机反投影、历史 mask、geometry token、有序 route anchors、PointGoal 标度、零目标停止、连续曲率硬界、教师 B-spline、checkpoint 和部署接口；
 2. 前向/梯度：训练 loss、全部参数梯度、零先验众数的确定性推理、静态编译图和有限值；
 3. 重新训练后的 held-out/闭环：ADE、弧长、目标进展、曲率、延迟，以及固定协议 SR/SPL。
 

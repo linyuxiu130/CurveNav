@@ -72,12 +72,12 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
         losses.flow_loss,
         losses.path_loss,
         losses.tangent_loss,
-        losses.subgoal_loss,
+        losses.route_loss,
     ):
         assert value.ndim == 0 and torch.isfinite(value)
     torch.testing.assert_close(
         losses.loss,
-        losses.flow_loss + losses.path_loss + losses.tangent_loss + losses.subgoal_loss,
+        losses.flow_loss + losses.path_loss + losses.tangent_loss + losses.route_loss,
     )
     losses.loss.backward()
     gradients = [
@@ -210,7 +210,7 @@ def test_heun_integration_transports_the_zero_prior_mode() -> None:
     encoded = ConditionFeatures(
         tokens=torch.zeros(batch, 1, 32),
         route_token=torch.zeros(batch, 32),
-        local_subgoal=torch.zeros(batch, 2),
+        route_anchors=torch.zeros(batch, 4, 2),
     )
 
     def constant_velocity(state, time, condition_tokens, route_token):
@@ -233,6 +233,24 @@ def test_flow_curve_coordinate_normalization_is_exact_and_order_one() -> None:
         coordinates,
     )
     assert normalized.abs().max() >= 0.5
+
+
+def test_route_anchors_follow_ordered_uniform_arc_progress() -> None:
+    policy = build_policy(tiny_config())
+    path = torch.zeros(2, 16, 2)
+    path[..., 0] = torch.linspace(0.0, 3.6, 16)
+    anchors = path[:, policy.route_anchor_indices]
+    encoded = ConditionFeatures(
+        tokens=torch.zeros(2, 1, 32),
+        route_token=torch.zeros(2, 32),
+        route_anchors=anchors,
+    )
+
+    torch.testing.assert_close(policy._route_loss(encoded, path), torch.tensor(0.0))
+    torch.testing.assert_close(
+        anchors[0, :, 0],
+        torch.tensor([0.96, 1.92, 2.64, 3.60]),
+    )
 
 
 def test_future_flow_has_no_generated_history_or_candidate_set() -> None:
@@ -318,9 +336,11 @@ def test_sand_spatial_tokens_and_geometry_query_compression_have_fixed_contract(
     assert torch.all(mask[:32, :12])
     assert not torch.any(mask[:32, 12:])
     assert not torch.any(mask[32:])
-    assert encoded.tokens.shape == (1, 1 + 1 + 4 + 64, 32)
-    torch.testing.assert_close(encoded.tokens[:, 0], encoded.route_token)
-    assert torch.linalg.vector_norm(encoded.local_subgoal, dim=-1).max() <= 3.6
+    assert encoder.route_query_embedding.shape == (1, 4, 32)
+    assert encoded.tokens.shape == (1, 4 + 1 + 4 + 64, 32)
+    assert encoded.route_anchors.shape == (1, 4, 2)
+    assert torch.linalg.vector_norm(encoded.route_anchors, dim=-1).max() <= 3.6
+    assert torch.equal(policy.route_anchor_indices, torch.tensor([4, 8, 11, 15]))
 
 
 def test_learned_token_embeddings_are_not_weight_decayed() -> None:

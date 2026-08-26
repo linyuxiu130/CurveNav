@@ -81,7 +81,7 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
     contract = checkpoint["policy_contract"]
     assert (
         checkpoint["checkpoint_type"]
-        == "curvenav_current_context_gaussian_flow_zero_mode_bounded_curvature_policy"
+        == "curvenav_ordered_route_anchors_gaussian_flow_zero_mode_bounded_curvature_policy"
     )
     assert {"model", "optimizer", "scheduler", "ema", "grad_scaler"} <= set(checkpoint)
     assert "extra" not in checkpoint
@@ -94,7 +94,7 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
     assert contract["flow_inference_source_type"] == "zero_prior_mode"
     assert (
         contract["training_objective"]
-        == "gaussian_source_future_flow_plus_metric_path_tangent_subgoal"
+        == "gaussian_source_future_flow_plus_metric_path_tangent_route_anchors"
     )
     assert (
         contract["trajectory_prediction"]
@@ -107,6 +107,11 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
         "downward_pitch_degrees": pytest.approx(10.0),
     }
     assert contract["num_curve_tokens"] == 8
+    assert contract["route_anchor_count"] == 4
+    assert (
+        contract["route_anchor_sampling"]
+        == "uniform_metric_arc_progress_excluding_origin"
+    )
     assert contract["num_curvature_control_points"] == 7
     assert contract["path_sampling"] == "fixed_uniform_metric_arc_progress"
     assert contract["curve_coordinates"] == (
@@ -139,7 +144,7 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
 def test_checkpoint_contract_catches_geometry_mismatch() -> None:
     config = CurveNavConfig()
     checkpoint = {
-        "checkpoint_type": "curvenav_current_context_gaussian_flow_zero_mode_bounded_curvature_policy",
+        "checkpoint_type": "curvenav_ordered_route_anchors_gaussian_flow_zero_mode_bounded_curvature_policy",
         "policy_contract": build_policy_contract(config),
     }
     validate_policy_contract(checkpoint, config)

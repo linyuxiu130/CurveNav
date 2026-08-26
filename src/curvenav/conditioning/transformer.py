@@ -10,9 +10,10 @@ from curvenav.types import ConditionFeatures, DepthFeatures
 CURRENT_GEOMETRY_QUERY_COUNT = 32
 CONTEXT_GEOMETRY_QUERY_COUNT = 32
 GEOMETRY_QUERY_COUNT = CURRENT_GEOMETRY_QUERY_COUNT + CONTEXT_GEOMETRY_QUERY_COUNT
+ROUTE_ANCHOR_COUNT = 4
 ROUTE_QUERY_LAYERS = 2
 CONDITION_ENCODER_TYPE = (
-    "current_context_metric_geometry_queries_supervised_route_bottleneck_explicit_state"
+    "current_context_metric_geometry_ordered_route_anchor_queries_explicit_state"
 )
 
 
@@ -114,7 +115,9 @@ class PolicyConditionEncoder(nn.Module):
         self.invalid_state_embedding = nn.Parameter(
             torch.zeros(1, observation_frames, model_dim)
         )
-        self.route_query_embedding = nn.Parameter(torch.zeros(1, 1, model_dim))
+        self.route_query_embedding = nn.Parameter(
+            torch.zeros(1, ROUTE_ANCHOR_COUNT, model_dim)
+        )
         self.route_blocks = nn.ModuleList(
             CrossAttentionBlock(model_dim, transformer_heads, dropout)
             for _ in range(ROUTE_QUERY_LAYERS)
@@ -124,17 +127,18 @@ class PolicyConditionEncoder(nn.Module):
             for _ in range(transformer_layers)
         )
         self.output_norm = RMSNorm(model_dim)
-        self.subgoal_head = nn.Sequential(
+        self.route_anchor_head = nn.Sequential(
             nn.Linear(model_dim, model_dim),
             nn.SiLU(),
             nn.Linear(model_dim, 2),
         )
-        self.subgoal_embedding = nn.Sequential(
+        self.route_anchor_embedding = nn.Sequential(
             nn.Linear(2, model_dim),
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
         self.route_output_norm = RMSNorm(model_dim)
+        self.route_summary_norm = RMSNorm(model_dim)
         nn.init.trunc_normal_(self.frame_slot_embedding, std=0.02)
         nn.init.trunc_normal_(self.current_geometry_query_embedding, std=0.02)
         nn.init.trunc_normal_(self.context_geometry_query_embedding, std=0.02)
@@ -208,17 +212,18 @@ class PolicyConditionEncoder(nn.Module):
         for block in self.condition_blocks:
             tokens = block(tokens)
         tokens = self.output_norm(tokens)
-        route_latent = tokens[:, 0]
-        local_subgoal = self.planning_horizon_m * self._unit_disk(
-            self.subgoal_head(route_latent)
+        route_latent = tokens[:, :ROUTE_ANCHOR_COUNT]
+        route_anchors = self.planning_horizon_m * self._unit_disk(
+            self.route_anchor_head(route_latent)
         )
-        route_token = self.route_output_norm(
+        route_tokens = self.route_output_norm(
             route_latent
-            + self.subgoal_embedding(local_subgoal / self.planning_horizon_m)
+            + self.route_anchor_embedding(route_anchors / self.planning_horizon_m)
         )
-        tokens = torch.cat((route_token[:, None], tokens[:, 1:]), dim=1)
+        route_token = self.route_summary_norm(route_tokens.mean(dim=1))
+        tokens = torch.cat((route_tokens, tokens[:, ROUTE_ANCHOR_COUNT:]), dim=1)
         return ConditionFeatures(
             tokens=tokens,
             route_token=route_token,
-            local_subgoal=local_subgoal,
+            route_anchors=route_anchors,
         )

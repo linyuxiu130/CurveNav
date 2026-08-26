@@ -263,7 +263,7 @@ def run_training(
                             losses.flow_loss,
                             losses.path_loss,
                             losses.tangent_loss,
-                            losses.subgoal_loss,
+                            losses.route_loss,
                         )
                     )
                     .detach()
@@ -297,7 +297,7 @@ def run_training(
                         "flow_loss": mean_losses[1],
                         "path_loss": mean_losses[2],
                         "tangent_loss": mean_losses[3],
-                        "subgoal_loss": mean_losses[4],
+                        "route_loss": mean_losses[4],
                         "learning_rate": scheduler.get_last_lr()[0],
                         "gradient_norm": grad_norm.detach().float().item(),
                         "loss_scale": float(grad_scaler.get_scale()),
