@@ -55,6 +55,11 @@ y_o = z(v-cy)/fy,
 p_body = (a + cos(α)z - sin(α)y_o, -x_o).
 ```
 
+部署输入允许 benchmark 在保持 horizontal/vertical aperture 不变时改变像素采样率。
+若参考内参 `K` 的分辨率为 `(W,H)`，实际深度分辨率为 `(W',H')`，则先使用
+`K' = diag(W'/W,H'/H,1)K`；这保持每个归一化像平面射线和 FoV 不变，再重投影到
+固定的 `224×126` 模型相机。它是同一相机合同的解析重采样，不是图像尺寸 fallback。
+
 历史点用真实位姿变换到当前机器人系：
 
 ```text

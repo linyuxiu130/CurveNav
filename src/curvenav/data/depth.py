@@ -18,14 +18,29 @@ class PinholeIntrinsics:
     cx: float
     cy: float
 
+    def at_resolution(self, width: int, height: int) -> "PinholeIntrinsics":
+        """Resample the same horizontal and vertical field of view."""
+        if width < 1 or height < 1:
+            raise ValueError("pinhole resolution must be positive")
+        scale_x = width / self.width
+        scale_y = height / self.height
+        return PinholeIntrinsics(
+            width=width,
+            height=height,
+            fx=self.fx * scale_x,
+            fy=self.fy * scale_y,
+            cx=self.cx * scale_x,
+            cy=self.cy * scale_y,
+        )
+
 
 BENCHMARK_INTRINSICS = PinholeIntrinsics(
     width=640,
     height=360,
     fx=326.398559570312,
     fy=326.398559570312,
-    cx=321.792145,
-    cy=181.007690,
+    cx=320.0,
+    cy=180.0,
 )
 CANONICAL_INTRINSICS = PinholeIntrinsics(
     width=224,
@@ -74,17 +89,18 @@ def preprocess_metric_depth(
     source_intrinsics: PinholeIntrinsics,
     maximum_m: float,
 ) -> np.ndarray:
-    """Reproject physical depth into CurveNav's fixed pinhole camera and normalize."""
+    """Reproject one calibrated FoV at its delivered sampling resolution."""
     frame = np.asarray(depth_m, dtype=np.float32)
-    if frame.shape != (source_intrinsics.height, source_intrinsics.width):
-        raise ValueError(
-            "depth shape does not match source intrinsics: "
-            f"{frame.shape} != {(source_intrinsics.height, source_intrinsics.width)}"
-        )
+    if frame.ndim != 2:
+        raise ValueError(f"depth must be a two-dimensional image, got {frame.shape}")
+    sampled_intrinsics = source_intrinsics.at_resolution(
+        width=frame.shape[1],
+        height=frame.shape[0],
+    )
     invalid = ~np.isfinite(frame) | (frame <= 0.0)
     frame = frame.copy()
     frame[invalid] = maximum_m
-    map_x, map_y = _pinhole_remap(source_intrinsics, CANONICAL_INTRINSICS)
+    map_x, map_y = _pinhole_remap(sampled_intrinsics, CANONICAL_INTRINSICS)
     canonical = cv2.remap(
         frame,
         map_x,

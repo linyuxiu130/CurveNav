@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from curvenav.config import CurveNavConfig
 from curvenav.data.depth import BENCHMARK_INTRINSICS, preprocess_metric_depth
@@ -18,6 +19,33 @@ def test_invalid_depth_is_encoded_as_sensor_limit():
     assert normalized.shape == (126, 224)
     assert normalized[63, 112] == 1.0
     np.testing.assert_allclose(normalized[0, 0], 0.8)
+
+
+def test_benchmark_depth_resolution_rescales_the_same_camera_rays():
+    half = BENCHMARK_INTRINSICS.at_resolution(width=320, height=180)
+    assert half.fx == BENCHMARK_INTRINSICS.fx / 2
+    assert half.fy == BENCHMARK_INTRINSICS.fy / 2
+    assert half.cx == 160.0
+    assert half.cy == 90.0
+
+    full_depth = np.full((360, 640), 2.0, dtype=np.float32)
+    half_depth = np.full((180, 320), 2.0, dtype=np.float32)
+    full = preprocess_metric_depth(
+        full_depth, source_intrinsics=BENCHMARK_INTRINSICS, maximum_m=5.0
+    )
+    downsampled = preprocess_metric_depth(
+        half_depth, source_intrinsics=BENCHMARK_INTRINSICS, maximum_m=5.0
+    )
+    np.testing.assert_array_equal(downsampled, full)
+
+
+def test_depth_preprocessing_rejects_non_image_input():
+    with pytest.raises(ValueError, match="two-dimensional"):
+        preprocess_metric_depth(
+            np.ones((1, 180, 320), dtype=np.float32),
+            source_intrinsics=BENCHMARK_INTRINSICS,
+            maximum_m=5.0,
+        )
 
 
 def test_depth_context_uses_expert_spatial_offsets():
