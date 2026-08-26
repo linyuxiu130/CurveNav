@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+import pytest
 import torch
 
 from curvenav import PolicyCondition, TrajectoryTarget, build_policy
@@ -13,6 +14,7 @@ from curvenav.config import (
     TrajectoryConfig,
 )
 from curvenav.training.optimizer import build_optimizer
+from curvenav.types import ConditionFeatures
 
 
 def tiny_config() -> CurveNavConfig:
@@ -54,7 +56,7 @@ def condition(batch: int = 2) -> PolicyCondition:
     )
 
 
-def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -> None:
+def test_policy_trains_every_module_and_returns_one_latent_conditioned_trajectory() -> None:
     torch.manual_seed(0)
     policy = build_policy(tiny_config())
     inputs = condition(batch=8)
@@ -87,9 +89,15 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
     )
 
     policy.eval()
-    first = policy(inputs)
+    generator = torch.Generator().manual_seed(7)
+    source = policy.trajectory_flow.sample_source(
+        len(inputs.point_goal),
+        policy.curve_codec.free_mask,
+        generator=generator,
+    )
+    first = policy.sample(inputs, source)
     torch.manual_seed(999)
-    second = policy(inputs)
+    second = policy.sample(inputs, source)
     assert first.path.shape == (8, 16, 2)
     assert first.heading.shape == (8, 16)
     assert first.curvature.shape == (8, 16)
@@ -170,10 +178,63 @@ def test_flow_endpoint_reconstruction_matches_linear_path_identity() -> None:
     free_mask = policy.curve_codec.free_mask[None].expand(3, -1, -1)
     clean = clean * free_mask
     state, time, velocity = flow.training_path(clean, free_mask)
-    torch.testing.assert_close(state, time[:, None, None] * clean)
-    torch.testing.assert_close(velocity, clean)
+    source = clean - velocity
+    torch.testing.assert_close(
+        state,
+        (1.0 - time[:, None, None]) * source + time[:, None, None] * clean,
+    )
+    torch.testing.assert_close(source * free_mask, source)
     reconstructed = flow.reconstruct_clean(state, time, velocity)
     torch.testing.assert_close(reconstructed, clean)
+
+
+def test_flow_source_is_gaussian_masked_and_reproducible() -> None:
+    policy = build_policy(tiny_config())
+    assert torch.count_nonzero(policy.trajectory_flow.velocity_projection.weight) > 0
+    assert torch.count_nonzero(policy.trajectory_flow.velocity_projection.bias) == 0
+    first_generator = torch.Generator().manual_seed(17)
+    second_generator = torch.Generator().manual_seed(17)
+    first = policy.trajectory_flow.sample_source(
+        1024,
+        policy.curve_codec.free_mask,
+        generator=first_generator,
+    )
+    second = policy.trajectory_flow.sample_source(
+        1024,
+        policy.curve_codec.free_mask,
+        generator=second_generator,
+    )
+    torch.testing.assert_close(first, second)
+    assert first[:, policy.curve_codec.free_mask].std().item() == pytest.approx(
+        1.0,
+        abs=0.03,
+    )
+    assert torch.equal(
+        first[:, ~policy.curve_codec.free_mask],
+        torch.zeros_like(first[:, ~policy.curve_codec.free_mask]),
+    )
+
+
+def test_heun_integration_transports_the_supplied_source() -> None:
+    policy = build_policy(tiny_config())
+    flow = policy.trajectory_flow
+    batch = 2
+    mask = policy.curve_codec.free_mask[None].expand(batch, -1, -1)
+    source = torch.randn(batch, flow.future_tokens, 2) * mask
+    target = torch.randn_like(source) * mask
+    velocity = target - source
+    encoded = ConditionFeatures(
+        tokens=torch.zeros(batch, 1, 32),
+        route_token=torch.zeros(batch, 32),
+        local_subgoal=torch.zeros(batch, 2),
+    )
+
+    def constant_velocity(state, time, condition_tokens, route_token):
+        return velocity
+
+    flow.forward = constant_velocity
+    transported = flow.integrate(encoded, source, integration_steps=4, free_mask=mask)
+    torch.testing.assert_close(transported, target)
 
 
 def test_flow_curve_coordinate_normalization_is_exact_and_order_one() -> None:
@@ -190,7 +251,7 @@ def test_flow_curve_coordinate_normalization_is_exact_and_order_one() -> None:
     assert normalized.abs().max() >= 0.5
 
 
-def test_future_flow_has_no_generated_history_or_candidate_state() -> None:
+def test_future_flow_has_no_generated_history_or_candidate_set() -> None:
     policy = build_policy(tiny_config())
     flow = policy.trajectory_flow
     assert flow.future_tokens == policy.curve_codec.num_curve_tokens

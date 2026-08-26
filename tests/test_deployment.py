@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -13,9 +15,24 @@ from curvenav.deployment.runtime import (
 class _RecordingPolicy:
     def __init__(self) -> None:
         self.conditions = []
+        self.sources = []
+        free_mask = torch.zeros(8, 2, dtype=torch.bool)
+        free_mask[0] = True
+        free_mask[1:, 0] = True
+        self.curve_codec = SimpleNamespace(free_mask=free_mask)
+        self.trajectory_flow = self
 
-    def __call__(self, condition):
+    def sample_source(self, batch_size, free_mask, *, generator):
+        return torch.randn(
+            batch_size,
+            8,
+            2,
+            generator=generator,
+        ) * free_mask
+
+    def sample(self, condition, source):
         self.conditions.append(condition)
+        self.sources.append(source.clone())
 
 
 def test_invalid_depth_is_encoded_as_sensor_limit():
@@ -71,6 +88,32 @@ def test_runtime_reset_warms_the_actual_batch_execution() -> None:
     assert condition.point_goal.shape == (3, 2)
     assert torch.all(condition.observation_valid)
     assert torch.all(condition.observation_to_current[..., 3] == 1.0)
+    assert policy.sources[0].shape == (3, 8, 2)
+
+
+def test_runtime_keeps_one_flow_source_until_environment_reset() -> None:
+    policy = _RecordingPolicy()
+    runtime = CurveNavRuntime(CurveNavConfig(), policy, device="cpu")
+    runtime.reset(3)
+    first = runtime.flow_source.clone()
+
+    runtime.reset_env(1)
+
+    torch.testing.assert_close(runtime.flow_source[0], first[0])
+    assert not torch.equal(runtime.flow_source[1], first[1])
+    torch.testing.assert_close(runtime.flow_source[2], first[2])
+
+
+def test_runtime_top_level_reset_restarts_the_episode_source_sequence() -> None:
+    policy = _RecordingPolicy()
+    runtime = CurveNavRuntime(CurveNavConfig(), policy, device="cpu")
+    runtime.reset(3)
+    first = runtime.flow_source.clone()
+    runtime.reset_env(0)
+
+    runtime.reset(3)
+
+    torch.testing.assert_close(runtime.flow_source, first)
 
 
 def test_depth_context_uses_expert_spatial_offsets():

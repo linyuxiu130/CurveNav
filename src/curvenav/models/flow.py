@@ -1,4 +1,4 @@
-"""Deterministic conditional flow over future executable-curve coordinates."""
+"""Conditional flow matching over future executable-curve coordinates."""
 
 import math
 
@@ -11,9 +11,11 @@ from curvenav.types import ConditionFeatures
 
 
 TRAJECTORY_FLOW_TYPE = (
-    "normalized_zero_source_future_bounded_curvature_rectified_flow_adarmszero_heun"
+    "normalized_gaussian_source_future_bounded_curvature_rectified_flow_adarmszero_heun"
 )
 FLOW_CURVE_COORDINATE_SCALE = 8.0
+FLOW_SOURCE_TYPE = "masked_isotropic_gaussian_episode_persistent"
+FLOW_SOURCE_SEED = 42
 
 
 class FourierTimeEmbedding(nn.Module):
@@ -40,12 +42,13 @@ class FourierTimeEmbedding(nn.Module):
 
 
 class CurvatureTrajectoryFlow(nn.Module):
-    """Generate one future curve from a zero-source conditional flow.
+    """Generate one future curve from a Gaussian-source conditional flow.
 
-    For expert curve coordinates ``x_1`` the conditional probability path is
-    ``x_t = t x_1`` and its exact velocity target is ``v_t = x_1``.  Executed
-    history is already present in the condition tokens, so it is never noised,
-    reconstructed, or used to rank stochastic future samples.
+    For Gaussian source ``x_0`` and expert curve coordinates ``x_1``, the
+    conditional probability path is ``x_t = (1-t)x_0 + t x_1`` and its exact
+    velocity target is ``v_t = x_1 - x_0``.  One source latent is retained for
+    an entire episode, which selects one coherent mode without generating or
+    ranking trajectory candidates.
     """
 
     def __init__(
@@ -71,7 +74,6 @@ class CurvatureTrajectoryFlow(nn.Module):
         self.output_norm = RMSNorm(model_dim)
         self.velocity_projection = nn.Linear(model_dim, 2)
         nn.init.trunc_normal_(self.token_embedding, std=0.02)
-        nn.init.zeros_(self.velocity_projection.weight)
         nn.init.zeros_(self.velocity_projection.bias)
 
     @staticmethod
@@ -119,8 +121,34 @@ class CurvatureTrajectoryFlow(nn.Module):
             dtype=clean_state.dtype,
         )
         clean_state = clean_state * free_mask
-        state = time[:, None, None] * clean_state
-        return state, time, clean_state
+        source = torch.randn_like(clean_state) * free_mask
+        state = (
+            (1.0 - time[:, None, None]) * source
+            + time[:, None, None] * clean_state
+        )
+        return state, time, clean_state - source
+
+    def sample_source(
+        self,
+        batch_size: int,
+        free_mask: Tensor,
+        *,
+        generator: torch.Generator,
+    ) -> Tensor:
+        """Draw one masked standard-Gaussian latent for each episode."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if free_mask.shape != (self.future_tokens, 2):
+            raise ValueError("free_mask must have shape [T,2]")
+        mask = free_mask.to(dtype=torch.float32)[None]
+        return torch.randn(
+            batch_size,
+            self.future_tokens,
+            2,
+            device=free_mask.device,
+            dtype=torch.float32,
+            generator=generator,
+        ) * mask
 
     @staticmethod
     def reconstruct_clean(
@@ -133,23 +161,26 @@ class CurvatureTrajectoryFlow(nn.Module):
     def integrate(
         self,
         condition: ConditionFeatures,
+        source: Tensor,
         integration_steps: int,
         free_mask: Tensor,
     ) -> Tensor:
-        """Integrate the unique zero-source future state with Heun's method."""
+        """Transport one episode-persistent source with Heun's method."""
         if integration_steps < 1:
             raise ValueError("integration_steps must be positive")
         batch = condition.tokens.shape[0]
         if free_mask.shape != (batch, self.future_tokens, 2):
             raise ValueError("free_mask must have shape [B,T,2]")
-        state = torch.zeros(
-            batch,
-            self.future_tokens,
-            2,
+        if source.shape != (batch, self.future_tokens, 2):
+            raise ValueError("source must have shape [B,T,2]")
+        mask = free_mask.to(
             device=condition.tokens.device,
             dtype=condition.tokens.dtype,
         )
-        mask = free_mask.to(dtype=state.dtype)
+        state = source.to(
+            device=condition.tokens.device,
+            dtype=condition.tokens.dtype,
+        ) * mask
         step_size = 1.0 / integration_steps
         for index in range(integration_steps):
             time = torch.full(

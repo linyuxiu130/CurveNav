@@ -191,7 +191,11 @@ class CurveNavPolicy(nn.Module):
         )
 
     @torch.no_grad()
-    def sample(self, condition: PolicyCondition) -> TrajectoryPrediction:
+    def sample(
+        self,
+        condition: PolicyCondition,
+        flow_source: Tensor,
+    ) -> TrajectoryPrediction:
         encoded = self.encode_condition(condition)
         free_mask = self.curve_codec.free_mask.to(
             device=condition.point_goal.device,
@@ -199,6 +203,7 @@ class CurveNavPolicy(nn.Module):
         )[None].expand(condition.point_goal.shape[0], -1, -1)
         curve_coordinates = self.trajectory_flow.integrate(
             encoded,
+            flow_source,
             self.integration_steps,
             free_mask,
         )
@@ -215,8 +220,6 @@ class CurveNavPolicy(nn.Module):
     def forward(
         self,
         condition: PolicyCondition,
-        target: TrajectoryTarget | None = None,
-    ) -> CurveNavLoss | TrajectoryPrediction:
-        if target is None:
-            return self.sample(condition)
+        target: TrajectoryTarget,
+    ) -> CurveNavLoss:
         return self.training_loss(condition, target)
