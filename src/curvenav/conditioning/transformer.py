@@ -10,10 +10,10 @@ from curvenav.types import ConditionFeatures, DepthFeatures
 CURRENT_GEOMETRY_QUERY_COUNT = 32
 CONTEXT_GEOMETRY_QUERY_COUNT = 32
 GEOMETRY_QUERY_COUNT = CURRENT_GEOMETRY_QUERY_COUNT + CONTEXT_GEOMETRY_QUERY_COUNT
-ROUTE_ANCHOR_COUNT = 4
+ROUTE_QUERY_COUNT = 4
 ROUTE_QUERY_LAYERS = 2
 CONDITION_ENCODER_TYPE = (
-    "current_context_metric_geometry_ordered_route_anchor_queries_explicit_state"
+    "current_context_metric_geometry_ordered_route_queries_explicit_state"
 )
 
 
@@ -64,20 +64,18 @@ class PolicyConditionEncoder(nn.Module):
         observation_frames: int,
         spatial_tokens: int,
         history_scale_m: float,
-        planning_horizon_m: float,
         model_dim: int = 384,
         transformer_layers: int = 4,
         transformer_heads: int = 8,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        if history_scale_m <= 0 or planning_horizon_m <= 0:
-            raise ValueError("condition metric scales must be positive")
+        if history_scale_m <= 0:
+            raise ValueError("history_scale_m must be positive")
         self.point_goal_encoder = point_goal_encoder
         self.observation_frames = observation_frames
         self.spatial_tokens = spatial_tokens
         self.history_scale_m = float(history_scale_m)
-        self.planning_horizon_m = float(planning_horizon_m)
 
         self.frame_slot_embedding = nn.Parameter(
             torch.zeros(1, observation_frames, 1, model_dim)
@@ -116,7 +114,7 @@ class PolicyConditionEncoder(nn.Module):
             torch.zeros(1, observation_frames, model_dim)
         )
         self.route_query_embedding = nn.Parameter(
-            torch.zeros(1, ROUTE_ANCHOR_COUNT, model_dim)
+            torch.zeros(1, ROUTE_QUERY_COUNT, model_dim)
         )
         self.route_blocks = nn.ModuleList(
             CrossAttentionBlock(model_dim, transformer_heads, dropout)
@@ -127,16 +125,6 @@ class PolicyConditionEncoder(nn.Module):
             for _ in range(transformer_layers)
         )
         self.output_norm = RMSNorm(model_dim)
-        self.route_anchor_head = nn.Sequential(
-            nn.Linear(model_dim, model_dim),
-            nn.SiLU(),
-            nn.Linear(model_dim, 2),
-        )
-        self.route_anchor_embedding = nn.Sequential(
-            nn.Linear(2, model_dim),
-            nn.SiLU(),
-            nn.Linear(model_dim, model_dim),
-        )
         self.route_output_norm = RMSNorm(model_dim)
         self.route_summary_norm = RMSNorm(model_dim)
         nn.init.trunc_normal_(self.frame_slot_embedding, std=0.02)
@@ -144,11 +132,6 @@ class PolicyConditionEncoder(nn.Module):
         nn.init.trunc_normal_(self.context_geometry_query_embedding, std=0.02)
         nn.init.trunc_normal_(self.invalid_state_embedding, std=0.02)
         nn.init.trunc_normal_(self.route_query_embedding, std=0.02)
-
-    @staticmethod
-    def _unit_disk(value: Tensor) -> Tensor:
-        squared_radius = value.float().square().sum(dim=-1, keepdim=True)
-        return value / torch.sqrt(1.0 + squared_radius).to(value.dtype)
 
     def forward(
         self,
@@ -212,18 +195,11 @@ class PolicyConditionEncoder(nn.Module):
         for block in self.condition_blocks:
             tokens = block(tokens)
         tokens = self.output_norm(tokens)
-        route_latent = tokens[:, :ROUTE_ANCHOR_COUNT]
-        route_anchors = self.planning_horizon_m * self._unit_disk(
-            self.route_anchor_head(route_latent)
-        )
-        route_tokens = self.route_output_norm(
-            route_latent
-            + self.route_anchor_embedding(route_anchors / self.planning_horizon_m)
-        )
+        route_latent = tokens[:, :ROUTE_QUERY_COUNT]
+        route_tokens = self.route_output_norm(route_latent)
         route_token = self.route_summary_norm(route_tokens.mean(dim=1))
-        tokens = torch.cat((route_tokens, tokens[:, ROUTE_ANCHOR_COUNT:]), dim=1)
+        tokens = torch.cat((route_tokens, tokens[:, ROUTE_QUERY_COUNT:]), dim=1)
         return ConditionFeatures(
             tokens=tokens,
             route_token=route_token,
-            route_anchors=route_anchors,
         )

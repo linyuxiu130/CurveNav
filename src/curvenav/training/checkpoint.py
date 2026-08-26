@@ -10,10 +10,11 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from curvenav.config import CurveNavConfig
-from curvenav.conditioning import CONDITION_ENCODER_TYPE, ROUTE_ANCHOR_COUNT
+from curvenav.conditioning import CONDITION_ENCODER_TYPE, ROUTE_QUERY_COUNT
 from curvenav.encoders.depth import DEPTH_ENCODER_TYPE
 from curvenav.encoders import POINT_GOAL_ENCODER_TYPE
 from curvenav.models import (
+    CURVE_PROPOSAL_TYPE,
     FLOW_CURVE_COORDINATE_SCALE,
     FLOW_INFERENCE_SOURCE_TYPE,
     FLOW_TRAINING_SOURCE_TYPE,
@@ -31,7 +32,7 @@ from curvenav.trajectory import (
 
 
 CHECKPOINT_TYPE = (
-    "curvenav_route_consistent_ordered_anchors_gaussian_flow_zero_mode_bounded_curvature_policy"
+    "curvenav_conditioned_proposal_residual_flow_bounded_curvature_policy"
 )
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
@@ -97,6 +98,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             "condition_layers": condition.transformer_layers,
             "condition_heads": condition.transformer_heads,
             "condition_dropout": condition.dropout,
+            "proposal_layers": flow.proposal_layers,
             "flow_layers": flow.transformer_layers,
             "flow_heads": flow.transformer_heads,
             "flow_dropout": flow.dropout,
@@ -108,29 +110,30 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "point_goal_clip_distance_m": config.point_goal_encoder.goal_clip_distance_m,
         "trajectory_supervision": "fixed_future_expert_waypoints_or_true_goal",
         "arc_length_policy": "pointgoal_scaled_positive_total_arc_length",
-        "trajectory_endpoint_policy": "supervised_ordered_route_anchors",
+        "trajectory_endpoint_policy": "conditioned_executable_curve_proposal",
         "curve_boundary_conditions": "origin_and_forward_half_plane_initial_heading",
         "trajectory_flow_type": TRAJECTORY_FLOW_TYPE,
         "flow_curve_coordinate_scale": FLOW_CURVE_COORDINATE_SCALE,
         "flow_training_source_type": FLOW_TRAINING_SOURCE_TYPE,
         "flow_inference_source_type": FLOW_INFERENCE_SOURCE_TYPE,
+        "curve_proposal_type": CURVE_PROPOSAL_TYPE,
+        "flow_source_gradient": "detached_from_flow_and_directly_supervised",
         "training_objective": (
-            "gaussian_source_future_flow_plus_metric_path_tangent_route_consistency"
+            "conditioned_proposal_geometry_plus_residual_flow_path_tangent"
         ),
-        "trajectory_prediction": "single_zero_prior_mode_heun_trajectory",
+        "trajectory_prediction": "single_proposal_initialized_heun_trajectory",
         "trajectory_flow_integration_steps": config.trajectory_flow.integration_steps,
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
         "visual_context": (
             "dedicated_current_plus_full_context_metric_geometry_queries_and_"
-            "explicit_ego_state_supervised_ordered_route_queries"
+            "explicit_ego_state_ordered_route_queries"
         ),
         "depth_token_pooling": "nearest_surface",
         "observation_to_current": "planar_rigid_transform_used_for_depth_token_alignment",
         "visual_compression": "32_current_plus_32_full_context_metric_geometry_queries",
         "goal_conditioning": "pointgoal_direction_range_and_metric_local_scale",
         "temporal_modeling": "executed_metric_observation_history",
-        "route_anchor_count": ROUTE_ANCHOR_COUNT,
-        "route_anchor_sampling": "uniform_metric_arc_progress_excluding_origin",
+        "route_query_count": ROUTE_QUERY_COUNT,
         "num_curve_tokens": trajectory.num_curvature_control_points + 1,
         "num_curvature_control_points": trajectory.num_curvature_control_points,
         "curvature_spline_degree": trajectory.curvature_spline_degree,

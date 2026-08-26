@@ -8,9 +8,12 @@ from .flow import (
     TRAJECTORY_FLOW_TYPE,
 )
 from .policy import CurveNavPolicy
+from .proposal import CURVE_PROPOSAL_TYPE, ConditionedCurveProposal
 
 __all__ = [
     "CurveNavPolicy",
+    "ConditionedCurveProposal",
+    "CURVE_PROPOSAL_TYPE",
     "CurvatureTrajectoryFlow",
     "FLOW_CURVE_COORDINATE_SCALE",
     "FLOW_INFERENCE_SOURCE_TYPE",

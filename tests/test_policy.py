@@ -1,6 +1,5 @@
 from dataclasses import replace
 
-import pytest
 import torch
 
 from curvenav import PolicyCondition, TrajectoryTarget, build_policy
@@ -72,12 +71,15 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
         losses.flow_loss,
         losses.path_loss,
         losses.tangent_loss,
-        losses.route_loss,
+        losses.proposal_loss,
     ):
         assert value.ndim == 0 and torch.isfinite(value)
     torch.testing.assert_close(
         losses.loss,
-        losses.flow_loss + losses.path_loss + losses.tangent_loss + losses.route_loss,
+        losses.flow_loss
+        + losses.path_loss
+        + losses.tangent_loss
+        + losses.proposal_loss,
     )
     losses.loss.backward()
     gradients = [
@@ -171,8 +173,8 @@ def test_flow_endpoint_reconstruction_matches_linear_path_identity() -> None:
     policy = build_policy(tiny_config())
     free_mask = policy.curve_codec.free_mask[None].expand(3, -1, -1)
     clean = clean * free_mask
-    state, time, velocity = flow.training_path(clean, free_mask)
-    source = clean - velocity
+    source = torch.randn_like(clean) * free_mask
+    state, time, velocity = flow.training_path(clean, source, free_mask)
     torch.testing.assert_close(
         state,
         (1.0 - time[:, None, None]) * source + time[:, None, None] * clean,
@@ -182,42 +184,52 @@ def test_flow_endpoint_reconstruction_matches_linear_path_identity() -> None:
     torch.testing.assert_close(reconstructed, clean)
 
 
-def test_flow_training_source_is_gaussian_and_masked() -> None:
+def test_flow_training_source_is_the_deterministic_conditioned_proposal() -> None:
     policy = build_policy(tiny_config())
     assert torch.count_nonzero(policy.trajectory_flow.velocity_projection.weight) > 0
     assert torch.count_nonzero(policy.trajectory_flow.velocity_projection.bias) == 0
-    clean = torch.zeros(8192, 8, 2)
+    inputs = condition(batch=4)
+    encoded = policy.encode_condition(inputs)
+    clean = torch.randn(4, 8, 2)
     mask = policy.curve_codec.free_mask[None].expand_as(clean)
-    _, _, target_velocity = policy.trajectory_flow.training_path(clean, mask)
-    source = -target_velocity
-    assert source[:, policy.curve_codec.free_mask].std().item() == pytest.approx(
-        1.0,
-        abs=0.03,
+    source = policy.curve_proposal(encoded, mask)
+    repeated = policy.curve_proposal(encoded, mask)
+    torch.testing.assert_close(source, repeated)
+    _, _, target_velocity = policy.trajectory_flow.training_path(
+        clean,
+        source,
+        mask,
     )
+    torch.testing.assert_close(clean * mask - target_velocity, source)
     assert torch.equal(
         source[:, ~policy.curve_codec.free_mask],
         torch.zeros_like(source[:, ~policy.curve_codec.free_mask]),
     )
 
 
-def test_heun_integration_transports_the_zero_prior_mode() -> None:
+def test_heun_integration_transports_the_conditioned_proposal() -> None:
     policy = build_policy(tiny_config())
     flow = policy.trajectory_flow
     batch = 2
     mask = policy.curve_codec.free_mask[None].expand(batch, -1, -1)
+    source = torch.randn(batch, flow.future_tokens, 2) * mask
     target = torch.randn(batch, flow.future_tokens, 2) * mask
-    velocity = target
+    velocity = target - source
     encoded = ConditionFeatures(
         tokens=torch.zeros(batch, 1, 32),
         route_token=torch.zeros(batch, 32),
-        route_anchors=torch.zeros(batch, 4, 2),
     )
 
     def constant_velocity(state, time, condition_tokens, route_token):
         return velocity
 
     flow.forward = constant_velocity
-    transported = flow.integrate(encoded, integration_steps=4, free_mask=mask)
+    transported = flow.integrate(
+        encoded,
+        source,
+        integration_steps=4,
+        free_mask=mask,
+    )
     torch.testing.assert_close(transported, target)
 
 
@@ -235,32 +247,20 @@ def test_flow_curve_coordinate_normalization_is_exact_and_order_one() -> None:
     assert normalized.abs().max() >= 0.5
 
 
-def test_route_anchors_follow_ordered_uniform_arc_progress() -> None:
+def test_conditioned_proposal_decodes_to_one_bounded_curve() -> None:
     policy = build_policy(tiny_config())
-    path = torch.zeros(2, 16, 2)
-    path[..., 0] = torch.linspace(0.0, 3.6, 16)
-    anchors = path[:, policy.route_anchor_indices]
-    encoded = ConditionFeatures(
-        tokens=torch.zeros(2, 1, 32),
-        route_token=torch.zeros(2, 32),
-        route_anchors=anchors,
+    inputs = condition(batch=2)
+    encoded = policy.encode_condition(inputs)
+    mask = policy.curve_codec.free_mask[None].expand(2, -1, -1)
+    source = policy.curve_proposal(encoded, mask)
+    path, heading, curvature = policy.curve_codec.decode(
+        policy.trajectory_flow.denormalize_curve_coordinates(source),
+        inputs.point_goal,
     )
-
-    torch.testing.assert_close(
-        policy._route_loss(encoded, path, path),
-        torch.tensor(0.0),
-    )
-    torch.testing.assert_close(
-        anchors[0, :, 0],
-        torch.tensor([0.96, 1.92, 2.64, 3.60]),
-    )
-
-    inconsistent_path = path.clone()
-    inconsistent_path[:, policy.route_anchor_indices, 1] = 0.36
-    torch.testing.assert_close(
-        policy._route_loss(encoded, inconsistent_path, path),
-        torch.tensor(0.1),
-    )
+    assert source.shape == (2, 8, 2)
+    assert path.shape == (2, 16, 2)
+    assert heading.shape == (2, 16)
+    assert curvature.abs().max() < policy.curve_codec.maximum_curvature_inv_m
 
 
 def test_future_flow_has_no_generated_history_or_candidate_set() -> None:
@@ -270,6 +270,7 @@ def test_future_flow_has_no_generated_history_or_candidate_set() -> None:
     assert not hasattr(flow, "history_tokens")
     assert not hasattr(flow, "total_tokens")
     assert not hasattr(policy, "candidate_bases")
+    assert policy.curve_proposal.curve_tokens == flow.future_tokens
 
 
 def test_straight_target_is_an_exact_curve_projection() -> None:
@@ -348,9 +349,7 @@ def test_sand_spatial_tokens_and_geometry_query_compression_have_fixed_contract(
     assert not torch.any(mask[32:])
     assert encoder.route_query_embedding.shape == (1, 4, 32)
     assert encoded.tokens.shape == (1, 4 + 1 + 4 + 64, 32)
-    assert encoded.route_anchors.shape == (1, 4, 2)
-    assert torch.linalg.vector_norm(encoded.route_anchors, dim=-1).max() <= 3.6
-    assert torch.equal(policy.route_anchor_indices, torch.tensor([4, 8, 11, 15]))
+    assert policy.curve_proposal.token_embedding.shape == (1, 8, 32)
 
 
 def test_learned_token_embeddings_are_not_weight_decayed() -> None:

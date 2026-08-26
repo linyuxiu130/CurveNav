@@ -91,6 +91,7 @@ class ConditionEncoderConfig:
 @dataclass(frozen=True)
 class TrajectoryFlowConfig:
     model_dim: int = 384
+    proposal_layers: int = 2
     transformer_layers: int = 8
     transformer_heads: int = 8
     integration_steps: int = 8
@@ -180,6 +181,7 @@ class CurveNavConfig:
                 )
         for name, layers in (
             ("condition_encoder", self.condition_encoder.transformer_layers),
+            ("trajectory_proposal", self.trajectory_flow.proposal_layers),
             ("trajectory_flow", self.trajectory_flow.transformer_layers),
         ):
             if layers < 1:

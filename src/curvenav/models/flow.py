@@ -11,11 +11,11 @@ from curvenav.types import ConditionFeatures
 
 
 TRAJECTORY_FLOW_TYPE = (
-    "normalized_gaussian_source_future_bounded_curvature_rectified_flow_adarmszero_heun"
+    "conditioned_curve_source_residual_bounded_curvature_rectified_flow_adarmszero_heun"
 )
 FLOW_CURVE_COORDINATE_SCALE = 8.0
-FLOW_TRAINING_SOURCE_TYPE = "masked_isotropic_gaussian"
-FLOW_INFERENCE_SOURCE_TYPE = "zero_prior_mode"
+FLOW_TRAINING_SOURCE_TYPE = "deterministic_conditioned_curve_proposal"
+FLOW_INFERENCE_SOURCE_TYPE = "same_conditioned_curve_proposal"
 
 
 class FourierTimeEmbedding(nn.Module):
@@ -42,13 +42,12 @@ class FourierTimeEmbedding(nn.Module):
 
 
 class CurvatureTrajectoryFlow(nn.Module):
-    """Generate one future curve from a Gaussian-source conditional flow.
+    """Refine one conditioned executable curve through a residual flow.
 
-    For Gaussian source ``x_0`` and expert curve coordinates ``x_1``, the
-    conditional probability path is ``x_t = (1-t)x_0 + t x_1`` and its exact
-    velocity target is ``v_t = x_1 - x_0``.  Training samples the full Gaussian
-    prior.  Single-trajectory inference starts at its zero mode so execution is
-    deterministic without an unavailable candidate evaluator.
+    For conditioned proposal ``b(c)`` and expert curve coordinates ``x_1``, the
+    probability path is ``x_t = (1-t)b(c) + t x_1`` and its exact velocity is
+    ``x_1 - b(c)``.  Training and deterministic inference therefore start from
+    the identical curve state instead of using different points of a Gaussian.
     """
 
     def __init__(
@@ -111,22 +110,25 @@ class CurvatureTrajectoryFlow(nn.Module):
     def training_path(
         self,
         clean_state: Tensor,
+        source_state: Tensor,
         free_mask: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        if clean_state.shape != free_mask.shape:
-            raise ValueError("clean_state and free_mask must have identical shapes")
+        if clean_state.shape != source_state.shape or clean_state.shape != free_mask.shape:
+            raise ValueError(
+                "clean_state, source_state and free_mask must have identical shapes"
+            )
         time = torch.rand(
             clean_state.shape[0],
             device=clean_state.device,
             dtype=clean_state.dtype,
         )
         clean_state = clean_state * free_mask
-        source = torch.randn_like(clean_state) * free_mask
+        source_state = source_state * free_mask
         state = (
-            (1.0 - time[:, None, None]) * source
+            (1.0 - time[:, None, None]) * source_state
             + time[:, None, None] * clean_state
         )
-        return state, time, clean_state - source
+        return state, time, clean_state - source_state
 
     @staticmethod
     def reconstruct_clean(
@@ -139,10 +141,11 @@ class CurvatureTrajectoryFlow(nn.Module):
     def integrate(
         self,
         condition: ConditionFeatures,
+        source_state: Tensor,
         integration_steps: int,
         free_mask: Tensor,
     ) -> Tensor:
-        """Transport the deterministic Gaussian prior mode with Heun's method."""
+        """Transport the conditioned proposal with Heun's method."""
         if integration_steps < 1:
             raise ValueError("integration_steps must be positive")
         batch = condition.tokens.shape[0]
@@ -152,13 +155,12 @@ class CurvatureTrajectoryFlow(nn.Module):
             device=condition.tokens.device,
             dtype=condition.tokens.dtype,
         )
-        state = torch.zeros(
-            batch,
-            self.future_tokens,
-            2,
+        if source_state.shape != mask.shape:
+            raise ValueError("source_state must have shape [B,T,2]")
+        state = source_state.to(
             device=condition.tokens.device,
             dtype=condition.tokens.dtype,
-        )
+        ) * mask
         step_size = 1.0 / integration_steps
         for index in range(integration_steps):
             time = torch.full(

@@ -27,19 +27,21 @@ PointGoal direction + log range ────────────────
                                                                       ↓
                                       4 ordered route queries, 2× cross-attention
                                       4× joint condition Transformer
-                                      4 supervised metric route anchors
                                                                       ↓
-                                      8 future bounded-curvature tokens
+                                      8 learned curve proposal queries
+                                      2× proposal Transformer
+                                      deterministic executable source b(C)
+                                                                      ↓
                                       fixed coordinate map y = 8x
-                                      8× future Flow Transformer
+                                      8× residual Flow Transformer
                                       adaRMS-Zero(time, route)
                                                                       ↓
-                 deterministic zero prior mode, 8-step Heun integration
+                 b(C) → expert residual transport, 8-step Heun integration
                                                                       ↓
           PointGoal-scaled arc-length/curvature decoder → metric local path
 ```
 
-训练和部署只组装这一张图。checkpoint 类型为 `curvenav_route_consistent_ordered_anchors_gaussian_flow_zero_mode_bounded_curvature_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
+训练和部署只组装这一张图。checkpoint 类型为 `curvenav_conditioned_proposal_residual_flow_bounded_curvature_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
 
 ## 2. 视觉几何、历史状态与路线融合
 
@@ -83,23 +85,18 @@ feature(g) = [g/max(r,ε), log(1+min(r,25 m))/log(26)].
 
 CurveNav 的任务合同始终提供 PointGoal，因此不采用 NoMaD/NavDP 为统一 goal-conditioned/goal-agnostic 策略而使用的 50% goal mask。对本任务机械照搬该 mask 会无依据地删除一半目标监督。
 
-### 2.3 有序监督路线锚点
+### 2.3 有序路线查询与条件曲线提案
 
-单个二维局部终点不能区分绕过同一障碍的不同路线形状，也会把近端可执行方向和远端进展压进同一个 latent。CurveNav 使用四个有序 learned route query；每个 query 与 goal token 相加，连续两次 cross-attend `[state, geometry]`。随后 `[4 route, goal, 4 state, 64 geometry]` 共 73 个 token 经过四层联合 condition Transformer。四个 route latent 分别预测平滑专家路径在 `1/4、2/4、3/4、4/4` 等弧长进度处的二维锚点：
-
-```text
-a_i = MLP(q_i),
-r_hat_i = 3.6 a_i / sqrt(1 + ||a_i||²),   i=1..4.
-```
-
-该光滑映射把任意二维向量映到 3.6 m 开圆盘，零点处导数良好，也不需要预测后裁剪。每个预测锚点经同一个 MLP 重新注入对应的有序 route token；四个 token 的归一化均值形成逐层调制向量：
+单个二维局部终点不能区分绕过同一障碍的不同路线形状，也会把近端可执行方向和远端进展压进同一个 latent。CurveNav 使用四个有序 learned route query；每个 query 与 goal token 相加，连续两次 cross-attend `[state, geometry]`。随后 `[4 route, goal, 4 state, 64 geometry]` 共 73 个 token 经过四层联合 condition Transformer。四个 route latent 保留不同路线推理槽位，归一化均值形成逐层调制向量：
 
 ```text
-c_i = RMSNorm(q_i + MLP(r_hat_i / 3.6)),
+c_i = RMSNorm(q_i),
 c_route = RMSNorm(mean_i c_i).
 ```
 
-Flow cross-attend 全部 73 个条件 token，因此保留四个锚点的顺序和局部路线形状；`c_route` 只提供全局调制。训练与部署都使用预测锚点，不把真实路线喂给生成器，因此没有 teacher-forcing 落差。训练时还约束最终解码曲线在相同等弧长索引处通过预测锚点，使低频路线和实际执行曲线属于同一个几何解，而不是两个只各自拟合标签的并行输出。这四个 head 共享参数，是唯一轨迹生成器的低频路线骨架，不是候选轨迹的评价头。它吸收 SanD 的结构化低维控制点和 NavDP/X-NavDP 的有序动作 token，但最终执行轨迹仍由同一个连续有界曲率 Flow 产生。
+不再从这四个 latent 另行回归一组与执行输出并列的 XY 锚点。八个 learned curve proposal query 经过两层 self-attention、对全部 73 个条件 token 的 cross-attention、SwiGLU 和 `c_route` adaRMS-Zero 调制，直接预测归一化的八个有界曲率坐标 `b(C)`。同一个生产 decoder 将它变成完整的 64 点提案路径，训练时直接接受 metric path 与 tangent 监督；因此路线表示本身就是 Flow 的实际起点，而不是只在 loss 中要求最终路径靠近的辅助 head。
+
+这保留了 SanD 的结构化低维轨迹控制和 NavDP/X-NavDP 的有序动作查询，同时修复两者在“没有候选评价器、只执行一条轨迹”约束下不能直接照搬随机生成的缺口。route query 负责从 geometry/state/goal 推理低频拓扑，curve proposal query 负责把拓扑写成可执行曲线坐标，残差 Flow 只做连续细化；三者职责不重叠。
 
 ## 3. PointGoal 标度的有界曲率曲线
 
@@ -156,9 +153,9 @@ r* = atanh(c*/κmax).
 
 离线 ADE/RMSE 仍以原始等弧长专家路径为准；参考曲率则从上述去噪 B-spline 计算。离散专家折线在顶点处的有限差分曲率会被采样角点放大，不能作为连续生成曲线的正确曲率基准。
 
-## 4. Future-only Gaussian Rectified Flow Transformer
+## 4. 条件曲线源上的残差 Rectified Flow Transformer
 
-### 4.1 高斯源条件 Flow Matching
+### 4.1 训练与部署同源的 Flow Matching
 
 三帧已执行历史已经通过 metric depth alignment 和四个显式 state token 进入条件序列。几何 decoder 消费的曲线坐标记为 `x∈R^(8×2)`。它们受硬几何尺度约束，当前验证集九个自由维度的标准差只有 `0.014–0.058`；直接把 `x` 当作 FP16 Flow 状态会使速度场长期处于 `10^-2` 量级，并让零初始化网络偏向无需修正的直线。训练和推理因此都使用唯一的固定无量纲坐标变换：
 
@@ -168,41 +165,43 @@ y = 8x,       x = y/8.
 
 尺度 8 把九个自由维度的典型标准差移到 `0.11–0.47`，同时保持零点、相对维度权重、可表示轨迹集合和曲率硬界完全不变。它对应 SanD/Diffusion Policy 对控制坐标做归一化的必要数值条件，但不读取验证统计、不保存数据集专用 normalizer，也不产生第二套 decoder。Flow 只生成 `y`，不把已知历史复制成生成目标。
 
-局部绕障在部分可观测条件下具有真实多模态：同一障碍可能从左侧或右侧安全绕行。把训练源退化为 Dirac 零点时，条件 MSE 只能学习条件均值；在对称障碍前，该均值会落到两种专家模式之间。CurveNav 因此使用标准高斯源直线条件 Flow 训练完整速度场：
+随机扩散或高斯 Flow 只有在采样多条候选并由碰撞代价、critic 或 Q 值选择时，才定义了完整的局部决策。CurveNav 当前明确不使用评价头且只输出一条轨迹；旧结构却用高斯源训练、部署固定从零点积分。高斯零点既不是条件分布的均值/众数，也没有被监督成安全路线，这构成训练—部署起点错配。
+
+当前结构先由条件网络产生唯一可执行源 `b_φ(C)`，再学习它到专家曲线的残差直线 Flow：
 
 ```text
 y_1 = 8x_1,
-y_0 ~ N(0,I) on the nine free coordinates,
+b = b_φ(C) on the nine free coordinates,
 t ~ U(0,1),
-y_t = (1-t)y_0 + t y_1,
-u_t = d y_t/dt = y_1-y_0,
-L_flow = Σ mask·||v_θ(y_t,t,C)-(y_1-y_0)||² / Σ mask.
+y_t = (1-t)sg(b) + t y_1,
+u_t = d y_t/dt = y_1-sg(b),
+L_flow = Σ mask·||v_θ(y_t,t,C)-(y_1-sg(b))||² / Σ mask.
 ```
 
-七个曲率 token 的第二通道由结构 mask 从状态、损失和 ODE 更新中同时移除。一步干净端点估计为：
+`sg` 表示 Flow loss 不通过源坐标反向传播；提案由独立的直接几何监督学习，避免提案与速度场仅靠互相抵消降低 velocity MSE。condition encoder 仍同时接收提案几何 loss 和 Flow loss。七个曲率 token 的第二通道由结构 mask 从提案、状态、损失和 ODE 更新中同时移除。一步干净端点估计为：
 
 ```text
 y_hat_1 = y_t + (1-t)v_θ(y_t,t,C).
 ```
 
-先用唯一逆变换 `x_hat_1=y_hat_1/8` 解码，再施加 metric path 和 tangent 监督，Flow 学到的不只是内禀坐标均方误差。固定为零的七个无效通道在训练状态、损失和 ODE 中始终保持为零。部署不把训练先验改成 Dirac 分布，而是在已学得的 Gaussian transport 中固定选择最大密度输入 `y0=0`。
+先用唯一逆变换 `x_hat_1=y_hat_1/8` 解码，再施加 metric path 和 tangent 监督，Flow 学到的不只是内禀坐标均方误差。部署使用完全相同的 `b_φ(C)`，所以没有 source distribution、采样温度或特殊零点。
 
 ### 4.2 轨迹 Transformer
 
-8 个未来 token 加 learned token-position embedding。八层 Flow block 均包含：
+提案器有 8 个 learned curve token 和两层 conditional block；Flow 有另一组 8 个 future token embedding 和八层 conditional block。两者的每层均包含：
 
 1. 8 token 双向 self-attention，使弧长、初始航向和七个曲率控制直接交换信息；
-2. 对 73 个 condition token 的 cross-attention，保留局部几何和有序路线锚点的 token 级信息；
+2. 对 73 个 condition token 的 cross-attention，保留局部几何和有序路线 query 的 token 级信息；
 3. SwiGLU feed-forward；
-4. 由 Fourier flow time 与 `c_route` 共同产生的 adaRMS-Zero shift、scale 和 residual gate。
+4. adaRMS-Zero shift、scale 和 residual gate：提案器由 `c_route` 调制；Flow 由 Fourier time 与 `c_route` 共同调制。
 
-adaRMS-Zero 的各分支 gate 零初始化，使深层残差分支平滑打开；velocity projection 保留 PyTorch 线性层的方差缩放权重初始化并将 bias 置零。这样初始输出与标准高斯 velocity target 同为 O(1)，第一步即可给 route/cross-attention gate 传递梯度，而不是先等待全零输出头缓慢长大。相较只在输入拼接一次时间/目标，逐层调制让路线和 Flow 时间控制每个残差更新；这吸收 DiT 的 adaptive-normalization 稳定性和 X-NavDP 的 FiLM 条件注入思想，但 geometry 仍通过 cross-attention 保持空间分辨率。
+adaRMS-Zero 的各分支 gate 零初始化，使深层残差分支平滑打开；提案坐标 projection 和 Flow velocity projection 保留 PyTorch 线性层的方差缩放权重初始化并将 bias 置零，从第一步即可向输出头传递梯度。相较只在输入拼接一次时间/目标，逐层调制让路线和 Flow 时间控制每个残差更新；这吸收 DiT 的 adaptive-normalization 稳定性和 X-NavDP 的 FiLM 条件注入思想，但 geometry 仍通过 cross-attention 保持空间分辨率。
 
-生产深度不是为了堆参数而设置：条件端四层负责 geometry/state/goal 路线推理，Flow 端八层负责不同连续时间上的未来曲线修正，两者职责不同且没有重复生成器。
+生产深度不是为了堆参数而设置：条件端四层负责 geometry/state/goal 路线推理，提案端两层把路线写入可执行坐标，Flow 端八层负责不同连续时间上的残差修正。
 
 ### 4.3 唯一推理轨迹
 
-部署从高斯先验的众数 `y0=0` 做八步 Heun 积分：
+部署先计算 `y0=b_φ(C)`，再从这个与训练一致的条件源做八步 Heun 积分：
 
 ```text
 y' = v_θ(y,t,C),
@@ -210,20 +209,20 @@ y_predict = y + Δt y',
 y_next = y + Δt/2 [y' + v_θ(y_predict,t+Δt,C)].
 ```
 
-输出只有一个 `[B,8,2]` 归一化 Flow 状态，经固定除 8 后送入曲线 decoder；不存在随机 episode 状态、候选维、候选排序、历史重建分数或 oracle 选择。SanD 的随机扩散 batch 后接 ESDF 评价，NavDP/X-NavDP 的多样候选后接 critic/Q 约束；没有评价器时随机执行其中一条并不是完整决策架构。固定先验众数把唯一输出定义为确定性中央 transport，并让全部时序一致性来自真实执行历史，不递归传播上一周期预测误差。当前数据没有“上一周期模型已提交计划”字段，用专家未来伪造 previous-plan token 会产生标签泄漏。
+输出只有一个 `[B,8,2]` 归一化 Flow 状态，经固定除 8 后送入曲线 decoder；不存在随机 episode 状态、候选维、候选排序、历史重建分数或 oracle 选择。SanD 的随机扩散 batch 后接 ESDF 评价，NavDP/X-NavDP 的多样候选后接 critic/Q 约束；没有评价器时随机执行其中一条并不是完整决策架构。条件提案把唯一输出的路线选择显式交给受监督网络，Flow 只细化该选择；全部时序一致性仍来自真实执行历史，不递归传播上一周期预测误差。
 
 ## 5. 唯一训练目标
 
 所有项都先无量纲化，再直接相加：
 
 ```text
-L = L_flow + L_path + L_tangent + L_route.
+L = L_flow + L_path + L_tangent + L_proposal.
 ```
 
-- `L_flow`：上述 O(1) 归一化 Gaussian-source future masked velocity MSE。
+- `L_flow`：上述 O(1) 条件提案源 residual velocity masked MSE。
 - `L_path`：每个等弧长位置的欧氏误差 `||p_hat-p*||₂/H`；使用 `0.25+exp(-4s)` 并归一到均值一，强调马上要执行的近端。
 - `L_tangent`：有效相邻路径段的 `1-cos(Δp_hat,Δp*)`，使用相同近端权重。
-- `L_route`：四个预测路线锚点的目标误差与锚点—执行曲线一致性误差之和，`mean_i (||r_hat_i-r_i*||₂+||p_hat_i-r_hat_i||₂)/H`。SanD 的控制点和 NavDP/X-NavDP 的动作增量都直接定义执行轨迹；这一约束保留有界曲率 Flow 表示，同时消除独立路线头与最终曲线在困难转弯上的几何脱节。
+- `L_proposal`：条件提案解码路径相对平滑专家路径的同一 near-weighted path loss 与 tangent loss 之和。它直接监督部署/Flow 实际使用的起点，而不是训练一个并列锚点 head。
 
 不另加平滑 loss 或后处理：连续曲率界和高阶路径平滑由弧长域参数化直接给出，路径和切向项负责实际 metric 几何。训练日志分别记录四项损失，避免总 loss 掩盖某个子任务失效。
 
@@ -231,12 +230,12 @@ L = L_flow + L_path + L_tangent + L_route.
 
 | 来源 | 吸收的有效设计 | CurveNav 的针对性改进 |
 |---|---|---|
-| SanD | 四帧共享深度 backbone、空间 token、平滑低维轨迹先验、归一化高斯生成 | 教师 B-spline 只做标签平滑；生产输出改为 PointGoal 标度的连续有界曲率曲线；没有 ESDF 评价器时用先验众数生成唯一确定轨迹 |
-| NavDP | `D=384` actor、当前深度与历史 memory 分工、learned-query 视觉压缩、trajectory-token cross-attention、高斯动作扩散 | 32 个 current query 保证即时几何，32 个 context query 补全历史视野，四个有序 route query 显式表达局部路线；同一无量纲坐标用于训练和 ODE；无 ESDF 标签时不训练 critic |
+| SanD | 四帧共享深度 backbone、空间 token、平滑低维轨迹先验、候选生成后评价 | 教师 B-spline 只做标签平滑；生产输出改为 PointGoal 标度的连续有界曲率曲线；没有 ESDF 评价器时用受监督条件提案完成唯一拓扑选择 |
+| NavDP | `D=384` actor、当前深度与历史 memory 分工、learned-query 视觉压缩、trajectory-token cross-attention、扩散动作生成 | 32 个 current query 保证即时几何，32 个 context query 补全历史视野，四个有序 route query 和八个 proposal query 直接形成可执行源；同一无量纲坐标用于训练和 ODE |
 | X-NavDP | 深层条件生成器、逐层 FiLM 思想、闭环时序一致性 | 用 adaRMS-Zero 做 time-route 调制；真实执行历史承担时序状态；当前阶段不做 GQRM/RL，也不随机执行未经 Q 选择的候选 |
-| LoGoPlanner | geometry/state/route 的任务专用 query | CurveNav 已有标定 metric depth 和真实位姿，不复制重型视频三维重建模型；四个路线 query 直接监督专家路径的等弧长骨架 |
+| LoGoPlanner | geometry/state/route 的任务专用 query | CurveNav 已有标定 metric depth 和真实位姿，不复制重型视频三维重建模型；route query 做拓扑推理，curve proposal query 输出实际执行坐标 |
 | Past-Token Prediction | 用可观测过去约束未来的思想 | 历史已经由 condition encoder 显式编码；不再联合生成过去，因为过去重建误差不能代表未来轨迹质量 |
-| Flow Matching / DiT | Gaussian-to-data 直线 CFM、少步 ODE、adaptive normalization | 在与可执行坐标严格双射的 O(1) 空间学习多模态速度场；只保留残差 gate 零初始化，输出头从第一步传递梯度 |
+| Flow Matching / DiT | 条件直线概率路径、少步 ODE、adaptive normalization | 在与可执行坐标严格双射的 O(1) 空间，从受监督条件曲线源学习短残差 transport；训练和部署从同一点出发 |
 | NoMaD | 生成分布适合多模态局部行为 | 不照搬为 goal-agnostic 统一策略服务的 50% goal mask；CurveNav 始终严格 PointGoal 条件 |
 
 主要来源：[SanD 论文](https://arxiv.org/abs/2602.00923) 与 [官方源码](https://github.com/WangJinCheng1998/sandplanner)、[NavDP 论文](https://arxiv.org/abs/2505.08712) 与 [官方源码](https://github.com/InternRobotics/NavDP)、[X-NavDP](https://arxiv.org/abs/2607.28560)、[LoGoPlanner](https://arxiv.org/abs/2512.19629)、[Past-Token Prediction](https://arxiv.org/abs/2505.09561)、[NoMaD](https://arxiv.org/abs/2310.07896)、[Flow Matching](https://arxiv.org/abs/2209.03003)、[DiT](https://arxiv.org/abs/2212.09748)。
@@ -245,14 +244,14 @@ L = L_flow + L_path + L_tangent + L_route.
 
 训练只读取 `data/policy_dataset`。该目录当前仅包含本项目在固定 HSSD 资产上生成、按 Dingo 标定相机渲染的深度和专家轨迹，不混用论文作者的数据。四帧历史按行驶距离 `[-1.35,-0.90,-0.45,0] m` 取样；未来最多 24 个 `0.15 m` 专家点，近目标自然缩短。
 
-唯一训练入口使用 FP16、GPU 常驻 depth bank、异步 prefetch、AdamW、cosine schedule、EMA 和静态 `torch.compile`；多卡时由同一入口启用 DDP。数学 batch 固定为 1024，显存 micro-batch 上限为每卡 112，以适配 11 GiB 2080 Ti。对 world size `W`，每 rank 分配 `floor(1024/W)` 或 `ceil(1024/W)` 个互不重叠样本；局部 batch 均值乘 `W·B_r/1024` 后再经 DDP 求平均，严格得到全局 1024 样本均值。6 卡时分配为 `171×4 + 170×2`，每 rank 执行 `112+59/58` 两次前后向，只在末次同步梯度。这样 1–8 卡的每次 optimizer、schedule 与 EMA 更新都保持同一数学合同，不需要 padding、重复样本或改变学习率。2080 Ti 真实生产图的 50-step 稳态复测中，112 上限为 `0.2143–0.2154 s/rank-step`、峰值分配约 `6.30 GiB`；64 上限为 `0.2336 s/rank-step`，而单批 171 反而回落到 `0.2189 s/rank-step` 并触发一次 loss-scale 下调，因此生产值固定为实测吞吐最优且保留充足显存余量的 112。训练 source 使用 checkpoint 已保存的逐 rank CUDA RNG；部署没有 source RNG 或 episode latent，始终从先验众数零点积分。唯一部署入口加载 EMA 权重并使用上述单轨迹八步 Heun，没有部署 fallback。
+唯一训练入口使用 FP16、GPU 常驻 depth bank、异步 prefetch、AdamW、cosine schedule、EMA 和静态 `torch.compile`；多卡时由同一入口启用 DDP。数学 batch 固定为 1024，显存 micro-batch 上限为每卡 112，以适配 11 GiB 2080 Ti。对 world size `W`，每 rank 分配 `floor(1024/W)` 或 `ceil(1024/W)` 个互不重叠样本；局部 batch 均值乘 `W·B_r/1024` 后再经 DDP 求平均，严格得到全局 1024 样本均值。6 卡时分配为 `171×4 + 170×2`，每 rank 执行 `112+59/58` 两次前后向，只在末次同步梯度。这样 1–8 卡的每次 optimizer、schedule 与 EMA 更新都保持同一数学合同，不需要 padding、重复样本或改变学习率。2080 Ti 旧图实测的 micro-batch 上限仍为 112；增加两层 proposal block 后必须重新复测吞吐和峰值显存，再报告新图速度。checkpoint 保存逐 rank CUDA RNG 以精确恢复 `t` 采样；部署没有 source RNG 或 episode latent，始终从当前条件提案积分。唯一部署入口加载 EMA 权重并使用上述单轨迹八步 Heun，没有部署 fallback。
 
 在线部署使用 eager FP16 推理，不把分钟级编译成本放进短回合测评。`navigator_reset` 已知实际 batch size 后立即使用零观测完成 CUDA kernel 初始化和同步；该步骤发生在 evaluator 的 episode 循环开始前。因此首个真实观测不会承担初始化时间，也不会让机器人在开局持续执行零动作。训练仍使用静态 `torch.compile`，因为 8000 个优化器 step 足以摊薄一次编译成本；1024 样本离线检查同样使用 eager，避免编译时间超过实际评估计算。
 
 必要验证分三层：
 
-1. 张量/数学单测：相机反投影、历史 mask、geometry token、有序 route anchors、PointGoal 标度、零目标停止、连续曲率硬界、教师 B-spline、checkpoint 和部署接口；
-2. 前向/梯度：训练 loss、全部参数梯度、零先验众数的确定性推理、静态编译图和有限值；
+1. 张量/数学单测：相机反投影、历史 mask、geometry/route/proposal token、训练—部署同源 Flow、PointGoal 标度、零目标停止、连续曲率硬界、教师 B-spline、checkpoint 和部署接口；
+2. 前向/梯度：训练 loss、全部参数梯度、条件提案的确定性推理、静态编译图和有限值；
 3. 重新训练后的 held-out/闭环：ADE、弧长、目标进展、曲率、延迟，以及固定协议 SR/SPL。
 
 旧 checkpoint 的低闭环成绩可以证明旧链路失败，但不能单独证明新模块有效。当前结构必须从头训练；离线几何通过后再进入固定协议闭环，最终结论以 SR/SPL 为准。

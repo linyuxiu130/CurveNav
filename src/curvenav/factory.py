@@ -4,6 +4,7 @@ from curvenav.config import CurveNavConfig
 from curvenav.conditioning import PolicyConditionEncoder
 from curvenav.encoders import DepthObservationEncoder, PointGoalEncoder
 from curvenav.models import (
+    ConditionedCurveProposal,
     CurveNavPolicy,
     CurvatureTrajectoryFlow,
 )
@@ -45,9 +46,6 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         history_scale_m=(
             (config.data.observation_frames - 1) * config.data.frame_spacing_m
         ),
-        planning_horizon_m=(
-            config.data.future_steps * config.data.expert_waypoint_spacing_m
-        ),
         model_dim=condition.model_dim,
         transformer_layers=condition.transformer_layers,
         transformer_heads=condition.transformer_heads,
@@ -67,6 +65,13 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         degree=trajectory.target_spline_degree,
         num_path_points=trajectory.num_path_points,
     )
+    curve_proposal = ConditionedCurveProposal(
+        curve_tokens=curve_codec.num_curve_tokens,
+        model_dim=trajectory_flow_config.model_dim,
+        layers=trajectory_flow_config.proposal_layers,
+        heads=trajectory_flow_config.transformer_heads,
+        dropout=trajectory_flow_config.dropout,
+    )
     trajectory_flow = CurvatureTrajectoryFlow(
         future_tokens=curve_codec.num_curve_tokens,
         model_dim=trajectory_flow_config.model_dim,
@@ -77,6 +82,7 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
     return CurveNavPolicy(
         depth_encoder=depth_encoder,
         condition_encoder=condition_encoder,
+        curve_proposal=curve_proposal,
         trajectory_flow=trajectory_flow,
         curve_codec=curve_codec,
         target_codec=target_codec,

@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from curvenav.conditioning import ROUTE_ANCHOR_COUNT
 from curvenav.trajectory import BoundedCurvatureTrajectory, PlanarBSplineCodec
 from curvenav.types import (
     ConditionFeatures,
@@ -22,7 +21,7 @@ class CurveNavLoss:
     flow_loss: Tensor
     path_loss: Tensor
     tangent_loss: Tensor
-    route_loss: Tensor
+    proposal_loss: Tensor
 
 
 class CurveNavPolicy(nn.Module):
@@ -30,6 +29,7 @@ class CurveNavPolicy(nn.Module):
         self,
         depth_encoder: nn.Module,
         condition_encoder: nn.Module,
+        curve_proposal: nn.Module,
         trajectory_flow: nn.Module,
         curve_codec: BoundedCurvatureTrajectory,
         target_codec: PlanarBSplineCodec,
@@ -38,28 +38,21 @@ class CurveNavPolicy(nn.Module):
         super().__init__()
         self.depth_encoder = depth_encoder
         self.condition_encoder = condition_encoder
+        self.curve_proposal = curve_proposal
         self.trajectory_flow = trajectory_flow
         self.curve_codec = curve_codec
         self.target_codec = target_codec
         self.integration_steps = integration_steps
         if self.trajectory_flow.future_tokens != self.curve_codec.num_curve_tokens:
             raise ValueError("flow and curve token counts differ")
+        if self.curve_proposal.curve_tokens != self.curve_codec.num_curve_tokens:
+            raise ValueError("proposal and curve token counts differ")
 
         progress = torch.linspace(0.0, 1.0, curve_codec.num_path_points)
         near_weights = 0.25 + torch.exp(-4.0 * progress)
         self.register_buffer(
             "near_path_weights",
             near_weights / near_weights.mean(),
-            persistent=True,
-        )
-        route_anchor_indices = torch.linspace(
-            0,
-            curve_codec.num_path_points - 1,
-            ROUTE_ANCHOR_COUNT + 1,
-        )[1:].round().to(torch.long)
-        self.register_buffer(
-            "route_anchor_indices",
-            route_anchor_indices,
             persistent=True,
         )
 
@@ -121,23 +114,6 @@ class CurveNavPolicy(nn.Module):
         weighted = direction_error * weights * valid
         return weighted.sum() / (weights * valid).sum().clamp_min(1.0)
 
-    def _route_loss(
-        self,
-        encoded: ConditionFeatures,
-        predicted_path: Tensor,
-        reference_path: Tensor,
-    ) -> Tensor:
-        reference_anchors = reference_path[:, self.route_anchor_indices]
-        target_error = torch.linalg.vector_norm(
-            encoded.route_anchors - reference_anchors,
-            dim=-1,
-        ) / self.planning_horizon_m
-        path_error = torch.linalg.vector_norm(
-            predicted_path[:, self.route_anchor_indices] - encoded.route_anchors,
-            dim=-1,
-        ) / self.planning_horizon_m
-        return (target_error + path_error).mean()
-
     def training_loss(
         self,
         condition: PolicyCondition,
@@ -158,18 +134,27 @@ class CurveNavPolicy(nn.Module):
         smoothed_target_path = self.target_codec.decode_equal_arc(
             target.control_points.float()
         )
+        free_mask = self.curve_codec.free_mask.to(
+            device=condition.point_goal.device,
+            dtype=torch.bool,
+        )[None].expand(condition.point_goal.shape[0], -1, -1)
+        proposal_state = self.curve_proposal(
+            encoded,
+            free_mask.to(encoded.tokens.dtype),
+        )
+        proposal_path, _, _ = self.curve_codec.decode(
+            self.trajectory_flow.denormalize_curve_coordinates(proposal_state),
+            condition.point_goal.float(),
+        )
         clean_future = self.trajectory_flow.normalize_curve_coordinates(
             self.curve_codec.encode_target(
                 smoothed_target_path,
                 condition.point_goal.float(),
             )
         )
-        free_mask = self.curve_codec.free_mask.to(
-            device=clean_future.device,
-            dtype=torch.bool,
-        )[None].expand(clean_future.shape[0], -1, -1)
         flow_state, time, target_velocity = self.trajectory_flow.training_path(
             clean_future,
+            proposal_state.detach(),
             free_mask.to(clean_future.dtype),
         )
         predicted_velocity = (
@@ -196,19 +181,18 @@ class CurveNavPolicy(nn.Module):
         reference_path = target.reference_path.float()
         path_loss = self._path_loss(predicted_path, reference_path)
         tangent_loss = self._tangent_loss(predicted_path, reference_path)
-        route_loss = self._route_loss(
-            encoded,
-            predicted_path,
-            smoothed_target_path,
+        proposal_loss = (
+            self._path_loss(proposal_path, smoothed_target_path)
+            + self._tangent_loss(proposal_path, smoothed_target_path)
         )
 
-        loss = flow_loss + path_loss + tangent_loss + route_loss
+        loss = flow_loss + path_loss + tangent_loss + proposal_loss
         return CurveNavLoss(
             loss=loss,
             flow_loss=flow_loss,
             path_loss=path_loss,
             tangent_loss=tangent_loss,
-            route_loss=route_loss,
+            proposal_loss=proposal_loss,
         )
 
     @torch.no_grad()
@@ -221,8 +205,13 @@ class CurveNavPolicy(nn.Module):
             device=condition.point_goal.device,
             dtype=torch.bool,
         )[None].expand(condition.point_goal.shape[0], -1, -1)
+        proposal_state = self.curve_proposal(
+            encoded,
+            free_mask.to(encoded.tokens.dtype),
+        )
         curve_coordinates = self.trajectory_flow.integrate(
             encoded,
+            proposal_state,
             self.integration_steps,
             free_mask,
         )
