@@ -38,7 +38,7 @@
 
 当前 prepared dataset、checkpoint 合同和部署输入统一使用上述 Dingo D455 标定。旧 `0.40 m` 水平相机 checkpoint 与当前合同不兼容，必须直接拒绝，不能通过二维缩放或兼容分支继续评测。
 
-CurveNav 每个规划周期把八个固定反向成对的 Flow base 同批做八步 Heun 积分，用联合生成的已执行历史重建误差选择唯一未来轨迹。这个分数不含 learned critic 或碰撞启发式。当前单专家数据没有 NavDP critic 所需的 privileged ESDF 标签，也没有 X-NavDP 的在线 Q target，因此闭环主结果不得混入未训练 scorer、oracle 选轨、标签轨迹或启发式碰撞 mask。离线只报告实际输出轨迹的 ADE、弧长、目标进展、延迟，以及弧长域曲率 B-spline 直接给出的连续曲率；不再用 XY 控制多边形离散转角冒充轨迹曲率界。
+CurveNav 每个规划周期从训练定义的唯一零源状态做八步 Heun 积分，直接得到一条未来轨迹。不存在随机候选、历史重建打分、learned critic 或碰撞启发式。当前单专家数据没有 NavDP critic 所需的 privileged ESDF 标签，也没有 X-NavDP 的在线 Q target，因此闭环主结果不得混入未训练 scorer、oracle 选轨、标签轨迹或启发式碰撞 mask。离线只报告实际输出轨迹的 ADE、弧长、目标进展、延迟，以及弧长域曲率 B-spline 直接给出的连续曲率；不再用 XY 控制多边形离散转角冒充轨迹曲率界。
 
 上游评测真源是部署时固定 commit 的 benchmark checkout：
 

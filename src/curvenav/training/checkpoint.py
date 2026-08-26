@@ -25,7 +25,7 @@ from curvenav.trajectory import (
 )
 
 
-CHECKPOINT_TYPE = "curvenav_bounded_curvature_flow_policy"
+CHECKPOINT_TYPE = "curvenav_deterministic_bounded_curvature_flow_policy"
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
 
@@ -105,12 +105,9 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "curve_boundary_conditions": "origin_and_forward_half_plane_initial_heading",
         "trajectory_flow_type": TRAJECTORY_FLOW_TYPE,
         "training_objective": (
-            "past_future_curvature_flow_plus_normalized_path_tangent_subgoal"
+            "zero_source_future_flow_plus_metric_path_tangent_subgoal"
         ),
-        "trajectory_prediction": (
-            "eight_antithetic_samples_selected_by_executed_history_reconstruction"
-        ),
-        "trajectory_candidate_samples": 8,
+        "trajectory_prediction": "single_zero_source_heun_trajectory",
         "trajectory_flow_integration_steps": config.trajectory_flow.integration_steps,
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
         "visual_context": (
@@ -121,7 +118,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "observation_to_current": "planar_rigid_transform_used_for_depth_token_alignment",
         "visual_compression": "64_goal_independent_metric_geometry_queries",
         "goal_conditioning": "pointgoal_direction_range_and_metric_local_scale",
-        "temporal_modeling": "joint_past_reconstruction_and_future_curvature_flow",
+        "temporal_modeling": "executed_history_conditions_future_only_flow",
         "num_curve_tokens": trajectory.num_curvature_control_points + 1,
         "num_curvature_control_points": trajectory.num_curvature_control_points,
         "curvature_spline_degree": trajectory.curvature_spline_degree,

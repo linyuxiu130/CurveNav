@@ -1,4 +1,4 @@
-"""Conditional rectified flow over past motion and future spline coordinates."""
+"""Deterministic conditional flow over future executable-curve coordinates."""
 
 import math
 
@@ -10,7 +10,9 @@ from curvenav.models.blocks import ConditionalTrajectoryBlock
 from curvenav.types import ConditionFeatures
 
 
-TRAJECTORY_FLOW_TYPE = "past_future_bounded_curvature_rectified_flow_adarmszero_heun"
+TRAJECTORY_FLOW_TYPE = (
+    "zero_source_future_bounded_curvature_rectified_flow_adarmszero_heun"
+)
 
 
 class FourierTimeEmbedding(nn.Module):
@@ -37,28 +39,30 @@ class FourierTimeEmbedding(nn.Module):
 
 
 class CurvatureTrajectoryFlow(nn.Module):
-    """Jointly reconstruct executed history and generate feasible curve state."""
+    """Generate one future curve from a zero-source conditional flow.
+
+    For expert curve coordinates ``x_1`` the conditional probability path is
+    ``x_t = t x_1`` and its exact velocity target is ``v_t = x_1``.  Executed
+    history is already present in the condition tokens, so it is never noised,
+    reconstructed, or used to rank stochastic future samples.
+    """
 
     def __init__(
         self,
         future_tokens: int,
-        history_tokens: int,
         model_dim: int,
         layers: int,
         heads: int,
         dropout: float,
     ) -> None:
         super().__init__()
-        if history_tokens < 1:
-            raise ValueError("history_tokens must be positive")
+        if future_tokens < 1:
+            raise ValueError("future_tokens must be positive")
         self.future_tokens = future_tokens
-        self.history_tokens = history_tokens
-        self.total_tokens = history_tokens + future_tokens
         self.state_projection = nn.Linear(2, model_dim)
         self.token_embedding = nn.Parameter(
-            torch.empty(1, self.total_tokens, model_dim)
+            torch.empty(1, future_tokens, model_dim)
         )
-        self.role_embedding = nn.Parameter(torch.empty(1, 2, model_dim))
         self.time_embedding = FourierTimeEmbedding(model_dim)
         self.blocks = nn.ModuleList(
             ConditionalTrajectoryBlock(model_dim, heads, dropout) for _ in range(layers)
@@ -66,116 +70,96 @@ class CurvatureTrajectoryFlow(nn.Module):
         self.output_norm = RMSNorm(model_dim)
         self.velocity_projection = nn.Linear(model_dim, 2)
         nn.init.trunc_normal_(self.token_embedding, std=0.02)
-        nn.init.trunc_normal_(self.role_embedding, std=0.02)
         nn.init.zeros_(self.velocity_projection.weight)
         nn.init.zeros_(self.velocity_projection.bias)
 
     def forward(
         self,
-        noisy_state: Tensor,
+        state: Tensor,
         time: Tensor,
         condition_tokens: Tensor,
         route_token: Tensor,
     ) -> Tensor:
-        if noisy_state.ndim != 3 or noisy_state.shape[1:] != (
-            self.total_tokens,
+        if state.ndim != 3 or state.shape[1:] != (
+            self.future_tokens,
             2,
         ):
-            raise ValueError(
-                "noisy_state does not match the past-future token contract"
-            )
-        if time.shape != (noisy_state.shape[0],):
+            raise ValueError("state does not match the future token contract")
+        if time.shape != (state.shape[0],):
             raise ValueError("time must have shape [B]")
-        if route_token.shape != (noisy_state.shape[0], self.token_embedding.shape[-1]):
+        if route_token.shape != (state.shape[0], self.token_embedding.shape[-1]):
             raise ValueError("route_token must have shape [B,D]")
-        roles = torch.cat(
-            (
-                self.role_embedding[:, :1].expand(-1, self.history_tokens, -1),
-                self.role_embedding[:, 1:].expand(-1, self.future_tokens, -1),
-            ),
-            dim=1,
-        )
-        trajectory = self.state_projection(noisy_state) + self.token_embedding + roles
+        trajectory = self.state_projection(state) + self.token_embedding
         modulation = self.time_embedding(time) + route_token
         for block in self.blocks:
             trajectory = block(trajectory, condition_tokens, modulation)
         return self.velocity_projection(self.output_norm(trajectory))
 
-    def training_pair(
+    def training_path(
         self,
         clean_state: Tensor,
         free_mask: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         if clean_state.shape != free_mask.shape:
             raise ValueError("clean_state and free_mask must have identical shapes")
-        noise = torch.randn_like(clean_state) * free_mask
         time = torch.rand(
             clean_state.shape[0],
             device=clean_state.device,
             dtype=clean_state.dtype,
         )
-        noisy = torch.lerp(noise, clean_state, time[:, None, None]) * free_mask
-        return noisy, time, (clean_state - noise) * free_mask
+        clean_state = clean_state * free_mask
+        state = time[:, None, None] * clean_state
+        return state, time, clean_state
 
     @staticmethod
     def reconstruct_clean(
-        noisy_state: Tensor,
+        state: Tensor,
         time: Tensor,
         velocity: Tensor,
     ) -> Tensor:
-        return noisy_state + (1.0 - time[:, None, None]) * velocity
+        return state + (1.0 - time[:, None, None]) * velocity
 
-    def integrate_candidates(
+    def integrate(
         self,
         condition: ConditionFeatures,
         integration_steps: int,
-        base_samples: Tensor,
         free_mask: Tensor,
     ) -> Tensor:
-        """Integrate a fixed candidate group in one batched Heun solve."""
-        if base_samples.ndim != 3 or base_samples.shape[1:] != (
-            self.total_tokens,
-            2,
-        ):
-            raise ValueError("base_samples must have shape [C,T,2]")
+        """Integrate the unique zero-source future state with Heun's method."""
+        if integration_steps < 1:
+            raise ValueError("integration_steps must be positive")
         batch = condition.tokens.shape[0]
-        candidates = base_samples.shape[0]
-        if free_mask.shape != (batch, self.total_tokens, 2):
+        if free_mask.shape != (batch, self.future_tokens, 2):
             raise ValueError("free_mask must have shape [B,T,2]")
-
-        state = (
-            base_samples.to(
-                device=condition.tokens.device,
-                dtype=condition.tokens.dtype,
-            )[None]
-            .expand(batch, -1, -1, -1)
-            .clone()
+        state = torch.zeros(
+            batch,
+            self.future_tokens,
+            2,
+            device=condition.tokens.device,
+            dtype=condition.tokens.dtype,
         )
-        mask = free_mask[:, None].to(dtype=state.dtype).expand_as(state)
-        state = state * mask
-        state = state.reshape(batch * candidates, self.total_tokens, 2)
-        mask = mask.reshape_as(state)
-        memory = (
-            condition.tokens[:, None]
-            .expand(-1, candidates, -1, -1)
-            .reshape(batch * candidates, condition.tokens.shape[1], -1)
-        )
-        route = (
-            condition.route_token[:, None]
-            .expand(-1, candidates, -1)
-            .reshape(batch * candidates, -1)
-        )
+        mask = free_mask.to(dtype=state.dtype)
         step_size = 1.0 / integration_steps
         for index in range(integration_steps):
             time = torch.full(
-                (batch * candidates,),
+                (batch,),
                 index * step_size,
                 device=state.device,
                 dtype=state.dtype,
             )
             next_time = torch.full_like(time, (index + 1) * step_size)
-            velocity = self(state, time, memory, route) * mask
+            velocity = self(
+                state,
+                time,
+                condition.tokens,
+                condition.route_token,
+            ) * mask
             predictor = (state + step_size * velocity) * mask
-            corrected = self(predictor, next_time, memory, route) * mask
+            corrected = self(
+                predictor,
+                next_time,
+                condition.tokens,
+                condition.route_token,
+            ) * mask
             state = (state + 0.5 * step_size * (velocity + corrected)) * mask
-        return state.reshape(batch, candidates, self.total_tokens, 2)
+        return state

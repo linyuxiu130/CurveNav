@@ -69,7 +69,6 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
     )
     trajectory_flow = CurvatureTrajectoryFlow(
         future_tokens=curve_codec.num_curve_tokens,
-        history_tokens=config.data.observation_frames - 1,
         model_dim=trajectory_flow_config.model_dim,
         layers=trajectory_flow_config.transformer_layers,
         heads=trajectory_flow_config.transformer_heads,
@@ -82,8 +81,4 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         curve_codec=curve_codec,
         target_codec=target_codec,
         integration_steps=trajectory_flow_config.integration_steps,
-        observation_frames=config.data.observation_frames,
-        history_scale_m=(
-            (config.data.observation_frames - 1) * config.data.frame_spacing_m
-        ),
     )

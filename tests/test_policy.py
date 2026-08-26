@@ -165,17 +165,24 @@ def test_seven_curvature_control_contract_is_unique() -> None:
 
 def test_flow_endpoint_reconstruction_matches_linear_path_identity() -> None:
     flow = build_policy(tiny_config()).trajectory_flow
-    clean = torch.randn(3, flow.total_tokens, 2)
+    clean = torch.randn(3, flow.future_tokens, 2)
     policy = build_policy(tiny_config())
-    future_mask = policy.curve_codec.free_mask[None].expand(3, -1, -1)
-    free_mask = torch.cat(
-        (torch.ones(3, flow.history_tokens, 2, dtype=torch.bool), future_mask),
-        dim=1,
-    )
+    free_mask = policy.curve_codec.free_mask[None].expand(3, -1, -1)
     clean = clean * free_mask
-    noisy, time, velocity = flow.training_pair(clean, free_mask)
-    reconstructed = flow.reconstruct_clean(noisy, time, velocity)
+    state, time, velocity = flow.training_path(clean, free_mask)
+    torch.testing.assert_close(state, time[:, None, None] * clean)
+    torch.testing.assert_close(velocity, clean)
+    reconstructed = flow.reconstruct_clean(state, time, velocity)
     torch.testing.assert_close(reconstructed, clean)
+
+
+def test_future_flow_has_no_generated_history_or_candidate_state() -> None:
+    policy = build_policy(tiny_config())
+    flow = policy.trajectory_flow
+    assert flow.future_tokens == policy.curve_codec.num_curve_tokens
+    assert not hasattr(flow, "history_tokens")
+    assert not hasattr(flow, "total_tokens")
+    assert not hasattr(policy, "candidate_bases")
 
 
 def test_straight_target_is_an_exact_curve_projection() -> None:

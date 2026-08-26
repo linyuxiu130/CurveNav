@@ -1,6 +1,6 @@
 # CurveNav
 
-CurveNav 是 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal，通过 geometry/route/state Transformer 与 past-future rectified flow 生成一条前向、平滑且连续曲率严格有界的弧长域局部轨迹。部署时由生成器重建已执行历史的一致性选择未来样本，不使用轨迹评价头。
+CurveNav 是 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal，通过 geometry/route/state Transformer 与 future-only deterministic rectified flow 生成唯一一条前向、平滑且连续曲率严格有界的弧长域局部轨迹。历史只作为生成条件，不生成随机候选，也不使用轨迹评价头。
 
 当前目标只有一个：先在现有深度合同下验证 PointGoal 局部规划，再在完全相同的 episode、相机、异步 MPC 和指标口径下对比 NavDP 与 X-NavDP。局部基线成立前不专项扩展长距离或脱困能力。
 

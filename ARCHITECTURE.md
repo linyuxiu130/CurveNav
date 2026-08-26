@@ -29,17 +29,16 @@ PointGoal direction + log range ────────────────
                                       4× joint condition Transformer
                                       supervised local-route bottleneck
                                                                       ↓
-three executed-past xy tokens + eight future bounded-curvature tokens
-                                      8× past-future Flow Transformer
+                                      8 future bounded-curvature tokens
+                                      8× future Flow Transformer
                                       adaRMS-Zero(time, route)
                                                                       ↓
-                     8 antithetic joint samples, 8-step batched Heun
-                     select by executed-past reconstruction consistency
+                     unique zero-source state, 8-step Heun integration
                                                                       ↓
           PointGoal-scaled arc-length/curvature decoder → metric local path
 ```
 
-训练和部署只组装这一张图。checkpoint 类型为 `curvenav_bounded_curvature_flow_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
+训练和部署只组装这一张图。checkpoint 类型为 `curvenav_deterministic_bounded_curvature_flow_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
 
 ## 2. 视觉几何、历史状态与路线融合
 
@@ -153,58 +152,54 @@ r* = atanh(c*/κmax).
 
 当前 30,642 个训练样本和 7,960 个验证样本的目标坐标全部有限，最大绝对值分别为 `2.710/1.113`；投影到可行曲线后，相对原专家路径的平均点误差为 `3.83/4.02 mm`，99% 样本的最大点误差为 `8.78/8.72 cm`。训练、离线评估和部署共用同一个有界曲率 decoder。
 
-## 4. Past-Future Rectified Flow Transformer
+## 4. Future-only Deterministic Rectified Flow Transformer
 
-### 4.1 联合状态与 CFM
+### 4.1 零源条件 Flow Matching
 
-三帧已执行历史的当前系平移除以 1.35 m，形成 `h∈R^(3×2)`。未来曲线坐标为 `y∈R^(8×2)`。Flow 联合建模：
+三帧已执行历史已经通过 metric depth alignment 和四个显式 state token 进入条件序列。未来曲线坐标为 `y∈R^(8×2)`；Flow 只生成 `y`，不再把已知历史复制成随机生成目标。
 
-```text
-x_1 = [h,y] ∈ R^(11×2).
-```
-
-无效历史以及七个曲率 token 的第二通道通过自由度 mask 从噪声、损失和 ODE 更新中同时移除。其余维度使用标准直线 conditional flow matching：
+当前数据对每个观测只有一条专家局部轨迹，任务输出也要求一条可执行轨迹，因此采用从 Dirac 零源到条件专家目标的直线 Flow：
 
 ```text
-z ~ N(0,I),  t ~ U(0,1),
-x_t = (1-t)z + t x_1,
-u_t = x_1-z,
-L_flow = Σ mask·||v_θ(x_t,t,C)-u_t||² / Σ mask.
+y_0 = 0,
+t ~ U(0,1),
+y_t = t y_1,
+u_t = d y_t/dt = y_1,
+L_flow = Σ mask·||v_θ(y_t,t,C)-y_1||² / Σ mask.
 ```
 
-一步干净端点估计为：
+七个曲率 token 的第二通道由结构 mask 从状态、损失和 ODE 更新中同时移除。一步干净端点估计为：
 
 ```text
-x_hat_1 = x_t + (1-t)v_θ(x_t,t,C).
+y_hat_1 = y_t + (1-t)v_θ(y_t,t,C).
 ```
 
-直接解码 `x_hat_1` 的未来部分施加 metric path 和 tangent 监督，Flow 学到的不只是内禀坐标均方误差。
+直接解码 `y_hat_1` 施加 metric path 和 tangent 监督，Flow 学到的不只是内禀坐标均方误差。零源不是推理启发式：它就是训练概率路径的唯一起点，所以训练和部署没有 base-sample 分布差异。
 
 ### 4.2 轨迹 Transformer
 
-11 个状态 token 加 learned token-position embedding 和 past/future role embedding。八层 Flow block 均包含：
+8 个未来 token 加 learned token-position embedding。八层 Flow block 均包含：
 
-1. 11 token 双向 self-attention，使已执行历史和未来控制结构直接交换信息；
+1. 8 token 双向 self-attention，使弧长、初始航向和七个曲率控制直接交换信息；
 2. 对 70 个 condition token 的 cross-attention，保留局部几何的 token 级信息；
 3. SwiGLU feed-forward；
 4. 由 Fourier flow time 与 `c_route` 共同产生的 adaRMS-Zero shift、scale 和 residual gate。
 
 adaRMS-Zero 的各分支 gate 零初始化，输出 velocity projection 也零初始化，使初始网络从稳定的零向量场开始学习。相较只在输入拼接一次时间/目标，逐层调制让路线和 Flow 时间控制每个残差更新；这吸收 DiT 的 adaptive-normalization 稳定性和 X-NavDP 的 FiLM 条件注入思想，但 geometry 仍通过 cross-attention 保持空间分辨率。
 
-生产深度不是为了堆参数而设置：条件端四层负责 geometry/state/goal 路线推理，Flow 端八层负责不同噪声时间上的过去—未来联合恢复，两者职责不同且没有重复生成器。
+生产深度不是为了堆参数而设置：条件端四层负责 geometry/state/goal 路线推理，Flow 端八层负责不同连续时间上的未来曲线修正，两者职责不同且没有重复生成器。
 
-### 4.3 生成器内部的历史自校验
+### 4.3 唯一推理轨迹
 
-部署使用八个固定、成对反号且逐维 RMS 为一的 Gaussian base，一次扩成 `[B×8,11,2]`，通过八步 Heun 同批积分。对第 `j` 个联合结果，以真实已执行历史计算：
+部署从与训练完全相同的 `y_0=0` 出发，通过八步 Heun 积分：
 
 ```text
-S_j = Σ valid·||h_hat_j-h||² / Σ valid.
-j* = argmin_j S_j.
+y' = v_θ(y,t,C),
+y_predict = y + Δt y',
+y_next = y + Δt/2 [y' + v_θ(y_predict,t+Δt,C)].
 ```
 
-只解码 `j*` 对应的未来曲线。这里没有 learned score、碰撞概率或启发式总代价；同一个生成器同时重建 past 与 future，past 是推理时可验证的已发生事实。该设计把 Past-Token Prediction 的“用过去重建验证未来样本”原则迁移到局部导航。冷启动没有有效过去时，各候选分数同为零，固定顺序给出确定结果。
-
-它比直接输入上一条预测计划更适合当前合同：真实执行历史不会传播上一周期的错误计划，prepared data 也确实拥有因果历史位姿；相反，当前数据没有“上一周期模型已提交计划”字段，用专家未来伪造 RTC/previous-plan token 会发生标签泄漏和训练—部署偏移。
+输出只有一个 `[B,8,2]` 曲线状态，不存在候选维、随机 base、历史重建分数或 oracle 选择。真实执行历史仍通过条件序列影响每一步速度场，但不会消耗未来 Flow 的监督维度。该结构也避免传播上一周期的错误计划：当前数据没有“上一周期模型已提交计划”字段，用专家未来伪造 previous-plan token 会产生标签泄漏。
 
 ## 5. 唯一训练目标
 
@@ -214,10 +209,10 @@ j* = argmin_j S_j.
 L = L_flow + L_path + L_tangent + L_route.
 ```
 
-- `L_flow`：上述 past-future masked velocity MSE。
-- `L_path`：`path/H` 与 `reference/H` 的 Smooth-L1；沿等弧长进度使用 `0.25+exp(-4s)` 并归一到均值一，强调马上要执行的近端。
+- `L_flow`：上述 zero-source future masked velocity MSE。
+- `L_path`：每个等弧长位置的欧氏误差 `||p_hat-p*||₂/H`；使用 `0.25+exp(-4s)` 并归一到均值一，强调马上要执行的近端。
 - `L_tangent`：有效相邻路径段的 `1-cos(Δp_hat,Δp*)`，使用相同近端权重。
-- `L_route`：预测局部终点 `s_hat/H` 与专家参考终点的 Smooth-L1。
+- `L_route`：预测局部终点与专家参考终点的欧氏误差 `||s_hat-s*||₂/H`。
 
 不另加平滑 loss 或后处理：连续曲率界和高阶路径平滑由弧长域参数化直接给出，路径和切向项负责实际 metric 几何。训练日志分别记录四项损失，避免总 loss 掩盖某个子任务失效。
 
@@ -225,12 +220,12 @@ L = L_flow + L_path + L_tangent + L_route.
 
 | 来源 | 吸收的有效设计 | CurveNav 的针对性改进 |
 |---|---|---|
-| SanD | 四帧共享深度 backbone、空间 token、平滑低维轨迹先验 | 教师 B-spline 只做标签平滑；生产输出改为 PointGoal 标度的连续有界曲率曲线，并以真实 executed past 代替不可得的 previous-plan 标签 |
+| SanD | 四帧共享深度 backbone、空间 token、平滑低维轨迹先验 | 教师 B-spline 只做标签平滑；生产输出改为 PointGoal 标度的连续有界曲率曲线；不依赖部署时 ESDF 候选筛选 |
 | NavDP | `D=384` actor、learned-query 视觉压缩、trajectory-token cross-attention | query 先保存目标无关 metric geometry，再由独立 route query 融合目标；无 ESDF 标签时不训练 critic |
-| X-NavDP | 深层条件生成器、逐层 FiLM 思想、时序一致性的重要性 | 用 adaRMS-Zero 做 time-route 调制；用真实过去自校验，不让错误旧计划递归传播；当前阶段不做 GQRM/RL |
+| X-NavDP | 深层条件生成器、逐层 FiLM 思想、时序一致性的重要性 | 用 adaRMS-Zero 做 time-route 调制；真实历史只作为条件，不让错误旧计划递归传播；当前阶段不做 GQRM/RL |
 | LoGoPlanner | geometry/state/route 的任务专用 query | CurveNav 已有标定 metric depth 和真实位姿，不复制重型视频三维重建模型；路线瓶颈直接监督当前局部专家终点 |
-| Past-Token Prediction | past/future 联合生成和 past reconstruction verification | 把 past action 改为当前系历史运动，候选选择只依赖可观测事实，不引入评价头 |
-| Flow Matching / DiT | 直线 CFM、少步 ODE、adaptive normalization zero-init | Flow 作用于弧长/航向/曲率的可执行坐标空间，并以 token 级 metric geometry 作为 memory |
+| Past-Token Prediction | 用可观测过去约束未来的思想 | 历史已经由 condition encoder 显式编码；不再联合生成过去，因为过去重建误差不能代表未来轨迹质量 |
+| Flow Matching / DiT | 直线 CFM、少步 ODE、adaptive normalization zero-init | 对单专家 PointGoal 条件采用零源确定性 Flow，直接作用于弧长/航向/曲率的可执行坐标空间 |
 | NoMaD | 生成分布适合多模态局部行为 | 不照搬为 goal-agnostic 统一策略服务的 50% goal mask；CurveNav 始终严格 PointGoal 条件 |
 
 主要来源：[SanD 论文](https://arxiv.org/abs/2602.00923) 与 [官方源码](https://github.com/WangJinCheng1998/sandplanner)、[NavDP 论文](https://arxiv.org/abs/2505.08712) 与 [官方源码](https://github.com/InternRobotics/NavDP)、[X-NavDP](https://arxiv.org/abs/2607.28560)、[LoGoPlanner](https://arxiv.org/abs/2512.19629)、[Past-Token Prediction](https://arxiv.org/abs/2505.09561)、[NoMaD](https://arxiv.org/abs/2310.07896)、[Flow Matching](https://arxiv.org/abs/2209.03003)、[DiT](https://arxiv.org/abs/2212.09748)。
@@ -239,7 +234,7 @@ L = L_flow + L_path + L_tangent + L_route.
 
 训练只读取 `data/policy_dataset`。该目录当前仅包含本项目在固定 HSSD 资产上生成、按 Dingo 标定相机渲染的深度和专家轨迹，不混用论文作者的数据。四帧历史按行驶距离 `[-1.35,-0.90,-0.45,0] m` 取样；未来最多 24 个 `0.15 m` 专家点，近目标自然缩短。
 
-唯一训练入口使用 FP16、GPU 常驻 depth bank、异步 prefetch、AdamW、cosine schedule、EMA 和静态 `torch.compile`；多卡时由同一入口启用 DDP。数学 batch 固定为 1024，显存 micro-batch 上限为每卡 64，以适配 11 GiB 2080 Ti。对 world size `W`，每 rank 分配 `floor(1024/W)` 或 `ceil(1024/W)` 个互不重叠样本；局部 batch 均值乘 `W·B_r/1024` 后再经 DDP 求平均，严格得到全局 1024 样本均值。6 卡时分配为 `171×4 + 170×2`，每 rank 执行 `64+64+43/42` 三次前后向，只在末次同步梯度。这样 1–8 卡的每次 optimizer、schedule 与 EMA 更新都保持同一数学合同，不需要 padding、重复样本或改变学习率。唯一部署入口加载 EMA 权重并使用上述八候选 batched Heun 与 past consistency。没有训练专用生成器或部署 fallback。
+唯一训练入口使用 FP16、GPU 常驻 depth bank、异步 prefetch、AdamW、cosine schedule、EMA 和静态 `torch.compile`；多卡时由同一入口启用 DDP。数学 batch 固定为 1024，显存 micro-batch 上限为每卡 64，以适配 11 GiB 2080 Ti。对 world size `W`，每 rank 分配 `floor(1024/W)` 或 `ceil(1024/W)` 个互不重叠样本；局部 batch 均值乘 `W·B_r/1024` 后再经 DDP 求平均，严格得到全局 1024 样本均值。6 卡时分配为 `171×4 + 170×2`，每 rank 执行 `64+64+43/42` 三次前后向，只在末次同步梯度。这样 1–8 卡的每次 optimizer、schedule 与 EMA 更新都保持同一数学合同，不需要 padding、重复样本或改变学习率。唯一部署入口加载 EMA 权重并使用上述单轨迹八步 Heun。没有训练专用生成器或部署 fallback。
 
 必要验证分三层：
 
