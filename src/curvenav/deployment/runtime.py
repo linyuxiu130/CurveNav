@@ -28,7 +28,6 @@ def load_policy(checkpoint_path, config_path, device: str):
     ema.load_state_dict(checkpoint["ema"])
     ema.copy_to(policy)
     policy.eval().to(device)
-    policy.compile(mode="reduce-overhead", dynamic=False)
     return config, policy
 
 
@@ -164,7 +163,7 @@ class CurveNavRuntime:
         self.request_seconds = 0.0
 
     def _warmup_policy(self, batch_size: int) -> None:
-        """Materialize the compiled graph before the simulator starts an episode."""
+        """Initialize the actual batch execution before the episode starts."""
         observation_to_current = torch.zeros(
             batch_size,
             self.config.data.observation_frames,

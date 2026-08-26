@@ -109,7 +109,6 @@ def measure_policy(
 ) -> PolicyMeasurements:
     """Collect one deterministic prediction for every aligned observation."""
     policy.to(device).eval()
-    policy.compile(mode="reduce-overhead", dynamic=False)
     warmup = next(iter(loader))
     _sample(policy, warmup)
     torch.cuda.synchronize(device)

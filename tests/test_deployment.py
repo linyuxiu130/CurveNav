@@ -58,7 +58,7 @@ def test_depth_preprocessing_rejects_non_image_input():
         )
 
 
-def test_runtime_reset_materializes_the_actual_batch_graph() -> None:
+def test_runtime_reset_warms_the_actual_batch_execution() -> None:
     policy = _RecordingPolicy()
     runtime = CurveNavRuntime(CurveNavConfig(), policy, device="cpu")
 
