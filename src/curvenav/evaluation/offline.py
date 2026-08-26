@@ -129,8 +129,11 @@ def measure_policy(
         end.record()
         end.synchronize()
         batch_latency.append(start.elapsed_time(end))
+        smoothed_reference_path = policy.target_codec.decode_equal_arc(
+            prepared.target.control_points.float()
+        )
         _, _, reference_curvature = policy.curve_codec.path_geometry(
-            prepared.target.reference_path.float()
+            smoothed_reference_path
         )
         metrics = trajectory_batch_metrics(
             prediction.path.float(),
