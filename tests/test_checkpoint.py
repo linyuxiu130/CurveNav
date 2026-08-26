@@ -81,7 +81,7 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
     contract = checkpoint["policy_contract"]
     assert (
         checkpoint["checkpoint_type"]
-        == "curvenav_ordered_route_anchors_gaussian_flow_zero_mode_bounded_curvature_policy"
+        == "curvenav_route_consistent_ordered_anchors_gaussian_flow_zero_mode_bounded_curvature_policy"
     )
     assert {"model", "optimizer", "scheduler", "ema", "grad_scaler"} <= set(checkpoint)
     assert "extra" not in checkpoint
@@ -94,7 +94,7 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
     assert contract["flow_inference_source_type"] == "zero_prior_mode"
     assert (
         contract["training_objective"]
-        == "gaussian_source_future_flow_plus_metric_path_tangent_route_anchors"
+        == "gaussian_source_future_flow_plus_metric_path_tangent_route_consistency"
     )
     assert (
         contract["trajectory_prediction"]
@@ -144,7 +144,7 @@ def test_checkpoint_records_the_bounded_curvature_flow_contract() -> None:
 def test_checkpoint_contract_catches_geometry_mismatch() -> None:
     config = CurveNavConfig()
     checkpoint = {
-        "checkpoint_type": "curvenav_ordered_route_anchors_gaussian_flow_zero_mode_bounded_curvature_policy",
+        "checkpoint_type": "curvenav_route_consistent_ordered_anchors_gaussian_flow_zero_mode_bounded_curvature_policy",
         "policy_contract": build_policy_contract(config),
     }
     validate_policy_contract(checkpoint, config)

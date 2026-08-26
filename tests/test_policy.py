@@ -246,10 +246,20 @@ def test_route_anchors_follow_ordered_uniform_arc_progress() -> None:
         route_anchors=anchors,
     )
 
-    torch.testing.assert_close(policy._route_loss(encoded, path), torch.tensor(0.0))
+    torch.testing.assert_close(
+        policy._route_loss(encoded, path, path),
+        torch.tensor(0.0),
+    )
     torch.testing.assert_close(
         anchors[0, :, 0],
         torch.tensor([0.96, 1.92, 2.64, 3.60]),
+    )
+
+    inconsistent_path = path.clone()
+    inconsistent_path[:, policy.route_anchor_indices, 1] = 0.36
+    torch.testing.assert_close(
+        policy._route_loss(encoded, inconsistent_path, path),
+        torch.tensor(0.1),
     )
 
 

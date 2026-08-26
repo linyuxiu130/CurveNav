@@ -39,7 +39,7 @@ PointGoal direction + log range ────────────────
           PointGoal-scaled arc-length/curvature decoder → metric local path
 ```
 
-训练和部署只组装这一张图。checkpoint 类型为 `curvenav_ordered_route_anchors_gaussian_flow_zero_mode_bounded_curvature_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
+训练和部署只组装这一张图。checkpoint 类型为 `curvenav_route_consistent_ordered_anchors_gaussian_flow_zero_mode_bounded_curvature_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
 
 ## 2. 视觉几何、历史状态与路线融合
 
@@ -99,7 +99,7 @@ c_i = RMSNorm(q_i + MLP(r_hat_i / 3.6)),
 c_route = RMSNorm(mean_i c_i).
 ```
 
-Flow cross-attend 全部 73 个条件 token，因此保留四个锚点的顺序和局部路线形状；`c_route` 只提供全局调制。训练与部署都使用预测锚点，不把真实路线喂给生成器，因此没有 teacher-forcing 落差。这四个 head 共享参数，是唯一轨迹生成器的低频路线骨架，不是候选轨迹的评价头。它吸收 SanD 的结构化低维控制点和 NavDP/X-NavDP 的有序动作 token，但最终执行轨迹仍由同一个连续有界曲率 Flow 产生。
+Flow cross-attend 全部 73 个条件 token，因此保留四个锚点的顺序和局部路线形状；`c_route` 只提供全局调制。训练与部署都使用预测锚点，不把真实路线喂给生成器，因此没有 teacher-forcing 落差。训练时还约束最终解码曲线在相同等弧长索引处通过预测锚点，使低频路线和实际执行曲线属于同一个几何解，而不是两个只各自拟合标签的并行输出。这四个 head 共享参数，是唯一轨迹生成器的低频路线骨架，不是候选轨迹的评价头。它吸收 SanD 的结构化低维控制点和 NavDP/X-NavDP 的有序动作 token，但最终执行轨迹仍由同一个连续有界曲率 Flow 产生。
 
 ## 3. PointGoal 标度的有界曲率曲线
 
@@ -223,7 +223,7 @@ L = L_flow + L_path + L_tangent + L_route.
 - `L_flow`：上述 O(1) 归一化 Gaussian-source future masked velocity MSE。
 - `L_path`：每个等弧长位置的欧氏误差 `||p_hat-p*||₂/H`；使用 `0.25+exp(-4s)` 并归一到均值一，强调马上要执行的近端。
 - `L_tangent`：有效相邻路径段的 `1-cos(Δp_hat,Δp*)`，使用相同近端权重。
-- `L_route`：四个预测路线锚点与同一平滑专家路径相同等弧长进度点的平均欧氏误差 `mean_i ||r_hat_i-r_i*||₂/H`。
+- `L_route`：四个预测路线锚点的目标误差与锚点—执行曲线一致性误差之和，`mean_i (||r_hat_i-r_i*||₂+||p_hat_i-r_hat_i||₂)/H`。SanD 的控制点和 NavDP/X-NavDP 的动作增量都直接定义执行轨迹；这一约束保留有界曲率 Flow 表示，同时消除独立路线头与最终曲线在困难转弯上的几何脱节。
 
 不另加平滑 loss 或后处理：连续曲率界和高阶路径平滑由弧长域参数化直接给出，路径和切向项负责实际 metric 几何。训练日志分别记录四项损失，避免总 loss 掩盖某个子任务失效。
 

@@ -124,14 +124,19 @@ class CurveNavPolicy(nn.Module):
     def _route_loss(
         self,
         encoded: ConditionFeatures,
+        predicted_path: Tensor,
         reference_path: Tensor,
     ) -> Tensor:
         reference_anchors = reference_path[:, self.route_anchor_indices]
-        error = torch.linalg.vector_norm(
+        target_error = torch.linalg.vector_norm(
             encoded.route_anchors - reference_anchors,
             dim=-1,
         ) / self.planning_horizon_m
-        return error.mean()
+        path_error = torch.linalg.vector_norm(
+            predicted_path[:, self.route_anchor_indices] - encoded.route_anchors,
+            dim=-1,
+        ) / self.planning_horizon_m
+        return (target_error + path_error).mean()
 
     def training_loss(
         self,
@@ -191,7 +196,11 @@ class CurveNavPolicy(nn.Module):
         reference_path = target.reference_path.float()
         path_loss = self._path_loss(predicted_path, reference_path)
         tangent_loss = self._tangent_loss(predicted_path, reference_path)
-        route_loss = self._route_loss(encoded, smoothed_target_path)
+        route_loss = self._route_loss(
+            encoded,
+            predicted_path,
+            smoothed_target_path,
+        )
 
         loss = flow_loss + path_loss + tangent_loss + route_loss
         return CurveNavLoss(

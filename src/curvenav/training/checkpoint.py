@@ -31,7 +31,7 @@ from curvenav.trajectory import (
 
 
 CHECKPOINT_TYPE = (
-    "curvenav_ordered_route_anchors_gaussian_flow_zero_mode_bounded_curvature_policy"
+    "curvenav_route_consistent_ordered_anchors_gaussian_flow_zero_mode_bounded_curvature_policy"
 )
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
@@ -115,7 +115,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "flow_training_source_type": FLOW_TRAINING_SOURCE_TYPE,
         "flow_inference_source_type": FLOW_INFERENCE_SOURCE_TYPE,
         "training_objective": (
-            "gaussian_source_future_flow_plus_metric_path_tangent_route_anchors"
+            "gaussian_source_future_flow_plus_metric_path_tangent_route_consistency"
         ),
         "trajectory_prediction": "single_zero_prior_mode_heun_trajectory",
         "trajectory_flow_integration_steps": config.trajectory_flow.integration_steps,
