@@ -12,17 +12,7 @@ from curvenav.deployment.runtime import CurveNavRuntime, RuntimePrediction, load
 REQUEST_FIELDS = frozenset(
     {"point_goal", "depth_m", "robot_position", "robot_quaternion", "reset"}
 )
-RESPONSE_FIELDS = frozenset(
-    {
-        "path",
-        "candidate_paths",
-        "candidate_costs",
-        "candidate_clearance_costs",
-        "candidate_length_costs",
-        "candidate_goal_costs",
-        "candidate_minimum_clearance_m",
-    }
-)
+RESPONSE_FIELDS = frozenset({"path"})
 
 
 def _read_request(payload: bytes) -> dict[str, np.ndarray]:
@@ -43,34 +33,12 @@ def _read_request(payload: bytes) -> dict[str, np.ndarray]:
 
 def _write_response(prediction: RuntimePrediction) -> bytes:
     path = prediction.path
-    candidate_paths = prediction.candidate_paths
     if path.ndim != 3 or path.shape[-1] != 3:
         raise ValueError("path must have shape [B,P,3]")
-    batch, path_points, _ = path.shape
-    if (
-        candidate_paths.ndim != 4
-        or candidate_paths.shape[0] != batch
-        or candidate_paths.shape[2:] != (path_points, 3)
-    ):
-        raise ValueError("candidate_paths must have shape [B,C,P,3]")
-    costs = {
-        "candidate_costs": prediction.candidate_costs,
-        "candidate_clearance_costs": prediction.candidate_clearance_costs,
-        "candidate_length_costs": prediction.candidate_length_costs,
-        "candidate_goal_costs": prediction.candidate_goal_costs,
-        "candidate_minimum_clearance_m": prediction.candidate_minimum_clearance_m,
-    }
-    if any(value.shape != candidate_paths.shape[:2] for value in costs.values()):
-        raise ValueError("candidate costs must have shape [B,C]")
     stream = BytesIO()
     np.savez(
         stream,
         path=np.asarray(path, dtype=np.float32),
-        candidate_paths=np.asarray(candidate_paths, dtype=np.float32),
-        **{
-            name: np.asarray(value, dtype=np.float32)
-            for name, value in costs.items()
-        },
     )
     return stream.getvalue()
 
@@ -107,6 +75,4 @@ def load_npz_interface(
 ) -> CurveNavNpzInterface:
     """Load the deployable EMA policy behind the only benchmark boundary."""
     config, policy = load_policy(checkpoint_path, config_path, device)
-    return CurveNavNpzInterface(
-        CurveNavRuntime(config, policy, device=device)
-    )
+    return CurveNavNpzInterface(CurveNavRuntime(config, policy, device=device))

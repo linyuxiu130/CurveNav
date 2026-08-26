@@ -174,10 +174,9 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
         raise ValueError("HSSD camera calibration does not match CurveNav")
     cache = root / f"curvenav_hssd_depth_{data.image_height}x{data.image_width}_float16"
     manifest = json.loads((cache / "manifest.json").read_text(encoding="utf-8"))
-    if (
-        manifest.get("dtype") != "float16"
-        or manifest.get("target_camera") != depth_camera_contract(data)
-    ):
+    if manifest.get("dtype") != "float16" or manifest.get(
+        "target_camera"
+    ) != depth_camera_contract(data):
         raise ValueError("HSSD depth cache does not match the CurveNav data contract")
     records = [
         json.loads(line)
@@ -300,8 +299,8 @@ def _compile_split(
     ).astype(np.bool_)
 
     codec = PlanarBSplineCodec(
-        num_control_points=config.trajectory.num_control_points,
-        degree=config.trajectory.degree,
+        num_control_points=config.trajectory.num_target_control_points,
+        degree=config.trajectory.target_spline_degree,
         num_path_points=config.trajectory.num_path_points,
     )
     reference_batches = []
@@ -461,9 +460,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
-    compile_policy_dataset(
-        args.hssd_root, args.output, load_config(args.config)
-    )
+    compile_policy_dataset(args.hssd_root, args.output, load_config(args.config))
 
 
 if __name__ == "__main__":

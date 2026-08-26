@@ -22,15 +22,8 @@ class _FakeRuntime:
     def step(self, point_goals, depth, positions, quaternions):
         del depth, positions, quaternions
         batch = len(point_goals)
-        candidate_values = np.zeros((batch, 16), np.float32)
         return RuntimePrediction(
             path=np.zeros((batch, 64, 3), np.float32),
-            candidate_paths=np.zeros((batch, 16, 64, 3), np.float32),
-            candidate_costs=candidate_values,
-            candidate_clearance_costs=candidate_values,
-            candidate_length_costs=candidate_values,
-            candidate_goal_costs=candidate_values,
-            candidate_minimum_clearance_m=candidate_values,
         )
 
 
@@ -39,9 +32,7 @@ def _payload(**updates) -> bytes:
         "point_goal": np.zeros((2, 2), np.float32),
         "depth_m": np.ones((2, 360, 640, 1), np.float32),
         "robot_position": np.zeros((2, 3), np.float32),
-        "robot_quaternion": np.tile(
-            np.array([0.0, 0.0, 0.0, 1.0], np.float32), (2, 1)
-        ),
+        "robot_quaternion": np.tile(np.array([0.0, 0.0, 0.0, 1.0], np.float32), (2, 1)),
         "reset": np.array([True, False]),
     }
     values.update(updates)
@@ -59,9 +50,6 @@ def test_npz_interface_has_one_strict_request_and_response_contract() -> None:
     with np.load(BytesIO(response), allow_pickle=False) as archive:
         assert frozenset(archive.files) == RESPONSE_FIELDS
         assert archive["path"].shape == (2, 64, 3)
-        assert archive["candidate_paths"].shape == (2, 16, 64, 3)
-        assert archive["candidate_costs"].shape == (2, 16)
-        assert archive["candidate_minimum_clearance_m"].shape == (2, 16)
         assert all(archive[name].dtype == np.float32 for name in RESPONSE_FIELDS)
 
 

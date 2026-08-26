@@ -1,4 +1,4 @@
-"""SanD visual tokens and NavDP learned-query multi-frame compression."""
+"""Metric geometry, route, and state queries for the CurveNav generator."""
 
 import torch
 from torch import Tensor, nn
@@ -7,8 +7,11 @@ from curvenav.layers import EncoderBlock, RMSNorm, SwiGLU
 from curvenav.types import ConditionFeatures, DepthFeatures
 
 
-COMPRESSED_TOKENS_PER_FRAME = 16
-CONDITION_ENCODER_TYPE = "sand_geometry_aligned_navdp_query_memory"
+GEOMETRY_QUERY_COUNT = 64
+ROUTE_QUERY_LAYERS = 2
+CONDITION_ENCODER_TYPE = (
+    "metric_geometry_queries_supervised_route_bottleneck_explicit_state"
+)
 
 
 class CrossAttentionBlock(nn.Module):
@@ -43,13 +46,11 @@ class CrossAttentionBlock(nn.Module):
             need_weights=False,
         )[0]
         query = query + self.dropout(attended)
-        return query + self.dropout(
-            self.feed_forward(self.feed_forward_norm(query))
-        )
+        return query + self.dropout(self.feed_forward(self.feed_forward_norm(query)))
 
 
 class PolicyConditionEncoder(nn.Module):
-    """Compress geometry-aligned depth tokens and fuse the PointGoal token."""
+    """Build separate metric-geometry, ego-state, and local-route tokens."""
 
     def __init__(
         self,
@@ -57,40 +58,77 @@ class PolicyConditionEncoder(nn.Module):
         *,
         observation_frames: int,
         spatial_tokens: int,
-        model_dim: int = 256,
-        transformer_layers: int = 2,
-        transformer_heads: int = 4,
+        history_scale_m: float,
+        planning_horizon_m: float,
+        model_dim: int = 384,
+        transformer_layers: int = 4,
+        transformer_heads: int = 8,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        if history_scale_m <= 0 or planning_horizon_m <= 0:
+            raise ValueError("condition metric scales must be positive")
         self.point_goal_encoder = point_goal_encoder
         self.observation_frames = observation_frames
         self.spatial_tokens = spatial_tokens
-        self.compressed_tokens = observation_frames * COMPRESSED_TOKENS_PER_FRAME
+        self.history_scale_m = float(history_scale_m)
+        self.planning_horizon_m = float(planning_horizon_m)
 
         self.frame_slot_embedding = nn.Parameter(
             torch.zeros(1, observation_frames, 1, model_dim)
         )
-        self.compression_queries = nn.Parameter(
-            torch.zeros(1, self.compressed_tokens, model_dim)
+        self.geometry_query_embedding = nn.Parameter(
+            torch.zeros(1, GEOMETRY_QUERY_COUNT, model_dim)
         )
-        self.visual_compressor = CrossAttentionBlock(
+        self.geometry_compressor = CrossAttentionBlock(
             model_dim,
             transformer_heads,
             dropout,
+        )
+        self.state_encoder = nn.Sequential(
+            nn.Linear(4, model_dim),
+            nn.SiLU(),
+            nn.Linear(model_dim, model_dim),
+        )
+        self.invalid_state_embedding = nn.Parameter(
+            torch.zeros(1, observation_frames, model_dim)
+        )
+        self.route_query_embedding = nn.Parameter(torch.zeros(1, 1, model_dim))
+        self.route_blocks = nn.ModuleList(
+            CrossAttentionBlock(model_dim, transformer_heads, dropout)
+            for _ in range(ROUTE_QUERY_LAYERS)
         )
         self.condition_blocks = nn.ModuleList(
             EncoderBlock(model_dim, transformer_heads, dropout)
             for _ in range(transformer_layers)
         )
         self.output_norm = RMSNorm(model_dim)
+        self.subgoal_head = nn.Sequential(
+            nn.Linear(model_dim, model_dim),
+            nn.SiLU(),
+            nn.Linear(model_dim, 2),
+        )
+        self.subgoal_embedding = nn.Sequential(
+            nn.Linear(2, model_dim),
+            nn.SiLU(),
+            nn.Linear(model_dim, model_dim),
+        )
+        self.route_output_norm = RMSNorm(model_dim)
         nn.init.trunc_normal_(self.frame_slot_embedding, std=0.02)
-        nn.init.trunc_normal_(self.compression_queries, std=0.02)
+        nn.init.trunc_normal_(self.geometry_query_embedding, std=0.02)
+        nn.init.trunc_normal_(self.invalid_state_embedding, std=0.02)
+        nn.init.trunc_normal_(self.route_query_embedding, std=0.02)
+
+    @staticmethod
+    def _unit_disk(value: Tensor) -> Tensor:
+        squared_radius = value.float().square().sum(dim=-1, keepdim=True)
+        return value / torch.sqrt(1.0 + squared_radius).to(value.dtype)
 
     def forward(
         self,
         observation: DepthFeatures,
         point_goal: Tensor,
+        observation_to_current: Tensor,
         observation_valid: Tensor,
     ) -> ConditionFeatures:
         batch = point_goal.shape[0]
@@ -100,12 +138,12 @@ class PolicyConditionEncoder(nn.Module):
                 "observation tokens must have shape "
                 f"[B, {self.observation_frames}, {self.spatial_tokens}, D]"
             )
+        if observation_to_current.shape != (batch, self.observation_frames, 4):
+            raise ValueError("observation_to_current must have shape [B, F, 4]")
         if observation_valid.shape != (batch, self.observation_frames):
             raise ValueError("observation_valid must have shape [B, F]")
         if observation_valid.dtype != torch.bool:
             raise TypeError("observation_valid must be boolean")
-        if not observation_valid[:, -1].all():
-            raise ValueError("the current observation must always be valid")
 
         visual = observation.tokens + self.frame_slot_embedding
         visual_memory = visual.flatten(1, 2)
@@ -115,15 +153,42 @@ class PolicyConditionEncoder(nn.Module):
             .expand(-1, -1, self.spatial_tokens)
             .flatten(1)
         )
-        queries = self.compression_queries.expand(batch, -1, -1)
-        compressed_visual = self.visual_compressor(
-            queries,
+        geometry = self.geometry_compressor(
+            self.geometry_query_embedding.expand(batch, -1, -1),
             visual_memory,
             visual_padding_mask,
         )
 
-        goal_token = self.point_goal_encoder(point_goal).unsqueeze(1)
-        tokens = torch.cat((goal_token, compressed_visual), dim=1)
+        state_input = observation_to_current.clone()
+        state_input[..., :2] = state_input[..., :2] / self.history_scale_m
+        state = self.state_encoder(state_input)
+        state = torch.where(
+            observation_valid[..., None],
+            state,
+            self.invalid_state_embedding.expand(batch, -1, -1),
+        )
+
+        goal = self.point_goal_encoder(point_goal).unsqueeze(1)
+        route = self.route_query_embedding.expand(batch, -1, -1) + goal
+        route_memory = torch.cat((state, geometry), dim=1)
+        for block in self.route_blocks:
+            route = block(route, route_memory)
+
+        tokens = torch.cat((route, goal, state, geometry), dim=1)
         for block in self.condition_blocks:
             tokens = block(tokens)
-        return ConditionFeatures(tokens=self.output_norm(tokens))
+        tokens = self.output_norm(tokens)
+        route_latent = tokens[:, 0]
+        local_subgoal = self.planning_horizon_m * self._unit_disk(
+            self.subgoal_head(route_latent)
+        )
+        route_token = self.route_output_norm(
+            route_latent
+            + self.subgoal_embedding(local_subgoal / self.planning_horizon_m)
+        )
+        tokens = torch.cat((route_token[:, None], tokens[:, 1:]), dim=1)
+        return ConditionFeatures(
+            tokens=tokens,
+            route_token=route_token,
+            local_subgoal=local_subgoal,
+        )

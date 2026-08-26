@@ -7,7 +7,6 @@ import torch
 from curvenav.config import DataConfig, TrajectoryConfig
 from curvenav.data.depth_bank import gather_depth_observations, load_packed_depth_bank
 from curvenav.data.loader import (
-    build_fixed_batch_loader,
     build_policy_training_loader,
     build_policy_validation_loader,
 )
@@ -17,6 +16,10 @@ from curvenav.data.prepare import (
     _fixed_future,
 )
 from curvenav.data.prepared import PreparedPolicyDataset, RepeatedPolicyDataset
+from curvenav.training.batching import (
+    DistributedStepBatchSampler,
+    build_distributed_batch_layout,
+)
 
 
 def _write_dataset(root, count: int = 4) -> None:
@@ -39,9 +42,7 @@ def _write_dataset(root, count: int = 4) -> None:
         "bspline_bending_regularization_m4": 1e-5,
     }
     root.mkdir()
-    (root / "manifest.json").write_text(
-        json.dumps({"contract": contract})
-    )
+    (root / "manifest.json").write_text(json.dumps({"contract": contract}))
     for split in ("train", "validation"):
         split_root = root / split
         (split_root / "depth").mkdir(parents=True)
@@ -97,6 +98,7 @@ def test_prepared_dataset_has_one_fixed_tensor_contract(tmp_path) -> None:
     }
     assert sample["depth_indices"].dtype == torch.uint32
     assert sample["control_points"].shape == (8, 2)
+    assert sample["reference_path"].shape == (64, 2)
     bank = load_packed_depth_bank(dataset.depth_bank, torch.device("cpu"))
     depth = gather_depth_observations(bank, sample["depth_indices"].unsqueeze(0))
     assert depth.shape == (1, 4, 1, 126, 224)
@@ -115,17 +117,7 @@ def test_prepared_dataset_rejects_geometry_contract_mismatch(tmp_path) -> None:
         )
 
 
-def test_fixed_batch_loader_repeats_only_the_prepared_dataset(tmp_path) -> None:
-    root = tmp_path / "policy"
-    _write_dataset(root, count=2)
-    data = DataConfig(root=str(root))
-    bundle = build_fixed_batch_loader(data, TrajectoryConfig(), 8)
-    batch = next(iter(bundle.loader))
-    assert batch["point_goal"].shape == (8, 2)
-    assert bundle.samples == 8
-
-
-def test_validation_is_ordered_while_training_keeps_out_of_order_throughput(tmp_path) -> None:
+def test_training_and_validation_preserve_deterministic_batch_order(tmp_path) -> None:
     root = tmp_path / "policy"
     _write_dataset(root)
     data = DataConfig(root=str(root))
@@ -137,15 +129,18 @@ def test_validation_is_ordered_while_training_keeps_out_of_order_throughput(tmp_
     training = build_policy_training_loader(
         data,
         trajectory,
-        batch_size=2,
-        samples_per_epoch=4,
+        optimizer_steps=1,
+        global_batch_size=4,
+        per_device_batch_size=2,
+        rank=0,
+        world_size=1,
         num_workers=1,
         prefetch_factor=2,
         seed=42,
     )
 
     assert validation.loader.in_order
-    assert not training.loader.in_order
+    assert training.loader.in_order
 
 
 def test_training_sampler_covers_each_cycle_once_and_resume_continues() -> None:
@@ -165,7 +160,33 @@ def test_training_sampler_covers_each_cycle_once_and_resume_continues() -> None:
     assert sorted(first_cycle) == list(range(7))
     assert sorted(second_cycle) == list(range(7))
     resumed = RepeatedPolicyDataset(base, count=6, seed=42, start_index=8)
-    assert [resumed[index] for index in range(6)] == [complete[index] for index in range(8, 14)]
+    assert [resumed[index] for index in range(6)] == [
+        complete[index] for index in range(8, 14)
+    ]
+
+
+def test_six_rank_batches_cover_exact_global_step_without_padding() -> None:
+    layout = build_distributed_batch_layout(1024, 128, 6)
+    assert layout.rank_batch_sizes == (171, 171, 171, 171, 170, 170)
+    assert layout.micro_batches_per_step == 2
+
+    rank_batches = [
+        list(DistributedStepBatchSampler(1, 1024, 128, rank, 6))
+        for rank in range(6)
+    ]
+    assert [list(map(len, batches)) for batches in rank_batches] == [
+        [128, 43],
+        [128, 43],
+        [128, 43],
+        [128, 43],
+        [128, 42],
+        [128, 42],
+    ]
+    covered = [index for batches in rank_batches for batch in batches for index in batch]
+    assert sorted(covered) == list(range(1024))
+    assert len(set(covered)) == 1024
+    ddp_weight = sum(6 * len(batch) / 1024 for batches in rank_batches for batch in batches)
+    assert ddp_weight / 6 == pytest.approx(1.0)
 
 
 def test_fixed_future_uses_steps_without_rescaling_metric_length() -> None:

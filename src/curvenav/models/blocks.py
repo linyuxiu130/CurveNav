@@ -1,12 +1,21 @@
-"""Shared conditional Transformer block for trajectory tokens."""
+"""Adaptive trajectory Transformer blocks for conditional flow."""
 
 from torch import Tensor, nn
 
 from curvenav.layers import RMSNorm, SwiGLU
 
 
+def _modulate(value: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
+    return value * (1.0 + scale[:, None]) + shift[:, None]
+
+
 class ConditionalTrajectoryBlock(nn.Module):
-    """Pre-norm trajectory self-attention, visual cross-attention and SwiGLU."""
+    """Bidirectional trajectory attention with adaRMS-Zero conditioning.
+
+    Flow time and the supervised route token modulate every residual branch.
+    Geometry remains a token sequence and enters through cross-attention, so
+    spatial information is not collapsed into the global modulation vector.
+    """
 
     def __init__(self, model_dim: int, heads: int, dropout: float) -> None:
         super().__init__()
@@ -21,22 +30,51 @@ class ConditionalTrajectoryBlock(nn.Module):
         )
         self.feed_forward_norm = RMSNorm(model_dim)
         self.feed_forward = SwiGLU(model_dim, dropout)
+        self.modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(model_dim, 9 * model_dim),
+        )
         self.dropout = nn.Dropout(dropout)
+        nn.init.zeros_(self.modulation[-1].weight)
+        nn.init.zeros_(self.modulation[-1].bias)
 
-    def forward(self, trajectory: Tensor, condition: Tensor) -> Tensor:
-        normalized = self.self_norm(trajectory)
-        trajectory = trajectory + self.dropout(
-            self.self_attention(normalized, normalized, normalized, need_weights=False)[0]
-        )
+    def forward(
+        self,
+        trajectory: Tensor,
+        condition: Tensor,
+        modulation: Tensor,
+    ) -> Tensor:
+        (
+            self_shift,
+            self_scale,
+            self_gate,
+            cross_shift,
+            cross_scale,
+            cross_gate,
+            feed_shift,
+            feed_scale,
+            feed_gate,
+        ) = self.modulation(modulation).chunk(9, dim=-1)
+
+        normalized = _modulate(self.self_norm(trajectory), self_shift, self_scale)
+        attended = self.self_attention(
+            normalized, normalized, normalized, need_weights=False
+        )[0]
+        trajectory = trajectory + self_gate[:, None] * self.dropout(attended)
+
         normalized_condition = self.memory_norm(condition)
-        trajectory = trajectory + self.dropout(
-            self.cross_attention(
-                self.query_norm(trajectory),
-                normalized_condition,
-                normalized_condition,
-                need_weights=False,
-            )[0]
+        query = _modulate(self.query_norm(trajectory), cross_shift, cross_scale)
+        attended = self.cross_attention(
+            query,
+            normalized_condition,
+            normalized_condition,
+            need_weights=False,
+        )[0]
+        trajectory = trajectory + cross_gate[:, None] * self.dropout(attended)
+
+        normalized = _modulate(
+            self.feed_forward_norm(trajectory), feed_shift, feed_scale
         )
-        return trajectory + self.dropout(
-            self.feed_forward(self.feed_forward_norm(trajectory))
+        return trajectory + feed_gate[:, None] * self.dropout(
+            self.feed_forward(normalized)
         )

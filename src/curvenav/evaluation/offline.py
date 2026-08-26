@@ -1,4 +1,4 @@
-"""Held-out evaluation for CurveNav's generate-select policy."""
+"""Held-out evaluation for CurveNav's deterministic local policy."""
 
 import argparse
 from dataclasses import dataclass
@@ -80,48 +80,13 @@ def trajectory_batch_metrics(
 def _sample(policy: CurveNavPolicy, batch: dict[str, Tensor]):
     prepared = unpack_policy_batch(batch)
     with torch.autocast(device_type="cuda", dtype=torch.float16):
-        prediction = policy.sample(prepared.condition)
+        prediction = policy(prepared.condition)
     return prepared, prediction
 
 
-def candidate_batch_metrics(
-    candidate_paths: Tensor,
-    candidate_costs: Tensor,
-    candidate_minimum_clearance_m: Tensor,
-    reference_path: Tensor,
-    safe_center_distance_m: float,
-) -> dict[str, Tensor]:
-    """Measure candidate diversity, oracle quality, and geometric selection margin."""
-    if candidate_paths.ndim != 4:
-        raise ValueError("candidate_paths must have shape [B, C, P, 2]")
-    candidates = candidate_paths.shape[1]
-    if candidates < 2 or candidate_costs.shape != candidate_paths.shape[:2]:
-        raise ValueError("candidate_costs must match at least two candidate paths")
-    if candidate_minimum_clearance_m.shape != candidate_paths.shape[:2]:
-        raise ValueError("candidate minimum clearance must have shape [B,C]")
-    candidate_error = torch.linalg.vector_norm(
-        candidate_paths - reference_path[:, None], dim=-1
-    ).mean(dim=-1)
-    endpoints = candidate_paths[:, :, -1]
-    pairwise = torch.cdist(endpoints, endpoints)
-    upper = torch.triu(
-        torch.ones(candidates, candidates, device=pairwise.device, dtype=torch.bool),
-        diagonal=1,
-    )
-    sorted_costs = candidate_costs.sort(dim=1).values
-    selected = candidate_costs.argmin(dim=1)
-    batch = torch.arange(len(selected), device=selected.device)
-    selected_clearance = candidate_minimum_clearance_m[batch, selected]
-    return {
-        "oracle_ade_m": candidate_error.min(dim=1).values,
-        "candidate_endpoint_diversity_m": pairwise[:, upper].mean(dim=1),
-        "geometric_cost_margin": sorted_costs[:, 1] - sorted_costs[:, 0],
-        "selected_minimum_clearance_m": selected_clearance,
-        "selected_clearance_violation": selected_clearance < safe_center_distance_m,
-    }
-
-
-def _time_online(policy: CurveNavPolicy, batch: dict[str, Tensor], repeats: int) -> Tensor:
+def _time_online(
+    policy: CurveNavPolicy, batch: dict[str, Tensor], repeats: int
+) -> Tensor:
     first = {name: value[:1] for name, value in batch.items()}
     for _ in range(2):
         _sample(policy, first)
@@ -144,7 +109,7 @@ def measure_policy(
 ) -> PolicyMeasurements:
     """Collect one deterministic prediction for every aligned observation."""
     policy.to(device).eval()
-    policy.compile(mode="default")
+    policy.compile(mode="reduce-overhead", dynamic=False)
     warmup = next(iter(loader))
     _sample(policy, warmup)
     torch.cuda.synchronize(device)
@@ -160,7 +125,7 @@ def measure_policy(
         end.record()
         end.synchronize()
         batch_latency.append(start.elapsed_time(end))
-        _, reference_curvature = policy.codec.geometry(
+        _, _, reference_curvature = policy.curve_codec.path_geometry(
             prepared.target.reference_path.float()
         )
         metrics = trajectory_batch_metrics(
@@ -169,15 +134,6 @@ def measure_policy(
             prepared.target.reference_path.float(),
             reference_curvature,
             prepared.condition.point_goal.float(),
-        )
-        metrics.update(
-            candidate_batch_metrics(
-                prediction.candidate_paths.float(),
-                prediction.candidate_costs.float(),
-                prediction.candidate_minimum_clearance_m.float(),
-                prepared.target.reference_path.float(),
-                policy.trajectory_evaluator.safe_center_distance_m,
-            )
         )
         for name, value in metrics.items():
             values.setdefault(name, []).append(value.cpu())
@@ -203,31 +159,21 @@ def summarize_policy_metrics(metrics: dict[str, Tensor]) -> dict[str, float]:
         "arc_length_error_m": metrics["arc_length_error_m"].mean().item(),
         "reference_arc_length_m": metrics["reference_arc_length_m"].mean().item(),
         "goal_progress_m": metrics["goal_progress_m"].mean().item(),
-        "reference_goal_progress_m": metrics[
-            "reference_goal_progress_m"
-        ].mean().item(),
-        "negative_progress_fraction": (metrics["goal_progress_m"] < 0).float().mean().item(),
+        "reference_goal_progress_m": metrics["reference_goal_progress_m"].mean().item(),
+        "negative_progress_fraction": (metrics["goal_progress_m"] < 0)
+        .float()
+        .mean()
+        .item(),
         "max_abs_curvature_inv_m_p95": torch.quantile(
             metrics["max_abs_curvature_inv_m"], 0.95
         ).item(),
         "reference_max_abs_curvature_inv_m_p95": torch.quantile(
             metrics["reference_max_abs_curvature_inv_m"], 0.95
         ).item(),
-        "tangent_reversal_fraction": metrics["has_tangent_reversal"].float().mean().item(),
-        "oracle_ade_m": metrics["oracle_ade_m"].mean().item(),
-        "candidate_endpoint_diversity_m": metrics[
-            "candidate_endpoint_diversity_m"
-        ].mean().item(),
-        "geometric_cost_margin": metrics["geometric_cost_margin"].mean().item(),
-        "selected_minimum_clearance_m_mean": metrics[
-            "selected_minimum_clearance_m"
-        ].mean().item(),
-        "selected_minimum_clearance_m_p05": torch.quantile(
-            metrics["selected_minimum_clearance_m"], 0.05
-        ).item(),
-        "selected_clearance_violation_fraction": metrics[
-            "selected_clearance_violation"
-        ].float().mean().item(),
+        "tangent_reversal_fraction": metrics["has_tangent_reversal"]
+        .float()
+        .mean()
+        .item(),
     }
     if not all(torch.isfinite(torch.tensor(value)) for value in result.values()):
         raise FloatingPointError(f"validation metrics are non-finite: {result}")
@@ -248,12 +194,16 @@ def evaluate_policy(
     return {
         "protocol": "curvenav_local_validation",
         "samples": measurements.samples,
-        "trajectories_per_observation": policy.trajectory_flow.inference_candidates,
+        "trajectories_per_observation": 1,
         **summarize_policy_metrics(measurements.metrics),
         "batch32_latency_ms_mean": measurements.batch_latency_ms.mean().item(),
         "throughput_observations_per_second": measurements.samples / seconds,
-        "online_latency_ms_p50": torch.quantile(measurements.online_latency_ms, 0.50).item(),
-        "online_latency_ms_p95": torch.quantile(measurements.online_latency_ms, 0.95).item(),
+        "online_latency_ms_p50": torch.quantile(
+            measurements.online_latency_ms, 0.50
+        ).item(),
+        "online_latency_ms_p95": torch.quantile(
+            measurements.online_latency_ms, 0.95
+        ).item(),
     }
 
 

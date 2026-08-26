@@ -15,47 +15,39 @@ data:
 
 model:
   trajectory:
-    num_control_points: 8
-    degree: 3
+    num_target_control_points: 8
+    target_spline_degree: 3
+    num_curvature_control_points: 7
+    curvature_spline_degree: 3
     num_path_points: 64
-    normalization_scale_m: 4.0
+    maximum_curvature_inv_m: 8.0
   depth_encoder:
-    model_dim: 256
+    model_dim: 384
     frame_tokens_height: 8
     frame_tokens_width: 12
     dropout: 0.0
   point_goal_encoder:
-    model_dim: 256
-    hidden_dim: 256
+    model_dim: 384
+    hidden_dim: 384
     goal_clip_distance_m: 25.0
   condition_encoder:
-    model_dim: 256
-    transformer_layers: 2
-    transformer_heads: 4
+    model_dim: 384
+    transformer_layers: 4
+    transformer_heads: 8
     dropout: 0.0
   trajectory_flow:
-    model_dim: 256
-    transformer_layers: 3
-    transformer_heads: 4
-    inference_candidates: 16
+    model_dim: 384
+    transformer_layers: 8
+    transformer_heads: 8
     integration_steps: 8
-    inference_seed: 20260821
     dropout: 0.0
-  trajectory_evaluator:
-    minimum_obstacle_height_m: 0.05
-    robot_height_m: 0.70
-    robot_radius_m: 0.25
-    safety_margin_m: 0.10
-    discount_factor: 0.95
-    clearance_weight: 10.0
-    length_weight: 1.0
-    goal_weight: 1.0
 training:
   seed: 42
-  per_device_batch_size: 256
-  samples_per_epoch: 38400
+  global_batch_size: 1024
+  per_device_batch_size: 128
+  samples_per_epoch: 40960
   epochs: 200
-  num_workers: 8
+  num_workers: 2
   prefetch_factor: 2
   warmup_epochs: 5
   min_learning_rate_factor: 0.01

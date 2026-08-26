@@ -40,7 +40,7 @@ def policy_dataset_contract(
         "future_steps": data.future_steps,
         "observation_to_current_semantics": "planar_rigid_transform_from_observation_to_current_frame",
         **depth_camera_contract(data),
-        "num_control_points": trajectory.num_control_points,
+        "num_control_points": trajectory.num_target_control_points,
         "num_path_points": trajectory.num_path_points,
         "bspline_bending_regularization_m4": BSPLINE_BENDING_REGULARIZATION_M4,
     }
@@ -88,7 +88,11 @@ class PreparedPolicyDataset(Dataset):
             metadata = array_manifest.get(name, {})
             path = split_root / str(metadata.get("file", ""))
             array = np.load(path, mmap_mode="r")
-            if str(array.dtype) != dtype or array.ndim != rank or len(array) != self.count:
+            if (
+                str(array.dtype) != dtype
+                or array.ndim != rank
+                or len(array) != self.count
+            ):
                 raise ValueError(
                     f"invalid prepared array {name}: dtype={array.dtype}, shape={array.shape}"
                 )
@@ -100,7 +104,11 @@ class PreparedPolicyDataset(Dataset):
             "point_goal": (self.count, 2),
             "observation_to_current": (self.count, data.observation_frames, 4),
             "observation_valid": (self.count, data.observation_frames),
-            "control_points": (self.count, trajectory.num_control_points, 2),
+            "control_points": (
+                self.count,
+                trajectory.num_target_control_points,
+                2,
+            ),
             "reference_path": (self.count, trajectory.num_path_points, 2),
         }
         invalid_shapes = {
@@ -110,10 +118,26 @@ class PreparedPolicyDataset(Dataset):
         }
         if invalid_shapes:
             raise ValueError(f"prepared policy tensor shape mismatch: {invalid_shapes}")
+        finite_arrays = (
+            "point_goal",
+            "observation_to_current",
+            "control_points",
+            "reference_path",
+        )
+        if any(not np.isfinite(self.arrays[name]).all() for name in finite_arrays):
+            raise ValueError(
+                f"prepared policy split contains non-finite values: {split}"
+            )
+        if not self.arrays["observation_valid"][:, -1].all():
+            raise ValueError(
+                f"prepared policy split has an invalid current frame: {split}"
+            )
 
         depth = split_manifest.get("depth", {})
         if depth.get("dtype") != "float16_normalized" or (
-            depth.get("height"), depth.get("width"), depth.get("max_depth_m")
+            depth.get("height"),
+            depth.get("width"),
+            depth.get("max_depth_m"),
         ) != (data.image_height, data.image_width, data.max_depth_m):
             raise ValueError(f"prepared depth contract mismatch: {split}")
         runs = tuple(

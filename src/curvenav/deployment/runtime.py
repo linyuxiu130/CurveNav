@@ -28,7 +28,7 @@ def load_policy(checkpoint_path, config_path, device: str):
     ema.load_state_dict(checkpoint["ema"])
     ema.copy_to(policy)
     policy.eval().to(device)
-    policy.compile(mode="default")
+    policy.compile(mode="reduce-overhead", dynamic=False)
     return config, policy
 
 
@@ -42,16 +42,15 @@ class DepthContextBuffer:
 
     def __init__(self, config: CurveNavConfig) -> None:
         data = config.data
-        self.offsets_m = np.arange(
-            data.observation_frames - 1, -1, -1, dtype=np.float64
-        ) * data.frame_spacing_m
+        self.offsets_m = (
+            np.arange(data.observation_frames - 1, -1, -1, dtype=np.float64)
+            * data.frame_spacing_m
+        )
         self.height = data.image_height
         self.width = data.image_width
         self.maximum_m = data.max_depth_m
         self.prune_margin_m = data.expert_waypoint_spacing_m
-        self.samples: list[
-            deque[tuple[float, np.ndarray, np.ndarray, float]]
-        ] = []
+        self.samples: list[deque[tuple[float, np.ndarray, np.ndarray, float]]] = []
         self.distances = np.empty(0, dtype=np.float64)
         self.previous_positions = np.empty((0, 2), dtype=np.float32)
 
@@ -103,9 +102,9 @@ class DepthContextBuffer:
             positions = tuple(item[2] for item in samples)
             yaws = tuple(item[3] for item in samples)
             targets = self.distances[env_id] - self.offsets_m
-            reverse_indices = np.abs(
-                distances[::-1, None] - targets[None]
-            ).argmin(axis=0)
+            reverse_indices = np.abs(distances[::-1, None] - targets[None]).argmin(
+                axis=0
+            )
             indices = len(distances) - 1 - reverse_indices
             valid = np.ones(len(indices), dtype=np.bool_)
             valid[:-1] = indices[:-1] != indices[1:]
@@ -145,12 +144,6 @@ class DepthContext:
 @dataclass(frozen=True)
 class RuntimePrediction:
     path: np.ndarray
-    candidate_paths: np.ndarray
-    candidate_costs: np.ndarray
-    candidate_clearance_costs: np.ndarray
-    candidate_length_costs: np.ndarray
-    candidate_goal_costs: np.ndarray
-    candidate_minimum_clearance_m: np.ndarray
 
 
 class CurveNavRuntime:
@@ -190,7 +183,11 @@ class CurveNavRuntime:
         quaternions = np.asarray(quaternions, dtype=np.float32)
         if point_goals.shape != (self.batch_size, 2):
             raise ValueError(f"point_goal must have shape [{self.batch_size},2]")
-        if depth_m.ndim != 4 or depth_m.shape[0] != self.batch_size or depth_m.shape[-1] != 1:
+        if (
+            depth_m.ndim != 4
+            or depth_m.shape[0] != self.batch_size
+            or depth_m.shape[-1] != 1
+        ):
             raise ValueError(f"depth must have shape [{self.batch_size},H,W,1]")
         if positions.shape != (self.batch_size, 3):
             raise ValueError(f"robot_pos must have shape [{self.batch_size},3]")
@@ -205,40 +202,27 @@ class CurveNavRuntime:
         condition = PolicyCondition(
             depth=torch.from_numpy(context.depth).to(self.device),
             point_goal=torch.from_numpy(point_goals).to(self.device),
-            observation_to_current=torch.from_numpy(context.observation_to_current).to(self.device),
-            observation_valid=torch.from_numpy(context.observation_valid).to(self.device),
+            observation_to_current=torch.from_numpy(context.observation_to_current).to(
+                self.device
+            ),
+            observation_valid=torch.from_numpy(context.observation_valid).to(
+                self.device
+            ),
         )
         started = time.perf_counter()
         amp = self.device.type == "cuda"
-        with torch.inference_mode(), torch.autocast(
-            device_type=self.device.type, dtype=torch.float16, enabled=amp
+        with (
+            torch.inference_mode(),
+            torch.autocast(
+                device_type=self.device.type, dtype=torch.float16, enabled=amp
+            ),
         ):
-            prediction = self.policy.sample(condition)
+            prediction = self.policy(condition)
         self.requests += 1
         self.request_seconds += time.perf_counter() - started
         path_xy = prediction.path.float().cpu().numpy()
-        candidate_xy = prediction.candidate_paths.float().cpu().numpy()
-        candidates = np.concatenate(
-            [candidate_xy, np.zeros((*candidate_xy.shape[:-1], 1), dtype=np.float32)], axis=-1
-        )
         selected = np.concatenate(
             [path_xy, np.zeros((*path_xy.shape[:-1], 1), dtype=np.float32)],
             axis=-1,
         )
-        return RuntimePrediction(
-            path=selected,
-            candidate_paths=candidates,
-            candidate_costs=prediction.candidate_costs.float().cpu().numpy(),
-            candidate_clearance_costs=(
-                prediction.candidate_clearance_costs.float().cpu().numpy()
-            ),
-            candidate_length_costs=(
-                prediction.candidate_length_costs.float().cpu().numpy()
-            ),
-            candidate_goal_costs=(
-                prediction.candidate_goal_costs.float().cpu().numpy()
-            ),
-            candidate_minimum_clearance_m=(
-                prediction.candidate_minimum_clearance_m.float().cpu().numpy()
-            ),
-        )
+        return RuntimePrediction(path=selected)

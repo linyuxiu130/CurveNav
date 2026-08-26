@@ -1,4 +1,4 @@
-"""Conditional rectified flow over planar B-spline control points."""
+"""Conditional rectified flow over past motion and future spline coordinates."""
 
 import math
 
@@ -10,7 +10,7 @@ from curvenav.models.blocks import ConditionalTrajectoryBlock
 from curvenav.types import ConditionFeatures
 
 
-TRAJECTORY_FLOW_TYPE = "conditional_bspline_rectified_flow_heun"
+TRAJECTORY_FLOW_TYPE = "past_future_bounded_curvature_rectified_flow_adarmszero_heun"
 
 
 class FourierTimeEmbedding(nn.Module):
@@ -19,6 +19,11 @@ class FourierTimeEmbedding(nn.Module):
         if model_dim % 2:
             raise ValueError("model_dim must be even for the flow time embedding")
         self.model_dim = model_dim
+        self.register_buffer(
+            "frequency",
+            torch.logspace(0.0, 3.0, model_dim // 2, dtype=torch.float32),
+            persistent=True,
+        )
         self.projection = nn.Sequential(
             nn.Linear(model_dim, model_dim),
             nn.SiLU(),
@@ -26,133 +31,151 @@ class FourierTimeEmbedding(nn.Module):
         )
 
     def forward(self, time: Tensor) -> Tensor:
-        half = self.model_dim // 2
-        frequency = torch.exp(
-            torch.arange(half, device=time.device, dtype=time.dtype)
-            * (-math.log(10_000.0) / max(half - 1, 1))
-        )
-        phase = time[:, None] * frequency[None] * (2.0 * math.pi)
+        frequency = self.frequency.to(device=time.device)
+        phase = time.float()[:, None] * frequency[None] * (2.0 * math.pi)
         return self.projection(torch.cat((phase.sin(), phase.cos()), dim=-1))
 
 
-class SplineControlFlow(nn.Module):
-    """Predict the straight-path conditional flow velocity from noise to data."""
+class CurvatureTrajectoryFlow(nn.Module):
+    """Jointly reconstruct executed history and generate feasible curve state."""
 
     def __init__(
         self,
-        num_control_points: int,
+        future_tokens: int,
+        history_tokens: int,
         model_dim: int,
         layers: int,
         heads: int,
         dropout: float,
-        inference_candidates: int,
-        inference_seed: int,
     ) -> None:
         super().__init__()
-        self.num_control_points = num_control_points
-        self.inference_candidates = inference_candidates
-        self.control_projection = nn.Linear(2, model_dim)
-        self.control_embedding = nn.Parameter(
-            torch.empty(1, num_control_points, model_dim)
+        if history_tokens < 1:
+            raise ValueError("history_tokens must be positive")
+        self.future_tokens = future_tokens
+        self.history_tokens = history_tokens
+        self.total_tokens = history_tokens + future_tokens
+        self.state_projection = nn.Linear(2, model_dim)
+        self.token_embedding = nn.Parameter(
+            torch.empty(1, self.total_tokens, model_dim)
         )
+        self.role_embedding = nn.Parameter(torch.empty(1, 2, model_dim))
         self.time_embedding = FourierTimeEmbedding(model_dim)
         self.blocks = nn.ModuleList(
             ConditionalTrajectoryBlock(model_dim, heads, dropout) for _ in range(layers)
         )
         self.output_norm = RMSNorm(model_dim)
         self.velocity_projection = nn.Linear(model_dim, 2)
-        nn.init.trunc_normal_(self.control_embedding, std=0.02)
-        nn.init.normal_(self.velocity_projection.weight, std=0.02)
+        nn.init.trunc_normal_(self.token_embedding, std=0.02)
+        nn.init.trunc_normal_(self.role_embedding, std=0.02)
+        nn.init.zeros_(self.velocity_projection.weight)
         nn.init.zeros_(self.velocity_projection.bias)
-
-        generator = torch.Generator(device="cpu").manual_seed(inference_seed)
-        noise = torch.randn(
-            inference_candidates,
-            num_control_points,
-            2,
-            generator=generator,
-        )
-        noise[:, 0] = 0
-        self.register_buffer("inference_noise", noise, persistent=True)
 
     def forward(
         self,
-        noisy_controls: Tensor,
+        noisy_state: Tensor,
         time: Tensor,
         condition_tokens: Tensor,
+        route_token: Tensor,
     ) -> Tensor:
-        if noisy_controls.ndim != 3 or noisy_controls.shape[1:] != (
-            self.num_control_points,
+        if noisy_state.ndim != 3 or noisy_state.shape[1:] != (
+            self.total_tokens,
             2,
         ):
-            raise ValueError("noisy_controls must have shape [B, K, 2]")
-        if time.shape != (noisy_controls.shape[0],):
+            raise ValueError(
+                "noisy_state does not match the past-future token contract"
+            )
+        if time.shape != (noisy_state.shape[0],):
             raise ValueError("time must have shape [B]")
-        trajectory = (
-            self.control_projection(noisy_controls)
-            + self.control_embedding
-            + self.time_embedding(time).unsqueeze(1)
+        if route_token.shape != (noisy_state.shape[0], self.token_embedding.shape[-1]):
+            raise ValueError("route_token must have shape [B,D]")
+        roles = torch.cat(
+            (
+                self.role_embedding[:, :1].expand(-1, self.history_tokens, -1),
+                self.role_embedding[:, 1:].expand(-1, self.future_tokens, -1),
+            ),
+            dim=1,
         )
+        trajectory = self.state_projection(noisy_state) + self.token_embedding + roles
+        modulation = self.time_embedding(time) + route_token
         for block in self.blocks:
-            trajectory = block(trajectory, condition_tokens)
-        velocity = self.velocity_projection(self.output_norm(trajectory))
-        velocity = velocity.clone()
-        velocity[:, 0] = 0
-        return velocity
+            trajectory = block(trajectory, condition_tokens, modulation)
+        return self.velocity_projection(self.output_norm(trajectory))
 
-    def training_pair(self, clean_controls: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        noise = torch.randn_like(clean_controls)
-        noise[:, 0] = 0
+    def training_pair(
+        self,
+        clean_state: Tensor,
+        free_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if clean_state.shape != free_mask.shape:
+            raise ValueError("clean_state and free_mask must have identical shapes")
+        noise = torch.randn_like(clean_state) * free_mask
         time = torch.rand(
-            clean_controls.shape[0],
-            device=clean_controls.device,
-            dtype=clean_controls.dtype,
+            clean_state.shape[0],
+            device=clean_state.device,
+            dtype=clean_state.dtype,
         )
-        noisy = torch.lerp(noise, clean_controls, time[:, None, None])
-        return noisy, time, clean_controls - noise
+        noisy = torch.lerp(noise, clean_state, time[:, None, None]) * free_mask
+        return noisy, time, (clean_state - noise) * free_mask
 
     @staticmethod
     def reconstruct_clean(
-        noisy_controls: Tensor,
+        noisy_state: Tensor,
         time: Tensor,
         velocity: Tensor,
     ) -> Tensor:
-        """Recover the clean endpoint of the linear flow path from ``v``.
+        return noisy_state + (1.0 - time[:, None, None]) * velocity
 
-        For ``x_t=(1-t)z+t x_1`` and ``v*=x_1-z``, the endpoint is exactly
-        ``x_1=x_t+(1-t)v*``.  Keeping this relation explicit prevents the path
-        auxiliary loss from silently becoming a diffusion-style x0 estimator.
-        """
-        return noisy_controls + (1.0 - time[:, None, None]) * velocity
-
-    def sample(
+    def integrate_candidates(
         self,
         condition: ConditionFeatures,
         integration_steps: int,
+        base_samples: Tensor,
+        free_mask: Tensor,
     ) -> Tensor:
+        """Integrate a fixed candidate group in one batched Heun solve."""
+        if base_samples.ndim != 3 or base_samples.shape[1:] != (
+            self.total_tokens,
+            2,
+        ):
+            raise ValueError("base_samples must have shape [C,T,2]")
         batch = condition.tokens.shape[0]
-        candidates = self.inference_candidates
-        controls = self.inference_noise.to(
-            device=condition.tokens.device,
-            dtype=condition.tokens.dtype,
-        ).unsqueeze(0).expand(batch, -1, -1, -1).reshape(
-            batch * candidates, self.num_control_points, 2
-        ).clone()
-        memory = condition.tokens[:, None].expand(
-            -1, candidates, -1, -1
-        ).reshape(batch * candidates, condition.tokens.shape[1], condition.tokens.shape[2])
+        candidates = base_samples.shape[0]
+        if free_mask.shape != (batch, self.total_tokens, 2):
+            raise ValueError("free_mask must have shape [B,T,2]")
+
+        state = (
+            base_samples.to(
+                device=condition.tokens.device,
+                dtype=condition.tokens.dtype,
+            )[None]
+            .expand(batch, -1, -1, -1)
+            .clone()
+        )
+        mask = free_mask[:, None].to(dtype=state.dtype).expand_as(state)
+        state = state * mask
+        state = state.reshape(batch * candidates, self.total_tokens, 2)
+        mask = mask.reshape_as(state)
+        memory = (
+            condition.tokens[:, None]
+            .expand(-1, candidates, -1, -1)
+            .reshape(batch * candidates, condition.tokens.shape[1], -1)
+        )
+        route = (
+            condition.route_token[:, None]
+            .expand(-1, candidates, -1)
+            .reshape(batch * candidates, -1)
+        )
         step_size = 1.0 / integration_steps
         for index in range(integration_steps):
             time = torch.full(
                 (batch * candidates,),
                 index * step_size,
-                device=controls.device,
-                dtype=controls.dtype,
+                device=state.device,
+                dtype=state.dtype,
             )
             next_time = torch.full_like(time, (index + 1) * step_size)
-            velocity = self(controls, time, memory)
-            predictor = controls + step_size * velocity
-            corrected = self(predictor, next_time, memory)
-            controls = controls + 0.5 * step_size * (velocity + corrected)
-            controls[:, 0] = 0
-        return controls.reshape(batch, candidates, self.num_control_points, 2)
+            velocity = self(state, time, memory, route) * mask
+            predictor = (state + step_size * velocity) * mask
+            corrected = self(predictor, next_time, memory, route) * mask
+            state = (state + 0.5 * step_size * (velocity + corrected)) * mask
+        return state.reshape(batch, candidates, self.total_tokens, 2)

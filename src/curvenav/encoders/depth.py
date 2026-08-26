@@ -10,7 +10,14 @@ from curvenav.types import DepthFeatures
 from .geometry import PlanarDepthProjector
 
 
-DEPTH_ENCODER_TYPE = "sand_resnet18_stage3_spatial_tokens_plus_planar_backprojection_8x12"
+DEPTH_ENCODER_TYPE = (
+    "sand_resnet18_groupnorm_stage3_spatial_tokens_plus_planar_backprojection_8x12"
+)
+
+
+def _channel_group_norm(channels: int) -> nn.GroupNorm:
+    """Normalize each sample without mutable batch or running statistics."""
+    return nn.GroupNorm(32, channels)
 
 
 class ResNet18BasicBlock(nn.Module):
@@ -28,7 +35,7 @@ class ResNet18BasicBlock(nn.Module):
             padding=1,
             bias=False,
         )
-        self.norm_1 = nn.BatchNorm2d(out_channels)
+        self.norm_1 = _channel_group_norm(out_channels)
         self.activation = nn.ReLU(inplace=True)
         self.convolution_2 = nn.Conv2d(
             out_channels,
@@ -37,7 +44,7 @@ class ResNet18BasicBlock(nn.Module):
             padding=1,
             bias=False,
         )
-        self.norm_2 = nn.BatchNorm2d(out_channels)
+        self.norm_2 = _channel_group_norm(out_channels)
         self.skip = (
             nn.Identity()
             if stride == 1 and in_channels == out_channels
@@ -49,7 +56,7 @@ class ResNet18BasicBlock(nn.Module):
                     stride=stride,
                     bias=False,
                 ),
-                nn.BatchNorm2d(out_channels),
+                _channel_group_norm(out_channels),
             )
         )
 
@@ -88,13 +95,15 @@ class DepthObservationEncoder(nn.Module):
     ) -> None:
         super().__init__()
         if model_dim % 4:
-            raise ValueError("model_dim must be divisible by four for 2D position encoding")
+            raise ValueError(
+                "model_dim must be divisible by four for 2D position encoding"
+            )
         self.model_dim = model_dim
         self.tokens_height = frame_tokens_height
         self.tokens_width = frame_tokens_width
         self.backbone = nn.Sequential(
             nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(64),
+            _channel_group_norm(64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
             _resnet18_stage(64, 64, stride=1),
@@ -161,7 +170,10 @@ class DepthObservationEncoder(nn.Module):
             raise ValueError("depth must have shape [B, T, 1, H, W]")
         if observation_to_current.shape != (*depth.shape[:2], 4):
             raise ValueError("observation_to_current must have shape [B, T, 4]")
-        if observation_valid.shape != depth.shape[:2] or observation_valid.dtype != torch.bool:
+        if (
+            observation_valid.shape != depth.shape[:2]
+            or observation_valid.dtype != torch.bool
+        ):
             raise ValueError("observation_valid must be boolean with shape [B, T]")
         batch, frames = depth.shape[:2]
         features = self.backbone(depth.flatten(0, 1))
@@ -187,9 +199,4 @@ class DepthObservationEncoder(nn.Module):
             tokens,
             torch.zeros_like(tokens),
         )
-        planar_points = torch.where(
-            observation_valid[:, :, None, None],
-            planar_points,
-            torch.zeros_like(planar_points),
-        )
-        return DepthFeatures(tokens=tokens, planar_points=planar_points)
+        return DepthFeatures(tokens=tokens)

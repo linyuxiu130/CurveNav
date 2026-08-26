@@ -26,7 +26,11 @@ def _open_uniform_knots(num_control_points: int, degree: int) -> Tensor:
     )
 
 
-def _basis_matrix(num_control_points: int, degree: int, num_samples: int) -> Tensor:
+def bspline_basis_matrix(
+    num_control_points: int,
+    degree: int,
+    num_samples: int,
+) -> Tensor:
     knots = _open_uniform_knots(num_control_points, degree)
     t = torch.linspace(0.0, 1.0, num_samples, dtype=torch.float32)
     basis = ((t[:, None] >= knots[:-1]) & (t[:, None] < knots[1:])).float()
@@ -97,12 +101,12 @@ class PlanarBSplineCodec(nn.Module):
         self.num_path_points = num_path_points
         self.register_buffer(
             "basis",
-            _basis_matrix(num_control_points, degree, num_path_points),
+            bspline_basis_matrix(num_control_points, degree, num_path_points),
             persistent=True,
         )
         self.register_buffer(
             "arc_basis",
-            _basis_matrix(
+            bspline_basis_matrix(
                 num_control_points,
                 degree,
                 ARC_LENGTH_OVERSAMPLE_FACTOR * num_path_points,

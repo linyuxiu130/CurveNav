@@ -1,10 +1,10 @@
 # CurveNav
 
-CurveNav 是高效的 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal，生成短距离平滑 B-spline，并由当前深度上的显式几何代价选择一条执行轨迹。
+CurveNav 是 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal，通过 geometry/route/state Transformer 与 past-future rectified flow 生成一条前向、平滑且连续曲率严格有界的弧长域局部轨迹。部署时由生成器重建已执行历史的一致性选择未来样本，不使用轨迹评价头。
 
 当前目标只有一个：先在现有深度合同下验证 PointGoal 局部规划，再在完全相同的 episode、相机、异步 MPC 和指标口径下对比 NavDP 与 X-NavDP。局部基线成立前不专项扩展长距离或脱困能力。
 
-架构合同见 `ARCHITECTURE.md`，评测合同见 `EVALUATION.md`，保留的实验结论见 `EXPERIMENTS.md`。
+架构与训练合同见 `ARCHITECTURE.md`，评测合同见 `EVALUATION.md`。
 
 ## 唯一工作流
 
@@ -25,20 +25,20 @@ scripts/build_dataset.sh
 当前唯一相机合同与 X-NavDP Dingo 测评相机一致：原始深度为 `640×360`，
 经固定内参裁切到 `224×126, fx=fy=166.80851`；相机在机器人系前向
 `0.28618 m`、高度 `0.62532 m`、下俯 `10°`。HSSD 直接按该外参渲染；数据、
-模型反投影、显式评价器与 checkpoint 共用该合同。旧 SanD `0/0.40/0°`
+模型反投影与 checkpoint 共用该合同。旧 SanD `0/0.40/0°`
 深度不再进入训练，因为单张深度无法无损改造成不同视点。
 
-测试、固定批诊断、训练与离线评估：
+测试、训练与离线评估：
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
   ../.venvs/curvenav/bin/python -m pytest -q -p no:cacheprovider
-GPU_ID=0
 GPU_IDS=0,1
-CUDA_VISIBLE_DEVICES="${GPU_ID}" scripts/diagnose_policy.sh configs/base.yaml
 CUDA_VISIBLE_DEVICES="${GPU_IDS}" scripts/train_policy.sh configs/base.yaml
-CUDA_VISIBLE_DEVICES="${GPU_ID}" scripts/evaluate_policy.sh configs/base.yaml outputs/train_policy/checkpoint.pt
+CUDA_VISIBLE_DEVICES=0 scripts/evaluate_policy.sh configs/base.yaml outputs/train_policy/checkpoint.pt
 ```
+
+训练固定全局 batch 为 1024、每卡 micro-batch 上限为 128；1–8 张 GPU 都保持每次更新严格覆盖 1024 个不重复样本以及相同的 8000 个优化器更新。不能整除时只允许相邻 rank 相差一个样本，并按样本数缩放 loss 后再做 DDP 平均。例如 6 卡为 `171×4 + 170×2`，各 rank 执行 `128+43/42` 两个 micro-batch，只在第二个同步梯度。当前 prepared dataset 只包含我们在固定 HSSD 资产上生成的 Dingo 深度与专家轨迹，不混入 SanD/NavDP 数据。
 
 ## 目录
 
@@ -50,8 +50,8 @@ src/curvenav/data/         标定深度、统一数据编译与 loader
 src/curvenav/data_generation/ HSSD 资产、几何、生成与正式审计
 src/curvenav/encoders/     深度与 PointGoal 编码
 src/curvenav/conditioning/ 多帧视觉压缩、逐帧位姿与目标融合
-src/curvenav/models/       flow、显式几何评价器与 policy
-src/curvenav/trajectory/   B-spline 和几何
+src/curvenav/models/       conditional flow 与 policy
+src/curvenav/trajectory/   教师样条与有界曲率轨迹几何
 src/curvenav/training/     DDP、AMP、EMA 与 checkpoint
 src/curvenav/evaluation/   固定离线评测
 src/curvenav/deployment/   多帧观测状态与严格推理接口

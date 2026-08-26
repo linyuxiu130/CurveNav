@@ -45,12 +45,17 @@ class PlanarDepthProjector(nn.Module):
         if observation_to_current.shape != (*depth.shape[:2], 4):
             raise ValueError("observation_to_current must have shape [B, T, 4]")
         batch, frames, _, height, width = depth.shape
-        depth_m = depth.float().squeeze(2) * self.max_depth_m
-        pooled_depth = F.adaptive_avg_pool2d(
-            depth_m.flatten(0, 1).unsqueeze(1),
-            (self.token_height, self.token_width),
-        ).squeeze(1).reshape(
-            batch, frames, self.token_height, self.token_width
+        # A token represents the nearest observed surface in its image cell.
+        # Averaging mixes foreground obstacles with farther background depth.
+        pooled_depth = (
+            -F.adaptive_max_pool2d(
+                -depth.squeeze(2).flatten(0, 1).unsqueeze(1),
+                (self.token_height, self.token_width),
+            )
+            .squeeze(1)
+            .reshape(batch, frames, self.token_height, self.token_width)
+            .float()
+            * self.max_depth_m
         )
 
         column = torch.linspace(
@@ -58,14 +63,14 @@ class PlanarDepthProjector(nn.Module):
             width - 0.5 * width / self.token_width,
             self.token_width,
             device=depth.device,
-            dtype=depth.dtype,
+            dtype=torch.float32,
         )
         row = torch.linspace(
             0.5 * height / self.token_height - 0.5,
             height - 0.5 * height / self.token_height,
             self.token_height,
             device=depth.device,
-            dtype=depth.dtype,
+            dtype=torch.float32,
         )
         ray_x = (column - width / 2.0) / self.focal_x_px
         ray_y = (row - height / 2.0) / self.focal_y_px
@@ -81,8 +86,14 @@ class PlanarDepthProjector(nn.Module):
         translation = observation_to_current[..., :2].float()
         sine = observation_to_current[..., 2].float()
         cosine = observation_to_current[..., 3].float()
-        x_current = cosine[..., None, None] * points[..., 0] - sine[..., None, None] * points[..., 1]
-        y_current = sine[..., None, None] * points[..., 0] + cosine[..., None, None] * points[..., 1]
+        x_current = (
+            cosine[..., None, None] * points[..., 0]
+            - sine[..., None, None] * points[..., 1]
+        )
+        y_current = (
+            sine[..., None, None] * points[..., 0]
+            + cosine[..., None, None] * points[..., 1]
+        )
         points = torch.stack((x_current, y_current), dim=-1)
         points = points + translation[..., None, None, :]
         return points.flatten(2, 3), pooled_depth.flatten(2)

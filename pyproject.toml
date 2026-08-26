@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "curvenav-navigation"
 version = "1.0.0"
-description = "CurveNav: PointGoal-conditioned Transformer B-spline local navigation"
+description = "CurveNav: PointGoal-conditioned bounded-curvature local navigation"
 requires-python = ">=3.10"
 dependencies = [
   "torch>=2.7",
@@ -17,7 +17,6 @@ dependencies = [
 ]
 
 [project.scripts]
-curvenav-diagnose = "curvenav.training.diagnostic:main"
 curvenav-train = "curvenav.training.train:main"
 curvenav-prepare-data = "curvenav.data.prepare:main"
 curvenav-evaluate = "curvenav.evaluation.offline:main"

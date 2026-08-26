@@ -40,28 +40,34 @@ class DataConfig:
 
 @dataclass(frozen=True)
 class TrajectoryConfig:
-    num_control_points: int = 8
-    degree: int = 3
+    num_target_control_points: int = 8
+    target_spline_degree: int = 3
+    num_curvature_control_points: int = 7
+    curvature_spline_degree: int = 3
     num_path_points: int = 64
-    normalization_scale_m: float = 4.0
+    maximum_curvature_inv_m: float = 8.0
 
     def validate(self) -> None:
-        if self.degree != 3:
-            raise ValueError("CurveNav uses one fixed cubic B-spline degree")
-        if self.num_control_points != 8:
-            raise ValueError("CurveNav uses exactly eight cubic B-spline control points")
-        if self.num_path_points < self.num_control_points:
-            raise ValueError("num_path_points must be at least num_control_points")
+        if self.target_spline_degree != 3:
+            raise ValueError("expert targets use one fixed cubic B-spline degree")
+        if self.num_target_control_points != 8:
+            raise ValueError("expert targets use exactly eight spline control points")
+        if self.num_curvature_control_points != 7:
+            raise ValueError("CurveNav uses exactly seven curvature controls")
+        if self.curvature_spline_degree != 3:
+            raise ValueError("CurveNav uses one cubic curvature B-spline")
+        if self.num_path_points < self.num_target_control_points:
+            raise ValueError("num_path_points must cover the target control points")
         if (
-            not math.isfinite(self.normalization_scale_m)
-            or self.normalization_scale_m <= 0
+            not math.isfinite(self.maximum_curvature_inv_m)
+            or self.maximum_curvature_inv_m <= 0
         ):
-            raise ValueError("normalization_scale_m must be positive")
+            raise ValueError("maximum_curvature_inv_m must be positive")
 
 
 @dataclass(frozen=True)
 class DepthEncoderConfig:
-    model_dim: int = 256
+    model_dim: int = 384
     frame_tokens_height: int = 8
     frame_tokens_width: int = 12
     dropout: float = 0.0
@@ -69,66 +75,36 @@ class DepthEncoderConfig:
 
 @dataclass(frozen=True)
 class PointGoalEncoderConfig:
-    model_dim: int = 256
-    hidden_dim: int = 256
+    model_dim: int = 384
+    hidden_dim: int = 384
     goal_clip_distance_m: float = 25.0
 
 
 @dataclass(frozen=True)
 class ConditionEncoderConfig:
-    model_dim: int = 256
-    transformer_layers: int = 2
-    transformer_heads: int = 4
+    model_dim: int = 384
+    transformer_layers: int = 4
+    transformer_heads: int = 8
     dropout: float = 0.0
 
 
 @dataclass(frozen=True)
 class TrajectoryFlowConfig:
-    model_dim: int = 256
-    transformer_layers: int = 3
-    transformer_heads: int = 4
-    inference_candidates: int = 16
+    model_dim: int = 384
+    transformer_layers: int = 8
+    transformer_heads: int = 8
     integration_steps: int = 8
-    inference_seed: int = 20260821
     dropout: float = 0.0
-
-
-@dataclass(frozen=True)
-class TrajectoryEvaluatorConfig:
-    minimum_obstacle_height_m: float = 0.05
-    robot_height_m: float = 0.70
-    robot_radius_m: float = 0.25
-    safety_margin_m: float = 0.10
-    discount_factor: float = 0.95
-    clearance_weight: float = 10.0
-    length_weight: float = 1.0
-    goal_weight: float = 1.0
-
-    def validate(self) -> None:
-        positive = (
-            self.minimum_obstacle_height_m,
-            self.robot_height_m,
-            self.robot_radius_m,
-            self.safety_margin_m,
-            self.clearance_weight,
-            self.length_weight,
-            self.goal_weight,
-        )
-        if not all(math.isfinite(value) and value > 0 for value in positive):
-            raise ValueError("trajectory evaluator metric values must be positive")
-        if self.minimum_obstacle_height_m >= self.robot_height_m:
-            raise ValueError("minimum obstacle height must be below robot height")
-        if not math.isfinite(self.discount_factor) or not 0 < self.discount_factor <= 1:
-            raise ValueError("trajectory evaluator discount_factor must be in (0, 1]")
 
 
 @dataclass(frozen=True)
 class TrainingConfig:
     seed: int = 42
-    per_device_batch_size: int = 256
-    samples_per_epoch: int = 38_400
+    global_batch_size: int = 1_024
+    per_device_batch_size: int = 128
+    samples_per_epoch: int = 40_960
     epochs: int = 200
-    num_workers: int = 8
+    num_workers: int = 2
     prefetch_factor: int = 2
     warmup_epochs: int = 5
     min_learning_rate_factor: float = 0.01
@@ -145,7 +121,9 @@ class TrainingConfig:
 class CurveNavConfig:
     data: DataConfig = dataclass_field(default_factory=DataConfig)
     trajectory: TrajectoryConfig = dataclass_field(default_factory=TrajectoryConfig)
-    depth_encoder: DepthEncoderConfig = dataclass_field(default_factory=DepthEncoderConfig)
+    depth_encoder: DepthEncoderConfig = dataclass_field(
+        default_factory=DepthEncoderConfig
+    )
     point_goal_encoder: PointGoalEncoderConfig = dataclass_field(
         default_factory=PointGoalEncoderConfig
     )
@@ -155,23 +133,22 @@ class CurveNavConfig:
     trajectory_flow: TrajectoryFlowConfig = dataclass_field(
         default_factory=TrajectoryFlowConfig
     )
-    trajectory_evaluator: TrajectoryEvaluatorConfig = dataclass_field(
-        default_factory=TrajectoryEvaluatorConfig
-    )
     training: TrainingConfig = dataclass_field(default_factory=TrainingConfig)
 
     def validate(self) -> None:
         self.data.validate()
         self.trajectory.validate()
-        self.trajectory_evaluator.validate()
         if self.data.observation_frames != 4:
             raise ValueError(
                 "CurveNav uses four depth observations: three past and one current"
             )
-        if min(
-            self.depth_encoder.frame_tokens_height,
-            self.depth_encoder.frame_tokens_width,
-        ) < 1:
+        if (
+            min(
+                self.depth_encoder.frame_tokens_height,
+                self.depth_encoder.frame_tokens_width,
+            )
+            < 1
+        ):
             raise ValueError("depth encoder token grid dimensions must be positive")
         if self.point_goal_encoder.hidden_dim < 1:
             raise ValueError("point_goal_encoder.hidden_dim must be positive")
@@ -198,7 +175,9 @@ class CurveNavConfig:
             if heads < 1:
                 raise ValueError(f"{name}.transformer_heads must be positive")
             if model_dim % heads != 0:
-                raise ValueError(f"model_dim must be divisible by {name}.transformer_heads")
+                raise ValueError(
+                    f"model_dim must be divisible by {name}.transformer_heads"
+                )
         for name, layers in (
             ("condition_encoder", self.condition_encoder.transformer_layers),
             ("trajectory_flow", self.trajectory_flow.transformer_layers),
@@ -212,15 +191,12 @@ class CurveNavConfig:
         ):
             if not 0 <= dropout < 1:
                 raise ValueError(f"{name}.dropout must be in [0, 1)")
-        if self.trajectory_flow.inference_candidates != 16:
-            raise ValueError("CurveNav uses exactly sixteen flow candidates")
         if self.trajectory_flow.integration_steps < 1:
             raise ValueError("trajectory_flow.integration_steps must be positive")
-        if not 0 <= self.trajectory_flow.inference_seed < 2**32:
-            raise ValueError("trajectory_flow.inference_seed must be in [0, 2**32)")
         if not 0 <= self.training.seed < 2**32:
             raise ValueError("training.seed must be in [0, 2**32)")
         positive_integers = {
+            "global_batch_size": self.training.global_batch_size,
             "per_device_batch_size": self.training.per_device_batch_size,
             "samples_per_epoch": self.training.samples_per_epoch,
             "epochs": self.training.epochs,
@@ -232,6 +208,10 @@ class CurveNavConfig:
         invalid = [name for name, value in positive_integers.items() if value < 1]
         if invalid:
             raise ValueError(f"training values must be positive: {invalid}")
+        if self.training.per_device_batch_size > self.training.global_batch_size:
+            raise ValueError("per_device_batch_size cannot exceed global_batch_size")
+        if self.training.samples_per_epoch % self.training.global_batch_size:
+            raise ValueError("samples_per_epoch must be divisible by global_batch_size")
         if not 0 <= self.training.warmup_epochs < self.training.epochs:
             raise ValueError("training.warmup_epochs must be in [0, epochs)")
         if not 0 < self.training.min_learning_rate_factor <= 1:

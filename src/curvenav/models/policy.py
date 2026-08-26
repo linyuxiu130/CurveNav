@@ -1,4 +1,4 @@
-"""One conditional-flow generation and geometric-selection policy."""
+"""Past-aware conditional-flow generation of one executable local curve."""
 
 from dataclasses import dataclass
 
@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from curvenav.trajectory import PlanarBSplineCodec, PlanarScaleNormalizer
+from curvenav.trajectory import BoundedCurvatureTrajectory, PlanarBSplineCodec
 from curvenav.types import (
     ConditionFeatures,
     PolicyCondition,
@@ -15,9 +15,7 @@ from curvenav.types import (
 )
 
 
-FLOW_LOSS_WEIGHT = 1.0
-PATH_LOSS_WEIGHT = 0.5
-TANGENT_LOSS_WEIGHT = 0.1
+CANDIDATE_SAMPLES = 8
 
 
 @dataclass
@@ -26,6 +24,15 @@ class CurveNavLoss:
     flow_loss: Tensor
     path_loss: Tensor
     tangent_loss: Tensor
+    subgoal_loss: Tensor
+
+
+def _deterministic_antithetic_bases(tokens: int) -> Tensor:
+    generator = torch.Generator(device="cpu").manual_seed(0xC0A7E)
+    half = torch.randn(CANDIDATE_SAMPLES // 2, tokens, 2, generator=generator)
+    samples = torch.cat((half, -half), dim=0)
+    rms = samples.square().mean(dim=0, keepdim=True).sqrt().clamp_min(1e-6)
+    return samples / rms
 
 
 class CurveNavPolicy(nn.Module):
@@ -34,32 +41,53 @@ class CurveNavPolicy(nn.Module):
         depth_encoder: nn.Module,
         condition_encoder: nn.Module,
         trajectory_flow: nn.Module,
-        trajectory_evaluator: nn.Module,
-        codec: PlanarBSplineCodec,
-        normalizer: PlanarScaleNormalizer,
+        curve_codec: BoundedCurvatureTrajectory,
+        target_codec: PlanarBSplineCodec,
         integration_steps: int,
+        observation_frames: int,
+        history_scale_m: float,
     ) -> None:
         super().__init__()
+        if observation_frames < 2 or history_scale_m <= 0:
+            raise ValueError(
+                "past-aware policy requires a positive observation history"
+            )
         self.depth_encoder = depth_encoder
         self.condition_encoder = condition_encoder
         self.trajectory_flow = trajectory_flow
-        self.trajectory_evaluator = trajectory_evaluator
-        self.codec = codec
-        self.normalizer = normalizer
+        self.curve_codec = curve_codec
+        self.target_codec = target_codec
         self.integration_steps = integration_steps
+        self.history_tokens = observation_frames - 1
+        self.history_scale_m = float(history_scale_m)
+        if self.trajectory_flow.history_tokens != self.history_tokens:
+            raise ValueError("condition and flow history token counts differ")
+        if self.trajectory_flow.future_tokens != self.curve_codec.num_curve_tokens:
+            raise ValueError("flow and curve token counts differ")
 
-        progress = torch.linspace(0.0, 1.0, codec.num_path_points)
+        progress = torch.linspace(0.0, 1.0, curve_codec.num_path_points)
         near_weights = 0.25 + torch.exp(-4.0 * progress)
         self.register_buffer(
             "near_path_weights",
             near_weights / near_weights.mean(),
             persistent=True,
         )
+        self.register_buffer(
+            "candidate_bases",
+            _deterministic_antithetic_bases(self.trajectory_flow.total_tokens),
+            persistent=True,
+        )
+
+    @property
+    def planning_horizon_m(self) -> float:
+        return self.curve_codec.planning_horizon_m
 
     def encode_condition(self, condition: PolicyCondition) -> ConditionFeatures:
         condition.validate()
         valid_depth = condition.observation_valid[:, :, None, None, None]
-        depth = torch.where(valid_depth, condition.depth, torch.zeros_like(condition.depth))
+        depth = torch.where(
+            valid_depth, condition.depth, torch.zeros_like(condition.depth)
+        )
         observation = self.depth_encoder(
             depth,
             condition.observation_to_current.float(),
@@ -68,26 +96,48 @@ class CurveNavPolicy(nn.Module):
         return self.condition_encoder(
             observation,
             condition.point_goal,
+            condition.observation_to_current.float(),
             condition.observation_valid,
         )
 
-    def _decode_candidates(self, normalized_controls: Tensor) -> tuple[Tensor, Tensor]:
-        batch, candidates = normalized_controls.shape[:2]
-        controls = self.normalizer.denormalize(normalized_controls.float())
-        controls = controls.clone()
-        controls[:, :, 0] = 0
-        paths = self.codec.decode_equal_arc(controls.flatten(0, 1)).reshape(
-            batch,
-            candidates,
-            self.codec.num_path_points,
-            2,
+    def _history_state(self, condition: PolicyCondition) -> tuple[Tensor, Tensor]:
+        coordinates = (
+            condition.observation_to_current[:, : self.history_tokens, :2].float()
+            / self.history_scale_m
         )
-        return controls, paths
+        valid = condition.observation_valid[:, : self.history_tokens, None].expand(
+            -1, -1, 2
+        )
+        return coordinates * valid, valid
+
+    def _joint_state(
+        self,
+        condition: PolicyCondition,
+        future: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        history, history_mask = self._history_state(condition)
+        future_mask = self.curve_codec.free_mask.to(
+            device=future.device, dtype=torch.bool
+        )[None].expand(future.shape[0], -1, -1)
+        return (
+            torch.cat((history.to(future.dtype), future), dim=1),
+            torch.cat((history_mask, future_mask), dim=1),
+        )
+
+    def _decode(
+        self,
+        curve_coordinates: Tensor,
+        point_goal: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        return self.curve_codec.decode(
+            curve_coordinates.float(),
+            point_goal.float(),
+        )
 
     def _path_loss(self, predicted_path: Tensor, reference_path: Tensor) -> Tensor:
         point_loss = F.smooth_l1_loss(
-            predicted_path,
-            reference_path,
+            predicted_path / self.planning_horizon_m,
+            reference_path / self.planning_horizon_m,
             reduction="none",
         ).mean(dim=-1)
         weights = self.near_path_weights.to(
@@ -102,9 +152,7 @@ class CurveNavPolicy(nn.Module):
         reference_length = torch.linalg.vector_norm(reference_delta, dim=-1)
         predicted_direction = F.normalize(predicted_delta, dim=-1, eps=1e-6)
         reference_direction = F.normalize(reference_delta, dim=-1, eps=1e-6)
-        direction_error = 1.0 - (
-            predicted_direction * reference_direction
-        ).sum(dim=-1)
+        direction_error = 1.0 - (predicted_direction * reference_direction).sum(dim=-1)
         valid = reference_length > 1e-5
         weights = self.near_path_weights[1:].to(
             device=direction_error.device,
@@ -113,92 +161,125 @@ class CurveNavPolicy(nn.Module):
         weighted = direction_error * weights * valid
         return weighted.sum() / (weights * valid).sum().clamp_min(1.0)
 
+    def _subgoal_loss(
+        self,
+        encoded: ConditionFeatures,
+        reference_path: Tensor,
+    ) -> Tensor:
+        error = F.smooth_l1_loss(
+            encoded.local_subgoal / self.planning_horizon_m,
+            reference_path[:, -1] / self.planning_horizon_m,
+            reduction="none",
+        ).mean(dim=-1)
+        return error.mean()
+
     def training_loss(
         self,
         condition: PolicyCondition,
         target: TrajectoryTarget,
     ) -> CurveNavLoss:
-        target.validate()
-        if target.control_points.shape[1:] != (self.codec.num_control_points, 2):
-            raise ValueError("target controls do not match the policy spline")
-        if target.reference_path.shape[1:] != (self.codec.num_path_points, 2):
-            raise ValueError("target reference path does not match the policy spline")
+        if target.reference_path.shape[1:] != (
+            self.curve_codec.num_path_points,
+            2,
+        ):
+            raise ValueError("target reference path does not match the policy curve")
+        if target.control_points.shape[1:] != (
+            self.target_codec.num_control_points,
+            2,
+        ):
+            raise ValueError("target controls do not match the expert smoother")
 
         encoded = self.encode_condition(condition)
-        clean = self.normalizer.normalize(target.control_points.float()).clone()
-        clean[:, 0] = 0
-        noisy, time, target_velocity = self.trajectory_flow.training_pair(clean)
-        predicted_velocity = self.trajectory_flow(noisy, time, encoded.tokens)
-        flow_loss = F.mse_loss(
-            predicted_velocity[:, 1:],
-            target_velocity[:, 1:],
+        smoothed_target_path = self.target_codec.decode_equal_arc(
+            target.control_points.float()
         )
+        clean_future = self.curve_codec.encode_target(
+            smoothed_target_path,
+            condition.point_goal.float(),
+        )
+        clean, free_mask = self._joint_state(condition, clean_future)
+        noisy, time, target_velocity = self.trajectory_flow.training_pair(
+            clean, free_mask.to(clean.dtype)
+        )
+        predicted_velocity = (
+            self.trajectory_flow(
+                noisy,
+                time,
+                encoded.tokens,
+                encoded.route_token,
+            )
+            * free_mask
+        )
+        flow_error = (predicted_velocity - target_velocity).square()
+        flow_loss = (flow_error * free_mask).sum() / free_mask.sum().clamp_min(1)
 
         reconstructed = self.trajectory_flow.reconstruct_clean(
             noisy,
             time,
             predicted_velocity,
         )
-        reconstructed = reconstructed.clone()
-        reconstructed[:, 0] = 0
-        reconstructed_metric = self.normalizer.denormalize(reconstructed.float())
-        predicted_path = self.codec.decode_equal_arc(reconstructed_metric)
+        reconstructed_future = reconstructed[:, self.history_tokens :]
+        predicted_path, _, _ = self.curve_codec.decode(
+            reconstructed_future,
+            condition.point_goal.float(),
+        )
         reference_path = target.reference_path.float()
         path_loss = self._path_loss(predicted_path, reference_path)
         tangent_loss = self._tangent_loss(predicted_path, reference_path)
+        subgoal_loss = self._subgoal_loss(encoded, reference_path)
 
-        loss = (
-            FLOW_LOSS_WEIGHT * flow_loss
-            + PATH_LOSS_WEIGHT * path_loss
-            + TANGENT_LOSS_WEIGHT * tangent_loss
-        )
+        loss = flow_loss + path_loss + tangent_loss + subgoal_loss
         return CurveNavLoss(
-            loss,
-            flow_loss,
-            path_loss,
-            tangent_loss,
+            loss=loss,
+            flow_loss=flow_loss,
+            path_loss=path_loss,
+            tangent_loss=tangent_loss,
+            subgoal_loss=subgoal_loss,
         )
 
     @torch.no_grad()
     def sample(self, condition: PolicyCondition) -> TrajectoryPrediction:
         encoded = self.encode_condition(condition)
-        normalized_candidates = self.trajectory_flow.sample(
+        history, history_mask = self._history_state(condition)
+        future_mask = self.curve_codec.free_mask.to(
+            device=history.device, dtype=torch.bool
+        )[None].expand(history.shape[0], -1, -1)
+        free_mask = torch.cat((history_mask, future_mask), dim=1)
+        candidates = self.trajectory_flow.integrate_candidates(
             encoded,
             self.integration_steps,
+            self.candidate_bases,
+            free_mask,
         )
-        candidate_controls, candidate_paths = self._decode_candidates(
-            normalized_candidates
+
+        reconstructed_past = candidates[:, :, : self.history_tokens]
+        error = (reconstructed_past - history[:, None]).square()
+        mask = history_mask[:, None].to(error.dtype)
+        consistency = (error * mask).sum(dim=(2, 3)) / mask.sum(dim=(2, 3)).clamp_min(
+            1.0
         )
-        costs = self.trajectory_evaluator(
-            candidate_paths,
-            condition.depth[:, -1, 0],
-            condition.point_goal.float(),
+        selected_index = consistency.argmin(dim=1)
+        batch_index = torch.arange(candidates.shape[0], device=candidates.device)
+        curve_coordinates = candidates[
+            batch_index,
+            selected_index,
+            self.history_tokens :,
+        ]
+        path, heading, curvature = self._decode(
+            curve_coordinates,
+            condition.point_goal,
         )
-        selected_index = costs.total.argmin(dim=1)
-        batch_index = torch.arange(
-            selected_index.shape[0],
-            device=selected_index.device,
-        )
-        control_points = candidate_controls[batch_index, selected_index]
-        path = candidate_paths[batch_index, selected_index]
-        heading, curvature = self.codec.geometry(path)
         return TrajectoryPrediction(
-            control_points=control_points,
             path=path,
             heading=heading,
             curvature=curvature,
-            candidate_control_points=candidate_controls,
-            candidate_paths=candidate_paths,
-            candidate_costs=costs.total,
-            candidate_clearance_costs=costs.clearance,
-            candidate_length_costs=costs.length,
-            candidate_goal_costs=costs.goal,
-            candidate_minimum_clearance_m=costs.minimum_clearance,
         )
 
     def forward(
         self,
         condition: PolicyCondition,
-        target: TrajectoryTarget,
-    ) -> CurveNavLoss:
+        target: TrajectoryTarget | None = None,
+    ) -> CurveNavLoss | TrajectoryPrediction:
+        if target is None:
+            return self.sample(condition)
         return self.training_loss(condition, target)

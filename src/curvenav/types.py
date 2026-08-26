@@ -25,8 +25,6 @@ class PolicyCondition:
             raise ValueError("observation_valid must have shape [B, F]")
         if self.observation_valid.dtype != torch.bool:
             raise TypeError("observation_valid must be boolean")
-        if not self.observation_valid[:, -1].all():
-            raise ValueError("the current observation must always be valid")
         if not (
             self.depth.shape[0]
             == self.point_goal.shape[0]
@@ -38,27 +36,28 @@ class PolicyCondition:
 
 @dataclass
 class DepthFeatures:
-    """Per-frame depth tokens and their metric planar coordinates."""
+    """Per-frame depth tokens with metric geometry already embedded."""
 
     tokens: Tensor
-    planar_points: Tensor
 
 
 @dataclass
 class ConditionFeatures:
     tokens: Tensor
+    route_token: Tensor
+    local_subgoal: Tensor
 
 
 @dataclass
 class TrajectoryTarget:
-    """Metric planar B-spline controls and their uniform-arc reference path."""
+    """Smoothed expert controls and their uniform-arc reference path."""
 
     control_points: Tensor
     reference_path: Tensor
 
     def validate(self) -> None:
         if self.control_points.ndim != 3 or self.control_points.shape[-1] != 2:
-            raise ValueError("control_points must have shape [B, K, 2]")
+            raise ValueError("control_points must have shape [B,K,2]")
         if self.reference_path.ndim != 3 or self.reference_path.shape[-1] != 2:
             raise ValueError("reference_path must have shape [B, P, 2]")
         if self.control_points.shape[0] != self.reference_path.shape[0]:
@@ -67,14 +66,6 @@ class TrajectoryTarget:
 
 @dataclass
 class TrajectoryPrediction:
-    control_points: Tensor
     path: Tensor
     heading: Tensor
     curvature: Tensor
-    candidate_control_points: Tensor
-    candidate_paths: Tensor
-    candidate_costs: Tensor
-    candidate_clearance_costs: Tensor
-    candidate_length_costs: Tensor
-    candidate_goal_costs: Tensor
-    candidate_minimum_clearance_m: Tensor
