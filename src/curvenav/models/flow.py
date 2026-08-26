@@ -14,8 +14,8 @@ TRAJECTORY_FLOW_TYPE = (
     "normalized_gaussian_source_future_bounded_curvature_rectified_flow_adarmszero_heun"
 )
 FLOW_CURVE_COORDINATE_SCALE = 8.0
-FLOW_SOURCE_TYPE = "masked_isotropic_gaussian_episode_persistent"
-FLOW_SOURCE_SEED = 42
+FLOW_TRAINING_SOURCE_TYPE = "masked_isotropic_gaussian"
+FLOW_INFERENCE_SOURCE_TYPE = "zero_prior_mode"
 
 
 class FourierTimeEmbedding(nn.Module):
@@ -46,9 +46,9 @@ class CurvatureTrajectoryFlow(nn.Module):
 
     For Gaussian source ``x_0`` and expert curve coordinates ``x_1``, the
     conditional probability path is ``x_t = (1-t)x_0 + t x_1`` and its exact
-    velocity target is ``v_t = x_1 - x_0``.  One source latent is retained for
-    an entire episode, which selects one coherent mode without generating or
-    ranking trajectory candidates.
+    velocity target is ``v_t = x_1 - x_0``.  Training samples the full Gaussian
+    prior.  Single-trajectory inference starts at its zero mode so execution is
+    deterministic without an unavailable candidate evaluator.
     """
 
     def __init__(
@@ -128,28 +128,6 @@ class CurvatureTrajectoryFlow(nn.Module):
         )
         return state, time, clean_state - source
 
-    def sample_source(
-        self,
-        batch_size: int,
-        free_mask: Tensor,
-        *,
-        generator: torch.Generator,
-    ) -> Tensor:
-        """Draw one masked standard-Gaussian latent for each episode."""
-        if batch_size < 1:
-            raise ValueError("batch_size must be positive")
-        if free_mask.shape != (self.future_tokens, 2):
-            raise ValueError("free_mask must have shape [T,2]")
-        mask = free_mask.to(dtype=torch.float32)[None]
-        return torch.randn(
-            batch_size,
-            self.future_tokens,
-            2,
-            device=free_mask.device,
-            dtype=torch.float32,
-            generator=generator,
-        ) * mask
-
     @staticmethod
     def reconstruct_clean(
         state: Tensor,
@@ -161,26 +139,26 @@ class CurvatureTrajectoryFlow(nn.Module):
     def integrate(
         self,
         condition: ConditionFeatures,
-        source: Tensor,
         integration_steps: int,
         free_mask: Tensor,
     ) -> Tensor:
-        """Transport one episode-persistent source with Heun's method."""
+        """Transport the deterministic Gaussian prior mode with Heun's method."""
         if integration_steps < 1:
             raise ValueError("integration_steps must be positive")
         batch = condition.tokens.shape[0]
         if free_mask.shape != (batch, self.future_tokens, 2):
             raise ValueError("free_mask must have shape [B,T,2]")
-        if source.shape != (batch, self.future_tokens, 2):
-            raise ValueError("source must have shape [B,T,2]")
         mask = free_mask.to(
             device=condition.tokens.device,
             dtype=condition.tokens.dtype,
         )
-        state = source.to(
+        state = torch.zeros(
+            batch,
+            self.future_tokens,
+            2,
             device=condition.tokens.device,
             dtype=condition.tokens.dtype,
-        ) * mask
+        )
         step_size = 1.0 / integration_steps
         for index in range(integration_steps):
             time = torch.full(

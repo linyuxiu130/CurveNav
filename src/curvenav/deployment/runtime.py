@@ -13,7 +13,6 @@ from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
 from curvenav.data.depth import BENCHMARK_INTRINSICS, preprocess_metric_depth
 from curvenav.factory import build_policy
-from curvenav.models import FLOW_SOURCE_SEED
 from curvenav.training.checkpoint import validate_policy_contract
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.types import PolicyCondition
@@ -160,10 +159,6 @@ class CurveNavRuntime:
         self.device = torch.device(device)
         self.context_buffer = DepthContextBuffer(config)
         self.batch_size = 0
-        self.flow_generator = torch.Generator(device=self.device).manual_seed(
-            FLOW_SOURCE_SEED
-        )
-        self.flow_source = torch.empty(0, device=self.device)
         self.requests = 0
         self.request_seconds = 0.0
 
@@ -202,28 +197,17 @@ class CurveNavRuntime:
                 enabled=self.device.type == "cuda",
             ),
         ):
-            self.policy.sample(condition, self.flow_source)
+            self.policy.sample(condition)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
     def reset(self, batch_size: int) -> None:
         self.batch_size = batch_size
         self.context_buffer.reset(batch_size)
-        self.flow_generator.manual_seed(FLOW_SOURCE_SEED)
-        self.flow_source = self.policy.trajectory_flow.sample_source(
-            batch_size,
-            self.policy.curve_codec.free_mask,
-            generator=self.flow_generator,
-        )
         self._warmup_policy(batch_size)
 
     def reset_env(self, env_id: int) -> None:
         self.context_buffer.reset_env(env_id)
-        self.flow_source[env_id] = self.policy.trajectory_flow.sample_source(
-            1,
-            self.policy.curve_codec.free_mask,
-            generator=self.flow_generator,
-        )[0]
 
     def step(
         self,
@@ -272,7 +256,7 @@ class CurveNavRuntime:
                 device_type=self.device.type, dtype=torch.float16, enabled=amp
             ),
         ):
-            prediction = self.policy.sample(condition, self.flow_source)
+            prediction = self.policy.sample(condition)
         self.requests += 1
         self.request_seconds += time.perf_counter() - started
         future_path_xy = prediction.path[:, 1:].float().cpu().numpy()

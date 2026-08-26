@@ -194,7 +194,6 @@ class CurveNavPolicy(nn.Module):
     def sample(
         self,
         condition: PolicyCondition,
-        flow_source: Tensor,
     ) -> TrajectoryPrediction:
         encoded = self.encode_condition(condition)
         free_mask = self.curve_codec.free_mask.to(
@@ -203,7 +202,6 @@ class CurveNavPolicy(nn.Module):
         )[None].expand(condition.point_goal.shape[0], -1, -1)
         curve_coordinates = self.trajectory_flow.integrate(
             encoded,
-            flow_source,
             self.integration_steps,
             free_mask,
         )

@@ -9,7 +9,6 @@ depth                  float [B,4,1,126,224]  三帧历史 + 当前深度；1 �
 point_goal             float [B,2]            当前机器人系任务目标 (x,y)
 observation_to_current float [B,4,4]           (x,y,sin Δyaw,cos Δyaw)
 observation_valid      bool  [B,4]             历史补帧 mask；当前帧有效
-episode flow source    float [B,8,2]           内部状态；每回合一次高斯采样
 
 target controls        float [B,8,2]
 target reference path  float [B,64,2]
@@ -35,12 +34,12 @@ PointGoal direction + log range ────────────────
                                       8× future Flow Transformer
                                       adaRMS-Zero(time, route)
                                                                       ↓
-                 episode-persistent Gaussian source, 8-step Heun integration
+                 deterministic zero prior mode, 8-step Heun integration
                                                                       ↓
           PointGoal-scaled arc-length/curvature decoder → metric local path
 ```
 
-训练和部署只组装这一张图。checkpoint 类型为 `curvenav_gaussian_flow_bounded_curvature_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
+训练和部署只组装这一张图。checkpoint 类型为 `curvenav_gaussian_flow_zero_mode_bounded_curvature_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
 
 ## 2. 视觉几何、历史状态与路线融合
 
@@ -166,7 +165,7 @@ y = 8x,       x = y/8.
 
 尺度 8 把九个自由维度的典型标准差移到 `0.11–0.47`，同时保持零点、相对维度权重、可表示轨迹集合和曲率硬界完全不变。它对应 SanD/Diffusion Policy 对控制坐标做归一化的必要数值条件，但不读取验证统计、不保存数据集专用 normalizer，也不产生第二套 decoder。Flow 只生成 `y`，不把已知历史复制成生成目标。
 
-局部绕障在部分可观测条件下具有真实多模态：同一障碍可能从左侧或右侧安全绕行。Dirac 零源 `y0=0` 的条件 MSE 只能学习条件均值；在对称障碍前，该均值会落到两种专家模式之间。CurveNav 因此使用标准高斯源直线条件 Flow：
+局部绕障在部分可观测条件下具有真实多模态：同一障碍可能从左侧或右侧安全绕行。把训练源退化为 Dirac 零点时，条件 MSE 只能学习条件均值；在对称障碍前，该均值会落到两种专家模式之间。CurveNav 因此使用标准高斯源直线条件 Flow 训练完整速度场：
 
 ```text
 y_1 = 8x_1,
@@ -183,7 +182,7 @@ L_flow = Σ mask·||v_θ(y_t,t,C)-(y_1-y_0)||² / Σ mask.
 y_hat_1 = y_t + (1-t)v_θ(y_t,t,C).
 ```
 
-先用唯一逆变换 `x_hat_1=y_hat_1/8` 解码，再施加 metric path 和 tangent 监督，Flow 学到的不只是内禀坐标均方误差。训练和部署使用同一 masked isotropic Gaussian 源分布；固定为零的七个无效通道在采样、损失和 ODE 中始终保持为零。
+先用唯一逆变换 `x_hat_1=y_hat_1/8` 解码，再施加 metric path 和 tangent 监督，Flow 学到的不只是内禀坐标均方误差。固定为零的七个无效通道在训练状态、损失和 ODE 中始终保持为零。部署不把训练先验改成 Dirac 分布，而是在已学得的 Gaussian transport 中固定选择最大密度输入 `y0=0`。
 
 ### 4.2 轨迹 Transformer
 
@@ -200,7 +199,7 @@ adaRMS-Zero 的各分支 gate 零初始化，使深层残差分支平滑打开�
 
 ### 4.3 唯一推理轨迹
 
-部署为每个环境维护一个 `[8,2]` masked Gaussian source。`navigator_reset` 时用固定生产 seed 的独立 generator 采样一次；同一 episode 的所有重规划周期复用该 latent，episode reset 后只替换对应环境的 latent。它既让生成器能选择一个绕障模式，又避免每帧重新采样导致左右模式振荡。随后从该 `y_0` 做八步 Heun 积分：
+部署从高斯先验的众数 `y0=0` 做八步 Heun 积分：
 
 ```text
 y' = v_θ(y,t,C),
@@ -208,7 +207,7 @@ y_predict = y + Δt y',
 y_next = y + Δt/2 [y' + v_θ(y_predict,t+Δt,C)].
 ```
 
-输出只有一个 `[B,8,2]` 归一化 Flow 状态，经固定除 8 后送入曲线 decoder；不存在候选维、候选排序、历史重建分数或 oracle 选择。真实执行历史通过条件序列影响速度场，episode latent 只承担模式身份，不包含上一周期预测，因此不会递归传播旧计划误差。当前数据没有“上一周期模型已提交计划”字段，用专家未来伪造 previous-plan token 会产生标签泄漏。
+输出只有一个 `[B,8,2]` 归一化 Flow 状态，经固定除 8 后送入曲线 decoder；不存在随机 episode 状态、候选维、候选排序、历史重建分数或 oracle 选择。SanD 的随机扩散 batch 后接 ESDF 评价，NavDP/X-NavDP 的多样候选后接 critic/Q 约束；没有评价器时随机执行其中一条并不是完整决策架构。固定先验众数把唯一输出定义为确定性中央 transport，并让全部时序一致性来自真实执行历史，不递归传播上一周期预测误差。当前数据没有“上一周期模型已提交计划”字段，用专家未来伪造 previous-plan token 会产生标签泄漏。
 
 ## 5. 唯一训练目标
 
@@ -229,9 +228,9 @@ L = L_flow + L_path + L_tangent + L_route.
 
 | 来源 | 吸收的有效设计 | CurveNav 的针对性改进 |
 |---|---|---|
-| SanD | 四帧共享深度 backbone、空间 token、平滑低维轨迹先验、归一化高斯生成、时序模式一致性 | 教师 B-spline 只做标签平滑；生产输出改为 PointGoal 标度的连续有界曲率曲线；用每回合单 latent 取代 ESDF 多候选筛选 |
+| SanD | 四帧共享深度 backbone、空间 token、平滑低维轨迹先验、归一化高斯生成 | 教师 B-spline 只做标签平滑；生产输出改为 PointGoal 标度的连续有界曲率曲线；没有 ESDF 评价器时用先验众数生成唯一确定轨迹 |
 | NavDP | `D=384` actor、learned-query 视觉压缩、trajectory-token cross-attention、高斯动作扩散 | query 先保存目标无关 metric geometry，再由独立 route query 融合目标；同一无量纲坐标用于训练和 ODE；无 ESDF 标签时不训练 critic |
-| X-NavDP | 深层条件生成器、逐层 FiLM 思想、闭环时序一致性 | 用 adaRMS-Zero 做 time-route 调制；episode latent 固定模式而不递归输入旧预测；当前阶段不做 GQRM/RL |
+| X-NavDP | 深层条件生成器、逐层 FiLM 思想、闭环时序一致性 | 用 adaRMS-Zero 做 time-route 调制；真实执行历史承担时序状态；当前阶段不做 GQRM/RL，也不随机执行未经 Q 选择的候选 |
 | LoGoPlanner | geometry/state/route 的任务专用 query | CurveNav 已有标定 metric depth 和真实位姿，不复制重型视频三维重建模型；路线瓶颈直接监督当前局部专家终点 |
 | Past-Token Prediction | 用可观测过去约束未来的思想 | 历史已经由 condition encoder 显式编码；不再联合生成过去，因为过去重建误差不能代表未来轨迹质量 |
 | Flow Matching / DiT | Gaussian-to-data 直线 CFM、少步 ODE、adaptive normalization | 在与可执行坐标严格双射的 O(1) 空间学习多模态速度场；只保留残差 gate 零初始化，输出头从第一步传递梯度 |
@@ -243,14 +242,14 @@ L = L_flow + L_path + L_tangent + L_route.
 
 训练只读取 `data/policy_dataset`。该目录当前仅包含本项目在固定 HSSD 资产上生成、按 Dingo 标定相机渲染的深度和专家轨迹，不混用论文作者的数据。四帧历史按行驶距离 `[-1.35,-0.90,-0.45,0] m` 取样；未来最多 24 个 `0.15 m` 专家点，近目标自然缩短。
 
-唯一训练入口使用 FP16、GPU 常驻 depth bank、异步 prefetch、AdamW、cosine schedule、EMA 和静态 `torch.compile`；多卡时由同一入口启用 DDP。数学 batch 固定为 1024，显存 micro-batch 上限为每卡 112，以适配 11 GiB 2080 Ti。对 world size `W`，每 rank 分配 `floor(1024/W)` 或 `ceil(1024/W)` 个互不重叠样本；局部 batch 均值乘 `W·B_r/1024` 后再经 DDP 求平均，严格得到全局 1024 样本均值。6 卡时分配为 `171×4 + 170×2`，每 rank 执行 `112+59/58` 两次前后向，只在末次同步梯度。这样 1–8 卡的每次 optimizer、schedule 与 EMA 更新都保持同一数学合同，不需要 padding、重复样本或改变学习率。2080 Ti 真实生产图的 50-step 稳态复测中，112 上限为 `0.2143–0.2154 s/rank-step`、峰值分配约 `6.30 GiB`；64 上限为 `0.2336 s/rank-step`，而单批 171 反而回落到 `0.2189 s/rank-step` 并触发一次 loss-scale 下调，因此生产值固定为实测吞吐最优且保留充足显存余量的 112。训练 source 使用 checkpoint 已保存的逐 rank CUDA RNG；部署 source 使用独立的固定 seed generator，并在 episode 内持久化。唯一部署入口加载 EMA 权重并使用上述单轨迹八步 Heun，没有部署 fallback。
+唯一训练入口使用 FP16、GPU 常驻 depth bank、异步 prefetch、AdamW、cosine schedule、EMA 和静态 `torch.compile`；多卡时由同一入口启用 DDP。数学 batch 固定为 1024，显存 micro-batch 上限为每卡 112，以适配 11 GiB 2080 Ti。对 world size `W`，每 rank 分配 `floor(1024/W)` 或 `ceil(1024/W)` 个互不重叠样本；局部 batch 均值乘 `W·B_r/1024` 后再经 DDP 求平均，严格得到全局 1024 样本均值。6 卡时分配为 `171×4 + 170×2`，每 rank 执行 `112+59/58` 两次前后向，只在末次同步梯度。这样 1–8 卡的每次 optimizer、schedule 与 EMA 更新都保持同一数学合同，不需要 padding、重复样本或改变学习率。2080 Ti 真实生产图的 50-step 稳态复测中，112 上限为 `0.2143–0.2154 s/rank-step`、峰值分配约 `6.30 GiB`；64 上限为 `0.2336 s/rank-step`，而单批 171 反而回落到 `0.2189 s/rank-step` 并触发一次 loss-scale 下调，因此生产值固定为实测吞吐最优且保留充足显存余量的 112。训练 source 使用 checkpoint 已保存的逐 rank CUDA RNG；部署没有 source RNG 或 episode latent，始终从先验众数零点积分。唯一部署入口加载 EMA 权重并使用上述单轨迹八步 Heun，没有部署 fallback。
 
-在线部署使用 eager FP16 推理，不把分钟级编译成本放进短回合测评。`navigator_reset` 已知实际 batch size 后立即使用零观测和该批 episode latent 完成 CUDA kernel 初始化和同步；该步骤发生在 evaluator 的 episode 循环开始前。因此首个真实观测不会承担初始化时间，也不会让机器人在开局持续执行零动作。训练仍使用静态 `torch.compile`，因为 8000 个优化器 step 足以摊薄一次编译成本；1024 样本离线检查同样使用 eager，避免编译时间超过实际评估计算。
+在线部署使用 eager FP16 推理，不把分钟级编译成本放进短回合测评。`navigator_reset` 已知实际 batch size 后立即使用零观测完成 CUDA kernel 初始化和同步；该步骤发生在 evaluator 的 episode 循环开始前。因此首个真实观测不会承担初始化时间，也不会让机器人在开局持续执行零动作。训练仍使用静态 `torch.compile`，因为 8000 个优化器 step 足以摊薄一次编译成本；1024 样本离线检查同样使用 eager，避免编译时间超过实际评估计算。
 
 必要验证分三层：
 
 1. 张量/数学单测：相机反投影、历史 mask、geometry/route token、PointGoal 标度、零目标停止、连续曲率硬界、教师 B-spline、checkpoint 和部署接口；
-2. 前向/梯度：训练 loss、全部参数梯度、固定 latent 的可复现推理、静态编译图和有限值；
+2. 前向/梯度：训练 loss、全部参数梯度、零先验众数的确定性推理、静态编译图和有限值；
 3. 重新训练后的 held-out/闭环：ADE、弧长、目标进展、曲率、延迟，以及固定协议 SR/SPL。
 
 旧 checkpoint 的低闭环成绩可以证明旧链路失败，但不能单独证明新模块有效。当前结构必须从头训练；离线几何通过后再进入固定协议闭环，最终结论以 SR/SPL 为准。

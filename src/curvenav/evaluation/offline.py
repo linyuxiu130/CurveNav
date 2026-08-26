@@ -14,7 +14,7 @@ from curvenav.config_io import load_config
 from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.loader import build_policy_validation_loader
 from curvenav.factory import build_policy
-from curvenav.models import CurveNavPolicy, FLOW_SOURCE_SEED
+from curvenav.models import CurveNavPolicy
 from curvenav.training.checkpoint import validate_policy_contract
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.prefetch import CudaPrefetchLoader
@@ -80,28 +80,26 @@ def trajectory_batch_metrics(
 def _sample(
     policy: CurveNavPolicy,
     batch: dict[str, Tensor],
-    flow_source: Tensor,
 ):
     prepared = unpack_policy_batch(batch)
     with torch.autocast(device_type="cuda", dtype=torch.float16):
-        prediction = policy.sample(prepared.condition, flow_source)
+        prediction = policy.sample(prepared.condition)
     return prepared, prediction
 
 
 def _time_online(
     policy: CurveNavPolicy,
     batch: dict[str, Tensor],
-    flow_source: Tensor,
     repeats: int,
 ) -> Tensor:
     first = {name: value[:1] for name, value in batch.items()}
     for _ in range(2):
-        _sample(policy, first, flow_source)
+        _sample(policy, first)
     torch.cuda.synchronize()
     latency = []
     for _ in range(repeats):
         started = time.perf_counter()
-        _sample(policy, first, flow_source)
+        _sample(policy, first)
         torch.cuda.synchronize()
         latency.append((time.perf_counter() - started) * 1000.0)
     return torch.tensor(latency, dtype=torch.float64)
@@ -116,29 +114,18 @@ def measure_policy(
 ) -> PolicyMeasurements:
     """Collect one deterministic prediction for every aligned observation."""
     policy.to(device).eval()
-    source_generator = torch.Generator(device=device).manual_seed(FLOW_SOURCE_SEED)
     warmup = next(iter(loader))
-    warmup_source = policy.trajectory_flow.sample_source(
-        len(warmup["point_goal"]),
-        policy.curve_codec.free_mask,
-        generator=source_generator,
-    )
-    _sample(policy, warmup, warmup_source)
+    _sample(policy, warmup)
     torch.cuda.synchronize(device)
 
     values: dict[str, list[Tensor]] = {}
     batch_latency = []
     samples = 0
     for batch in loader:
-        flow_source = policy.trajectory_flow.sample_source(
-            len(batch["point_goal"]),
-            policy.curve_codec.free_mask,
-            generator=source_generator,
-        )
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        prepared, prediction = _sample(policy, batch, flow_source)
+        prepared, prediction = _sample(policy, batch)
         end.record()
         end.synchronize()
         batch_latency.append(start.elapsed_time(end))
@@ -163,11 +150,6 @@ def measure_policy(
             _time_online(
                 policy,
                 warmup,
-                policy.trajectory_flow.sample_source(
-                    1,
-                    policy.curve_codec.free_mask,
-                    generator=source_generator,
-                ),
                 online_latency_repeats,
             )
             if online_latency_repeats

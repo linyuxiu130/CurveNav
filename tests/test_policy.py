@@ -56,7 +56,7 @@ def condition(batch: int = 2) -> PolicyCondition:
     )
 
 
-def test_policy_trains_every_module_and_returns_one_latent_conditioned_trajectory() -> None:
+def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -> None:
     torch.manual_seed(0)
     policy = build_policy(tiny_config())
     inputs = condition(batch=8)
@@ -89,15 +89,9 @@ def test_policy_trains_every_module_and_returns_one_latent_conditioned_trajector
     )
 
     policy.eval()
-    generator = torch.Generator().manual_seed(7)
-    source = policy.trajectory_flow.sample_source(
-        len(inputs.point_goal),
-        policy.curve_codec.free_mask,
-        generator=generator,
-    )
-    first = policy.sample(inputs, source)
+    first = policy.sample(inputs)
     torch.manual_seed(999)
-    second = policy.sample(inputs, source)
+    second = policy.sample(inputs)
     assert first.path.shape == (8, 16, 2)
     assert first.heading.shape == (8, 16)
     assert first.curvature.shape == (8, 16)
@@ -188,41 +182,31 @@ def test_flow_endpoint_reconstruction_matches_linear_path_identity() -> None:
     torch.testing.assert_close(reconstructed, clean)
 
 
-def test_flow_source_is_gaussian_masked_and_reproducible() -> None:
+def test_flow_training_source_is_gaussian_and_masked() -> None:
     policy = build_policy(tiny_config())
     assert torch.count_nonzero(policy.trajectory_flow.velocity_projection.weight) > 0
     assert torch.count_nonzero(policy.trajectory_flow.velocity_projection.bias) == 0
-    first_generator = torch.Generator().manual_seed(17)
-    second_generator = torch.Generator().manual_seed(17)
-    first = policy.trajectory_flow.sample_source(
-        1024,
-        policy.curve_codec.free_mask,
-        generator=first_generator,
-    )
-    second = policy.trajectory_flow.sample_source(
-        1024,
-        policy.curve_codec.free_mask,
-        generator=second_generator,
-    )
-    torch.testing.assert_close(first, second)
-    assert first[:, policy.curve_codec.free_mask].std().item() == pytest.approx(
+    clean = torch.zeros(8192, 8, 2)
+    mask = policy.curve_codec.free_mask[None].expand_as(clean)
+    _, _, target_velocity = policy.trajectory_flow.training_path(clean, mask)
+    source = -target_velocity
+    assert source[:, policy.curve_codec.free_mask].std().item() == pytest.approx(
         1.0,
         abs=0.03,
     )
     assert torch.equal(
-        first[:, ~policy.curve_codec.free_mask],
-        torch.zeros_like(first[:, ~policy.curve_codec.free_mask]),
+        source[:, ~policy.curve_codec.free_mask],
+        torch.zeros_like(source[:, ~policy.curve_codec.free_mask]),
     )
 
 
-def test_heun_integration_transports_the_supplied_source() -> None:
+def test_heun_integration_transports_the_zero_prior_mode() -> None:
     policy = build_policy(tiny_config())
     flow = policy.trajectory_flow
     batch = 2
     mask = policy.curve_codec.free_mask[None].expand(batch, -1, -1)
-    source = torch.randn(batch, flow.future_tokens, 2) * mask
-    target = torch.randn_like(source) * mask
-    velocity = target - source
+    target = torch.randn(batch, flow.future_tokens, 2) * mask
+    velocity = target
     encoded = ConditionFeatures(
         tokens=torch.zeros(batch, 1, 32),
         route_token=torch.zeros(batch, 32),
@@ -233,7 +217,7 @@ def test_heun_integration_transports_the_supplied_source() -> None:
         return velocity
 
     flow.forward = constant_velocity
-    transported = flow.integrate(encoded, source, integration_steps=4, free_mask=mask)
+    transported = flow.integrate(encoded, integration_steps=4, free_mask=mask)
     torch.testing.assert_close(transported, target)
 
 

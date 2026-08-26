@@ -15,8 +15,8 @@ from curvenav.encoders.depth import DEPTH_ENCODER_TYPE
 from curvenav.encoders import POINT_GOAL_ENCODER_TYPE
 from curvenav.models import (
     FLOW_CURVE_COORDINATE_SCALE,
-    FLOW_SOURCE_SEED,
-    FLOW_SOURCE_TYPE,
+    FLOW_INFERENCE_SOURCE_TYPE,
+    FLOW_TRAINING_SOURCE_TYPE,
     TRAJECTORY_FLOW_TYPE,
 )
 from curvenav.training.ema import ExponentialMovingAverage
@@ -30,7 +30,7 @@ from curvenav.trajectory import (
 )
 
 
-CHECKPOINT_TYPE = "curvenav_gaussian_flow_bounded_curvature_policy"
+CHECKPOINT_TYPE = "curvenav_gaussian_flow_zero_mode_bounded_curvature_policy"
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
 
@@ -110,12 +110,12 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "curve_boundary_conditions": "origin_and_forward_half_plane_initial_heading",
         "trajectory_flow_type": TRAJECTORY_FLOW_TYPE,
         "flow_curve_coordinate_scale": FLOW_CURVE_COORDINATE_SCALE,
-        "flow_source_type": FLOW_SOURCE_TYPE,
-        "flow_source_seed": FLOW_SOURCE_SEED,
+        "flow_training_source_type": FLOW_TRAINING_SOURCE_TYPE,
+        "flow_inference_source_type": FLOW_INFERENCE_SOURCE_TYPE,
         "training_objective": (
             "gaussian_source_future_flow_plus_metric_path_tangent_subgoal"
         ),
-        "trajectory_prediction": "single_episode_persistent_latent_heun_trajectory",
+        "trajectory_prediction": "single_zero_prior_mode_heun_trajectory",
         "trajectory_flow_integration_steps": config.trajectory_flow.integration_steps,
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
         "visual_context": (
@@ -126,9 +126,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "observation_to_current": "planar_rigid_transform_used_for_depth_token_alignment",
         "visual_compression": "64_goal_independent_metric_geometry_queries",
         "goal_conditioning": "pointgoal_direction_range_and_metric_local_scale",
-        "temporal_modeling": (
-            "executed_history_plus_episode_persistent_gaussian_flow_latent"
-        ),
+        "temporal_modeling": "executed_metric_observation_history",
         "num_curve_tokens": trajectory.num_curvature_control_points + 1,
         "num_curvature_control_points": trajectory.num_curvature_control_points,
         "curvature_spline_degree": trajectory.curvature_spline_degree,
