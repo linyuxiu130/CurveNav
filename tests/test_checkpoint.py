@@ -98,6 +98,12 @@ def test_checkpoint_records_the_direct_bounded_curvature_contract() -> None:
         contract["trajectory_prediction"]
         == "single_direct_bounded_curvature_trajectory"
     )
+    assert contract["temporal_modeling"] == (
+        "executed_metric_observation_history_with_strict_padding"
+    )
+    assert contract["history_training_distribution"] == (
+        "uniform_valid_observation_suffix_marginalization"
+    )
     assert not any("flow" in key for key in contract)
     assert "trajectory_candidate_samples" not in contract
     assert contract["camera_extrinsics"] == {

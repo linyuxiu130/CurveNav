@@ -28,6 +28,7 @@ ONLINE_LATENCY_REPEATS = 50
 @dataclass(frozen=True)
 class PolicyMeasurements:
     metrics: dict[str, Tensor]
+    current_frame_metrics: dict[str, Tensor]
     batch_latency_ms: Tensor
     online_latency_ms: Tensor
     samples: int
@@ -131,6 +132,7 @@ def measure_policy(
     torch.cuda.synchronize(device)
 
     values: dict[str, list[Tensor]] = {}
+    current_frame_values: dict[str, list[Tensor]] = {}
     batch_latency = []
     samples = 0
     for batch in loader:
@@ -141,6 +143,11 @@ def measure_policy(
         end.record()
         end.synchronize()
         batch_latency.append(start.elapsed_time(end))
+        current_frame_batch = dict(batch)
+        current_frame_valid = torch.zeros_like(batch["observation_valid"])
+        current_frame_valid[:, -1] = True
+        current_frame_batch["observation_valid"] = current_frame_valid
+        current_prepared, current_prediction = _sample(policy, current_frame_batch)
         smoothed_reference_path = policy.target_codec.decode_equal_arc(
             prepared.target.control_points.float()
         )
@@ -157,12 +164,27 @@ def measure_policy(
         metrics["valid_observation_frames"] = (
             prepared.condition.observation_valid.sum(dim=-1)
         )
+        current_metrics = trajectory_batch_metrics(
+            current_prediction.path.float(),
+            current_prediction.curvature.float(),
+            current_prepared.target.reference_path.float(),
+            reference_curvature,
+            current_prepared.condition.point_goal.float(),
+        )
+        current_metrics["valid_observation_frames"] = (
+            current_prepared.condition.observation_valid.sum(dim=-1)
+        )
         for name, value in metrics.items():
             values.setdefault(name, []).append(value.cpu())
+        for name, value in current_metrics.items():
+            current_frame_values.setdefault(name, []).append(value.cpu())
         samples += len(prediction.path)
 
     return PolicyMeasurements(
         metrics={name: torch.cat(parts) for name, parts in values.items()},
+        current_frame_metrics={
+            name: torch.cat(parts) for name, parts in current_frame_values.items()
+        },
         batch_latency_ms=torch.tensor(batch_latency, dtype=torch.float64),
         online_latency_ms=(
             _time_online(
@@ -258,11 +280,31 @@ def evaluate_policy(
             f"evaluated {measurements.samples} samples, expected {expected_samples}"
         )
     seconds = measurements.batch_latency_ms.sum().item() / 1000.0
+    current_frame_summary = summarize_policy_metrics(
+        measurements.current_frame_metrics
+    )
     return {
         "protocol": "curvenav_local_validation",
         "samples": measurements.samples,
         "trajectories_per_observation": 1,
         **summarize_policy_metrics(measurements.metrics),
+        "current_frame_only_ade_m": current_frame_summary["ade_m"],
+        "current_frame_only_ade_m_high_curvature_10pct": (
+            current_frame_summary["ade_m_high_curvature_10pct"]
+        ),
+        "current_frame_only_terminal_heading_error_rad_high_curvature_10pct": (
+            current_frame_summary[
+                "terminal_heading_error_rad_high_curvature_10pct"
+            ]
+        ),
+        "current_frame_only_curvature_ratio_high_curvature_10pct": (
+            current_frame_summary[
+                "predicted_to_reference_curvature_ratio_high_curvature_10pct"
+            ]
+        ),
+        "current_frame_only_negative_progress_fraction": current_frame_summary[
+            "negative_progress_fraction"
+        ],
         "batch32_latency_ms_mean": measurements.batch_latency_ms.mean().item(),
         "throughput_observations_per_second": measurements.samples / seconds,
         "online_latency_ms_p50": torch.quantile(

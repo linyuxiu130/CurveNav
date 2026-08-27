@@ -132,6 +132,11 @@ class PreparedPolicyDataset(Dataset):
             raise ValueError(
                 f"prepared policy split has an invalid current frame: {split}"
             )
+        observation_valid = self.arrays["observation_valid"]
+        if np.any(observation_valid[:, :-1] & ~observation_valid[:, 1:]):
+            raise ValueError(
+                f"prepared policy split history is not a valid suffix: {split}"
+            )
 
         depth = split_manifest.get("depth", {})
         if depth.get("dtype") != "float16_normalized" or (

@@ -18,6 +18,7 @@ from curvenav.models import (
     TRAJECTORY_DECODER_TYPE,
 )
 from curvenav.training.ema import ExponentialMovingAverage
+from curvenav.training.history import HISTORY_TRAINING_DISTRIBUTION
 from curvenav.training.batching import build_distributed_batch_layout
 from curvenav.trajectory import (
     ARC_LENGTH_OVERSAMPLE_FACTOR,
@@ -119,7 +120,8 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "observation_to_current": "planar_rigid_transform_used_for_depth_token_alignment",
         "visual_compression": "32_current_plus_32_full_context_metric_geometry_queries",
         "goal_conditioning": "pointgoal_direction_range_and_metric_local_scale",
-        "temporal_modeling": "executed_metric_observation_history",
+        "temporal_modeling": "executed_metric_observation_history_with_strict_padding",
+        "history_training_distribution": HISTORY_TRAINING_DISTRIBUTION,
         "route_query_count": ROUTE_QUERY_COUNT,
         "num_curve_tokens": trajectory.num_curvature_control_points + 1,
         "num_curvature_control_points": trajectory.num_curvature_control_points,

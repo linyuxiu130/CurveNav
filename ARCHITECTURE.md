@@ -22,7 +22,7 @@ prediction geometry    heading/curvature [B,64]
 4× metric depth
   └─ shared GroupNorm ResNet-18 stage-3 ── current 96 tokens ── 32 current queries ─┐
                                       └── all 4×96 tokens ── 32 context queries ───┤
-4× (x,y,sin Δyaw,cos Δyaw) ──────────────── 4 explicit state tokens ──┤
+4× (x,y,sin Δyaw,cos Δyaw) ───── 4 strictly padded state tokens ─────┤
 PointGoal direction + log range ─────────────────────── goal token ───┤
                                                                       ↓
                                       4 ordered route queries, 2× cross-attention
@@ -70,7 +70,16 @@ p_current = R(Δyaw) p_body + (tx,ty).
 
 ### 2.2 显式状态和 PointGoal
 
-`observation_to_current` 不只用于搬动深度点，也经过 MLP 形成四个 state token。平移除以 1.35 m 历史窗口尺度，旋转直接使用 `sin/cos`，不存在角度跳变。补帧使用 learned invalid-state token。
+`observation_to_current` 不只用于搬动深度点，也经过 MLP 形成四个 state token。平移除以 1.35 m 历史窗口尺度，旋转直接使用 `sin/cos`，不存在角度跳变。无效历史先在 MLP 输入和输出置零，并形成唯一 condition padding mask；该 mask 同时进入 route cross-attention、四层 condition self-attention 和八层 trajectory cross-attention。因而无效 state 在所有 key/value 路径上严格不可见，不再用 learned invalid-state embedding 让 padding 参与路线推理。
+
+部署中每个 episode 必然依次经历 1、2、3、4 个有效观测，旧训练集却有 `7,260/7,960=91.2%` 的验证样本已经具备完整四帧。当前训练因此对每个原样本已有的 `m` 个有效后缀，采样
+
+```text
+K ~ Uniform{1,...,m},
+valid'_j = valid_j · 1[j ≥ 4-K].
+```
+
+这不是删除深度或独立的数据增强分支，而是对物理上可能获得的历史长度做 Monte-Carlo 边缘化：优化目标变为 `E_(sample,K)[L(f(O_(t-K+1:t),g),p*)]`。每个被保留的历史仍使用真实深度和真实位姿；训练、恢复和 FP16 overflow retry 共用 CUDA RNG 状态，精确恢复同一前缀流。这样晚期路线样本也能作为合法 episode 冷启动状态训练，同时完整历史仍以 `K=4` 进入同一张图。
 
 PointGoal 编码为方向和对数距离：
 
@@ -192,7 +201,7 @@ geometry-supervised/self-consistent 实验在 step 4800 的 1024 条验证集上
 
 当前实现据此删除完整 Flow 模块、时间嵌入、velocity/endpoint heads、积分器及其 loss；不是在推理时绕过仍存在的旧分支。输出只有一个 `[B,8,2]` 归一化坐标，经固定除 8 后送入有界曲率 decoder。全部时序一致性来自真实执行历史，不递归传播上一周期预测误差。
 
-从头训练的当前直接模型进一步验证了这个判断。相同 1024 条 held-out 样本、EMA 权重和评估入口得到：
+从头训练的未做历史边缘化直接基线 `9a9ca17` 进一步验证了这个判断。相同 1024 条 held-out 样本、EMA 权重和评估入口得到：
 
 | step | 直接模型 ADE / 强转弯 ADE (m) | 旧 Flow 最终输出 ADE / 强转弯 ADE (m) |
 |---:|---:|---:|
@@ -202,7 +211,7 @@ geometry-supervised/self-consistent 实验在 step 4800 的 1024 条验证集上
 
 早中期两项都明确改善；step 4800 的总体 ADE 仍更好，而强转弯 ADE 基本持平。此时直接模型的强转弯终端航向误差为 `0.39878 rad`、全体最大曲率相关系数为 `0.76983`，分别优于旧 Flow 的 `0.42458 rad` 和 `0.74511`。因此现有证据支持删除第二生成阶段，但也明确指出剩余问题是强转弯几何学习和闭环执行，而不是重新加入随机 ODE。
 
-上表只用于与旧 Flow 保持相同 1024 条样本的受控比较。当前唯一离线入口不再用固定前缀选 checkpoint，而是读取数据清单并遍历完整 7,960 条 held-out split：
+上表只用于与旧 Flow 保持相同 1024 条样本的受控比较。唯一离线入口不再用固定前缀选 checkpoint，而是读取数据清单并遍历完整 7,960 条 held-out split；下表仍是 `9a9ca17` 基线：
 
 | step | ADE (m) | 强转弯 ADE (m) | 强转弯终端航向 (rad) | 最大曲率相关系数 |
 |---:|---:|---:|---:|---:|
@@ -212,7 +221,17 @@ geometry-supervised/self-consistent 实验在 step 4800 的 1024 条验证集上
 | 6400 | `0.07806` | `0.28367` | `0.42337` | `0.73486` |
 | 8000 | `0.07805` | `0.28196` | `0.43238` | `0.72692` |
 
-总体 ADE 在 step 4800 后饱和，强转弯 ADE 到 step 8000 仍改善，但航向和曲率相关性开始波动。因此训练 loss 或单个离线指标都不足以选最终权重；4800、6400、8000 必须在完全相同的闭环 episode 上比较 SR/SPL。
+总体 ADE 在 step 4800 后饱和，强转弯 ADE 到 step 8000 仍改善，但航向和曲率相关性开始波动。更关键的是，按自然历史长度分组后，四帧 ADE 从 step800 的 `0.09580 m` 降到 step8000 的 `0.07234 m`，而每回合必经的单帧 ADE 反而从 `0.18194 m` 升到 `0.21264 m`。把全部 7,960 条观测反事实地只保留当前帧后得到：
+
+| step | 单帧 ADE (m) | 单帧强转弯 ADE (m) | 单帧强转弯曲率比 |
+|---:|---:|---:|---:|
+| 800 | `0.15516` | `0.51424` | `0.22762` |
+| 2400 | `0.15183` | `0.49511` | `0.33438` |
+| 4800 | `0.15765` | `0.48602` | `0.45063` |
+| 6400 | `0.16256` | `0.49863` | `0.48782` |
+| 8000 | `0.16802` | `0.49694` | `0.50808` |
+
+这证明旧目标在不断优化占绝对多数的完整历史，同时牺牲冷启动条件；不是 100 个自然起始样本的偶然噪声。完全相同的常驻场景、seed1234、`num-envs=10` 吞吐诊断中，step800 为 `1/10`、mean SPL `0.08687`，step2400 为 `0/10`，也说明较低总体 ADE 不能代表闭环成功。当前结构据此同时修复 attention padding 和训练历史分布；旧权重不能靠推理补 mask 修复，必须从头训练。离线入口今后每次都同时记录自然 held-out 与全量 current-frame-only 指标，再以相同闭环 episode 的 SR/SPL 作最终选择。
 
 ## 5. 唯一训练目标
 

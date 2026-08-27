@@ -45,6 +45,7 @@ class DepthFeatures:
 class ConditionFeatures:
     tokens: Tensor
     route_token: Tensor
+    padding_mask: Tensor
 
 
 @dataclass

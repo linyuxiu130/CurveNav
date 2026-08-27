@@ -13,7 +13,7 @@ GEOMETRY_QUERY_COUNT = CURRENT_GEOMETRY_QUERY_COUNT + CONTEXT_GEOMETRY_QUERY_COU
 ROUTE_QUERY_COUNT = 4
 ROUTE_QUERY_LAYERS = 2
 CONDITION_ENCODER_TYPE = (
-    "current_context_metric_geometry_ordered_route_queries_explicit_state"
+    "current_context_metric_geometry_ordered_route_queries_masked_state"
 )
 
 
@@ -110,9 +110,6 @@ class PolicyConditionEncoder(nn.Module):
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
-        self.invalid_state_embedding = nn.Parameter(
-            torch.zeros(1, observation_frames, model_dim)
-        )
         self.route_query_embedding = nn.Parameter(
             torch.zeros(1, ROUTE_QUERY_COUNT, model_dim)
         )
@@ -130,7 +127,6 @@ class PolicyConditionEncoder(nn.Module):
         nn.init.trunc_normal_(self.frame_slot_embedding, std=0.02)
         nn.init.trunc_normal_(self.current_geometry_query_embedding, std=0.02)
         nn.init.trunc_normal_(self.context_geometry_query_embedding, std=0.02)
-        nn.init.trunc_normal_(self.invalid_state_embedding, std=0.02)
         nn.init.trunc_normal_(self.route_query_embedding, std=0.02)
 
     def forward(
@@ -176,30 +172,66 @@ class PolicyConditionEncoder(nn.Module):
             self.geometry_attention_mask,
         )
 
-        state_input = observation_to_current.clone()
+        state_input = torch.where(
+            observation_valid[..., None],
+            observation_to_current,
+            torch.zeros_like(observation_to_current),
+        )
         state_input[..., :2] = state_input[..., :2] / self.history_scale_m
         state = self.state_encoder(state_input)
-        state = torch.where(
-            observation_valid[..., None],
-            state,
-            self.invalid_state_embedding.expand(batch, -1, -1),
-        )
+        state = state.masked_fill(~observation_valid[..., None], 0.0)
 
         goal = self.point_goal_encoder(point_goal).unsqueeze(1)
         route = self.route_query_embedding.expand(batch, -1, -1) + goal
         route_memory = torch.cat((state, geometry), dim=1)
+        route_memory_padding_mask = torch.cat(
+            (
+                ~observation_valid,
+                torch.zeros(
+                    batch,
+                    GEOMETRY_QUERY_COUNT,
+                    device=observation_valid.device,
+                    dtype=torch.bool,
+                ),
+            ),
+            dim=1,
+        )
         for block in self.route_blocks:
-            route = block(route, route_memory)
+            route = block(
+                route,
+                route_memory,
+                memory_padding_mask=route_memory_padding_mask,
+            )
 
         tokens = torch.cat((route, goal, state, geometry), dim=1)
+        padding_mask = torch.cat(
+            (
+                torch.zeros(
+                    batch,
+                    ROUTE_QUERY_COUNT + 1,
+                    device=observation_valid.device,
+                    dtype=torch.bool,
+                ),
+                ~observation_valid,
+                torch.zeros(
+                    batch,
+                    GEOMETRY_QUERY_COUNT,
+                    device=observation_valid.device,
+                    dtype=torch.bool,
+                ),
+            ),
+            dim=1,
+        )
         for block in self.condition_blocks:
-            tokens = block(tokens)
+            tokens = block(tokens, padding_mask)
         tokens = self.output_norm(tokens)
         route_latent = tokens[:, :ROUTE_QUERY_COUNT]
         route_tokens = self.route_output_norm(route_latent)
         route_token = self.route_summary_norm(route_tokens.mean(dim=1))
         tokens = torch.cat((route_tokens, tokens[:, ROUTE_QUERY_COUNT:]), dim=1)
+        tokens = tokens.masked_fill(padding_mask[..., None], 0.0)
         return ConditionFeatures(
             tokens=tokens,
             route_token=route_token,
+            padding_mask=padding_mask,
         )

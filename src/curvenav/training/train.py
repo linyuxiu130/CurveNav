@@ -27,6 +27,7 @@ from curvenav.training.checkpoint import (
 )
 from curvenav.training.batching import build_distributed_batch_layout
 from curvenav.training.ema import ExponentialMovingAverage
+from curvenav.training.history import sample_observation_history_prefix
 from curvenav.training.optimizer import build_cosine_schedule, build_optimizer
 from curvenav.training.prefetch import CudaPrefetchLoader
 from curvenav.training.runtime import configure_cuda_training_backend
@@ -249,6 +250,9 @@ def run_training(
                 )
                 with synchronization_context:
                     prepared = unpack_policy_batch(batch)
+                    prepared.condition = sample_observation_history_prefix(
+                        prepared.condition
+                    )
                     with accelerator.autocast():
                         losses = policy(prepared.condition, prepared.target)
                     if not torch.isfinite(losses.loss.detach()):

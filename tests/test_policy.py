@@ -126,6 +126,12 @@ def test_invalid_padded_frames_cannot_change_the_prediction() -> None:
     first_encoded = policy.encode_condition(first)
     second_encoded = policy.encode_condition(second)
     torch.testing.assert_close(first_encoded.tokens, second_encoded.tokens)
+    assert torch.equal(first_encoded.padding_mask, second_encoded.padding_mask)
+    assert first_encoded.padding_mask.sum().item() == 2
+    assert torch.equal(
+        first_encoded.tokens[first_encoded.padding_mask],
+        torch.zeros_like(first_encoded.tokens[first_encoded.padding_mask]),
+    )
 
 
 def test_depth_tokens_do_not_depend_on_other_batch_members() -> None:
