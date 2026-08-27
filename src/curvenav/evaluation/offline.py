@@ -21,7 +21,6 @@ from curvenav.training.prefetch import CudaPrefetchLoader
 from curvenav.trajectory import path_arc_length
 
 
-VALIDATION_SAMPLES = 1024
 VALIDATION_BATCH_SIZE = 32
 ONLINE_LATENCY_REPEATS = 50
 
@@ -251,11 +250,12 @@ def evaluate_policy(
     policy: CurveNavPolicy,
     loader,
     device: torch.device,
+    expected_samples: int,
 ) -> dict[str, float | int | str]:
     measurements = measure_policy(policy, loader, device)
-    if measurements.samples != VALIDATION_SAMPLES:
+    if measurements.samples != expected_samples:
         raise RuntimeError(
-            f"evaluated {measurements.samples} samples, expected {VALIDATION_SAMPLES}"
+            f"evaluated {measurements.samples} samples, expected {expected_samples}"
         )
     seconds = measurements.batch_latency_ms.sum().item() / 1000.0
     return {
@@ -288,7 +288,6 @@ def run_evaluation(config: CurveNavConfig, checkpoint_path: Path) -> dict[str, o
         config.data,
         config.trajectory,
         batch_size=VALIDATION_BATCH_SIZE,
-        samples=VALIDATION_SAMPLES,
         num_workers=config.training.num_workers,
     )
     loader = CudaPrefetchLoader(bundle.loader, bundle.depth_bank, torch.device("cuda"))
@@ -296,6 +295,7 @@ def run_evaluation(config: CurveNavConfig, checkpoint_path: Path) -> dict[str, o
         policy,
         loader,
         torch.device("cuda"),
+        bundle.samples,
     )
     result.update(
         checkpoint=str(checkpoint_path.resolve()),

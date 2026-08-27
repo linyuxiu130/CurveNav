@@ -234,10 +234,10 @@ def run_training(
         batches = tuple(
             next(loader_iterator) for _ in range(micro_batches_per_step)
         )
-        flow_rng_state = torch.cuda.get_rng_state(accelerator.device)
+        cuda_rng_state = torch.cuda.get_rng_state(accelerator.device)
         overflow_retries = 0
         while True:
-            torch.cuda.set_rng_state(flow_rng_state, accelerator.device)
+            torch.cuda.set_rng_state(cuda_rng_state, accelerator.device)
             optimizer.zero_grad(set_to_none=True)
             current_losses = torch.zeros_like(window_losses)
             for micro_step, batch in enumerate(batches):

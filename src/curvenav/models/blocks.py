@@ -12,7 +12,7 @@ def _modulate(value: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
 class ConditionalTrajectoryBlock(nn.Module):
     """Bidirectional trajectory attention with adaRMS-Zero conditioning.
 
-    The supervised route token modulates every residual branch.
+    The end-to-end learned route summary modulates every residual branch.
     Geometry remains a token sequence and enters through cross-attention, so
     spatial information is not collapsed into the global modulation vector.
     """
