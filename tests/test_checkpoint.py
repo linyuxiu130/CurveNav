@@ -141,7 +141,7 @@ def test_checkpoint_records_the_direct_bounded_curvature_contract() -> None:
     )
     assert (
         contract["observation_to_current"]
-        == "planar_rigid_transform_used_for_depth_token_alignment"
+        == "planar_rigid_transform_used_for_metric_xyz_alignment"
     )
 
 
