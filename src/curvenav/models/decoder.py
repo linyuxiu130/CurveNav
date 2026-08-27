@@ -30,7 +30,7 @@ class OrderedCurveDecoder(nn.Module):
             ConditionalTrajectoryBlock(model_dim, heads, dropout) for _ in range(layers)
         )
         self.output_norm = RMSNorm(model_dim)
-        self.coordinate_projection = nn.Linear(model_dim, 2)
+        self.coordinate_projection = nn.Linear(model_dim, 1)
         nn.init.trunc_normal_(self.token_embedding, std=0.02)
         nn.init.zeros_(self.coordinate_projection.bias)
 
@@ -47,11 +47,8 @@ class OrderedCurveDecoder(nn.Module):
     def forward(
         self,
         condition: ConditionFeatures,
-        free_mask: Tensor,
     ) -> Tensor:
         batch = condition.tokens.shape[0]
-        if free_mask.shape != (batch, self.curve_tokens, 2):
-            raise ValueError("free_mask must have shape [B,T,2]")
         trajectory = self.token_embedding.expand(batch, -1, -1)
         for block in self.blocks:
             trajectory = block(
@@ -59,4 +56,4 @@ class OrderedCurveDecoder(nn.Module):
                 condition.tokens,
                 condition.route_token,
             )
-        return self.coordinate_projection(self.output_norm(trajectory)) * free_mask
+        return self.coordinate_projection(self.output_norm(trajectory)).squeeze(-1)

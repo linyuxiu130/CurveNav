@@ -28,6 +28,7 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         focal_x_px=config.data.canonical_focal_x_px,
         focal_y_px=config.data.canonical_focal_y_px,
         camera_forward_offset_m=config.data.camera_forward_offset_m,
+        camera_height_m=config.data.camera_height_m,
         camera_downward_pitch_degrees=(config.data.camera_downward_pitch_degrees),
     )
     point_goal_encoder = PointGoalEncoder(

@@ -82,22 +82,12 @@ class CurveNavPolicy(nn.Module):
             condition.observation_valid,
         )
 
-    def _free_mask(self, point_goal: Tensor) -> Tensor:
-        return self.curve_codec.free_mask.to(
-            device=point_goal.device,
-            dtype=torch.bool,
-        )[None].expand(point_goal.shape[0], -1, -1)
-
     def _predict_normalized_coordinates(
         self,
         condition: PolicyCondition,
     ) -> Tensor:
         encoded = self.encode_condition(condition)
-        free_mask = self._free_mask(condition.point_goal)
-        return self.trajectory_decoder(
-            encoded,
-            free_mask.to(encoded.tokens.dtype),
-        )
+        return self.trajectory_decoder(encoded)
 
     def _decode(
         self,
@@ -122,8 +112,8 @@ class CurveNavPolicy(nn.Module):
         weights = self.near_path_weights.to(
             device=point_loss.device,
             dtype=point_loss.dtype,
-        )
-        return (point_loss * weights).mean()
+        )[1:]
+        return (point_loss[:, 1:] * (weights / weights.mean())).mean()
 
     def _tangent_loss(self, predicted_path: Tensor, reference_path: Tensor) -> Tensor:
         predicted_delta = predicted_path[:, 1:] - predicted_path[:, :-1]
@@ -144,10 +134,8 @@ class CurveNavPolicy(nn.Module):
     def _coordinate_loss(
         predicted: Tensor,
         target: Tensor,
-        free_mask: Tensor,
     ) -> Tensor:
-        error = (predicted - target).square() * free_mask
-        return error.sum() / free_mask.sum().clamp_min(1.0)
+        return (predicted - target).square().mean()
 
     def training_loss(
         self,
@@ -168,7 +156,6 @@ class CurveNavPolicy(nn.Module):
         smoothed_target_path = self.target_codec.decode_equal_arc(
             target.control_points.float()
         )
-        free_mask = self._free_mask(condition.point_goal)
         predicted_coordinates = self._predict_normalized_coordinates(condition)
         target_coordinates = self.trajectory_decoder.normalize_curve_coordinates(
             self.curve_codec.encode_target(
@@ -183,7 +170,6 @@ class CurveNavPolicy(nn.Module):
         coordinate_loss = self._coordinate_loss(
             predicted_coordinates,
             target_coordinates,
-            free_mask,
         )
         path_loss = self._path_loss(predicted_path, smoothed_target_path)
         tangent_loss = self._tangent_loss(predicted_path, smoothed_target_path)

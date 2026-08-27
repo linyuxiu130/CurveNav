@@ -1,30 +1,26 @@
-"""PointGoal-scaled trajectories with a hard continuous-curvature bound."""
-
-import math
+"""Bounded-horizon trajectories with a hard continuous-curvature bound."""
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
 from .bspline import bspline_basis_matrix
 
 
-CURVATURE_PARAMETERIZATION_TYPE = "pointgoal_scaled_arc_length_cubic_curvature_bspline"
+CURVATURE_PARAMETERIZATION_TYPE = (
+    "bounded_local_arc_length_zero_tangent_cubic_curvature_bspline"
+)
 CURVE_INTEGRATION_OVERSAMPLE_FACTOR = 4
 CURVATURE_TARGET_REGULARIZATION = 0.3
-_UNIT_SOFTPLUS_OFFSET = math.log(math.expm1(1.0))
-
-
-def _inverse_softplus(value: Tensor) -> Tensor:
-    return value + torch.log(-torch.expm1(-value))
+MAXIMUM_LOCAL_DETOUR_RATIO = 2.0
+LENGTH_LOGIT_SCALE = 8.0
 
 
 class BoundedCurvatureTrajectory(nn.Module):
     """Encode and decode a forward arc-length curve.
 
-    Token zero contains total arc length and initial heading.  The remaining
-    tokens contain the control values of a cubic B-spline curvature profile in
-    their first channel; their second channel is structurally fixed to zero.
+    Token zero contains bounded total arc length.  The remaining tokens contain
+    the control values of a cubic B-spline curvature profile.  The initial
+    tangent is the robot forward axis.
 
     Cubic B-spline bases are non-negative and form a partition of unity.  Since
     every curvature control is mapped through ``tanh``, the complete continuous
@@ -44,8 +40,8 @@ class BoundedCurvatureTrajectory(nn.Module):
             raise ValueError("CurveNav uses one cubic curvature B-spline")
         if num_curvature_control_points < degree + 1:
             raise ValueError("curvature controls must support the spline degree")
-        if num_path_points < 2:
-            raise ValueError("num_path_points must be at least two")
+        if num_path_points < 3:
+            raise ValueError("num_path_points must be at least three")
         if planning_horizon_m <= 0 or maximum_curvature_inv_m <= 0:
             raise ValueError("trajectory metric scales must be positive")
 
@@ -82,10 +78,6 @@ class BoundedCurvatureTrajectory(nn.Module):
             integration_basis,
             persistent=True,
         )
-        free_mask = torch.zeros(self.num_curve_tokens, 2, dtype=torch.bool)
-        free_mask[0] = True
-        free_mask[1:, 0] = True
-        self.register_buffer("free_mask", free_mask, persistent=True)
 
     @staticmethod
     def path_geometry(path: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -101,9 +93,16 @@ class BoundedCurvatureTrajectory(nn.Module):
         )
         support_length = 0.5 * (segment_length[:, 1:] + segment_length[:, :-1])
         vertex_curvature = turn / support_length.clamp_min(1e-6)
+        initial_turn = torch.atan2(
+            torch.sin(segment_heading[:, 0]),
+            torch.cos(segment_heading[:, 0]),
+        )
+        initial_curvature = (
+            2.0 * initial_turn / segment_length[:, 0].clamp_min(1e-6)
+        )
         curvature = torch.cat(
             (
-                vertex_curvature[:, :1],
+                initial_curvature[:, None],
                 vertex_curvature,
                 vertex_curvature[:, -1:],
             ),
@@ -119,33 +118,35 @@ class BoundedCurvatureTrajectory(nn.Module):
             raise ValueError("point_goal does not match the reference path")
         reference_path = reference_path.float()
         point_goal = point_goal.float()
-        length, segment_heading, reference_curvature = self.path_geometry(
+        length, _, reference_curvature = self.path_geometry(
             reference_path
         )
-        local_scale = torch.linalg.vector_norm(point_goal, dim=-1).clamp_max(
-            self.planning_horizon_m
+        goal_distance = torch.linalg.vector_norm(point_goal, dim=-1)
+        maximum_length = torch.minimum(
+            torch.full_like(goal_distance, self.planning_horizon_m),
+            MAXIMUM_LOCAL_DETOUR_RATIO * goal_distance,
         )
-        positive_scale = local_scale > 0
-        safe_scale = torch.where(
-            positive_scale,
-            local_scale,
-            torch.ones_like(local_scale),
+        positive_length = maximum_length > 0
+        safe_maximum = torch.where(
+            positive_length,
+            maximum_length,
+            torch.ones_like(maximum_length),
         )
-        length_ratio = torch.where(
-            positive_scale,
-            length / safe_scale,
-            torch.ones_like(length),
+        length_fraction = torch.where(
+            positive_length,
+            length / safe_maximum,
+            0.5 * torch.ones_like(length),
         )
+        epsilon = torch.finfo(reference_path.dtype).eps
+        length_fraction = length_fraction.clamp(epsilon, 1.0 - epsilon)
 
         coordinates = torch.zeros(
             reference_path.shape[0],
             self.num_curve_tokens,
-            2,
             device=reference_path.device,
             dtype=reference_path.dtype,
         )
-        coordinates[:, 0, 0] = _inverse_softplus(length_ratio) - _UNIT_SOFTPLUS_OFFSET
-        coordinates[:, 0, 1] = torch.atanh(segment_heading[:, 0] / (0.5 * math.pi))
+        coordinates[:, 0] = torch.logit(length_fraction) / LENGTH_LOGIT_SCALE
         projection = self.target_curvature_projection.to(
             device=reference_path.device,
             dtype=reference_path.dtype,
@@ -153,9 +154,10 @@ class BoundedCurvatureTrajectory(nn.Module):
         curvature_controls = (
             projection[None] * reference_curvature[:, None]
         ).sum(dim=-1)
-        coordinates[:, 1:, 0] = torch.atanh(
+        bounded_fraction = (
             curvature_controls / self.maximum_curvature_inv_m
-        )
+        ).clamp(-1.0 + epsilon, 1.0 - epsilon)
+        coordinates[:, 1:] = torch.atanh(bounded_fraction)
         return coordinates
 
     def decode(
@@ -164,19 +166,22 @@ class BoundedCurvatureTrajectory(nn.Module):
         point_goal: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Decode coordinates into path, heading, and bounded curvature."""
-        if coordinates.shape[-2:] != (self.num_curve_tokens, 2):
+        if coordinates.ndim != 2 or coordinates.shape[1] != self.num_curve_tokens:
             raise ValueError("coordinates do not match the curve codec")
-        if point_goal.shape != (*coordinates.shape[:-2], 2):
+        if point_goal.shape != (coordinates.shape[0], 2):
             raise ValueError("point_goal does not match the curve coordinates")
         coordinates = coordinates.float()
         point_goal = point_goal.float()
-        local_scale = torch.linalg.vector_norm(point_goal, dim=-1).clamp_max(
-            self.planning_horizon_m
+        goal_distance = torch.linalg.vector_norm(point_goal, dim=-1)
+        maximum_length = torch.minimum(
+            torch.full_like(goal_distance, self.planning_horizon_m),
+            MAXIMUM_LOCAL_DETOUR_RATIO * goal_distance,
         )
-        length = local_scale * F.softplus(coordinates[:, 0, 0] + _UNIT_SOFTPLUS_OFFSET)
-        initial_heading = 0.5 * math.pi * torch.tanh(coordinates[:, 0, 1])
+        length = maximum_length * torch.sigmoid(
+            LENGTH_LOGIT_SCALE * coordinates[:, 0]
+        )
         curvature_controls = self.maximum_curvature_inv_m * torch.tanh(
-            coordinates[:, 1:, 0]
+            coordinates[:, 1:]
         )
         basis = self.integration_basis.to(
             device=coordinates.device,
@@ -191,15 +196,15 @@ class BoundedCurvatureTrajectory(nn.Module):
         delta_heading = (
             0.5 * (dense_curvature[:, :-1] + dense_curvature[:, 1:]) * delta_s
         )
-        dense_heading = initial_heading[:, None] + torch.cat(
+        dense_heading = torch.cat(
             (
-                torch.zeros_like(initial_heading[:, None]),
+                torch.zeros_like(length[:, None]),
                 delta_heading.cumsum(dim=1),
             ),
             dim=1,
         )
         midpoint_heading = dense_heading[:, :-1] + 0.5 * delta_heading
-        chord_length = delta_s * torch.sinc(delta_heading / (2.0 * math.pi))
+        chord_length = delta_s * torch.sinc(delta_heading / (2.0 * torch.pi))
         delta_position = chord_length[..., None] * torch.stack(
             (midpoint_heading.cos(), midpoint_heading.sin()),
             dim=-1,

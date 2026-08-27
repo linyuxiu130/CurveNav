@@ -58,7 +58,7 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
     torch.manual_seed(0)
     policy = build_policy(tiny_config())
     inputs = condition(batch=8)
-    curve_coordinates = 0.2 * torch.randn(8, 8, 2)
+    curve_coordinates = 0.2 * torch.randn(8, 8)
     reference_path, _, _ = policy.curve_codec(
         curve_coordinates,
         inputs.point_goal,
@@ -166,7 +166,7 @@ def test_seven_curvature_control_contract_is_unique() -> None:
 
 def test_curve_coordinate_normalization_is_exact_and_order_one() -> None:
     decoder = build_policy(tiny_config()).trajectory_decoder
-    coordinates = torch.tensor([[[0.05, -0.02], [0.08, 0.0], [-0.04, 0.0]]])
+    coordinates = torch.tensor([[0.05, 0.08, -0.04]])
     normalized = decoder.normalize_curve_coordinates(coordinates)
     torch.testing.assert_close(normalized, 8.0 * coordinates)
     torch.testing.assert_close(
@@ -180,19 +180,14 @@ def test_conditioned_decoder_returns_one_bounded_curve() -> None:
     policy = build_policy(tiny_config())
     inputs = condition(batch=2)
     encoded = policy.encode_condition(inputs)
-    mask = policy.curve_codec.free_mask[None].expand(2, -1, -1)
-    coordinates = policy.trajectory_decoder(encoded, mask)
-    repeated = policy.trajectory_decoder(encoded, mask)
+    coordinates = policy.trajectory_decoder(encoded)
+    repeated = policy.trajectory_decoder(encoded)
     torch.testing.assert_close(coordinates, repeated)
     path, heading, curvature = policy.curve_codec.decode(
         policy.trajectory_decoder.denormalize_curve_coordinates(coordinates),
         inputs.point_goal,
     )
-    assert coordinates.shape == (2, 8, 2)
-    assert torch.equal(
-        coordinates[:, ~policy.curve_codec.free_mask],
-        torch.zeros_like(coordinates[:, ~policy.curve_codec.free_mask]),
-    )
+    assert coordinates.shape == (2, 8)
     assert path.shape == (2, 16, 2)
     assert heading.shape == (2, 16)
     assert curvature.abs().max() < policy.curve_codec.maximum_curvature_inv_m
@@ -221,7 +216,7 @@ def test_straight_target_is_an_exact_curve_projection() -> None:
 
 def test_pointgoal_scaling_and_zero_goal_are_structural() -> None:
     codec = build_policy(tiny_config()).curve_codec
-    zero_coordinates = torch.zeros(1, codec.num_curve_tokens, 2)
+    zero_coordinates = torch.zeros(1, codec.num_curve_tokens)
     far_path, _, _ = codec(
         zero_coordinates,
         torch.tensor([[10.0, 0.0]]),
@@ -234,24 +229,23 @@ def test_pointgoal_scaling_and_zero_goal_are_structural() -> None:
         torch.randn_like(zero_coordinates),
         torch.zeros(1, 2),
     )
-    torch.testing.assert_close(far_path[0, -1], torch.tensor([3.6, 0.0]))
+    torch.testing.assert_close(far_path[0, -1], torch.tensor([1.8, 0.0]))
     torch.testing.assert_close(near_path[0, -1], torch.tensor([1.2, 0.0]))
     torch.testing.assert_close(stopped, torch.zeros_like(stopped))
 
 
 def test_curvature_bspline_has_a_hard_continuous_bound() -> None:
     codec = build_policy(tiny_config()).curve_codec
-    coordinates = 2.0 * torch.randn(32, 8, 2)
+    coordinates = 2.0 * torch.randn(32, 8)
     path, heading, curvature = codec.decode(
         coordinates,
         torch.tensor([[4.0, 1.0]]).expand(32, -1),
     )
-    assert torch.all(heading[:, 0].abs() < torch.pi / 2)
+    torch.testing.assert_close(heading[:, 0], torch.zeros_like(heading[:, 0]))
     assert curvature.abs().max() < codec.maximum_curvature_inv_m
     torch.testing.assert_close(path[:, 0], torch.zeros_like(path[:, 0]))
-    assert torch.equal(codec.free_mask[0], torch.tensor([True, True]))
-    assert torch.all(codec.free_mask[1:, 0])
-    assert not torch.any(codec.free_mask[1:, 1])
+    assert not hasattr(codec, "free_mask")
+    assert codec.num_curve_tokens == 8
 
 
 def test_sand_spatial_tokens_and_geometry_query_compression_have_fixed_contract() -> (
@@ -289,16 +283,19 @@ def test_learned_token_embeddings_are_not_weight_decayed() -> None:
             assert id(parameter) in no_decay, name
 
 
-def test_planar_backprojection_uses_observation_transform() -> None:
+def test_metric_xyz_backprojection_uses_camera_height_and_observation_transform() -> None:
     policy = build_policy(tiny_config()).eval()
     depth = torch.full((1, 4, 1, 126, 224), 0.4)
     identity = identity_observation_transform(1)
     translated = identity.clone()
     translated[:, 0, 0] = -1.0
     with torch.no_grad():
-        first, _ = policy.depth_encoder.planar_projector(depth, identity)
-        second, _ = policy.depth_encoder.planar_projector(depth, translated)
+        first, _ = policy.depth_encoder.metric_projector(depth, identity)
+        second, _ = policy.depth_encoder.metric_projector(depth, translated)
+    assert first.shape[-1] == 3
+    assert policy.depth_encoder.metric_projector.camera_height_m == 0.62532
     torch.testing.assert_close(
         second[:, 0, :, 0],
         first[:, 0, :, 0] - 1.0,
     )
+    torch.testing.assert_close(second[..., 2], first[..., 2])

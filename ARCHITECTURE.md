@@ -12,6 +12,7 @@ observation_valid      bool  [B,4]             历史补帧 mask；当前帧有�
 
 target controls        float [B,8,2]
 target reference path  float [B,64,2]
+production coordinates float [B,8]
 prediction path        float [B,64,2]
 prediction geometry    heading/curvature [B,64]
 ```
@@ -34,7 +35,7 @@ PointGoal direction + log range ────────────────
                                                                       ↓
                                       direct normalized coordinates y = 8x
                                                                       ↓
-          PointGoal-scaled arc-length/curvature decoder → metric local path
+          bounded-horizon zero-tangent curvature decoder → metric local path
 ```
 
 训练和部署只组装这一张图。checkpoint 类型为 `curvenav_direct_geometry_supervised_bounded_curvature_policy`，旧模型在加载前被严格拒绝，不存在兼容分支。
@@ -43,14 +44,16 @@ PointGoal direction + log range ────────────────
 
 ### 2.1 度量深度 memory
 
-每帧由同一个单通道 ResNet-18 编码到 stride-16 stage-3 特征，再池化为 `8×12=96` 个 token。卷积使用 GroupNorm，表示不依赖单卡 batch 或 DDP rank 的运行统计。token 同时包含二维图像位置编码和标定相机反投影得到的度量平面点。
+每帧由同一个单通道 ResNet-18 编码到 stride-16 stage-3 特征，再池化为 `8×12=96` 个 token。卷积使用 GroupNorm，表示不依赖单卡 batch 或 DDP rank 的运行统计。token 同时包含二维图像位置编码和标定相机反投影得到的机器人系三维表面点。旧实现只保留平面 `(x,y)`，配置中的相机高度没有进入模型，因此下视相机看到的地面与竖直障碍在显式几何中不可区分；当前实现保留高度 `z_b`，不再要求 CNN 单独猜测可跨越地面。
 
 对光轴深度 `z` 和像素 `(u,v)`，相机下俯角为 `α`、相对机器人前移为 `a`：
 
 ```text
 x_o = z(u-cx)/fx,
 y_o = z(v-cy)/fy,
-p_body = (a + cos(α)z - sin(α)y_o, -x_o).
+p_body = (a + cos(α)z - sin(α)y_o,
+          -x_o,
+          h - cos(α)y_o - sin(α)z).
 ```
 
 部署输入允许 benchmark 在保持 horizontal/vertical aperture 不变时改变像素采样率。
@@ -61,7 +64,8 @@ p_body = (a + cos(α)z - sin(α)y_o, -x_o).
 历史点用真实位姿变换到当前机器人系：
 
 ```text
-p_current = R(Δyaw) p_body + (tx,ty).
+(x_c,y_c) = R(Δyaw)(x_b,y_b) + (tx,ty),
+z_c = z_b.
 ```
 
 每个 token 图像格取最近可见表面而不是平均深度，避免把近障碍和远背景平均成不存在的中间表面。无效历史帧在 depth backbone 前置零，并在 geometry cross-attention 的 key/value 侧屏蔽。
@@ -111,24 +115,24 @@ c_route = RMSNorm(mean_i c_i).
 
 这保留了 SanD 的结构化低维轨迹控制和 NavDP/X-NavDP 的有序动作查询，同时修复两者在“没有候选评价器、只执行一条轨迹”约束下不能直接照搬随机生成的缺口。route query 负责从 geometry/state/goal 推理低频拓扑，curve query 负责把拓扑一次写成可执行曲线坐标；不存在第二生成阶段去改写已经受监督的路线。
 
-## 3. PointGoal 标度的有界曲率曲线
+## 3. 有限规划域内的零切向有界曲率曲线
 
 旧实现约束 XY 控制多边形的离散转角，但该条件不能推出最终三次 B-spline 的连续曲率上界。CurveNav 现在直接生成弧长域曲率函数。八个未来 token 的唯一语义为：
 
 ```text
-token 0:  [total arc-length coordinate, initial-heading coordinate]
-token 1..7: [curvature-control coordinate, fixed zero]
+token 0:    total arc-length coordinate
+token 1..7: curvature-control coordinate
 ```
 
-令 `H=3.6 m`、`ρ=min(||g||,H)`，总弧长与初始航向为：
+令 `H=3.6 m`、`d=||g||`。现有 30,642/7,960 条训练/验证标签的弧长全部严格小于 `H`；相对 `min(d,H)` 的最大比值为 `1.954/1.812`。唯一标签支持域和生产解码域因此固定为：
 
 ```text
-c = softplus_inverse(1),
-L = ρ softplus(a+c),
-θ0 = (π/2)tanh(h).
+Lmax = min(H, 2d),
+L = Lmax sigmoid(8a),
+θ(0) = 0.
 ```
 
-因此零坐标对远目标给出 3.6 m 直线，对近目标自然缩短到目标距离；当 PointGoal 为零时 `L=0`，任意有限网络输出都严格解码为停止轨迹。初始切向始终位于机器人前半平面。
+这同时满足 `0≤L≤H`、`L≤2d`：任何有限网络输出都不能越过当前 3.6 m 局部规划域；PointGoal 为零时严格有 `L=0`。旧 softplus 只有正值约束却没有上界，预测误差可以把短程参考放大到观测域外。初始切向现在严格等于机器人前向轴，而不是允许瞬时跳到 `±90°`；这与弧长参数化差速运动曲线的边界条件一致。零长度坐标对应 `Lmax/2`，近目标直达标签的自然中心也是 `d=Lmax/2`。
 
 其余七个坐标生成夹持三次 B-spline 的曲率控制：
 
@@ -148,21 +152,21 @@ ci = κmax tanh(ri),
 
 ```text
 s = Lu,
-θ(u) = θ0 + L∫_0^u κ(v)dv,
+θ(u) = L∫_0^u κ(v)dv,
 p(u) = L∫_0^u [cos θ(v), sin θ(v)]dv,
 p(0) = (0,0).
 ```
 
 曲率 B-spline 为 `C²`，因此连续模型中的航向为 `C³`、位置为 `C⁴`；可执行性不再依赖 XY 控制多边形近似、推理裁剪或 MPC 兜底。代码在固定 `4×` 密集弧长网格上以 midpoint/circular-chord 积分，再等间隔抽取 64 点。所有矩阵均在初始化时预计算，训练和部署的 shape 固定。
 
-训练标签中的八点平面 B-spline 只承担专家路径去噪和端点保持，不是生产输出表示。其平滑路径曲率 `κ*` 通过固定正则最小二乘投影到七个曲率控制：
+训练标签中的八点平面 B-spline 只承担专家路径去噪和端点保持，不是生产输出表示。为了与 `θ(0)=0` 一致，首个曲率样本由首段中点航向 `θ*_(1/2)` 和首段长度 `Δs_0` 定义为 `2θ*_(1/2)/Δs_0`；后续使用相邻段航向差除以中心支撑弧长。该曲率 `κ*` 再通过固定正则最小二乘投影到七个曲率控制：
 
 ```text
 c* = (BᵀB + 0.3 I)^-1 Bᵀκ*,
 r* = atanh(c*/κmax).
 ```
 
-当前 30,642 个训练样本和 7,960 个验证样本的目标坐标全部有限，最大绝对值分别为 `2.710/1.113`；投影到可行曲线后，相对原专家路径的平均点误差为 `3.83/4.02 mm`，99% 样本的最大点误差为 `8.78/8.72 cm`。训练、离线评估和部署共用同一个有界曲率 decoder。
+长度逆变换使用 `a=logit(L/Lmax)/8`；曲率控制超出可行连续曲率集合时投影到开区间边界，metric path/tangent loss 继续监督其最接近的可执行曲线。训练、离线评估和部署共用同一个有界曲率 decoder，不存在推理裁剪。
 
 离线 ADE/RMSE 仍以原始等弧长专家路径为准；参考曲率则从上述去噪 B-spline 计算。离散专家折线在顶点处的有限差分曲率会被采样角点放大，不能作为连续生成曲线的正确曲率基准。
 
@@ -170,34 +174,34 @@ r* = atanh(c*/κmax).
 
 ### 4.1 固定无量纲坐标
 
-三帧已执行历史已经通过 metric depth alignment 和一个有序 history-state summary 进入条件序列。几何 decoder 消费的曲线坐标记为 `x∈R^(8×2)`。当前验证集九个自由维度的标准差为 `0.014–0.058`；直接在 FP16 中回归会使主要信号长期位于 `10^-2` 量级。训练和部署因此共用唯一固定线性变换：
+三帧已执行历史已经通过 metric depth alignment 和一个有序 history-state summary 进入条件序列。几何 decoder 消费的曲线坐标记为 `x∈R^8`：一个长度 logit 和七个有界曲率坐标。训练和部署共用唯一固定线性变换：
 
 ```text
 y = 8x,       x = y/8.
 ```
 
-尺度 8 把九个自由维度的典型标准差移到 `0.11–0.47`，同时保持零点、相对维度权重、可表示轨迹集合和曲率硬界完全不变。它不读取验证统计、不保存数据集专用 normalizer，也不产生第二套几何表示。
+尺度 8 使小曲率时的归一化目标近似实际曲率 `8·atanh(κ/8)≈κ`，长度维则恰好成为 `logit(L/Lmax)`。它不读取验证统计、不保存数据集专用 normalizer，也不产生第二套几何表示。
 
-设条件序列为 `C`、route 调制向量为 `c_route`、结构 mask 为 `M`，唯一轨迹预测为：
+设条件序列为 `C`、route 调制向量为 `c_route`，唯一轨迹预测为：
 
 ```text
-y_hat = M ⊙ f_θ(q_curve, C, c_route),
+y_hat = f_θ(q_curve, C, c_route),
 x_hat = y_hat / 8,
 p_hat = Decode_bounded_curve(x_hat, point_goal).
 ```
 
-七个曲率 token 的第二通道由 `M` 从网络输出和坐标损失中严格移除。训练和部署调用相同的 `f_θ` 与相同的几何 decoder，没有噪声源、时间变量、ODE、候选温度或上一周期预测状态。
+八个 token 各输出一个有语义的标量，不再保留被 mask 的第二通道、死回归参数或 masked coordinate loss。训练和部署调用相同的 `f_θ` 与相同的几何 decoder，没有噪声源、时间变量、ODE、候选温度或上一周期预测状态。
 
 ### 4.2 八层轨迹解码器
 
 解码器只有一组 8 个 learned curve token 和八层 conditional block。每层包含：
 
-1. 8 token 双向 self-attention，使弧长、初始航向和七个曲率控制直接交换信息；
+1. 8 token 双向 self-attention，使弧长和七个曲率控制直接交换信息；
 2. 对 70 个 condition token 的 cross-attention，保留局部几何和有序路线 query 的 token 级信息；
 3. SwiGLU feed-forward；
 4. 由 `c_route` 控制的 adaRMS-Zero shift、scale 和 residual gate。
 
-adaRMS-Zero 的各分支 gate 零初始化，使八层网络从稳定的 query 主干逐步打开；最终 `D→2` projection 保留方差缩放权重初始化并将 bias 置零，从第一步即可向输出头传递梯度。geometry 始终通过 cross-attention 保持空间分辨率，route 则逐层控制每次残差更新。这吸收 X-NavDP 的深层条件生成和 FiLM 思想，但把全部容量直接用于最终执行坐标，不再把十层容量拆成“2 层提案 + 8 层修正”。
+adaRMS-Zero 的各分支 gate 零初始化，使八层网络从稳定的 query 主干逐步打开；最终 `D→1` projection 保留方差缩放权重初始化并将 bias 置零，从第一步即可向输出头传递梯度。geometry 始终通过 cross-attention 保持空间分辨率，route 则逐层控制每次残差更新。这吸收 X-NavDP 的深层条件生成和 FiLM 思想，但把全部容量直接用于最终执行坐标，不再把十层容量拆成“2 层提案 + 8 层修正”。
 
 ### 4.3 为什么删除 Flow
 
@@ -205,7 +209,7 @@ adaRMS-Zero 的各分支 gate 零初始化，使八层网络从稳定的 query �
 
 geometry-supervised/self-consistent 实验在 step 4800 的 1024 条验证集上得到：直接曲线总体/强转弯 ADE 为 `0.07153/0.28128 m`，velocity-Heun8 为 `0.07661/0.29093 m`，论文默认 `τ=0.5` 的 Self-Consistent Flow 混合求解为 `0.07644/0.28993 m`，`t=0` endpoint 为 `0.07405/0.27972 m`。ODE 在总体与强转弯上都劣于直接曲线，endpoint 也牺牲总体和强转弯航向；增加边界采样、endpoint 一致性和 solver collocation 后仍不能消除这个现象。因此根因不是求解器步数或采样节点，而是无评价器时对已受监督决策做第二次欠约束改写。
 
-当前实现据此删除完整 Flow 模块、时间嵌入、velocity/endpoint heads、积分器及其 loss；不是在推理时绕过仍存在的旧分支。输出只有一个 `[B,8,2]` 归一化坐标，经固定除 8 后送入有界曲率 decoder。全部时序一致性来自真实执行历史，不递归传播上一周期预测误差。
+当前实现据此删除完整 Flow 模块、时间嵌入、velocity/endpoint heads、积分器及其 loss；不是在推理时绕过仍存在的旧分支。输出只有一个 `[B,8]` 归一化坐标，经固定除 8 后送入有界曲率 decoder。全部时序一致性来自真实执行历史，不递归传播上一周期预测误差。
 
 从头训练的未做历史边缘化直接基线 `9a9ca17` 进一步验证了这个判断。相同 1024 条 held-out 样本、EMA 权重和评估入口得到：
 
@@ -237,7 +241,21 @@ geometry-supervised/self-consistent 实验在 step 4800 的 1024 条验证集上
 | 6400 | `0.16256` | `0.49863` | `0.48782` |
 | 8000 | `0.16802` | `0.49694` | `0.50808` |
 
-这证明旧目标在不断优化占绝对多数的完整历史，同时牺牲冷启动条件；不是 100 个自然起始样本的偶然噪声。完全相同的常驻场景、seed1234、`num-envs=10` 吞吐诊断中，step800 为 `1/10`、mean SPL `0.08687`，step2400 为 `0/10`，也说明较低总体 ADE 不能代表闭环成功。当前结构据此同时删除 padded state token 并修正训练历史分布；旧权重不能靠推理补 mask 修复，必须从头训练。离线入口今后每次都同时记录自然 held-out 与全量 current-frame-only 指标，再以相同闭环 episode 的 SR/SPL 作最终选择。
+这证明旧目标在不断优化占绝对多数的完整历史，同时牺牲冷启动条件；不是 100 个自然起始样本的偶然噪声。完全相同的 Home 场景 `MVUCSQAKTKJ5EAABAAAAABA8_usd`、seed1234、`num-envs=10` 的 10 回合吞吐诊断得到：
+
+| step | SR | mean SPL | 10 回合耗时 (s) |
+|---:|---:|---:|---:|
+| 800 | `1/10` | `0.08687` | `466.54` |
+| 2400 | `0/10` | `0` | `422.12` |
+| 4800 | `0/10` | `0` | `434.91` |
+| 6400 | `0/10` | `0` | `450.49` |
+| 8000 | `0/10` | `0` | `581.98` |
+
+该运行固定了同一 scene、episode、控制器和模型接口，但 `num-envs=10` 仅用于架构反馈，不作为 `num-envs=1` 固定协议成绩。后四个离线更优的 checkpoint 全部失败，证明较低总体 ADE 不能代表闭环成功。旧 `metric.csv` 中的 `distance` 是初始起终点直线距离，不是终止时剩余距离；旧日志也没有逐步位姿、局部轨迹和控制，所以现有 49/50 失败只能严格判定为 timeout，不能据此断言全部是碰撞、原地旋转或转弯后移。
+
+“单一专家”也不是充分根因：SanD 同样能从少量单专家示范学习，但其完整系统生成多条局部样条并用深度构建的 ESDF 做安全/目标评价。CurveNav 当前按约束不增加评价头，因此生成器本身必须满足更强的几何合同。本轮已经从代码直接证实并根修三项错误：显式深度几何丢失相机高度、轨迹长度无局部上界、弧长曲线允许不连续的初始切向；同时删除由此产生的整条死坐标通道。专家路径净空不是同类错误：HSSD navmesh 已先按 `0.25 m` 机器人半径膨胀，记录的 `0.10 m` 是额外净空。沿专家切向采样导致纠偏状态不足仍是闭环分布风险，但不再作为 49 次失败的单独解释。
+
+benchmark 唯一 evaluator 现在为每个完成回合写一个紧凑 numeric NPZ：仿真步记录世界位姿、机器人系目标、实际速度和已消费控制；重规划步记录模型局部轨迹、MPC 控制/预测状态、适应速度、参考曲率和 policy/MPC 延迟。下一轮只跑最小回合即可区分进展单调性、轨迹跨帧抖动、MPC 跟踪误差和卡住位置，再决定是否需要改变监督分布；旧权重与当前 XYZ/八标量合同严格不兼容，不能恢复训练。
 
 ## 5. 唯一训练目标
 
@@ -247,7 +265,7 @@ geometry-supervised/self-consistent 实验在 step 4800 的 1024 条验证集上
 L = L_coordinate + L_path + L_tangent.
 ```
 
-- `L_coordinate`：归一化生产曲线坐标 `y_hat` 与专家坐标 `y*` 在九个自由维度上的 masked MSE。
+- `L_coordinate`：归一化生产曲线坐标 `y_hat` 与专家坐标 `y*` 在八个真实自由维度上的 MSE。
 - `L_path`：每个等弧长位置的欧氏误差 `||p_hat-p*||₂/H`；使用 `0.25+exp(-4s)` 并归一到均值一，强调马上要执行的近端。
 - `L_tangent`：有效相邻路径段的 `1-cos(Δp_hat,Δp*)`，使用相同近端权重。
 
@@ -257,8 +275,8 @@ L = L_coordinate + L_path + L_tangent.
 
 | 来源 | 吸收的有效设计 | CurveNav 的针对性改进 |
 |---|---|---|
-| SanD | 四帧共享深度 backbone、空间 token、平滑低维轨迹先验、候选生成后评价 | 教师 B-spline 只做标签平滑；生产输出改为 PointGoal 标度的连续有界曲率曲线；没有 ESDF 评价器时用直接监督解码器完成唯一拓扑选择 |
-| NavDP | `D=384` actor、当前深度与历史 memory 分工、learned-query 视觉压缩、trajectory-token cross-attention、扩散动作生成 | 32 个 current query 保证即时几何，32 个 context query 补全历史视野，四个有序 route query 和八个 curve query 一次形成可执行曲线；不随机执行未经 critic 选择的候选 |
+| SanD | 四帧共享深度 backbone、空间 token、平滑低维轨迹先验、候选生成后以深度 ESDF 评价 | 教师 B-spline 只做标签平滑；生产输出改为严格有限规划域、零初始切向的连续有界曲率曲线；没有 ESDF 评价器时用直接监督解码器完成唯一拓扑选择，因此不能把 SanD 的少数据效果简化成“单专家自然收敛” |
+| NavDP | `D=384` actor、当前深度与历史 memory 分工、learned-query 视觉压缩、trajectory-token cross-attention、点云几何和扩散动作生成 | 32 个 current query 保证即时几何，32 个 context query 补全历史视野；标定反投影保留机器人系 XYZ 而不是丢掉高度；四个 route query 和八个标量 curve query 一次形成可执行曲线，不随机执行未经 critic 选择的候选 |
 | X-NavDP | 深层条件生成器、逐层 FiLM 思想、闭环时序一致性 | 用八层 adaRMS-Zero trajectory decoder 做 route 调制；真实执行历史承担时序状态；当前阶段不做 GQRM/RL，也不保留第二生成器 |
 | LoGoPlanner | geometry/state/route 的任务专用 query | CurveNav 已有标定 metric depth 和真实位姿，不复制重型视频三维重建模型；route query 做拓扑推理，curve query 输出实际执行坐标 |
 | Past-Token Prediction | 用可观测过去约束未来的思想 | 历史已经由 condition encoder 显式编码；不再联合生成过去，因为过去重建误差不能代表未来轨迹质量 |
@@ -280,7 +298,7 @@ L = L_coordinate + L_path + L_tangent.
 
 必要验证分三层：
 
-1. 张量/数学单测：相机反投影、历史 mask、geometry/route/curve token、坐标归一化、PointGoal 标度、零目标停止、连续曲率硬界、教师 B-spline、checkpoint 和部署接口；
+1. 张量/数学单测：含相机高度的 XYZ 反投影、历史 mask、geometry/route/curve token、八标量坐标归一化、局部长度上界、零目标停止、零初始切向、连续曲率硬界、教师 B-spline、checkpoint 和部署接口；
 2. 前向/梯度：三项训练 loss、全部参数梯度、直接曲线的确定性推理、静态编译图和有限值；
 3. 重新训练后的 held-out/闭环：ADE、弧长、目标进展、曲率、延迟，以及固定协议 SR/SPL。
 

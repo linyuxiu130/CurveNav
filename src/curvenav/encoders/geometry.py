@@ -1,4 +1,4 @@
-"""Metric planar geometry for the canonical calibrated depth camera."""
+"""Metric 3D geometry for the canonical calibrated depth camera."""
 
 import math
 
@@ -7,8 +7,8 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 
-class PlanarDepthProjector(nn.Module):
-    """Backproject pooled optical-axis depth and align it to the current frame."""
+class MetricDepthProjector(nn.Module):
+    """Backproject depth to body XYZ and align horizontal coordinates in time."""
 
     def __init__(
         self,
@@ -18,6 +18,7 @@ class PlanarDepthProjector(nn.Module):
         focal_x_px: float,
         focal_y_px: float,
         camera_forward_offset_m: float,
+        camera_height_m: float,
         camera_downward_pitch_degrees: float,
     ) -> None:
         super().__init__()
@@ -31,6 +32,7 @@ class PlanarDepthProjector(nn.Module):
         self.focal_x_px = float(focal_x_px)
         self.focal_y_px = float(focal_y_px)
         self.camera_forward_offset_m = float(camera_forward_offset_m)
+        self.camera_height_m = float(camera_height_m)
         pitch = math.radians(camera_downward_pitch_degrees)
         self.pitch_sine = math.sin(pitch)
         self.pitch_cosine = math.cos(pitch)
@@ -81,7 +83,12 @@ class PlanarDepthProjector(nn.Module):
             - self.pitch_sine * optical_y
         )
         lateral = -pooled_depth * ray_x[None, None, None, :]
-        points = torch.stack((forward, lateral), dim=-1)
+        vertical = (
+            self.camera_height_m
+            - self.pitch_cosine * optical_y
+            - self.pitch_sine * pooled_depth
+        )
+        points = torch.stack((forward, lateral, vertical), dim=-1)
 
         translation = observation_to_current[..., :2].float()
         sine = observation_to_current[..., 2].float()
@@ -94,6 +101,7 @@ class PlanarDepthProjector(nn.Module):
             sine[..., None, None] * points[..., 0]
             + cosine[..., None, None] * points[..., 1]
         )
-        points = torch.stack((x_current, y_current), dim=-1)
-        points = points + translation[..., None, None, :]
+        horizontal = torch.stack((x_current, y_current), dim=-1)
+        horizontal = horizontal + translation[..., None, None, :]
+        points = torch.cat((horizontal, points[..., 2:3]), dim=-1)
         return points.flatten(2, 3), pooled_depth.flatten(2)

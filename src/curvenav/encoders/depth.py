@@ -7,11 +7,11 @@ from torch import Tensor, nn
 
 from curvenav.layers import RMSNorm
 from curvenav.types import DepthFeatures
-from .geometry import PlanarDepthProjector
+from .geometry import MetricDepthProjector
 
 
 DEPTH_ENCODER_TYPE = (
-    "sand_resnet18_groupnorm_stage3_spatial_tokens_plus_planar_backprojection_8x12"
+    "sand_resnet18_groupnorm_stage3_spatial_tokens_plus_metric_xyz_8x12"
 )
 
 
@@ -91,6 +91,7 @@ class DepthObservationEncoder(nn.Module):
         focal_x_px: float = 166.80851063829786,
         focal_y_px: float = 166.80851063829786,
         camera_forward_offset_m: float = 0.28618,
+        camera_height_m: float = 0.62532,
         camera_downward_pitch_degrees: float = 10.0,
     ) -> None:
         super().__init__()
@@ -114,17 +115,18 @@ class DepthObservationEncoder(nn.Module):
         self.adaptive_pool = nn.AdaptiveAvgPool2d(
             (frame_tokens_height, frame_tokens_width)
         )
-        self.planar_projector = PlanarDepthProjector(
+        self.metric_projector = MetricDepthProjector(
             frame_tokens_height,
             frame_tokens_width,
             max_depth_m,
             focal_x_px,
             focal_y_px,
             camera_forward_offset_m,
+            camera_height_m,
             camera_downward_pitch_degrees,
         )
         self.geometry_projection = nn.Sequential(
-            nn.Linear(3, model_dim),
+            nn.Linear(4, model_dim),
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
@@ -180,14 +182,14 @@ class DepthObservationEncoder(nn.Module):
         features = self.adaptive_pool(self.spatial_projection(features))
         features = features.flatten(2).transpose(1, 2)
         position = self.position_2d.to(device=features.device, dtype=features.dtype)
-        planar_points, pooled_depth = self.planar_projector(
+        metric_points, pooled_depth = self.metric_projector(
             depth,
             observation_to_current,
         )
         geometry = torch.cat(
             (
-                planar_points / self.planar_projector.max_depth_m,
-                pooled_depth[..., None] / self.planar_projector.max_depth_m,
+                metric_points / self.metric_projector.max_depth_m,
+                pooled_depth[..., None] / self.metric_projector.max_depth_m,
             ),
             dim=-1,
         )

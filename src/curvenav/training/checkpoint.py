@@ -26,6 +26,8 @@ from curvenav.trajectory import (
     CURVATURE_PARAMETERIZATION_TYPE,
     CURVE_INTEGRATION_OVERSAMPLE_FACTOR,
     CURVATURE_TARGET_REGULARIZATION,
+    LENGTH_LOGIT_SCALE,
+    MAXIMUM_LOCAL_DETOUR_RATIO,
 )
 
 
@@ -104,9 +106,9 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "point_goal_features": "direction_plus_log_range",
         "point_goal_clip_distance_m": config.point_goal_encoder.goal_clip_distance_m,
         "trajectory_supervision": "fixed_future_expert_waypoints_or_true_goal",
-        "arc_length_policy": "pointgoal_scaled_positive_total_arc_length",
+        "arc_length_policy": "goal_continuous_strictly_bounded_local_arc_length",
         "trajectory_endpoint_policy": "direct_conditioned_executable_curve",
-        "curve_boundary_conditions": "origin_and_forward_half_plane_initial_heading",
+        "curve_boundary_conditions": "origin_and_robot_forward_initial_tangent",
         "trajectory_decoder_type": TRAJECTORY_DECODER_TYPE,
         "curve_coordinate_scale": CURVE_COORDINATE_SCALE,
         "training_objective": "direct_curve_coordinates_plus_metric_path_and_tangent",
@@ -116,10 +118,10 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             "dedicated_current_plus_full_context_metric_geometry_queries_and_"
             "explicit_ego_state_ordered_route_queries"
         ),
-        "depth_token_pooling": "nearest_surface",
-        "observation_to_current": "planar_rigid_transform_used_for_depth_token_alignment",
+        "depth_token_pooling": "nearest_surface_metric_body_xyz",
+        "observation_to_current": "planar_rigid_transform_used_for_metric_xyz_alignment",
         "visual_compression": "32_current_plus_32_full_context_metric_geometry_queries",
-        "goal_conditioning": "pointgoal_direction_range_and_metric_local_scale",
+        "goal_conditioning": "pointgoal_direction_range_and_bounded_local_extent",
         "temporal_modeling": "executed_metric_observation_history_with_masked_state_summary",
         "history_training_distribution": HISTORY_TRAINING_DISTRIBUTION,
         "state_token_count": 1,
@@ -138,6 +140,8 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "curve_planning_horizon_m": (
             data.future_steps * data.expert_waypoint_spacing_m
         ),
+        "maximum_local_detour_ratio": MAXIMUM_LOCAL_DETOUR_RATIO,
+        "length_logit_scale": LENGTH_LOGIT_SCALE,
         "maximum_continuous_curvature_inv_m": trajectory.maximum_curvature_inv_m,
         "target_curvature_projection": "regularized_least_squares_in_bounded_control_space",
         "target_curvature_regularization": CURVATURE_TARGET_REGULARIZATION,

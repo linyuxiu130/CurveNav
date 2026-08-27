@@ -10,6 +10,8 @@ from .curvature import (
     CURVATURE_PARAMETERIZATION_TYPE,
     CURVE_INTEGRATION_OVERSAMPLE_FACTOR,
     CURVATURE_TARGET_REGULARIZATION,
+    LENGTH_LOGIT_SCALE,
+    MAXIMUM_LOCAL_DETOUR_RATIO,
 )
 from .resampling import path_arc_length, resample_path_by_arc_length
 
@@ -21,6 +23,8 @@ __all__ = [
     "CURVATURE_PARAMETERIZATION_TYPE",
     "CURVE_INTEGRATION_OVERSAMPLE_FACTOR",
     "CURVATURE_TARGET_REGULARIZATION",
+    "LENGTH_LOGIT_SCALE",
+    "MAXIMUM_LOCAL_DETOUR_RATIO",
     "path_arc_length",
     "resample_path_by_arc_length",
 ]

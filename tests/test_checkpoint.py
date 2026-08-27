@@ -117,9 +117,11 @@ def test_checkpoint_records_the_direct_bounded_curvature_contract() -> None:
     assert contract["num_curvature_control_points"] == 7
     assert contract["path_sampling"] == "fixed_uniform_metric_arc_progress"
     assert contract["curve_coordinates"] == (
-        "pointgoal_scaled_arc_length_cubic_curvature_bspline"
+        "bounded_local_arc_length_zero_tangent_cubic_curvature_bspline"
     )
     assert contract["curve_planning_horizon_m"] == pytest.approx(3.6)
+    assert contract["maximum_local_detour_ratio"] == pytest.approx(2.0)
+    assert contract["length_logit_scale"] == pytest.approx(8.0)
     assert contract["maximum_continuous_curvature_inv_m"] == pytest.approx(8.0)
     assert contract["model_architecture"] == {
         "model_dim": 384,
