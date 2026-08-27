@@ -12,6 +12,7 @@ PYTHON_INCLUDE="$("${ENV_ROOT}/curvenav/bin/python" -c 'import sysconfig; print(
 export CPATH="${PYTHON_INCLUDE}${CPATH:+:${CPATH}}"
 export TORCHINDUCTOR_CACHE_DIR="${ENV_ROOT}/curvenav/torchinductor"
 export TORCHINDUCTOR_COMPILE_THREADS=2
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_HIGH_PRIORITY=1
 
