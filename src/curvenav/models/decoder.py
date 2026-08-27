@@ -57,7 +57,6 @@ class OrderedCurveDecoder(nn.Module):
             trajectory = block(
                 trajectory,
                 condition.tokens,
-                condition.padding_mask,
                 condition.route_token,
             )
         return self.coordinate_projection(self.output_norm(trajectory)) * free_mask

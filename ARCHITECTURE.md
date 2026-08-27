@@ -22,7 +22,7 @@ prediction geometry    heading/curvature [B,64]
 4× metric depth
   └─ shared GroupNorm ResNet-18 stage-3 ── current 96 tokens ── 32 current queries ─┐
                                       └── all 4×96 tokens ── 32 context queries ───┤
-4× (x,y,sin Δyaw,cos Δyaw) ───── 4 strictly padded state tokens ─────┤
+4× (x,y,sin Δyaw,cos Δyaw,valid) ── 1 ordered history-state token ───┤
 PointGoal direction + log range ─────────────────────── goal token ───┤
                                                                       ↓
                                       4 ordered route queries, 2× cross-attention
@@ -70,7 +70,13 @@ p_current = R(Δyaw) p_body + (tx,ty).
 
 ### 2.2 显式状态和 PointGoal
 
-`observation_to_current` 不只用于搬动深度点，也经过 MLP 形成四个 state token。平移除以 1.35 m 历史窗口尺度，旋转直接使用 `sin/cos`，不存在角度跳变。无效历史先在 MLP 输入和输出置零，并形成唯一 condition padding mask；该 mask 同时进入 route cross-attention、四层 condition self-attention 和八层 trajectory cross-attention。因而无效 state 在所有 key/value 路径上严格不可见，不再用 learned invalid-state embedding 让 padding 参与路线推理。
+`observation_to_current` 不只用于搬动深度点，也形成一个有序 history-state token。平移除以 1.35 m 历史窗口尺度，旋转直接使用 `sin/cos`，不存在角度跳变。对每个 frame slot，先把无效变换严格置零，再拼入对应 validity；四个五维 slot 按时间顺序展平后只经过一个 MLP：
+
+```text
+z_state = MLP(vec([valid_i · (x_i/1.35,y_i/1.35,sin Δψ_i,cos Δψ_i), valid_i]_(i=1..4))).
+```
+
+因此无效 state 根本不会成为 condition key/value，也不需要 learned invalid-state embedding 或下游 attention padding mask；slot 顺序和可用历史长度仍显式可辨。视觉侧的无效深度 token 则继续在唯一 geometry compressor 的 key/value 侧严格屏蔽。
 
 部署中每个 episode 必然依次经历 1、2、3、4 个有效观测，旧训练集却有 `7,260/7,960=91.2%` 的验证样本已经具备完整四帧。当前训练因此对每个原样本已有的 `m` 个有效后缀，采样
 
@@ -92,14 +98,14 @@ CurveNav 的任务合同始终提供 PointGoal，因此不采用 NoMaD/NavDP 为
 
 ### 2.3 有序路线查询与条件曲线解码
 
-单个二维局部终点不能区分绕过同一障碍的不同路线形状，也会把近端可执行方向和远端进展压进同一个 latent。CurveNav 使用四个有序 learned route query；每个 query 与 goal token 相加，连续两次 cross-attend `[state, geometry]`。随后 `[4 route, goal, 4 state, 64 geometry]` 共 73 个 token 经过四层联合 condition Transformer。四个 route latent 保留不同路线推理槽位，归一化均值形成逐层调制向量：
+单个二维局部终点不能区分绕过同一障碍的不同路线形状，也会把近端可执行方向和远端进展压进同一个 latent。CurveNav 使用四个有序 learned route query；每个 query 与 goal token 相加，连续两次 cross-attend `[history-state summary, geometry]`。随后 `[4 route, goal, 1 state, 64 geometry]` 共 70 个 token 经过四层联合 condition Transformer。四个 route latent 保留不同路线推理槽位，归一化均值形成逐层调制向量：
 
 ```text
 c_i = RMSNorm(q_i),
 c_route = RMSNorm(mean_i c_i).
 ```
 
-不再从这四个 latent 另行回归一组与执行输出并列的 XY 锚点。八个 learned curve query 经过八层 self-attention、对全部 73 个条件 token 的 cross-attention、SwiGLU 和 `c_route` adaRMS-Zero 调制，直接预测归一化的八个有界曲率坐标。它同时接受三项同目标监督：生产几何解码器实际消费的 expert coordinate MSE、解码后 metric path loss 和 tangent loss。坐标项固定每个 token 的内禀语义；metric path/tangent 项通过真实非线性 decoder 的 Jacobian 约束执行几何，尤其是同样坐标误差会造成更大航向偏差的强转弯。三项只训练同一条执行轨迹，不产生辅助轨迹或并列 head。
+不再从这四个 latent 另行回归一组与执行输出并列的 XY 锚点。八个 learned curve query 经过八层 self-attention、对全部 70 个条件 token 的 cross-attention、SwiGLU 和 `c_route` adaRMS-Zero 调制，直接预测归一化的八个有界曲率坐标。它同时接受三项同目标监督：生产几何解码器实际消费的 expert coordinate MSE、解码后 metric path loss 和 tangent loss。坐标项固定每个 token 的内禀语义；metric path/tangent 项通过真实非线性 decoder 的 Jacobian 约束执行几何，尤其是同样坐标误差会造成更大航向偏差的强转弯。三项只训练同一条执行轨迹，不产生辅助轨迹或并列 head。
 
 这个组合来自实测纠错而不是冗余 loss：coordinate-only 图在 step 4800 的直接曲线强转弯 ADE 为 `0.4488 m`，加入 metric path/tangent 后降到 `0.2813 m`。因此不能用内禀坐标 MSE 取代执行空间几何；两者分别约束参数辨识与导航误差。
 
@@ -164,7 +170,7 @@ r* = atanh(c*/κmax).
 
 ### 4.1 固定无量纲坐标
 
-三帧已执行历史已经通过 metric depth alignment 和四个显式 state token 进入条件序列。几何 decoder 消费的曲线坐标记为 `x∈R^(8×2)`。当前验证集九个自由维度的标准差为 `0.014–0.058`；直接在 FP16 中回归会使主要信号长期位于 `10^-2` 量级。训练和部署因此共用唯一固定线性变换：
+三帧已执行历史已经通过 metric depth alignment 和一个有序 history-state summary 进入条件序列。几何 decoder 消费的曲线坐标记为 `x∈R^(8×2)`。当前验证集九个自由维度的标准差为 `0.014–0.058`；直接在 FP16 中回归会使主要信号长期位于 `10^-2` 量级。训练和部署因此共用唯一固定线性变换：
 
 ```text
 y = 8x,       x = y/8.
@@ -187,7 +193,7 @@ p_hat = Decode_bounded_curve(x_hat, point_goal).
 解码器只有一组 8 个 learned curve token 和八层 conditional block。每层包含：
 
 1. 8 token 双向 self-attention，使弧长、初始航向和七个曲率控制直接交换信息；
-2. 对 73 个 condition token 的 cross-attention，保留局部几何和有序路线 query 的 token 级信息；
+2. 对 70 个 condition token 的 cross-attention，保留局部几何和有序路线 query 的 token 级信息；
 3. SwiGLU feed-forward；
 4. 由 `c_route` 控制的 adaRMS-Zero shift、scale 和 residual gate。
 
@@ -231,7 +237,7 @@ geometry-supervised/self-consistent 实验在 step 4800 的 1024 条验证集上
 | 6400 | `0.16256` | `0.49863` | `0.48782` |
 | 8000 | `0.16802` | `0.49694` | `0.50808` |
 
-这证明旧目标在不断优化占绝对多数的完整历史，同时牺牲冷启动条件；不是 100 个自然起始样本的偶然噪声。完全相同的常驻场景、seed1234、`num-envs=10` 吞吐诊断中，step800 为 `1/10`、mean SPL `0.08687`，step2400 为 `0/10`，也说明较低总体 ADE 不能代表闭环成功。当前结构据此同时修复 attention padding 和训练历史分布；旧权重不能靠推理补 mask 修复，必须从头训练。离线入口今后每次都同时记录自然 held-out 与全量 current-frame-only 指标，再以相同闭环 episode 的 SR/SPL 作最终选择。
+这证明旧目标在不断优化占绝对多数的完整历史，同时牺牲冷启动条件；不是 100 个自然起始样本的偶然噪声。完全相同的常驻场景、seed1234、`num-envs=10` 吞吐诊断中，step800 为 `1/10`、mean SPL `0.08687`，step2400 为 `0/10`，也说明较低总体 ADE 不能代表闭环成功。当前结构据此同时删除 padded state token 并修正训练历史分布；旧权重不能靠推理补 mask 修复，必须从头训练。离线入口今后每次都同时记录自然 held-out 与全量 current-frame-only 指标，再以相同闭环 episode 的 SR/SPL 作最终选择。
 
 ## 5. 唯一训练目标
 

@@ -42,7 +42,6 @@ class ConditionalTrajectoryBlock(nn.Module):
         self,
         trajectory: Tensor,
         condition: Tensor,
-        condition_padding_mask: Tensor,
         modulation: Tensor,
     ) -> Tensor:
         (
@@ -69,7 +68,6 @@ class ConditionalTrajectoryBlock(nn.Module):
             query,
             normalized_condition,
             normalized_condition,
-            key_padding_mask=condition_padding_mask,
             need_weights=False,
         )[0]
         trajectory = trajectory + cross_gate[:, None] * self.dropout(attended)

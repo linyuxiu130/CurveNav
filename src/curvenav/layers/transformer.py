@@ -48,13 +48,12 @@ class EncoderBlock(nn.Module):
         self.feed_forward = SwiGLU(model_dim, dropout)
         self.residual_dropout = nn.Dropout(dropout)
 
-    def forward(self, tokens: Tensor, padding_mask: Tensor | None = None) -> Tensor:
+    def forward(self, tokens: Tensor) -> Tensor:
         normalized = self.attention_norm(tokens)
         attended = self.attention(
             normalized,
             normalized,
             normalized,
-            key_padding_mask=padding_mask,
             need_weights=False,
         )[0]
         tokens = tokens + self.residual_dropout(attended)

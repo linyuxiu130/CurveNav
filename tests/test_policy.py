@@ -126,12 +126,7 @@ def test_invalid_padded_frames_cannot_change_the_prediction() -> None:
     first_encoded = policy.encode_condition(first)
     second_encoded = policy.encode_condition(second)
     torch.testing.assert_close(first_encoded.tokens, second_encoded.tokens)
-    assert torch.equal(first_encoded.padding_mask, second_encoded.padding_mask)
-    assert first_encoded.padding_mask.sum().item() == 2
-    assert torch.equal(
-        first_encoded.tokens[first_encoded.padding_mask],
-        torch.zeros_like(first_encoded.tokens[first_encoded.padding_mask]),
-    )
+    assert first_encoded.tokens.shape[1] == 70
 
 
 def test_depth_tokens_do_not_depend_on_other_batch_members() -> None:
@@ -281,7 +276,7 @@ def test_sand_spatial_tokens_and_geometry_query_compression_have_fixed_contract(
     assert not torch.any(mask[:32, 12:])
     assert not torch.any(mask[32:])
     assert encoder.route_query_embedding.shape == (1, 4, 32)
-    assert encoded.tokens.shape == (1, 4 + 1 + 4 + 64, 32)
+    assert encoded.tokens.shape == (1, 4 + 1 + 1 + 64, 32)
     assert policy.trajectory_decoder.token_embedding.shape == (1, 8, 32)
 
 
