@@ -225,7 +225,7 @@ L = L_coordinate + L_path + L_tangent.
 
 训练只读取 `data/policy_dataset`。该目录当前仅包含本项目在固定 HSSD 资产上生成、按 Dingo 标定相机渲染的深度和专家轨迹，不混用论文作者的数据。四帧历史按行驶距离 `[-1.35,-0.90,-0.45,0] m` 取样；未来最多 24 个 `0.15 m` 专家点，近目标自然缩短。
 
-唯一训练入口使用 FP16、GPU 常驻 depth bank、异步 prefetch、AdamW、cosine schedule、EMA 和静态 `torch.compile`；多卡时由同一入口启用 DDP。数学 batch 固定为 1024，当前显存 micro-batch 配置为每卡 171。对 world size `W`，每 rank 分配 `floor(1024/W)` 或 `ceil(1024/W)` 个互不重叠样本；局部 batch 均值乘 `W·B_r/1024` 后再经 DDP 求平均，严格得到全局 1024 样本均值。6 卡时分配为 `171×4 + 170×2`，每 rank 只执行一次前后向并立即同步。1–8 卡的每次 optimizer、schedule 与 EMA 更新保持同一数学合同，不需要 padding、重复样本或改变学习率。删除 Flow 前的 geometry-supervised 图在 6 张 2080 Ti 上稳态为约 `4340–4400 samples/s`；当前单阶段八层图必须重新实测显存上限和吞吐后才能调整 micro-batch 合同。checkpoint 保存逐 rank CPU/CUDA RNG 以精确恢复训练数据流；部署没有 source RNG、episode latent 或数值积分，唯一入口加载 EMA 权重并单次前向一条轨迹。
+唯一训练入口使用 FP16、GPU 常驻 depth bank、异步 prefetch、AdamW、cosine schedule、EMA 和静态 `torch.compile`；多卡时由同一入口启用 DDP。数学 batch 固定为 1024，显存 micro-batch 上限为每卡 192。对 world size `W`，每 rank 分配 `floor(1024/W)` 或 `ceil(1024/W)` 个互不重叠样本；局部 batch 均值乘 `W·B_r/1024` 后再经 DDP 求平均，严格得到全局 1024 样本均值。6 卡时分配为 `171×4 + 170×2`，每 rank 只执行一次前后向并立即同步。1–8 卡的每次 optimizer、schedule 与 EMA 更新保持同一数学合同，不需要 padding、重复样本或改变学习率。单阶段八层图在 2080 Ti 上用真实数据、静态编译、FP16 完整更新连续运行 batch 192 至 step 121，稳态约 `793 samples/s`；batch 205 在反向图 OOM，因此 192 是保留实际余量的上限。删除 Flow 前的六卡图稳态约 `4340–4400 samples/s`；当前六卡吞吐仍需由正式训练日志给出。checkpoint 保存逐 rank CPU/CUDA RNG 以精确恢复训练数据流；部署没有 source RNG、episode latent 或数值积分，唯一入口加载 EMA 权重并单次前向一条轨迹。
 
 在线部署使用 eager FP16 推理，不把分钟级编译成本放进短回合测评。`navigator_reset` 已知实际 batch size 后立即使用零观测完成 CUDA kernel 初始化和同步；该步骤发生在 evaluator 的 episode 循环开始前。因此首个真实观测不会承担初始化时间，也不会让机器人在开局持续执行零动作。训练仍使用静态 `torch.compile`，因为 8000 个优化器 step 足以摊薄一次编译成本；1024 样本离线检查同样使用 eager，避免编译时间超过实际评估计算。
 
