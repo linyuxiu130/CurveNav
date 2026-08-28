@@ -7,7 +7,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from curvenav.physical import MINIMUM_OBSTACLE_HEIGHT_M, ROBOT_HEIGHT_M
+from curvenav.physical import BODY_OBSTACLE_MIN_Z_M, ROBOT_COLLISION_TOP_Z_M
 
 
 @dataclass(frozen=True)
@@ -141,8 +141,8 @@ class MetricDepthProjector(nn.Module):
         )
         body_pixel = (
             (normalized_depth.float() < 1.0)
-            & (vertical >= MINIMUM_OBSTACLE_HEIGHT_M)
-            & (vertical <= ROBOT_HEIGHT_M)
+            & (vertical >= BODY_OBSTACLE_MIN_Z_M)
+            & (vertical <= ROBOT_COLLISION_TOP_Z_M)
         )
         masked_negative_depth = torch.where(
             body_pixel,

@@ -17,6 +17,7 @@ import torch
 
 from curvenav.config import CurveNavConfig, DataConfig
 from curvenav.config_io import load_config
+from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data.depth import depth_camera_contract
 from curvenav.data.prepared import (
     policy_dataset_contract,
@@ -149,6 +150,12 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
     source_manifest = json.loads(
         (root / "dataset_manifest.json").read_text(encoding="utf-8")
     )
+    if source_manifest.get("route_contract", {}).get(
+        "navigation_geometry"
+    ) != expert_navigation_geometry_contract():
+        raise ValueError(
+            "HSSD experts must be planned against the stage and static objects"
+        )
     pitch = math.radians(data.camera_downward_pitch_degrees)
     sine, cosine = math.sin(pitch), math.cos(pitch)
     expected_camera_transform = np.asarray(

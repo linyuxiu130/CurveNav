@@ -4,6 +4,7 @@ import math
 import numpy as np
 
 from curvenav.config import CurveNavConfig
+from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data.depth import depth_camera_contract
 from curvenav.data.depth_cache import (
     hssd_depth_cache_root,
@@ -43,7 +44,12 @@ def test_hssd_route_cache_and_local_slicing_share_depth_frames(tmp_path) -> None
         json.dumps(
             {
                 "schema": "curvenav_hssd_expert_routes",
-                "routes": 1,
+                    "routes": 1,
+                    "route_contract": {
+                        "navigation_geometry": (
+                            expert_navigation_geometry_contract()
+                        )
+                    },
                 "camera": {
                     "image": {
                         "K": [

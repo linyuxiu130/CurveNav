@@ -13,6 +13,7 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from curvenav.config import DataConfig, TrajectoryConfig
+from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data.depth import depth_camera_contract
 from curvenav.data.depth_bank import PackedDepthBankSpec, PackedDepthRun
 from curvenav.data.trajectory import MAXIMUM_EXPERT_PROJECTION_ADE_RATIO
@@ -31,6 +32,7 @@ def policy_dataset_contract(
 ) -> dict[str, Any]:
     """Return the model-facing fields every prepared dataset must satisfy."""
     return {
+        "expert_navigation_geometry": expert_navigation_geometry_contract(),
         "observation_frames": data.observation_frames,
         "frame_spacing_m": data.frame_spacing_m,
         "expert_waypoint_spacing_m": data.expert_waypoint_spacing_m,

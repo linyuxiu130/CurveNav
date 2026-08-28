@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data_generation.geometry import (
     Grid,
     path_length,
@@ -163,6 +164,10 @@ def audit_dataset(root: Path) -> dict[str, Any]:
     }
     failures = {
         "schema": manifest.get("schema") != SCHEMA,
+        "navigation_geometry": manifest.get("route_contract", {}).get(
+            "navigation_geometry"
+        )
+        != expert_navigation_geometry_contract(),
         "route_count": len(records) != 500 or manifest.get("routes") != 500,
         "split_counts": dict(split_counts) != {"train": 400, "validation": 100},
         "scene_route_counts": any(count != 25 for count in scene_counts.values())

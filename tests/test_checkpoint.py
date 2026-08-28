@@ -99,8 +99,12 @@ def test_checkpoint_records_the_metric_curvature_flow_contract() -> None:
     assert contract["flow_solver"] == "fixed_step_heun"
     assert contract["flow_time_embedding"] == "smooth_scalar_mlp"
     assert contract["training_objective"] == (
-        "conditional_flow_matching_euclidean_velocity_mse"
+        "conditional_flow_matching_velocity_mse_plus_soft_configuration_space_clearance"
     )
+    assert contract["safety_objective_type"] == (
+        "predicted_clean_curve_current_depth_configuration_space_clearance_hinge"
+    )
+    assert contract["safety_clearance_m"] == pytest.approx(0.267584539)
     assert (
         contract["trajectory_prediction"]
         == "single_flow_generated_smooth_metric_curvature_trajectory"
@@ -123,10 +127,13 @@ def test_checkpoint_records_the_metric_curvature_flow_contract() -> None:
     assert "route_query_count" not in contract
     assert contract["condition_token_count"] == 129
     assert contract["body_obstacle_geometry"] == {
-        "robot_radius_m": pytest.approx(0.25),
+        "footprint_radius_m": pytest.approx(0.167584539),
         "extra_clearance_m": pytest.approx(0.10),
-        "robot_height_m": pytest.approx(0.70),
-        "minimum_obstacle_height_m": pytest.approx(0.05),
+        "collision_bottom_z_m": pytest.approx(-0.044000001),
+        "collision_top_z_m": pytest.approx(0.117981499),
+        "collision_height_m": pytest.approx(0.161981500),
+        "body_obstacle_min_z_m": pytest.approx(0.005999999),
+        "maximum_traversable_height_m": pytest.approx(0.05),
     }
     assert contract["num_curvature_control_points"] == 7
     assert contract["path_sampling"] == "fixed_uniform_metric_arc_progress"

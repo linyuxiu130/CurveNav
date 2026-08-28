@@ -5,7 +5,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from curvenav.layers import RMSNorm, SwiGLU
-from curvenav.physical import EXTRA_CLEARANCE_M, ROBOT_RADIUS_M
+from curvenav.physical import EXTRA_CLEARANCE_M, ROBOT_FOOTPRINT_RADIUS_M
 
 
 class MetricPathCrossAttention(nn.Module):
@@ -29,7 +29,7 @@ class MetricPathCrossAttention(nn.Module):
         self.head_dim = model_dim // heads
         self.dropout = dropout
         self.planning_horizon_m = float(planning_horizon_m)
-        self.footprint_clearance_m = ROBOT_RADIUS_M + EXTRA_CLEARANCE_M
+        self.footprint_clearance_m = ROBOT_FOOTPRINT_RADIUS_M + EXTRA_CLEARANCE_M
         self.query_norm = RMSNorm(model_dim)
         self.memory_norm = RMSNorm(model_dim)
         self.query_projection = nn.Linear(model_dim, model_dim)

@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from curvenav.config import DataConfig, TrajectoryConfig
+from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data.depth_bank import gather_depth_observations, load_packed_depth_bank
 from curvenav.data.loader import (
     build_policy_training_loader,
@@ -26,6 +27,7 @@ from curvenav.training.batching import (
 
 def _write_dataset(root, count: int = 4) -> None:
     contract = {
+        "expert_navigation_geometry": expert_navigation_geometry_contract(),
         "observation_frames": 4,
         "frame_spacing_m": 0.45,
         "expert_waypoint_spacing_m": 0.15,

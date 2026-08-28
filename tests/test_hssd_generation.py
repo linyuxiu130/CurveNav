@@ -9,9 +9,11 @@ import numpy as np
 import pytest
 
 from curvenav.data_generation import assets
+from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data_generation.assets import selected_asset_paths
 from curvenav.data_generation.generate import (
     camera_contract,
+    configure_navmesh_settings,
     route_bands,
     validate_config,
 )
@@ -21,6 +23,11 @@ from curvenav.data_generation.geometry import (
     path_length,
     plan_route,
     source_family,
+)
+from curvenav.physical import (
+    MAXIMUM_TRAVERSABLE_HEIGHT_M,
+    ROBOT_COLLISION_HEIGHT_M,
+    ROBOT_FOOTPRINT_RADIUS_M,
 )
 
 
@@ -77,6 +84,45 @@ def test_hssd_generator_uses_the_model_camera_contract() -> None:
         [0.0, -math.cos(pitch), -math.sin(pitch), data.camera_height_m],
         [0.0, 0.0, 0.0, 1.0],
     ]
+
+
+def test_hssd_generator_rejects_nonbenchmark_camera() -> None:
+    project = Path(__file__).resolve().parents[1]
+    config = json.loads(
+        (project / "configs/hssd_dataset.json").read_text(encoding="utf-8")
+    )
+    config["camera"]["height_m"] += 0.01
+
+    with pytest.raises(ValueError, match="benchmark Dingo"):
+        validate_config(config)
+
+
+def test_hssd_expert_navmesh_includes_static_scene_objects() -> None:
+    class Settings:
+        def set_defaults(self) -> None:
+            self.include_static_objects = False
+
+    settings = Settings()
+    configure_navmesh_settings(settings)
+
+    assert settings.include_static_objects is True
+    assert settings.agent_radius == ROBOT_FOOTPRINT_RADIUS_M
+    assert settings.agent_height == ROBOT_COLLISION_HEIGHT_M
+    assert settings.agent_max_climb == MAXIMUM_TRAVERSABLE_HEIGHT_M
+    assert settings.cell_size == settings.cell_height == 0.05
+
+
+def test_dingo_geometry_contract_is_derived_from_the_benchmark_asset() -> None:
+    geometry = expert_navigation_geometry_contract()
+
+    assert geometry["embodiment"] == "dingo"
+    assert geometry["embodiment_asset_sha256"] == (
+        "43db9c54066d833e0bfc91d8d33eb1ff3345d4c8a3cd29f914649bafffbcce20"
+    )
+    assert geometry["wheel_radius_m"] == pytest.approx(0.06125)
+    assert geometry["wheel_base_m"] == pytest.approx(0.22616)
+    assert geometry["footprint_radius_m"] == pytest.approx(0.167584539)
+    assert geometry["collision_height_m"] == pytest.approx(0.161981500)
 
 
 def test_config_rejects_family_leakage(base_config: dict) -> None:

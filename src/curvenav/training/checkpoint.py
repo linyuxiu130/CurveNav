@@ -18,10 +18,13 @@ from curvenav.encoders.depth import DEPTH_ENCODER_TYPE
 from curvenav.encoders import POINT_GOAL_ENCODER_TYPE
 from curvenav.models import TRAJECTORY_DECODER_TYPE
 from curvenav.physical import (
+    BODY_OBSTACLE_MIN_Z_M,
     EXTRA_CLEARANCE_M,
-    MINIMUM_OBSTACLE_HEIGHT_M,
-    ROBOT_RADIUS_M,
-    ROBOT_HEIGHT_M,
+    MAXIMUM_TRAVERSABLE_HEIGHT_M,
+    ROBOT_COLLISION_BOTTOM_Z_M,
+    ROBOT_COLLISION_HEIGHT_M,
+    ROBOT_COLLISION_TOP_Z_M,
+    ROBOT_FOOTPRINT_RADIUS_M,
 )
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.history import HISTORY_TRAINING_DISTRIBUTION
@@ -35,6 +38,7 @@ from curvenav.models.policy import (
     FLOW_SOURCE_ENDPOINT_PROBABILITY,
     INFERENCE_SOURCE_SEED,
 )
+from curvenav.models.safety import SAFETY_CLEARANCE_M, SAFETY_OBJECTIVE_TYPE
 
 
 CHECKPOINT_TYPE = "curvenav_metric_curve_flow_policy"
@@ -130,7 +134,11 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "flow_path": "conditional_optimal_transport_displacement_interpolation",
         "flow_solver": "fixed_step_heun",
         "flow_time_embedding": "smooth_scalar_mlp",
-        "training_objective": "conditional_flow_matching_euclidean_velocity_mse",
+        "training_objective": (
+            "conditional_flow_matching_velocity_mse_plus_soft_configuration_space_clearance"
+        ),
+        "safety_objective_type": SAFETY_OBJECTIVE_TYPE,
+        "safety_clearance_m": SAFETY_CLEARANCE_M,
         "trajectory_prediction": "single_flow_generated_smooth_metric_curvature_trajectory",
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
         "visual_context": (
@@ -158,10 +166,13 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             + HISTORY_GEOMETRY_QUERY_COUNT
         ),
         "body_obstacle_geometry": {
-            "robot_radius_m": ROBOT_RADIUS_M,
+            "footprint_radius_m": ROBOT_FOOTPRINT_RADIUS_M,
             "extra_clearance_m": EXTRA_CLEARANCE_M,
-            "robot_height_m": ROBOT_HEIGHT_M,
-            "minimum_obstacle_height_m": MINIMUM_OBSTACLE_HEIGHT_M,
+            "collision_bottom_z_m": ROBOT_COLLISION_BOTTOM_Z_M,
+            "collision_top_z_m": ROBOT_COLLISION_TOP_Z_M,
+            "collision_height_m": ROBOT_COLLISION_HEIGHT_M,
+            "body_obstacle_min_z_m": BODY_OBSTACLE_MIN_Z_M,
+            "maximum_traversable_height_m": MAXIMUM_TRAVERSABLE_HEIGHT_M,
         },
         "num_curve_tokens": trajectory.num_curvature_control_points + 1,
         "num_curvature_control_points": trajectory.num_curvature_control_points,

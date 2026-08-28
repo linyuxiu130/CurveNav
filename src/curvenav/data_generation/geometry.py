@@ -13,15 +13,13 @@ from typing import Any
 import numpy as np
 from scipy.interpolate import splev, splprep
 
-from curvenav.physical import EXTRA_CLEARANCE_M
+from curvenav.physical import EXTRA_CLEARANCE_M, ROBOT_FOOTPRINT_RADIUS_M
 
 
 SAFETY_STEP_M = 0.025
 MIN_CLEARANCE_M = EXTRA_CLEARANCE_M
 ENDPOINT_CLEARANCE_M = 0.30
 MAX_SNAP_M = 0.06
-MAX_CURVATURE = 10.0
-MAX_CURVATURE_P95 = 4.0
 
 
 class PlanningError(RuntimeError):
@@ -170,7 +168,6 @@ class Plan:
     metrics: dict[str, float]
     difficulty: str
     difficulty_tags: tuple[str, ...]
-    clearance_weight: float
 
 
 _NEIGHBORS = (
@@ -185,9 +182,7 @@ _NEIGHBORS = (
 )
 
 
-def _astar(
-    grid: Grid, start: np.ndarray, goal: np.ndarray, weight: float, preferred_m: float
-) -> np.ndarray:
+def _astar(grid: Grid, start: np.ndarray, goal: np.ndarray) -> np.ndarray:
     shape = grid.free.shape
     allowed = grid.free & (grid.clearance_m + 1e-9 >= MIN_CLEARANCE_M)
     source, target = tuple(start), tuple(goal)
@@ -217,7 +212,7 @@ def _astar(
                 continue
             clear = 0.5 * (grid.clearance_m[x, y] + grid.clearance_m[nx, ny])
             trial = current + step * grid.cell_size_m * (
-                1 + weight * math.exp(-clear / preferred_m)
+                1 + math.exp(-clear / ROBOT_FOOTPRINT_RADIUS_M)
             )
             if trial + 1e-12 >= cost[nx, ny]:
                 continue
@@ -227,11 +222,31 @@ def _astar(
     raise PlanningError("no safe grid route")
 
 
-def _shortcut(grid: Grid, path: np.ndarray) -> np.ndarray:
+def _path_cost(grid: Grid, path: np.ndarray) -> float:
+    sampled = resample(path, SAFETY_STEP_M)
+    segment_length = np.linalg.norm(np.diff(sampled, axis=0), axis=1)
+    clearance = grid.clearance(sampled)
+    if not np.isfinite(clearance).all():
+        return math.inf
+    segment_clearance = 0.5 * (clearance[:-1] + clearance[1:])
+    return float(
+        np.sum(
+            segment_length
+            * (1.0 + np.exp(-segment_clearance / ROBOT_FOOTPRINT_RADIUS_M))
+        )
+    )
+
+
+def _simplify_route(grid: Grid, path: np.ndarray) -> np.ndarray:
     output, index = [path[0]], 0
     while index < len(path) - 1:
         following = len(path) - 1
-        while following > index + 1 and not grid.safe(path[[index, following]]):
+        while following > index + 1:
+            direct = path[[index, following]]
+            if grid.safe(direct) and _path_cost(grid, direct) <= _path_cost(
+                grid, path[index : following + 1]
+            ) + 1e-9:
+                break
             following -= 1
         output.append(path[following])
         index = following
@@ -310,93 +325,35 @@ def plan_route(
     grid: Grid,
     start_xy: np.ndarray,
     goal_xy: np.ndarray,
-    preferred_m: float = 0.30,
     spacing_m: float = 0.05,
 ) -> Plan:
     start, goal = grid.snap(start_xy), grid.snap(goal_xy)
-    candidates: list[tuple[float, np.ndarray, dict[str, float]]] = []
-    reference_length = None
-    for weight in (0.0, 0.5, 1.0, 2.0, 4.0):
-        try:
-            cells = _astar(grid, start, goal, weight, preferred_m)
-            path = _smooth(
-                grid,
-                _shortcut(
-                    grid, np.vstack([start_xy, grid.grid_to_world(cells), goal_xy])
-                ),
-                spacing_m,
-            )
-        except PlanningError:
-            continue
-        length = path_length(path)
-        if weight == 0.0:
-            reference_length = length
-        if reference_length is None:
-            continue
-        clear, curve = grid.clearance(path), curvature(path)
-        metrics = {
-            "length_m": length,
-            "reference_length_ratio": length / reference_length,
-            "geodesic_ratio": length / float(np.linalg.norm(path[-1] - path[0])),
-            "minimum_clearance_m": float(clear.min()),
-            "clearance_p05_m": float(np.percentile(clear, 5)),
-            "risk_density": float(np.mean(np.exp(-clear / preferred_m))),
-            "curvature_p95": float(np.percentile(curve, 95)),
-            "maximum_curvature": float(curve.max()),
-            "total_turn_radians": float(
-                np.abs(
-                    np.arctan2(
-                        np.sin(
-                            np.diff(
-                                np.arctan2(
-                                    np.diff(path, axis=0)[:, 1],
-                                    np.diff(path, axis=0)[:, 0],
-                                )
-                            )
-                        ),
-                        np.cos(
-                            np.diff(
-                                np.arctan2(
-                                    np.diff(path, axis=0)[:, 1],
-                                    np.diff(path, axis=0)[:, 0],
-                                )
-                            )
-                        ),
-                    )
-                ).sum()
-            ),
-        }
-        if (
-            metrics["maximum_curvature"] <= MAX_CURVATURE
-            and metrics["curvature_p95"] <= MAX_CURVATURE_P95
-        ):
-            candidates.append((weight, path, metrics))
-    eligible = [
-        item for item in candidates if item[2]["reference_length_ratio"] <= 1.2 + 1e-6
-    ]
-    if not eligible:
-        raise PlanningError("no curvature-feasible route within the detour budget")
-    frontier = [
-        item
-        for item in eligible
-        if not any(
-            other is not item
-            and other[2]["length_m"] <= item[2]["length_m"] + 1e-9
-            and other[2]["risk_density"] <= item[2]["risk_density"] + 1e-9
-            and other[2]["clearance_p05_m"] > item[2]["clearance_p05_m"] + 1e-9
-            for other in eligible
-        )
-    ]
-    weight, path, metrics = min(
-        frontier,
-        key=lambda item: (
-            item[2]["risk_density"]
-            + 0.02 * item[2]["curvature_p95"]
-            + 0.02 * item[2]["reference_length_ratio"],
-            -item[2]["clearance_p05_m"],
-            item[2]["length_m"],
-        ),
+    cells = _astar(grid, start, goal)
+    discrete_path = np.vstack([start_xy, grid.grid_to_world(cells), goal_xy])
+    path = _smooth(
+        grid,
+        _simplify_route(grid, discrete_path),
+        spacing_m,
     )
+    length = path_length(path)
+    clear, curve = grid.clearance(path), curvature(path)
+    heading = np.arctan2(np.diff(path, axis=0)[:, 1], np.diff(path, axis=0)[:, 0])
+    heading_change = np.arctan2(
+        np.sin(np.diff(heading)),
+        np.cos(np.diff(heading)),
+    )
+    metrics = {
+        "length_m": length,
+        "geodesic_ratio": length / float(np.linalg.norm(path[-1] - path[0])),
+        "minimum_clearance_m": float(clear.min()),
+        "clearance_p05_m": float(np.percentile(clear, 5)),
+        "risk_density": float(
+            np.mean(np.exp(-clear / ROBOT_FOOTPRINT_RADIUS_M))
+        ),
+        "curvature_p95": float(np.percentile(curve, 95)),
+        "maximum_curvature": float(curve.max()),
+        "total_turn_radians": float(np.abs(heading_change).sum()),
+    }
     tags = []
     if metrics["clearance_p05_m"] < 0.2:
         tags.append("narrow")
@@ -405,46 +362,11 @@ def plan_route(
     if metrics["total_turn_radians"] > math.pi / 2 or metrics["curvature_p95"] > 1.0:
         tags.append("turning")
     tags = tags or ["open"]
-    return Plan(path.astype(np.float32), metrics, tags[0], tuple(tags), float(weight))
+    return Plan(path.astype(np.float32), metrics, tags[0], tuple(tags))
 
 
-def native_route(
-    simulator: Any, start_xy: np.ndarray, goal_xy: np.ndarray, floor_m: float
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    import habitat_sim
-
-    requested = np.array(
-        [[start_xy[0], floor_m, start_xy[1]], [goal_xy[0], floor_m, goal_xy[1]]],
-        dtype=np.float32,
-    )
-    snapped = np.asarray(
-        [simulator.pathfinder.snap_point(point) for point in requested],
-        dtype=np.float32,
-    )
-    if (
-        not np.isfinite(snapped).all()
-        or np.linalg.norm(snapped[:, [0, 2]] - requested[:, [0, 2]], axis=1).max()
-        > MAX_SNAP_M
-    ):
-        raise PlanningError("route endpoint snap exceeds the physical contract")
-    query = habitat_sim.ShortestPath()
-    query.requested_start, query.requested_end = snapped
-    if not simulator.pathfinder.find_path(query):
-        raise PlanningError("Habitat found no route")
-    path = resample(np.asarray(query.points)[:, [0, 2]], 0.05)
-    path[[0, -1]] = snapped[:, [0, 2]]
-    return (
-        path.astype(np.float32),
-        snapped[0],
-        snapped[1],
-        float(query.geodesic_distance),
-    )
-
-
-def source_route(
-    grid: Grid, start_xy: np.ndarray, goal_xy: np.ndarray, preferred_m: float
-) -> Plan:
-    plan = plan_route(grid, start_xy, goal_xy, preferred_m, grid.cell_size_m)
+def source_route(grid: Grid, start_xy: np.ndarray, goal_xy: np.ndarray) -> Plan:
+    plan = plan_route(grid, start_xy, goal_xy, grid.cell_size_m)
     if not grid.safe(plan.path_xy):
         raise PlanningError("source route violates continuous clearance")
     return plan

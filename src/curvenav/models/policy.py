@@ -7,10 +7,17 @@ import torch
 from torch import Tensor, nn
 
 from curvenav.trajectory import MetricCurvatureTrajectory
-from curvenav.types import ConditionFeatures, PolicyCondition, TrajectoryPrediction, TrajectoryTarget
+from curvenav.types import (
+    ConditionFeatures,
+    PolicyCondition,
+    TrajectoryPrediction,
+    TrajectoryTarget,
+)
+
+from .safety import configuration_space_clearance_loss
 
 
-TRAINING_LOSS_NAMES = ("loss", "flow_loss")
+TRAINING_LOSS_NAMES = ("loss", "flow_loss", "clearance_loss")
 INFERENCE_SOURCE_SEED = 20_260_828
 FLOW_SOURCE_ENDPOINT_PROBABILITY = 1.0 / 9.0
 
@@ -19,9 +26,10 @@ FLOW_SOURCE_ENDPOINT_PROBABILITY = 1.0 / 9.0
 class CurveNavLoss:
     loss: Tensor
     flow_loss: Tensor
+    clearance_loss: Tensor
 
     def logging_values(self) -> tuple[Tensor, ...]:
-        return self.loss, self.flow_loss
+        return self.loss, self.flow_loss, self.clearance_loss
 
 
 class CurveNavPolicy(nn.Module):
@@ -109,12 +117,22 @@ class CurveNavPolicy(nn.Module):
         time = torch.where(source_endpoint, torch.zeros_like(time), time)
         state = (1.0 - time[:, None]) * source + time[:, None] * clean
         target_velocity = clean - source
-        predicted_velocity = self._predict_velocity(
-            state, time, self.encode_condition(condition)
-        )
+        encoded = self.encode_condition(condition)
+        predicted_velocity = self._predict_velocity(state, time, encoded)
         velocity_error = predicted_velocity.float() - target_velocity
         flow_loss = velocity_error.square().mean()
-        return CurveNavLoss(loss=flow_loss, flow_loss=flow_loss)
+        predicted_clean = state + (1.0 - time[:, None]) * predicted_velocity.float()
+        predicted_path, _, _ = self.curve_codec.decode(predicted_clean)
+        clearance_loss = configuration_space_clearance_loss(
+            predicted_path,
+            encoded.current_points,
+            encoded.current_obstacle_valid,
+        )
+        return CurveNavLoss(
+            loss=flow_loss + clearance_loss,
+            flow_loss=flow_loss,
+            clearance_loss=clearance_loss,
+        )
 
     @torch.no_grad()
     def sample(self, condition: PolicyCondition) -> TrajectoryPrediction:

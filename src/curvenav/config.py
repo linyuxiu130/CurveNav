@@ -3,6 +3,12 @@
 import math
 from dataclasses import dataclass, field as dataclass_field
 
+from curvenav.physical import (
+    DINGO_CAMERA_DOWNWARD_PITCH_DEGREES,
+    DINGO_CAMERA_FORWARD_OFFSET_M,
+    DINGO_CAMERA_HEIGHT_M,
+)
+
 
 @dataclass(frozen=True)
 class DataConfig:
@@ -16,9 +22,9 @@ class DataConfig:
     max_depth_m: float = 5.0
     canonical_focal_x_px: float = 166.80851063829786
     canonical_focal_y_px: float = 166.80851063829786
-    camera_forward_offset_m: float = 0.28618
-    camera_height_m: float = 0.62532
-    camera_downward_pitch_degrees: float = 10.0
+    camera_forward_offset_m: float = DINGO_CAMERA_FORWARD_OFFSET_M
+    camera_height_m: float = DINGO_CAMERA_HEIGHT_M
+    camera_downward_pitch_degrees: float = DINGO_CAMERA_DOWNWARD_PITCH_DEGREES
 
     def validate(self) -> None:
         if not self.root:
@@ -36,6 +42,18 @@ class DataConfig:
             )
         ):
             raise ValueError("data spatial scales must be positive")
+        camera = (
+            self.camera_forward_offset_m,
+            self.camera_height_m,
+            self.camera_downward_pitch_degrees,
+        )
+        expected_camera = (
+            DINGO_CAMERA_FORWARD_OFFSET_M,
+            DINGO_CAMERA_HEIGHT_M,
+            DINGO_CAMERA_DOWNWARD_PITCH_DEGREES,
+        )
+        if camera != expected_camera:
+            raise ValueError("data camera must match the benchmark Dingo")
 
 
 @dataclass(frozen=True)

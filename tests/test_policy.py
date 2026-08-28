@@ -68,10 +68,14 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
     for value in (
         losses.loss,
         losses.flow_loss,
+        losses.clearance_loss,
     ):
         assert value.ndim == 0 and torch.isfinite(value)
     assert len(losses.logging_values()) == len(TRAINING_LOSS_NAMES)
-    torch.testing.assert_close(losses.loss, losses.flow_loss)
+    torch.testing.assert_close(
+        losses.loss,
+        losses.flow_loss + losses.clearance_loss,
+    )
     losses.loss.backward()
     gradients = [
         parameter.grad for parameter in policy.parameters() if parameter.requires_grad
@@ -223,6 +227,32 @@ def test_training_uses_gaussian_conditional_flow_matching() -> None:
     torch.testing.assert_close(observed["time"], expected_time)
     expected = (clean - source).square().mean()
     torch.testing.assert_close(losses.flow_loss, expected)
+
+
+def test_configuration_space_loss_is_soft_differentiable_and_masked() -> None:
+    from curvenav.models.safety import configuration_space_clearance_loss
+
+    colliding = torch.tensor(
+        [[[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]]], requires_grad=True
+    )
+    obstacle = torch.tensor([[[0.5, 0.0], [10.0, 10.0]]])
+    valid = torch.tensor([[True, False]])
+    loss = configuration_space_clearance_loss(colliding, obstacle, valid)
+    assert loss > 0
+    loss.backward()
+    assert torch.isfinite(colliding.grad).all()
+
+    safe = colliding.detach() + torch.tensor([[[0.0, 1.0]]])
+    torch.testing.assert_close(
+        configuration_space_clearance_loss(safe, obstacle, valid),
+        torch.tensor(0.0),
+    )
+    torch.testing.assert_close(
+        configuration_space_clearance_loss(
+            colliding.detach(), obstacle, torch.zeros_like(valid)
+        ),
+        torch.tensor(0.0),
+    )
 
 
 def test_conditioned_decoder_returns_one_smooth_metric_curve() -> None:
@@ -436,10 +466,10 @@ def test_metric_xyz_backprojection_uses_camera_height_and_observation_transform(
 def test_body_obstacle_pooling_cannot_be_occluded_by_nearer_floor() -> None:
     policy = build_policy(tiny_config()).eval()
     depth = torch.ones(1, 4, 1, 126, 224)
-    # These pixels share one adaptive cell.  The 1.3 m lower pixel is below
-    # the robot body, while the slightly farther 1.5 m pixel is an obstacle.
-    depth[:, -1, 0, 109, 100] = 1.3 / 5.0
-    depth[:, -1, 0, 95, 100] = 1.5 / 5.0
+    # These pixels share one adaptive cell.  The 1.5 m lower pixel reaches the
+    # ground, while the slightly farther 1.6 m pixel intersects the body.
+    depth[:, -1, 0, 109, 100] = 1.5 / 5.0
+    depth[:, -1, 0, 95, 100] = 1.6 / 5.0
     projection = policy.depth_encoder.metric_projector(
         depth,
         identity_observation_transform(1),
@@ -449,7 +479,7 @@ def test_body_obstacle_pooling_cannot_be_occluded_by_nearer_floor() -> None:
     assert valid.sum() == 1
     torch.testing.assert_close(
         projection.depth[:, -1][valid],
-        torch.tensor([1.5]),
+        torch.tensor([1.6]),
     )
 
 

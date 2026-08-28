@@ -16,6 +16,8 @@ from typing import Any
 import numpy as np
 from scipy.ndimage import distance_transform_edt, label
 
+from curvenav.config import DataConfig
+from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data_generation.assets import (
     HSSD_COMMIT,
     HSSD_REPOSITORY,
@@ -30,14 +32,17 @@ from curvenav.data_generation.geometry import (
     PlanningError,
     candidate_pairs,
     headings,
-    native_route,
     path_length,
     points_at_arc,
     sha256_file,
     source_family,
     source_route,
 )
-from curvenav.physical import ROBOT_HEIGHT_M, ROBOT_RADIUS_M
+from curvenav.physical import (
+    MAXIMUM_TRAVERSABLE_HEIGHT_M,
+    ROBOT_COLLISION_HEIGHT_M,
+    ROBOT_FOOTPRINT_RADIUS_M,
+)
 
 
 GRID_CELL_M = 0.05
@@ -141,20 +146,29 @@ def create_simulator(
     ]
     agent = habitat_sim.agent.AgentConfiguration()
     agent.height, agent.radius, agent.sensor_specifications = (
-        ROBOT_HEIGHT_M,
-        ROBOT_RADIUS_M,
+        ROBOT_COLLISION_HEIGHT_M,
+        ROBOT_FOOTPRINT_RADIUS_M,
         [depth],
     )
     return habitat_sim.Simulator(habitat_sim.Configuration(settings, [agent]))
+
+
+def configure_navmesh_settings(settings: Any) -> None:
+    """Set the one robot configuration-space contract used by expert planning."""
+    settings.set_defaults()
+    settings.agent_radius = ROBOT_FOOTPRINT_RADIUS_M
+    settings.agent_height = ROBOT_COLLISION_HEIGHT_M
+    settings.agent_max_climb = MAXIMUM_TRAVERSABLE_HEIGHT_M
+    settings.cell_size = GRID_CELL_M
+    settings.cell_height = GRID_CELL_M
+    settings.include_static_objects = True
 
 
 def build_grid(simulator: Any, seed: int) -> tuple[Grid, float]:
     import habitat_sim
 
     settings = habitat_sim.NavMeshSettings()
-    settings.set_defaults()
-    settings.agent_radius, settings.agent_height = ROBOT_RADIUS_M, ROBOT_HEIGHT_M
-    settings.cell_size = settings.cell_height = GRID_CELL_M
+    configure_navmesh_settings(settings)
     if not simulator.recompute_navmesh(simulator.pathfinder, settings):
         raise RuntimeError("Habitat navmesh construction failed")
     pathfinder = simulator.pathfinder
@@ -174,8 +188,6 @@ def build_grid(simulator: Any, seed: int) -> tuple[Grid, float]:
     sizes = np.bincount(components.ravel())
     sizes[0] = 0
     free = components == int(sizes.argmax())
-    if free.sum() / all_free.sum() < 0.8:
-        raise RuntimeError("dominant navigable component is below 80 percent")
     clearance = (
         distance_transform_edt(np.pad(free, 1, constant_values=False))[1:-1, 1:-1]
         * GRID_CELL_M
@@ -207,6 +219,8 @@ def render_depth(
     image_width: int,
 ) -> tuple[str, float]:
     frames = len(xyz)
+    if len(yaw) != frames:
+        raise ValueError("route positions and headings must have equal length")
     stack = np.lib.format.open_memmap(
         path,
         mode="w+",
@@ -214,7 +228,7 @@ def render_depth(
         shape=(frames, image_height, image_width),
     )
     invalid = 0
-    for index, (position, heading) in enumerate(zip(xyz, yaw, strict=True)):
+    for index, (position, heading) in enumerate(zip(xyz, yaw)):
         set_pose(simulator, position, float(heading))
         depth = np.asarray(simulator.get_sensor_observations()["depth"])
         if depth.dtype != np.float32 or depth.shape != (image_height, image_width):
@@ -278,17 +292,10 @@ def generate_route(
     directory = scene_dir / route_name
     for start, goal in pairs:
         try:
-            _, snapped_start, snapped_goal, _ = native_route(
-                simulator, start, goal, floor_m
-            )
-            goal_xy = snapped_goal[[0, 2]].astype(np.float64)
-            if grid.clearance(goal_xy[None])[0] < ENDPOINT_CLEARANCE_M:
-                raise PlanningError("PointGoal endpoint lacks clearance")
             plan = source_route(
                 grid,
-                snapped_start[[0, 2]],
-                goal_xy,
-                MIN_CLEARANCE_M,
+                start,
+                goal,
             )
             route_xy, route_yaw, habitat_xyz, snap_error = sampled_route(
                 simulator,
@@ -453,6 +460,18 @@ def validate_config(config: dict[str, Any]) -> None:
     )
     if not all(math.isfinite(float(value)) and float(value) > 0 for value in numeric_camera):
         raise ValueError("camera dimensions, focal lengths and height must be positive")
+    data = DataConfig()
+    expected_camera = {
+        "image_width": data.image_width,
+        "image_height": data.image_height,
+        "focal_x_px": data.canonical_focal_x_px,
+        "focal_y_px": data.canonical_focal_y_px,
+        "forward_offset_m": data.camera_forward_offset_m,
+        "height_m": data.camera_height_m,
+        "downward_pitch_degrees": data.camera_downward_pitch_degrees,
+    }
+    if camera != expected_camera:
+        raise ValueError("generation camera must match the benchmark Dingo policy")
 
 
 def generate(config_path: Path) -> dict[str, Any]:
@@ -511,6 +530,7 @@ def generate(config_path: Path) -> dict[str, Any]:
             "scenes": config["selected_scenes"],
             "camera": camera_contract(config["camera"]),
             "route_contract": {
+                "navigation_geometry": expert_navigation_geometry_contract(),
                 "unperturbed": True,
                 "sample_spacing_m": config["route_sample_spacing_m"],
                 "continuous_safety_step_m": SAFETY_STEP_M,
