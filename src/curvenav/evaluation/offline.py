@@ -15,6 +15,8 @@ from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.loader import build_policy_validation_loader
 from curvenav.factory import build_policy
 from curvenav.models import CurveNavPolicy
+from curvenav.models.safety import SAFETY_CLEARANCE_M
+from curvenav.physical import ROBOT_FOOTPRINT_RADIUS_M
 from curvenav.training.checkpoint import validate_policy_contract
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.prefetch import CudaPrefetchLoader
@@ -94,6 +96,8 @@ def trajectory_batch_metrics(
         - torch.linalg.vector_norm(point_goal - path[:, -1], dim=-1),
         "reference_goal_progress_m": goal_distance
         - torch.linalg.vector_norm(point_goal - reference_path[:, -1], dim=-1),
+        "point_goal_distance_m": goal_distance,
+        "point_goal_is_behind": point_goal[:, 0] < 0,
         "max_abs_curvature_inv_m": curvature.abs().amax(dim=-1),
         "reference_max_abs_curvature_inv_m": reference_curvature.abs().amax(dim=-1),
         "total_abs_heading_change_rad": total_abs_heading_change,
@@ -102,6 +106,35 @@ def trajectory_batch_metrics(
         ),
         "terminal_heading_error_rad": torch.atan2(final_cross, final_dot).abs(),
         "has_tangent_reversal": (tangent_dot < 0).any(dim=-1),
+    }
+
+
+def observed_obstacle_metrics(
+    path: Tensor,
+    obstacle_points: Tensor,
+    obstacle_valid: Tensor,
+) -> dict[str, Tensor]:
+    """Measure path clearance against body-height surfaces in current depth."""
+    if path.ndim != 3 or path.shape[-1] != 2:
+        raise ValueError("path must have shape [B,P,2]")
+    if obstacle_points.ndim != 3 or obstacle_points.shape[-1] != 2:
+        raise ValueError("obstacle_points must have shape [B,O,2]")
+    if obstacle_valid.shape != obstacle_points.shape[:2]:
+        raise ValueError("obstacle_valid must have shape [B,O]")
+    if obstacle_valid.dtype != torch.bool or path.shape[0] != obstacle_points.shape[0]:
+        raise ValueError("obstacle mask and batch dimensions must match")
+
+    distance = torch.cdist(path.float(), obstacle_points.float())
+    distance = distance.masked_fill(~obstacle_valid[:, None], torch.inf)
+    nearest = distance.amin(dim=(-1, -2))
+    has_obstacle = obstacle_valid.any(dim=-1)
+    return {
+        "observed_obstacle_available": has_obstacle,
+        "observed_min_clearance_m": nearest,
+        "observed_footprint_collision": has_obstacle
+        & (nearest < ROBOT_FOOTPRINT_RADIUS_M),
+        "observed_safety_margin_violation": has_obstacle
+        & (nearest < SAFETY_CLEARANCE_M),
     }
 
 
@@ -163,6 +196,16 @@ def measure_policy(
         current_frame_valid[:, -1] = True
         current_frame_batch["observation_valid"] = current_frame_valid
         current_prepared, current_prediction = _sample(policy, current_frame_batch)
+        goal_shuffle_batch = dict(batch)
+        goal_shuffle_batch["point_goal"] = torch.roll(
+            batch["point_goal"], shifts=1, dims=0
+        )
+        _, goal_shuffle_prediction = _sample(policy, goal_shuffle_batch)
+        depth_shuffle_batch = dict(batch)
+        shuffled_depth = batch["depth"].clone()
+        shuffled_depth[:, -1] = torch.roll(batch["depth"][:, -1], shifts=1, dims=0)
+        depth_shuffle_batch["depth"] = shuffled_depth
+        _, depth_shuffle_prediction = _sample(policy, depth_shuffle_batch)
         reference_path, _, reference_curvature = policy.curve_codec.decode_values(
             prepared.target.curve_values.float(),
         )
@@ -176,6 +219,39 @@ def measure_policy(
         metrics["valid_observation_frames"] = (
             prepared.condition.observation_valid.sum(dim=-1)
         )
+        projection = policy.depth_encoder.metric_projector(
+            prepared.condition.depth,
+            prepared.condition.observation_to_current.float(),
+        )
+        current_obstacle_valid = (
+            projection.obstacle_valid[:, -1]
+            & prepared.condition.observation_valid[:, -1, None]
+        )
+        metrics.update(
+            observed_obstacle_metrics(
+                prediction.path.float(),
+                projection.obstacle_points[:, -1],
+                current_obstacle_valid,
+            )
+        )
+        goal_shuffle_error = torch.linalg.vector_norm(
+            goal_shuffle_prediction.path.float() - reference_path,
+            dim=-1,
+        ).mean(dim=-1)
+        depth_shuffle_error = torch.linalg.vector_norm(
+            depth_shuffle_prediction.path.float() - reference_path,
+            dim=-1,
+        ).mean(dim=-1)
+        metrics["point_goal_shuffle_ade_m"] = goal_shuffle_error
+        metrics["point_goal_shuffle_path_change_m"] = torch.linalg.vector_norm(
+            goal_shuffle_prediction.path.float() - prediction.path.float(),
+            dim=-1,
+        ).mean(dim=-1)
+        metrics["current_depth_shuffle_ade_m"] = depth_shuffle_error
+        metrics["current_depth_shuffle_path_change_m"] = torch.linalg.vector_norm(
+            depth_shuffle_prediction.path.float() - prediction.path.float(),
+            dim=-1,
+        ).mean(dim=-1)
         current_metrics = trajectory_batch_metrics(
             current_prediction.path.float(),
             current_prediction.curvature.float(),
@@ -280,6 +356,22 @@ def summarize_policy_metrics(metrics: dict[str, Tensor]) -> dict[str, float | in
         result[f"ade_m_with_{frame_count}_frames"] = (
             metrics["ade_m"][selected].mean().item()
         )
+    goal_distance = metrics["point_goal_distance_m"]
+    goal_distance_bands = (
+        ("lt_3m", goal_distance < 3.0),
+        ("3_to_6m", (goal_distance >= 3.0) & (goal_distance < 6.0)),
+        ("6_to_8_5m", (goal_distance >= 6.0) & (goal_distance < 8.5)),
+        ("ge_8_5m", goal_distance >= 8.5),
+    )
+    for name, selected in goal_distance_bands:
+        count = int(selected.sum().item())
+        result[f"samples_point_goal_{name}"] = count
+        if count:
+            result[f"ade_m_point_goal_{name}"] = metrics["ade_m"][selected].mean().item()
+    behind = metrics["point_goal_is_behind"]
+    result["point_goal_behind_samples"] = int(behind.sum().item())
+    if behind.any():
+        result["ade_m_point_goal_behind"] = metrics["ade_m"][behind].mean().item()
     if not all(torch.isfinite(torch.tensor(value)) for value in result.values()):
         raise FloatingPointError(f"validation metrics are non-finite: {result}")
     return result
@@ -300,6 +392,11 @@ def evaluate_policy(
     current_frame_summary = summarize_policy_metrics(
         measurements.current_frame_metrics
     )
+    metrics = measurements.metrics
+    observed = metrics["observed_obstacle_available"]
+    observed_count = int(observed.sum().item())
+    if observed_count == 0:
+        raise RuntimeError("validation contains no current-depth body obstacles")
     return {
         "protocol": "curvenav_local_validation",
         "samples": measurements.samples,
@@ -322,6 +419,32 @@ def evaluate_policy(
         "current_frame_only_negative_progress_fraction": current_frame_summary[
             "negative_progress_fraction"
         ],
+        "point_goal_shuffle_ade_m": metrics["point_goal_shuffle_ade_m"].mean().item(),
+        "point_goal_shuffle_ade_increase_m": (
+            metrics["point_goal_shuffle_ade_m"] - metrics["ade_m"]
+        ).mean().item(),
+        "point_goal_shuffle_path_change_m": metrics[
+            "point_goal_shuffle_path_change_m"
+        ].mean().item(),
+        "current_depth_shuffle_ade_m": metrics[
+            "current_depth_shuffle_ade_m"
+        ].mean().item(),
+        "current_depth_shuffle_ade_increase_m": (
+            metrics["current_depth_shuffle_ade_m"] - metrics["ade_m"]
+        ).mean().item(),
+        "current_depth_shuffle_path_change_m": metrics[
+            "current_depth_shuffle_path_change_m"
+        ].mean().item(),
+        "observed_obstacle_samples": observed_count,
+        "observed_min_clearance_m_mean": metrics["observed_min_clearance_m"][
+            observed
+        ].mean().item(),
+        "observed_footprint_collision_fraction": metrics[
+            "observed_footprint_collision"
+        ][observed].float().mean().item(),
+        "observed_safety_margin_violation_fraction": metrics[
+            "observed_safety_margin_violation"
+        ][observed].float().mean().item(),
         "batch32_latency_ms_mean": measurements.batch_latency_ms.mean().item(),
         "throughput_observations_per_second": measurements.samples / seconds,
         "online_latency_ms_p50": torch.quantile(
