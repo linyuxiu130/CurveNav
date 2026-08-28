@@ -43,10 +43,10 @@ class TrajectoryConfig:
     num_curvature_control_points: int = 7
     curvature_spline_degree: int = 3
     num_path_points: int = 64
-    length_pretransform_mean: float = 2.901571273803711
-    length_pretransform_std: float = 1.2541460990905762
-    curvature_control_mean_inv_m: float = -0.013263368047773838
-    curvature_control_std_inv_m: float = 0.3198425769805908
+    length_pretransform_mean: float = 2.900325059890747
+    length_pretransform_std: float = 1.2550740242004395
+    curvature_control_mean_inv_m: float = -0.012702565640211105
+    curvature_control_std_inv_m: float = 0.35367658734321594
 
     def validate(self) -> None:
         if self.num_curvature_control_points != 7:

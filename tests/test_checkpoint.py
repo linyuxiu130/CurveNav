@@ -138,10 +138,10 @@ def test_checkpoint_records_the_metric_curvature_flow_contract() -> None:
         "metric_arc_length_m_then_curvature_controls_inv_m"
     )
     assert contract["flow_length_transform"] == "standardized_inverse_softplus"
-    assert contract["length_pretransform_mean"] == pytest.approx(2.9015713)
-    assert contract["length_pretransform_std"] == pytest.approx(1.2541461)
-    assert contract["curvature_control_mean_inv_m"] == pytest.approx(-0.01326337)
-    assert contract["curvature_control_std_inv_m"] == pytest.approx(0.31984258)
+    assert contract["length_pretransform_mean"] == pytest.approx(2.9003251)
+    assert contract["length_pretransform_std"] == pytest.approx(1.2550740)
+    assert contract["curvature_control_mean_inv_m"] == pytest.approx(-0.01270257)
+    assert contract["curvature_control_std_inv_m"] == pytest.approx(0.35367659)
     assert contract["inference_source_seed"] == 20_260_828
     assert contract["training_source_endpoint_probability"] == pytest.approx(1 / 9)
     assert "maximum_local_detour_ratio" not in contract
