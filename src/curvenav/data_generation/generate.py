@@ -41,6 +41,7 @@ from curvenav.data_generation.geometry import (
 from curvenav.physical import (
     MAXIMUM_TRAVERSABLE_HEIGHT_M,
     ROBOT_COLLISION_HEIGHT_M,
+    ROBOT_BASE_HEIGHT_ABOVE_GROUND_M,
     ROBOT_FOOTPRINT_RADIUS_M,
 )
 
@@ -198,12 +199,19 @@ def build_grid(simulator: Any, seed: int) -> tuple[Grid, float]:
     return Grid(free, clearance.astype(np.float32), origin, GRID_CELL_M), floor
 
 
+def base_position_from_navmesh(position: np.ndarray) -> np.ndarray:
+    """Lift a floor contact point to the benchmark Dingo base-link origin."""
+    base_position = np.asarray(position, dtype=np.float32).copy()
+    base_position[1] += ROBOT_BASE_HEIGHT_ABOVE_GROUND_M
+    return base_position
+
+
 def set_pose(simulator: Any, position: np.ndarray, heading: float) -> None:
     import habitat_sim
 
     habitat_yaw = math.atan2(-math.cos(heading), -math.sin(heading))
     state = habitat_sim.AgentState()
-    state.position = position
+    state.position = base_position_from_navmesh(position)
     state.rotation = np.quaternion(
         math.cos(habitat_yaw / 2), 0.0, math.sin(habitat_yaw / 2), 0.0
     )

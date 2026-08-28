@@ -12,6 +12,7 @@ from curvenav.data_generation import assets
 from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data_generation.assets import selected_asset_paths
 from curvenav.data_generation.generate import (
+    base_position_from_navmesh,
     camera_contract,
     configure_navmesh_settings,
     route_bands,
@@ -27,6 +28,7 @@ from curvenav.data_generation.geometry import (
 from curvenav.physical import (
     MAXIMUM_TRAVERSABLE_HEIGHT_M,
     ROBOT_COLLISION_HEIGHT_M,
+    ROBOT_BASE_HEIGHT_ABOVE_GROUND_M,
     ROBOT_FOOTPRINT_RADIUS_M,
 )
 
@@ -86,6 +88,17 @@ def test_hssd_generator_uses_the_model_camera_contract() -> None:
     ]
 
 
+def test_render_pose_uses_the_dingo_base_link_height() -> None:
+    floor_position = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+
+    base_position = base_position_from_navmesh(floor_position)
+
+    assert np.array_equal(floor_position, np.array([1.0, 2.0, 3.0]))
+    assert base_position == pytest.approx(
+        [1.0, 2.0 + ROBOT_BASE_HEIGHT_ABOVE_GROUND_M, 3.0]
+    )
+
+
 def test_hssd_generator_rejects_nonbenchmark_camera() -> None:
     project = Path(__file__).resolve().parents[1]
     config = json.loads(
@@ -123,6 +136,7 @@ def test_dingo_geometry_contract_is_derived_from_the_benchmark_asset() -> None:
     assert geometry["wheel_base_m"] == pytest.approx(0.22616)
     assert geometry["footprint_radius_m"] == pytest.approx(0.167584539)
     assert geometry["collision_height_m"] == pytest.approx(0.161981500)
+    assert geometry["base_height_above_ground_m"] == pytest.approx(0.044000001)
 
 
 def test_config_rejects_family_leakage(base_config: dict) -> None:
