@@ -10,28 +10,34 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from curvenav.config import CurveNavConfig
-from curvenav.conditioning import CONDITION_ENCODER_TYPE, ROUTE_QUERY_COUNT
+from curvenav.conditioning import (
+    CONDITION_ENCODER_TYPE,
+    HISTORY_GEOMETRY_QUERY_COUNT,
+)
 from curvenav.encoders.depth import DEPTH_ENCODER_TYPE
 from curvenav.encoders import POINT_GOAL_ENCODER_TYPE
-from curvenav.models import (
-    CURVE_COORDINATE_SCALE,
-    TRAJECTORY_DECODER_TYPE,
+from curvenav.models import TRAJECTORY_DECODER_TYPE
+from curvenav.physical import (
+    EXTRA_CLEARANCE_M,
+    MINIMUM_OBSTACLE_HEIGHT_M,
+    ROBOT_RADIUS_M,
+    ROBOT_HEIGHT_M,
 )
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.history import HISTORY_TRAINING_DISTRIBUTION
 from curvenav.training.batching import build_distributed_batch_layout
 from curvenav.trajectory import (
-    ARC_LENGTH_OVERSAMPLE_FACTOR,
-    BSPLINE_BENDING_REGULARIZATION_M4,
     CURVATURE_PARAMETERIZATION_TYPE,
+    CURVATURE_VARIATION_REGULARIZATION,
     CURVE_INTEGRATION_OVERSAMPLE_FACTOR,
-    CURVATURE_TARGET_REGULARIZATION,
-    LENGTH_LOGIT_SCALE,
-    MAXIMUM_LOCAL_DETOUR_RATIO,
+)
+from curvenav.models.policy import (
+    FLOW_SOURCE_ENDPOINT_PROBABILITY,
+    INFERENCE_SOURCE_SEED,
 )
 
 
-CHECKPOINT_TYPE = "curvenav_direct_geometry_supervised_bounded_curvature_policy"
+CHECKPOINT_TYPE = "curvenav_metric_curve_flow_policy"
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
 
@@ -93,58 +99,89 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             ],
             "depth_dropout": depth.dropout,
             "point_goal_hidden_dim": point_goal.hidden_dim,
-            "condition_layers": condition.transformer_layers,
             "condition_heads": condition.transformer_heads,
+            "condition_layers": condition.transformer_layers,
             "condition_dropout": condition.dropout,
             "trajectory_decoder_layers": decoder.transformer_layers,
             "trajectory_decoder_heads": decoder.transformer_heads,
+            "trajectory_path_tokens": decoder.path_tokens,
             "trajectory_decoder_dropout": decoder.dropout,
         },
         "trajectory_dimensions": 2,
+        "planar_axis_convention": "x_forward_y_left",
         "point_goal_semantics": "mission_destination_in_current_robot_xy",
         "point_goal_encoder_type": POINT_GOAL_ENCODER_TYPE,
         "point_goal_features": "direction_plus_log_range",
         "point_goal_clip_distance_m": config.point_goal_encoder.goal_clip_distance_m,
-        "trajectory_supervision": "fixed_future_expert_waypoints_or_true_goal",
-        "arc_length_policy": "goal_continuous_strictly_bounded_local_arc_length",
-        "trajectory_endpoint_policy": "direct_conditioned_executable_curve",
+        "trajectory_supervision": (
+            "fixed_future_expert_projected_into_production_curve_values"
+        ),
+        "expert_curve_projection": (
+            "production_smooth_heading_regularized_least_squares"
+        ),
+        "arc_length_policy": "learned_positive_metric_arc_length_independent_of_point_goal_range",
+        "trajectory_endpoint_policy": "heun_integrated_conditional_flow_curve",
         "curve_boundary_conditions": "origin_and_robot_forward_initial_tangent",
         "trajectory_decoder_type": TRAJECTORY_DECODER_TYPE,
-        "curve_coordinate_scale": CURVE_COORDINATE_SCALE,
-        "training_objective": "direct_curve_coordinates_plus_metric_path_and_tangent",
-        "trajectory_prediction": "single_direct_bounded_curvature_trajectory",
+        "flow_steps": decoder.flow_steps,
+        "flow_source": "isotropic_gaussian_training_prior_with_fixed_typical_set_inference",
+        "inference_source_seed": INFERENCE_SOURCE_SEED,
+        "training_source_endpoint_probability": FLOW_SOURCE_ENDPOINT_PROBABILITY,
+        "flow_path": "conditional_optimal_transport_displacement_interpolation",
+        "flow_solver": "fixed_step_heun",
+        "flow_time_embedding": "smooth_scalar_mlp",
+        "training_objective": "conditional_flow_matching_euclidean_velocity_mse",
+        "trajectory_prediction": "single_flow_generated_smooth_metric_curvature_trajectory",
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
         "visual_context": (
-            "dedicated_current_plus_full_context_metric_geometry_queries_and_"
-            "explicit_ego_state_ordered_route_queries"
+            "goal_relative_uncompressed_current_metric_tokens_plus_"
+            "aligned_compressed_history"
         ),
-        "depth_token_pooling": "nearest_surface_metric_body_xyz",
+        "depth_token_pooling": (
+            "nearest_body_height_obstacle_else_nearest_surface_metric_xyz"
+        ),
         "observation_to_current": "planar_rigid_transform_used_for_metric_xyz_alignment",
-        "visual_compression": "32_current_plus_32_full_context_metric_geometry_queries",
-        "goal_conditioning": "pointgoal_direction_range_and_bounded_local_extent",
-        "temporal_modeling": "executed_metric_observation_history_with_masked_state_summary",
+        "visual_compression": "full_current_grid_plus_32_history_geometry_queries",
+        "condition_context": "four_layer_joint_goal_current_history_transformer",
+        "trajectory_condition_interaction": (
+            "decoded_path_tokens_with_metric_current_obstacle_cross_attention"
+        ),
+        "goal_conditioning": "goal_relative_metric_geometry_without_codec_length_coupling",
+        "temporal_modeling": (
+            "history_transforms_only_align_geometry_without_a_route_state_token"
+        ),
         "history_training_distribution": HISTORY_TRAINING_DISTRIBUTION,
-        "state_token_count": 1,
-        "route_query_count": ROUTE_QUERY_COUNT,
+        "state_token_count": 0,
+        "condition_token_count": (
+            1
+            + depth.frame_tokens_height * depth.frame_tokens_width
+            + HISTORY_GEOMETRY_QUERY_COUNT
+        ),
+        "body_obstacle_geometry": {
+            "robot_radius_m": ROBOT_RADIUS_M,
+            "extra_clearance_m": EXTRA_CLEARANCE_M,
+            "robot_height_m": ROBOT_HEIGHT_M,
+            "minimum_obstacle_height_m": MINIMUM_OBSTACLE_HEIGHT_M,
+        },
         "num_curve_tokens": trajectory.num_curvature_control_points + 1,
         "num_curvature_control_points": trajectory.num_curvature_control_points,
         "curvature_spline_degree": trajectory.curvature_spline_degree,
-        "target_spline_control_points": trajectory.num_target_control_points,
-        "target_spline_degree": trajectory.target_spline_degree,
-        "target_spline_arc_oversample_factor": ARC_LENGTH_OVERSAMPLE_FACTOR,
-        "target_spline_bending_regularization_m4": BSPLINE_BENDING_REGULARIZATION_M4,
         "num_path_points": trajectory.num_path_points,
         "path_sampling": "fixed_uniform_metric_arc_progress",
         "curve_integration_oversample_factor": CURVE_INTEGRATION_OVERSAMPLE_FACTOR,
         "curve_coordinates": CURVATURE_PARAMETERIZATION_TYPE,
-        "curve_planning_horizon_m": (
+        "visual_planning_scale_m": (
             data.future_steps * data.expert_waypoint_spacing_m
         ),
-        "maximum_local_detour_ratio": MAXIMUM_LOCAL_DETOUR_RATIO,
-        "length_logit_scale": LENGTH_LOGIT_SCALE,
-        "maximum_continuous_curvature_inv_m": trajectory.maximum_curvature_inv_m,
-        "target_curvature_projection": "regularized_least_squares_in_bounded_control_space",
-        "target_curvature_regularization": CURVATURE_TARGET_REGULARIZATION,
+        "curve_value_semantics": "metric_arc_length_m_then_curvature_controls_inv_m",
+        "flow_length_transform": "standardized_inverse_softplus",
+        "length_pretransform_mean": trajectory.length_pretransform_mean,
+        "length_pretransform_std": trajectory.length_pretransform_std,
+        "curvature_control_mean_inv_m": trajectory.curvature_control_mean_inv_m,
+        "curvature_control_std_inv_m": trajectory.curvature_control_std_inv_m,
+        "curvature_variation_regularization": (
+            CURVATURE_VARIATION_REGULARIZATION
+        ),
     }
 
 

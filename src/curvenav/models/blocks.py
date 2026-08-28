@@ -1,21 +1,104 @@
-"""Adaptive Transformer blocks for ordered trajectory queries."""
+"""Transformer blocks for metric trajectory--observation interaction."""
 
+import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from curvenav.layers import RMSNorm, SwiGLU
+from curvenav.physical import EXTRA_CLEARANCE_M, ROBOT_RADIUS_M
 
 
-def _modulate(value: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
-    return value * (1.0 + scale[:, None]) + shift[:, None]
+class MetricPathCrossAttention(nn.Module):
+    """Attend from decoded path anchors to current visual cells.
+
+    Attention combines learned visual semantics with an additive metric bias
+    computed from anchor-to-surface displacement and signed robot clearance.
+    The clearance is an input feature, not a hand-written trajectory score or
+    a post-processing rule.
+    """
+
+    def __init__(
+        self,
+        model_dim: int,
+        heads: int,
+        dropout: float,
+        planning_horizon_m: float,
+    ) -> None:
+        super().__init__()
+        self.heads = heads
+        self.head_dim = model_dim // heads
+        self.dropout = dropout
+        self.planning_horizon_m = float(planning_horizon_m)
+        self.footprint_clearance_m = ROBOT_RADIUS_M + EXTRA_CLEARANCE_M
+        self.query_norm = RMSNorm(model_dim)
+        self.memory_norm = RMSNorm(model_dim)
+        self.query_projection = nn.Linear(model_dim, model_dim)
+        self.key_projection = nn.Linear(model_dim, model_dim)
+        self.value_projection = nn.Linear(model_dim, model_dim)
+        self.relative_bias = nn.Sequential(
+            nn.Linear(5, model_dim // 2),
+            nn.SiLU(),
+            nn.Linear(model_dim // 2, heads),
+        )
+        self.output_projection = nn.Linear(model_dim, model_dim)
+        self.feed_forward_norm = RMSNorm(model_dim)
+        self.feed_forward = SwiGLU(model_dim, dropout)
+        self.residual_dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        path_tokens: Tensor,
+        path_points: Tensor,
+        current_tokens: Tensor,
+        current_points: Tensor,
+        current_obstacle_valid: Tensor,
+    ) -> Tensor:
+        batch, anchors, model_dim = path_tokens.shape
+        cells = current_tokens.shape[1]
+        query = self.query_projection(self.query_norm(path_tokens)).view(
+            batch, anchors, self.heads, self.head_dim
+        ).transpose(1, 2)
+        memory = self.memory_norm(current_tokens)
+        key = self.key_projection(memory).view(
+            batch, cells, self.heads, self.head_dim
+        ).transpose(1, 2)
+        value = self.value_projection(memory).view(
+            batch, cells, self.heads, self.head_dim
+        ).transpose(1, 2)
+
+        displacement = current_points[:, None] - path_points[:, :, None]
+        distance = torch.linalg.vector_norm(displacement, dim=-1, keepdim=True)
+        scale = self.planning_horizon_m
+        relative_geometry = torch.cat(
+            (
+                displacement / scale,
+                distance / scale,
+                (distance - self.footprint_clearance_m) / scale,
+                current_obstacle_valid[:, None, :, None]
+                .expand(-1, anchors, -1, -1)
+                .to(distance.dtype),
+            ),
+            dim=-1,
+        )
+        attention_bias = self.relative_bias(relative_geometry).permute(0, 3, 1, 2)
+        attended = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_bias.to(query.dtype),
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        attended = attended.transpose(1, 2).reshape(batch, anchors, model_dim)
+        path_tokens = path_tokens + self.residual_dropout(
+            self.output_projection(attended)
+        )
+        return path_tokens + self.residual_dropout(
+            self.feed_forward(self.feed_forward_norm(path_tokens))
+        )
 
 
 class ConditionalTrajectoryBlock(nn.Module):
-    """Bidirectional trajectory attention with adaRMS-Zero conditioning.
-
-    The end-to-end learned route summary modulates every residual branch.
-    Geometry remains a token sequence and enters through cross-attention, so
-    spatial information is not collapsed into the global modulation vector.
-    """
+    """Ordered self-attention followed by direct condition cross-attention."""
 
     def __init__(self, model_dim: int, heads: int, dropout: float) -> None:
         super().__init__()
@@ -30,51 +113,29 @@ class ConditionalTrajectoryBlock(nn.Module):
         )
         self.feed_forward_norm = RMSNorm(model_dim)
         self.feed_forward = SwiGLU(model_dim, dropout)
-        self.modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(model_dim, 9 * model_dim),
-        )
         self.dropout = nn.Dropout(dropout)
-        nn.init.zeros_(self.modulation[-1].weight)
-        nn.init.zeros_(self.modulation[-1].bias)
 
     def forward(
         self,
         trajectory: Tensor,
         condition: Tensor,
-        modulation: Tensor,
     ) -> Tensor:
-        (
-            self_shift,
-            self_scale,
-            self_gate,
-            cross_shift,
-            cross_scale,
-            cross_gate,
-            feed_shift,
-            feed_scale,
-            feed_gate,
-        ) = self.modulation(modulation).chunk(9, dim=-1)
-
-        normalized = _modulate(self.self_norm(trajectory), self_shift, self_scale)
+        normalized = self.self_norm(trajectory)
         attended = self.self_attention(
             normalized, normalized, normalized, need_weights=False
         )[0]
-        trajectory = trajectory + self_gate[:, None] * self.dropout(attended)
+        trajectory = trajectory + self.dropout(attended)
 
         normalized_condition = self.memory_norm(condition)
-        query = _modulate(self.query_norm(trajectory), cross_shift, cross_scale)
         attended = self.cross_attention(
-            query,
+            self.query_norm(trajectory),
             normalized_condition,
             normalized_condition,
             need_weights=False,
         )[0]
-        trajectory = trajectory + cross_gate[:, None] * self.dropout(attended)
+        trajectory = trajectory + self.dropout(attended)
 
-        normalized = _modulate(
-            self.feed_forward_norm(trajectory), feed_shift, feed_scale
-        )
-        return trajectory + feed_gate[:, None] * self.dropout(
+        normalized = self.feed_forward_norm(trajectory)
+        return trajectory + self.dropout(
             self.feed_forward(normalized)
         )

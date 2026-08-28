@@ -4,6 +4,14 @@ import torch
 from torch import Tensor, nn
 
 
+def unit_rms(value: Tensor, epsilon: float = 1e-12) -> Tensor:
+    """Remove an unidentifiable query radius using float32 statistics."""
+    inverse_rms = (
+        value.float().square().mean(dim=-1, keepdim=True).clamp_min(epsilon).rsqrt()
+    )
+    return value * inverse_rms.to(dtype=value.dtype)
+
+
 class RMSNorm(nn.Module):
     """RMS normalization with float32 statistics for mixed-precision stability."""
 

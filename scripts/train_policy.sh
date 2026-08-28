@@ -7,9 +7,10 @@ ENV_ROOT="${WORKSPACE_ROOT}/.venvs"
 
 : "${CUDA_VISIBLE_DEVICES:?set CUDA_VISIBLE_DEVICES to one or more free GPUs}"
 export OMP_NUM_THREADS=1
-export PYTHONPATH="${PROJECT_ROOT}/src"
-PYTHON_INCLUDE="$("${ENV_ROOT}/curvenav/bin/python" -c 'import sysconfig; print(sysconfig.get_path("include"))')"
-export CPATH="${PYTHON_INCLUDE}${CPATH:+:${CPATH}}"
+export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+PYTHON_ABI="$("${ENV_ROOT}/curvenav/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+PYTHON_INCLUDE_ROOT="${ENV_ROOT}/curvenav/python-dev/usr/include"
+export CPATH="${PYTHON_INCLUDE_ROOT}/python${PYTHON_ABI}:${PYTHON_INCLUDE_ROOT}${CPATH:+:${CPATH}}"
 export TORCHINDUCTOR_CACHE_DIR="${ENV_ROOT}/curvenav/torchinductor"
 export TORCHINDUCTOR_COMPILE_THREADS=2
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

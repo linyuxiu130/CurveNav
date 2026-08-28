@@ -40,29 +40,37 @@ class DataConfig:
 
 @dataclass(frozen=True)
 class TrajectoryConfig:
-    num_target_control_points: int = 8
-    target_spline_degree: int = 3
     num_curvature_control_points: int = 7
     curvature_spline_degree: int = 3
     num_path_points: int = 64
-    maximum_curvature_inv_m: float = 8.0
+    length_pretransform_mean: float = 2.901571273803711
+    length_pretransform_std: float = 1.2541460990905762
+    curvature_control_mean_inv_m: float = -0.013263368047773838
+    curvature_control_std_inv_m: float = 0.3198425769805908
 
     def validate(self) -> None:
-        if self.target_spline_degree != 3:
-            raise ValueError("expert targets use one fixed cubic B-spline degree")
-        if self.num_target_control_points != 8:
-            raise ValueError("expert targets use exactly eight spline control points")
         if self.num_curvature_control_points != 7:
             raise ValueError("CurveNav uses exactly seven curvature controls")
         if self.curvature_spline_degree != 3:
             raise ValueError("CurveNav uses one cubic curvature B-spline")
-        if self.num_path_points < self.num_target_control_points:
-            raise ValueError("num_path_points must cover the target control points")
-        if (
-            not math.isfinite(self.maximum_curvature_inv_m)
-            or self.maximum_curvature_inv_m <= 0
+        if self.num_path_points < self.num_curvature_control_points + 1:
+            raise ValueError("num_path_points must cover the curve controls")
+        if not all(
+            math.isfinite(value)
+            for value in (
+                self.length_pretransform_mean,
+                self.curvature_control_mean_inv_m,
+            )
         ):
-            raise ValueError("maximum_curvature_inv_m must be positive")
+            raise ValueError("trajectory coordinate means must be finite")
+        if not all(
+            math.isfinite(value) and value > 0
+            for value in (
+                self.length_pretransform_std,
+                self.curvature_control_std_inv_m,
+            )
+        ):
+            raise ValueError("trajectory coordinate standard deviations must be positive")
 
 
 @dataclass(frozen=True)
@@ -91,16 +99,24 @@ class ConditionEncoderConfig:
 @dataclass(frozen=True)
 class TrajectoryDecoderConfig:
     model_dim: int = 384
-    transformer_layers: int = 8
+    transformer_layers: int = 12
     transformer_heads: int = 8
+    path_tokens: int = 16
     dropout: float = 0.0
+    flow_steps: int = 8
+
+    def validate(self) -> None:
+        if self.flow_steps != 8:
+            raise ValueError("CurveNav uses exactly eight Heun flow steps")
+        if self.path_tokens != 16:
+            raise ValueError("CurveNav uses exactly sixteen path tokens")
 
 
 @dataclass(frozen=True)
 class TrainingConfig:
     seed: int = 42
     global_batch_size: int = 1_024
-    per_device_batch_size: int = 192
+    per_device_batch_size: int = 256
     samples_per_epoch: int = 40_960
     epochs: int = 200
     num_workers: int = 2
@@ -137,6 +153,7 @@ class CurveNavConfig:
     def validate(self) -> None:
         self.data.validate()
         self.trajectory.validate()
+        self.trajectory_decoder.validate()
         if self.data.observation_frames != 4:
             raise ValueError(
                 "CurveNav uses four depth observations: three past and one current"

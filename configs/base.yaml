@@ -15,12 +15,13 @@ data:
 
 model:
   trajectory:
-    num_target_control_points: 8
-    target_spline_degree: 3
     num_curvature_control_points: 7
     curvature_spline_degree: 3
     num_path_points: 64
-    maximum_curvature_inv_m: 8.0
+    length_pretransform_mean: 2.901571273803711
+    length_pretransform_std: 1.2541460990905762
+    curvature_control_mean_inv_m: -0.013263368047773838
+    curvature_control_std_inv_m: 0.3198425769805908
   depth_encoder:
     model_dim: 384
     frame_tokens_height: 8
@@ -37,13 +38,15 @@ model:
     dropout: 0.0
   trajectory_decoder:
     model_dim: 384
-    transformer_layers: 8
+    transformer_layers: 12
     transformer_heads: 8
+    path_tokens: 16
     dropout: 0.0
+    flow_steps: 8
 training:
   seed: 42
   global_batch_size: 1024
-  per_device_batch_size: 192
+  per_device_batch_size: 256
   samples_per_epoch: 40960
   epochs: 200
   num_workers: 2

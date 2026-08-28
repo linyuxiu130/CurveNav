@@ -15,16 +15,13 @@ from torch.utils.data import Dataset
 from curvenav.config import DataConfig, TrajectoryConfig
 from curvenav.data.depth import depth_camera_contract
 from curvenav.data.depth_bank import PackedDepthBankSpec, PackedDepthRun
-from curvenav.trajectory import BSPLINE_BENDING_REGULARIZATION_M4
-
-
+from curvenav.data.trajectory import MAXIMUM_EXPERT_PROJECTION_ADE_RATIO
 POLICY_ARRAYS = {
     "depth_indices": ("uint32", 2),
     "point_goal": ("float32", 2),
     "observation_to_current": ("float32", 3),
     "observation_valid": ("bool", 2),
-    "control_points": ("float32", 3),
-    "reference_path": ("float32", 3),
+    "curve_values": ("float32", 2),
 }
 
 
@@ -38,11 +35,21 @@ def policy_dataset_contract(
         "frame_spacing_m": data.frame_spacing_m,
         "expert_waypoint_spacing_m": data.expert_waypoint_spacing_m,
         "future_steps": data.future_steps,
+        "planar_axis_convention": "x_forward_y_left",
         "observation_to_current_semantics": "planar_rigid_transform_from_observation_to_current_frame",
         **depth_camera_contract(data),
-        "num_control_points": trajectory.num_target_control_points,
+        "num_curve_values": trajectory.num_curvature_control_points + 1,
         "num_path_points": trajectory.num_path_points,
-        "bspline_bending_regularization_m4": BSPLINE_BENDING_REGULARIZATION_M4,
+        "curve_value_semantics": "metric_arc_length_m_then_curvature_controls_inv_m",
+        "flow_length_transform": "standardized_inverse_softplus",
+        "length_pretransform_mean": trajectory.length_pretransform_mean,
+        "length_pretransform_std": trajectory.length_pretransform_std,
+        "curvature_control_mean_inv_m": trajectory.curvature_control_mean_inv_m,
+        "curvature_control_std_inv_m": trajectory.curvature_control_std_inv_m,
+        "expert_projection": "production_smooth_heading_regularized_least_squares",
+        "maximum_expert_projection_ade_m": (
+            data.expert_waypoint_spacing_m * MAXIMUM_EXPERT_PROJECTION_ADE_RATIO
+        ),
     }
 
 
@@ -104,12 +111,10 @@ class PreparedPolicyDataset(Dataset):
             "point_goal": (self.count, 2),
             "observation_to_current": (self.count, data.observation_frames, 4),
             "observation_valid": (self.count, data.observation_frames),
-            "control_points": (
+            "curve_values": (
                 self.count,
-                trajectory.num_target_control_points,
-                2,
+                trajectory.num_curvature_control_points + 1,
             ),
-            "reference_path": (self.count, trajectory.num_path_points, 2),
         }
         invalid_shapes = {
             name: (tuple(self.arrays[name].shape), shape)
@@ -121,13 +126,15 @@ class PreparedPolicyDataset(Dataset):
         finite_arrays = (
             "point_goal",
             "observation_to_current",
-            "control_points",
-            "reference_path",
+            "curve_values",
         )
         if any(not np.isfinite(self.arrays[name]).all() for name in finite_arrays):
             raise ValueError(
                 f"prepared policy split contains non-finite values: {split}"
             )
+        curve_values = self.arrays["curve_values"]
+        if np.any(curve_values[:, 0] <= 0):
+            raise ValueError(f"prepared curve lengths must be positive: {split}")
         if not self.arrays["observation_valid"][:, -1].all():
             raise ValueError(
                 f"prepared policy split has an invalid current frame: {split}"

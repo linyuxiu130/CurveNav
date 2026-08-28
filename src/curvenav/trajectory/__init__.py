@@ -1,30 +1,17 @@
-"""Planar target fitting and executable bounded-curvature geometry."""
-
-from .bspline import (
-    ARC_LENGTH_OVERSAMPLE_FACTOR,
-    BSPLINE_BENDING_REGULARIZATION_M4,
-    PlanarBSplineCodec,
-)
+"""The single expert and production metric curve geometry."""
 from .curvature import (
-    BoundedCurvatureTrajectory,
     CURVATURE_PARAMETERIZATION_TYPE,
+    CURVATURE_VARIATION_REGULARIZATION,
     CURVE_INTEGRATION_OVERSAMPLE_FACTOR,
-    CURVATURE_TARGET_REGULARIZATION,
-    LENGTH_LOGIT_SCALE,
-    MAXIMUM_LOCAL_DETOUR_RATIO,
+    MetricCurvatureTrajectory,
 )
 from .resampling import path_arc_length, resample_path_by_arc_length
 
 __all__ = [
-    "PlanarBSplineCodec",
-    "ARC_LENGTH_OVERSAMPLE_FACTOR",
-    "BSPLINE_BENDING_REGULARIZATION_M4",
-    "BoundedCurvatureTrajectory",
+    "MetricCurvatureTrajectory",
     "CURVATURE_PARAMETERIZATION_TYPE",
+    "CURVATURE_VARIATION_REGULARIZATION",
     "CURVE_INTEGRATION_OVERSAMPLE_FACTOR",
-    "CURVATURE_TARGET_REGULARIZATION",
-    "LENGTH_LOGIT_SCALE",
-    "MAXIMUM_LOCAL_DETOUR_RATIO",
     "path_arc_length",
     "resample_path_by_arc_length",
 ]

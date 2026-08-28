@@ -13,9 +13,11 @@ from typing import Any
 import numpy as np
 from scipy.interpolate import splev, splprep
 
+from curvenav.physical import EXTRA_CLEARANCE_M
+
 
 SAFETY_STEP_M = 0.025
-MIN_CLEARANCE_M = 0.10
+MIN_CLEARANCE_M = EXTRA_CLEARANCE_M
 ENDPOINT_CLEARANCE_M = 0.30
 MAX_SNAP_M = 0.06
 MAX_CURVATURE = 10.0

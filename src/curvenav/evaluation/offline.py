@@ -61,6 +61,17 @@ def trajectory_batch_metrics(
     goal_distance = torch.linalg.vector_norm(point_goal, dim=-1)
     path_delta = path[:, 1:] - path[:, :-1]
     reference_delta = reference_path[:, 1:] - reference_path[:, :-1]
+    path_segment_length = torch.linalg.vector_norm(path_delta, dim=-1)
+    reference_segment_length = torch.linalg.vector_norm(reference_delta, dim=-1)
+    total_abs_heading_change = (
+        0.5 * (curvature[:, :-1].abs() + curvature[:, 1:].abs())
+        * path_segment_length
+    ).sum(dim=-1)
+    reference_total_abs_heading_change = (
+        0.5
+        * (reference_curvature[:, :-1].abs() + reference_curvature[:, 1:].abs())
+        * reference_segment_length
+    ).sum(dim=-1)
     tangent_dot = (path_delta[:, 1:] * path_delta[:, :-1]).sum(dim=-1)
     final_predicted_direction = path_delta[:, -1] / torch.linalg.vector_norm(
         path_delta[:, -1], dim=-1, keepdim=True
@@ -85,6 +96,10 @@ def trajectory_batch_metrics(
         - torch.linalg.vector_norm(point_goal - reference_path[:, -1], dim=-1),
         "max_abs_curvature_inv_m": curvature.abs().amax(dim=-1),
         "reference_max_abs_curvature_inv_m": reference_curvature.abs().amax(dim=-1),
+        "total_abs_heading_change_rad": total_abs_heading_change,
+        "reference_total_abs_heading_change_rad": (
+            reference_total_abs_heading_change
+        ),
         "terminal_heading_error_rad": torch.atan2(final_cross, final_dot).abs(),
         "has_tangent_reversal": (tangent_dot < 0).any(dim=-1),
     }
@@ -148,16 +163,13 @@ def measure_policy(
         current_frame_valid[:, -1] = True
         current_frame_batch["observation_valid"] = current_frame_valid
         current_prepared, current_prediction = _sample(policy, current_frame_batch)
-        smoothed_reference_path = policy.target_codec.decode_equal_arc(
-            prepared.target.control_points.float()
-        )
-        _, _, reference_curvature = policy.curve_codec.path_geometry(
-            smoothed_reference_path
+        reference_path, _, reference_curvature = policy.curve_codec.decode_values(
+            prepared.target.curve_values.float(),
         )
         metrics = trajectory_batch_metrics(
             prediction.path.float(),
             prediction.curvature.float(),
-            prepared.target.reference_path.float(),
+            reference_path,
             reference_curvature,
             prepared.condition.point_goal.float(),
         )
@@ -167,7 +179,7 @@ def measure_policy(
         current_metrics = trajectory_batch_metrics(
             current_prediction.path.float(),
             current_prediction.curvature.float(),
-            current_prepared.target.reference_path.float(),
+            reference_path,
             reference_curvature,
             current_prepared.condition.point_goal.float(),
         )
@@ -201,10 +213,11 @@ def measure_policy(
 
 def summarize_policy_metrics(metrics: dict[str, Tensor]) -> dict[str, float | int]:
     reference_curvature = metrics["reference_max_abs_curvature_inv_m"]
-    high_curvature_threshold = torch.quantile(reference_curvature, 0.9)
-    high_curvature = reference_curvature >= high_curvature_threshold
-    predicted_high_curvature = metrics["max_abs_curvature_inv_m"][high_curvature]
-    reference_high_curvature = reference_curvature[high_curvature]
+    reference_turn = metrics["reference_total_abs_heading_change_rad"]
+    high_turn_threshold = torch.quantile(reference_turn, 0.9)
+    high_turn = reference_turn >= high_turn_threshold
+    predicted_high_turn = metrics["total_abs_heading_change_rad"][high_turn]
+    reference_high_turn = reference_turn[high_turn]
     result = {
         "ade_m": metrics["ade_m"].mean().item(),
         "rmse_m": metrics["rmse_m"].mean().item(),
@@ -226,22 +239,26 @@ def summarize_policy_metrics(metrics: dict[str, Tensor]) -> dict[str, float | in
         "terminal_heading_error_rad": metrics["terminal_heading_error_rad"]
         .mean()
         .item(),
-        "high_curvature_threshold_inv_m": high_curvature_threshold.item(),
-        "high_curvature_samples": int(high_curvature.sum().item()),
-        "ade_m_high_curvature_10pct": metrics["ade_m"][high_curvature].mean().item(),
-        "terminal_heading_error_rad_high_curvature_10pct": metrics[
-            "terminal_heading_error_rad"
-        ][high_curvature]
+        "total_abs_heading_change_rad": metrics["total_abs_heading_change_rad"]
         .mean()
         .item(),
-        "predicted_max_abs_curvature_inv_m_high_curvature_10pct": (
-            predicted_high_curvature.mean().item()
+        "reference_total_abs_heading_change_rad": reference_turn.mean().item(),
+        "high_turn_threshold_rad": high_turn_threshold.item(),
+        "high_turn_samples": int(high_turn.sum().item()),
+        "ade_m_high_turn_10pct": metrics["ade_m"][high_turn].mean().item(),
+        "terminal_heading_error_rad_high_turn_10pct": metrics[
+            "terminal_heading_error_rad"
+        ][high_turn]
+        .mean()
+        .item(),
+        "predicted_total_abs_heading_change_rad_high_turn_10pct": (
+            predicted_high_turn.mean().item()
         ),
-        "reference_max_abs_curvature_inv_m_high_curvature_10pct": (
-            reference_high_curvature.mean().item()
+        "reference_total_abs_heading_change_rad_high_turn_10pct": (
+            reference_high_turn.mean().item()
         ),
-        "predicted_to_reference_curvature_ratio_high_curvature_10pct": (
-            predicted_high_curvature.mean() / reference_high_curvature.mean()
+        "predicted_to_reference_turn_ratio_high_turn_10pct": (
+            predicted_high_turn.mean() / reference_high_turn.mean().clamp_min(1e-6)
         ).item(),
         "max_abs_curvature_correlation": torch.corrcoef(
             torch.stack(
@@ -289,17 +306,17 @@ def evaluate_policy(
         "trajectories_per_observation": 1,
         **summarize_policy_metrics(measurements.metrics),
         "current_frame_only_ade_m": current_frame_summary["ade_m"],
-        "current_frame_only_ade_m_high_curvature_10pct": (
-            current_frame_summary["ade_m_high_curvature_10pct"]
+        "current_frame_only_ade_m_high_turn_10pct": (
+            current_frame_summary["ade_m_high_turn_10pct"]
         ),
-        "current_frame_only_terminal_heading_error_rad_high_curvature_10pct": (
+        "current_frame_only_terminal_heading_error_rad_high_turn_10pct": (
             current_frame_summary[
-                "terminal_heading_error_rad_high_curvature_10pct"
+                "terminal_heading_error_rad_high_turn_10pct"
             ]
         ),
-        "current_frame_only_curvature_ratio_high_curvature_10pct": (
+        "current_frame_only_turn_ratio_high_turn_10pct": (
             current_frame_summary[
-                "predicted_to_reference_curvature_ratio_high_curvature_10pct"
+                "predicted_to_reference_turn_ratio_high_turn_10pct"
             ]
         ),
         "current_frame_only_negative_progress_fraction": current_frame_summary[

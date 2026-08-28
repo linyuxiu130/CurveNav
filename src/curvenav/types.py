@@ -36,31 +36,34 @@ class PolicyCondition:
 
 @dataclass
 class DepthFeatures:
-    """Per-frame depth tokens with metric geometry already embedded."""
+    """Per-frame visual and metric geometry tokens."""
 
     tokens: Tensor
+    points: Tensor
+    depth: Tensor
+    obstacle_valid: Tensor
 
 
 @dataclass
 class ConditionFeatures:
+    """Contextual condition memory plus current metric visual geometry."""
+
     tokens: Tensor
-    route_token: Tensor
+    current_tokens: Tensor
+    current_points: Tensor
+    current_obstacle_valid: Tensor
+    point_goal: Tensor
 
 
 @dataclass
 class TrajectoryTarget:
-    """Smoothed expert controls and their uniform-arc reference path."""
+    """Expert metric length and curvature controls used by the production codec."""
 
-    control_points: Tensor
-    reference_path: Tensor
+    curve_values: Tensor
 
     def validate(self) -> None:
-        if self.control_points.ndim != 3 or self.control_points.shape[-1] != 2:
-            raise ValueError("control_points must have shape [B,K,2]")
-        if self.reference_path.ndim != 3 or self.reference_path.shape[-1] != 2:
-            raise ValueError("reference_path must have shape [B, P, 2]")
-        if self.control_points.shape[0] != self.reference_path.shape[0]:
-            raise ValueError("trajectory target batch sizes must match")
+        if self.curve_values.ndim != 2:
+            raise ValueError("curve_values must have shape [B,C]")
 
 
 @dataclass

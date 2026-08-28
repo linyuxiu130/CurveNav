@@ -16,7 +16,6 @@ def test_base_mapping_has_one_prepared_dataset_and_fixed_future_contract() -> No
             },
             "model": {
                 "trajectory": {
-                    "num_target_control_points": 8,
                     "num_curvature_control_points": 7,
                 },
                 "trajectory_decoder": {"transformer_layers": 3},
@@ -26,7 +25,6 @@ def test_base_mapping_has_one_prepared_dataset_and_fixed_future_contract() -> No
     assert config.data.root == "data/policy_dataset"
     assert config.data.frame_spacing_m == 0.45
     assert config.data.future_steps == 24
-    assert config.trajectory.num_target_control_points == 8
     assert config.trajectory.num_curvature_control_points == 7
     assert config.trajectory_decoder.transformer_layers == 3
 
@@ -52,6 +50,10 @@ def test_rejects_removed_architecture_switches() -> None:
         config_from_mapping({"model": {"trajectory": {"scale_xy": [3.0, 3.0]}}})
     with pytest.raises(TypeError, match="normalization_scale_m"):
         config_from_mapping({"model": {"trajectory": {"normalization_scale_m": 4.0}}})
+    with pytest.raises(TypeError, match="maximum_curvature_inv_m"):
+        config_from_mapping(
+            {"model": {"trajectory": {"maximum_curvature_inv_m": 4.0}}}
+        )
     with pytest.raises(ValueError, match="unknown model config keys"):
         config_from_mapping({"model": {"trajectory_evaluator": {}}})
 
@@ -73,7 +75,7 @@ def test_training_batch_contract_is_global_and_exact() -> None:
         }
     )
     assert config.training.global_batch_size == 1024
-    assert config.training.per_device_batch_size == 192
+    assert config.training.per_device_batch_size == 256
     with pytest.raises(TypeError, match="micro_batch_size"):
         config_from_mapping({"training": {"micro_batch_size": 128}})
     with pytest.raises(ValueError, match="samples_per_epoch"):
@@ -85,20 +87,12 @@ def test_training_batch_contract_is_global_and_exact() -> None:
 
 
 def test_rejects_invalid_trajectory_contract() -> None:
-    with pytest.raises(ValueError, match="cubic"):
+    with pytest.raises(TypeError, match="target_spline_degree"):
         config_from_mapping({"model": {"trajectory": {"target_spline_degree": 2}}})
     with pytest.raises(ValueError, match="cubic curvature"):
         config_from_mapping({"model": {"trajectory": {"curvature_spline_degree": 2}}})
     with pytest.raises(ValueError, match="cover"):
         config_from_mapping({"model": {"trajectory": {"num_path_points": 4}}})
-    with pytest.raises(ValueError, match="exactly eight"):
-        replace(
-            CurveNavConfig(),
-            trajectory=replace(
-                CurveNavConfig().trajectory,
-                num_target_control_points=5,
-            ),
-        ).validate()
     with pytest.raises(ValueError, match="exactly seven"):
         replace(
             CurveNavConfig(),
@@ -107,6 +101,11 @@ def test_rejects_invalid_trajectory_contract() -> None:
                 num_curvature_control_points=6,
             ),
         ).validate()
+
+    with pytest.raises(ValueError, match="exactly eight"):
+        config_from_mapping(
+            {"model": {"trajectory_decoder": {"flow_steps": 7}}}
+        )
 
 
 def test_rejects_non_production_observation_frame_count() -> None:

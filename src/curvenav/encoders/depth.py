@@ -11,7 +11,7 @@ from .geometry import MetricDepthProjector
 
 
 DEPTH_ENCODER_TYPE = (
-    "sand_resnet18_groupnorm_stage3_spatial_tokens_plus_metric_xyz_8x12"
+    "sand_resnet18_groupnorm_stage3_body_first_metric_geometry_tokens_8x12"
 )
 
 
@@ -126,7 +126,7 @@ class DepthObservationEncoder(nn.Module):
             camera_downward_pitch_degrees,
         )
         self.geometry_projection = nn.Sequential(
-            nn.Linear(4, model_dim),
+            nn.Linear(6, model_dim),
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
@@ -182,14 +182,22 @@ class DepthObservationEncoder(nn.Module):
         features = self.adaptive_pool(self.spatial_projection(features))
         features = features.flatten(2).transpose(1, 2)
         position = self.position_2d.to(device=features.device, dtype=features.dtype)
-        metric_points, pooled_depth = self.metric_projector(
+        projection = self.metric_projector(
             depth,
             observation_to_current,
         )
+        metric_points = projection.points
+        pooled_depth = projection.depth
+        body_obstacle = projection.obstacle_valid & observation_valid[..., None]
+        surface_valid = pooled_depth < self.metric_projector.max_depth_m
         geometry = torch.cat(
             (
                 metric_points / self.metric_projector.max_depth_m,
                 pooled_depth[..., None] / self.metric_projector.max_depth_m,
+                surface_valid[..., None].to(metric_points.dtype),
+                body_obstacle.reshape_as(pooled_depth)[..., None].to(
+                    metric_points.dtype
+                ),
             ),
             dim=-1,
         )
@@ -201,4 +209,9 @@ class DepthObservationEncoder(nn.Module):
             tokens,
             torch.zeros_like(tokens),
         )
-        return DepthFeatures(tokens=tokens)
+        return DepthFeatures(
+            tokens=tokens,
+            points=metric_points,
+            depth=pooled_depth,
+            obstacle_valid=body_obstacle,
+        )

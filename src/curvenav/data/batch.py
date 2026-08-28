@@ -21,8 +21,7 @@ def unpack_policy_batch(batch: Mapping[str, object]) -> PreparedPolicyBatch:
         "point_goal",
         "observation_to_current",
         "observation_valid",
-        "control_points",
-        "reference_path",
+        "curve_values",
     )
     missing = [key for key in required if key not in batch]
     if missing:
@@ -37,8 +36,7 @@ def unpack_policy_batch(batch: Mapping[str, object]) -> PreparedPolicyBatch:
         observation_valid=batch["observation_valid"],  # type: ignore[arg-type]
     )
     target = TrajectoryTarget(
-        control_points=batch["control_points"],  # type: ignore[arg-type]
-        reference_path=batch["reference_path"],  # type: ignore[arg-type]
+        curve_values=batch["curve_values"],  # type: ignore[arg-type]
     )
     condition.validate()
     target.validate()

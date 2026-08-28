@@ -61,7 +61,7 @@ def test_optimizer_step_uses_loss_scale_as_the_overflow_signal(
     assert _optimizer_step_succeeded(optimizer, scaler) is succeeded
 
 
-def test_checkpoint_records_the_direct_bounded_curvature_contract() -> None:
+def test_checkpoint_records_the_metric_curvature_flow_contract() -> None:
     config = CurveNavConfig()
     model = nn.Linear(2, 2)
     optimizer = AdamW(model.parameters())
@@ -81,31 +81,38 @@ def test_checkpoint_records_the_direct_bounded_curvature_contract() -> None:
     contract = checkpoint["policy_contract"]
     assert (
         checkpoint["checkpoint_type"]
-        == "curvenav_direct_geometry_supervised_bounded_curvature_policy"
+        == "curvenav_metric_curve_flow_policy"
     )
     assert {"model", "optimizer", "scheduler", "ema", "grad_scaler"} <= set(checkpoint)
     assert "extra" not in checkpoint
     assert (
         contract["trajectory_decoder_type"]
-        == "ordered_route_conditioned_bounded_curvature_decoder"
+        == "metric_path_conditioned_curve_flow_transformer"
     )
-    assert contract["curve_coordinate_scale"] == pytest.approx(8.0)
-    assert (
-        contract["training_objective"]
-        == "direct_curve_coordinates_plus_metric_path_and_tangent"
+    assert contract["flow_steps"] == 8
+    assert contract["flow_source"] == (
+        "isotropic_gaussian_training_prior_with_fixed_typical_set_inference"
+    )
+    assert contract["flow_path"] == (
+        "conditional_optimal_transport_displacement_interpolation"
+    )
+    assert contract["flow_solver"] == "fixed_step_heun"
+    assert contract["flow_time_embedding"] == "smooth_scalar_mlp"
+    assert contract["training_objective"] == (
+        "conditional_flow_matching_euclidean_velocity_mse"
     )
     assert (
         contract["trajectory_prediction"]
-        == "single_direct_bounded_curvature_trajectory"
+        == "single_flow_generated_smooth_metric_curvature_trajectory"
     )
     assert contract["temporal_modeling"] == (
-        "executed_metric_observation_history_with_masked_state_summary"
+        "history_transforms_only_align_geometry_without_a_route_state_token"
     )
     assert contract["history_training_distribution"] == (
         "uniform_valid_observation_suffix_marginalization"
     )
-    assert contract["state_token_count"] == 1
-    assert not any("flow" in key for key in contract)
+    assert contract["state_token_count"] == 0
+    assert contract["flow_steps"] == 8
     assert "trajectory_candidate_samples" not in contract
     assert contract["camera_extrinsics"] == {
         "forward_offset_m": pytest.approx(0.28618),
@@ -113,31 +120,49 @@ def test_checkpoint_records_the_direct_bounded_curvature_contract() -> None:
         "downward_pitch_degrees": pytest.approx(10.0),
     }
     assert contract["num_curve_tokens"] == 8
-    assert contract["route_query_count"] == 4
+    assert "route_query_count" not in contract
+    assert contract["condition_token_count"] == 129
+    assert contract["body_obstacle_geometry"] == {
+        "robot_radius_m": pytest.approx(0.25),
+        "extra_clearance_m": pytest.approx(0.10),
+        "robot_height_m": pytest.approx(0.70),
+        "minimum_obstacle_height_m": pytest.approx(0.05),
+    }
     assert contract["num_curvature_control_points"] == 7
     assert contract["path_sampling"] == "fixed_uniform_metric_arc_progress"
     assert contract["curve_coordinates"] == (
-        "bounded_local_arc_length_zero_tangent_cubic_curvature_bspline"
+        "shared_expert_and_policy_softplus_arc_length_cubic_curvature_bspline"
     )
-    assert contract["curve_planning_horizon_m"] == pytest.approx(3.6)
-    assert contract["maximum_local_detour_ratio"] == pytest.approx(2.0)
-    assert contract["length_logit_scale"] == pytest.approx(8.0)
-    assert contract["maximum_continuous_curvature_inv_m"] == pytest.approx(8.0)
+    assert contract["visual_planning_scale_m"] == pytest.approx(3.6)
+    assert contract["curve_value_semantics"] == (
+        "metric_arc_length_m_then_curvature_controls_inv_m"
+    )
+    assert contract["flow_length_transform"] == "standardized_inverse_softplus"
+    assert contract["length_pretransform_mean"] == pytest.approx(2.9015713)
+    assert contract["length_pretransform_std"] == pytest.approx(1.2541461)
+    assert contract["curvature_control_mean_inv_m"] == pytest.approx(-0.01326337)
+    assert contract["curvature_control_std_inv_m"] == pytest.approx(0.31984258)
+    assert contract["inference_source_seed"] == 20_260_828
+    assert contract["training_source_endpoint_probability"] == pytest.approx(1 / 9)
+    assert "maximum_local_detour_ratio" not in contract
+    assert "maximum_continuous_curvature_inv_m" not in contract
+    assert contract["curvature_variation_regularization"] == pytest.approx(1e-3)
     assert contract["model_architecture"] == {
         "model_dim": 384,
         "depth_token_grid": [8, 12],
         "depth_dropout": 0.0,
         "point_goal_hidden_dim": 384,
-        "condition_layers": 4,
         "condition_heads": 8,
+        "condition_layers": 4,
         "condition_dropout": 0.0,
-        "trajectory_decoder_layers": 8,
+        "trajectory_decoder_layers": 12,
         "trajectory_decoder_heads": 8,
+        "trajectory_path_tokens": 16,
         "trajectory_decoder_dropout": 0.0,
     }
     assert (
         contract["visual_compression"]
-        == "32_current_plus_32_full_context_metric_geometry_queries"
+        == "full_current_grid_plus_32_history_geometry_queries"
     )
     assert (
         contract["observation_to_current"]
@@ -148,9 +173,7 @@ def test_checkpoint_records_the_direct_bounded_curvature_contract() -> None:
 def test_checkpoint_contract_catches_geometry_mismatch() -> None:
     config = CurveNavConfig()
     checkpoint = {
-        "checkpoint_type": (
-            "curvenav_direct_geometry_supervised_bounded_curvature_policy"
-        ),
+        "checkpoint_type": "curvenav_metric_curve_flow_policy",
         "policy_contract": build_policy_contract(config),
     }
     validate_policy_contract(checkpoint, config)
@@ -254,7 +277,7 @@ def test_training_contract_preserves_global_optimization_across_one_to_eight_gpu
             <= 1024
             <= contract["maximum_per_rank_batch_size"] * world_size
         )
-        assert contract["per_device_batch_size"] == 192
+        assert contract["per_device_batch_size"] == 256
         assert contract["global_batch_size"] == 1024
         assert contract["steps_per_epoch"] == 40
         assert contract["total_steps"] == 8000

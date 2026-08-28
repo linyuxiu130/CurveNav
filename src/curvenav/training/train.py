@@ -255,8 +255,19 @@ def run_training(
                     )
                     with accelerator.autocast():
                         losses = policy(prepared.condition, prepared.target)
-                    if not torch.isfinite(losses.loss.detach()):
-                        raise FloatingPointError("CurveNav training loss is non-finite")
+                    detached_losses = torch.stack(losses.logging_values()).detach()
+                    if not torch.isfinite(detached_losses).all():
+                        values = {
+                            name: float(value)
+                            for name, value in zip(
+                                TRAINING_LOSS_NAMES,
+                                detached_losses,
+                                strict=True,
+                            )
+                        }
+                        raise FloatingPointError(
+                            f"CurveNav training loss is non-finite: {values}"
+                        )
                     batch_weight = (
                         accelerator.num_processes
                         * prepared.condition.depth.shape[0]

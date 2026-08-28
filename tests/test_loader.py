@@ -14,6 +14,8 @@ from curvenav.data.prepare import (
     _cumulative_distance,
     _frame_indices,
     _fixed_future,
+    _observation_to_current,
+    _planar_local,
 )
 from curvenav.data.prepared import PreparedPolicyDataset, RepeatedPolicyDataset
 from curvenav.training.batching import (
@@ -28,6 +30,7 @@ def _write_dataset(root, count: int = 4) -> None:
         "frame_spacing_m": 0.45,
         "expert_waypoint_spacing_m": 0.15,
         "future_steps": 24,
+        "planar_axis_convention": "x_forward_y_left",
         "observation_to_current_semantics": "planar_rigid_transform_from_observation_to_current_frame",
         "image_height": 126,
         "image_width": 224,
@@ -37,9 +40,16 @@ def _write_dataset(root, count: int = 4) -> None:
         "camera_forward_offset_m": 0.28618,
         "camera_height_m": 0.62532,
         "camera_downward_pitch_degrees": 10.0,
-        "num_control_points": 8,
+        "num_curve_values": 8,
         "num_path_points": 64,
-        "bspline_bending_regularization_m4": 1e-5,
+        "curve_value_semantics": "metric_arc_length_m_then_curvature_controls_inv_m",
+        "flow_length_transform": "standardized_inverse_softplus",
+        "length_pretransform_mean": 2.901571273803711,
+        "length_pretransform_std": 1.2541460990905762,
+        "curvature_control_mean_inv_m": -0.013263368047773838,
+        "curvature_control_std_inv_m": 0.3198425769805908,
+        "expert_projection": "production_smooth_heading_regularized_least_squares",
+        "maximum_expert_projection_ade_m": 0.03,
     }
     root.mkdir()
     (root / "manifest.json").write_text(json.dumps({"contract": contract}))
@@ -54,8 +64,10 @@ def _write_dataset(root, count: int = 4) -> None:
                 np.array([0.0, 0.0, 0.0, 1.0], np.float32), (count, 4, 1)
             ),
             "observation_valid": np.ones((count, 4), np.bool_),
-            "control_points": np.zeros((count, 8, 2), np.float32),
-            "reference_path": np.zeros((count, 64, 2), np.float32),
+            "curve_values": np.tile(
+                np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], np.float32),
+                (count, 1),
+            ),
         }
         metadata = {}
         for name, value in arrays.items():
@@ -93,15 +105,30 @@ def test_prepared_dataset_has_one_fixed_tensor_contract(tmp_path) -> None:
         "point_goal",
         "observation_to_current",
         "observation_valid",
-        "control_points",
-        "reference_path",
+        "curve_values",
     }
     assert sample["depth_indices"].dtype == torch.uint32
-    assert sample["control_points"].shape == (8, 2)
-    assert sample["reference_path"].shape == (64, 2)
+    assert sample["curve_values"].shape == (8,)
     bank = load_packed_depth_bank(dataset.depth_bank, torch.device("cpu"))
     depth = gather_depth_observations(bank, sample["depth_indices"].unsqueeze(0))
     assert depth.shape == (1, 4, 1, 126, 224)
+
+
+def test_habitat_xz_routes_are_converted_to_x_forward_y_left() -> None:
+    # Facing world +X, world -Z is physically left and world +Z is right.
+    points = np.array([[1.0, -2.0], [1.0, 2.0]], dtype=np.float32)
+    local = _planar_local(points, np.zeros(2, dtype=np.float32), 0.0)
+    np.testing.assert_allclose(local, [[1.0, 2.0], [1.0, -2.0]])
+
+    # A past pose whose route angle is +90 degrees is a physical right turn,
+    # hence its body-yaw delta in the current left-positive frame is -90.
+    transform = _observation_to_current(
+        np.zeros((4, 2), dtype=np.float32),
+        np.array([np.pi / 2, 0.0, 0.0, 0.0], dtype=np.float32),
+        0.0,
+        4,
+    )
+    np.testing.assert_allclose(transform[0, 2:], [-1.0, 0.0], atol=1e-6)
 
 
 def test_prepared_dataset_rejects_geometry_contract_mismatch(tmp_path) -> None:
@@ -187,6 +214,14 @@ def test_six_rank_batches_cover_exact_global_step_without_padding() -> None:
     assert len(set(covered)) == 1024
     ddp_weight = sum(6 * len(batch) / 1024 for batches in rank_batches for batch in batches)
     assert ddp_weight / 6 == pytest.approx(1.0)
+
+
+def test_micro_batches_are_balanced_for_one_static_compiled_shape() -> None:
+    four_gpu = DistributedStepBatchSampler(1, 1024, 192, rank=0, world_size=4)
+    assert list(map(len, four_gpu)) == [128, 128]
+
+    two_gpu = DistributedStepBatchSampler(1, 1024, 192, rank=0, world_size=2)
+    assert list(map(len, two_gpu)) == [171, 171, 170]
 
 
 def test_fixed_future_uses_steps_without_rescaling_metric_length() -> None:

@@ -37,11 +37,10 @@ from curvenav.data_generation.geometry import (
     source_family,
     source_route,
 )
+from curvenav.physical import ROBOT_HEIGHT_M, ROBOT_RADIUS_M
 
 
 GRID_CELL_M = 0.05
-ROBOT_RADIUS_M = 0.25
-ROBOT_HEIGHT_M = 0.70
 SCHEMA = "curvenav_hssd_expert_routes"
 
 

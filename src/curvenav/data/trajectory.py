@@ -1,17 +1,23 @@
-"""Shared collation of variable-length metric expert paths."""
+"""Project variable-length expert paths into CurveNav's production codec."""
 
 import torch
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 
-from curvenav.trajectory import PlanarBSplineCodec, resample_path_by_arc_length
+from curvenav.trajectory import MetricCurvatureTrajectory, resample_path_by_arc_length
+
+
+MAXIMUM_EXPERT_PROJECTION_ADE_RATIO = 0.2
 
 
 def collate_metric_paths(
     metric_paths: list[Tensor],
-    codec: PlanarBSplineCodec,
-) -> tuple[Tensor, Tensor]:
-    if not metric_paths or any(path.ndim != 2 or path.shape[-1] != 2 for path in metric_paths):
+    codec: MetricCurvatureTrajectory,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Return metric controls, decoded targets, and source projection error."""
+    if not metric_paths or any(
+        path.ndim != 2 or path.shape[-1] != 2 for path in metric_paths
+    ):
         raise ValueError("metric_paths must be a non-empty list of [N,2] tensors")
     lengths = torch.tensor([path.shape[0] for path in metric_paths])
     if torch.any(lengths < 2):
@@ -20,8 +26,13 @@ def collate_metric_paths(
     padding = torch.arange(padded.shape[1]).unsqueeze(0) >= lengths.unsqueeze(1)
     endpoints = torch.stack([path[-1] for path in metric_paths])
     padded = torch.where(padding.unsqueeze(-1), endpoints.unsqueeze(1), padded)
-    reference_path = resample_path_by_arc_length(
+    source_reference = resample_path_by_arc_length(
         padded,
         num_samples=codec.num_path_points,
     )
-    return reference_path, codec.encode(reference_path)
+    values, reference_path, _, _ = codec.project_expert(source_reference)
+    projection_error = torch.linalg.vector_norm(
+        reference_path - source_reference,
+        dim=-1,
+    ).mean(1)
+    return values, reference_path, projection_error

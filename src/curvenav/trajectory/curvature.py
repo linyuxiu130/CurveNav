@@ -1,30 +1,26 @@
-"""Bounded-horizon trajectories with a hard continuous-curvature bound."""
+"""Smooth metric trajectories in an unconstrained Euclidean Flow space."""
 
 import torch
 from torch import Tensor, nn
 
-from .bspline import bspline_basis_matrix
+from .basis import bspline_basis_matrix
 
 
 CURVATURE_PARAMETERIZATION_TYPE = (
-    "bounded_local_arc_length_zero_tangent_cubic_curvature_bspline"
+    "shared_expert_and_policy_softplus_arc_length_cubic_curvature_bspline"
 )
 CURVE_INTEGRATION_OVERSAMPLE_FACTOR = 4
-CURVATURE_TARGET_REGULARIZATION = 0.3
-MAXIMUM_LOCAL_DETOUR_RATIO = 2.0
-LENGTH_LOGIT_SCALE = 8.0
+CURVATURE_VARIATION_REGULARIZATION = 1e-3
 
 
-class BoundedCurvatureTrajectory(nn.Module):
+class MetricCurvatureTrajectory(nn.Module):
     """Encode and decode a forward arc-length curve.
 
-    Token zero contains bounded total arc length.  The remaining tokens contain
-    the control values of a cubic B-spline curvature profile.  The initial
-    tangent is the robot forward axis.
-
-    Cubic B-spline bases are non-negative and form a partition of unity.  Since
-    every curvature control is mapped through ``tanh``, the complete continuous
-    profile satisfies ``abs(kappa(s)) < maximum_curvature_inv_m``.
+    Dataset values are physical arc length in metres followed by seven physical
+    cubic B-spline curvature controls in inverse metres.  Flow coordinates are
+    standardized pre-softplus length and standardized curvature.  This is a
+    bijection between positive length and an unconstrained Euclidean coordinate;
+    no PointGoal-dependent cap or curvature saturation is part of the model.
     """
 
     def __init__(
@@ -32,8 +28,10 @@ class BoundedCurvatureTrajectory(nn.Module):
         num_curvature_control_points: int,
         degree: int,
         num_path_points: int,
-        planning_horizon_m: float,
-        maximum_curvature_inv_m: float,
+        length_pretransform_mean: float,
+        length_pretransform_std: float,
+        curvature_control_mean_inv_m: float,
+        curvature_control_std_inv_m: float,
     ) -> None:
         super().__init__()
         if degree != 3:
@@ -42,43 +40,64 @@ class BoundedCurvatureTrajectory(nn.Module):
             raise ValueError("curvature controls must support the spline degree")
         if num_path_points < 3:
             raise ValueError("num_path_points must be at least three")
-        if planning_horizon_m <= 0 or maximum_curvature_inv_m <= 0:
-            raise ValueError("trajectory metric scales must be positive")
+        if length_pretransform_std <= 0 or curvature_control_std_inv_m <= 0:
+            raise ValueError("trajectory coordinate scales must be positive")
 
         self.num_curvature_control_points = num_curvature_control_points
         self.num_curve_tokens = num_curvature_control_points + 1
         self.degree = degree
         self.num_path_points = num_path_points
-        self.planning_horizon_m = float(planning_horizon_m)
-        self.maximum_curvature_inv_m = float(maximum_curvature_inv_m)
+        self.length_pretransform_mean = float(length_pretransform_mean)
+        self.length_pretransform_std = float(length_pretransform_std)
+        self.curvature_control_mean_inv_m = float(curvature_control_mean_inv_m)
+        self.curvature_control_std_inv_m = float(curvature_control_std_inv_m)
         dense_points = (num_path_points - 1) * CURVE_INTEGRATION_OVERSAMPLE_FACTOR + 1
-        target_basis = bspline_basis_matrix(
-            num_curvature_control_points,
-            degree,
-            num_path_points,
-        )
         integration_basis = bspline_basis_matrix(
             num_curvature_control_points,
             degree,
             dense_points,
-        )
-        target_normal = target_basis.T @ target_basis
-        target_projection = torch.linalg.solve(
-            target_normal
-            + CURVATURE_TARGET_REGULARIZATION * torch.eye(num_curvature_control_points),
-            target_basis.T,
-        )
-        self.register_buffer(
-            "target_curvature_projection",
-            target_projection,
-            persistent=True,
         )
         self.register_buffer(
             "integration_basis",
             integration_basis,
             persistent=True,
         )
-
+        unit_delta_heading = 0.5 * (
+            integration_basis[:-1] + integration_basis[1:]
+        ) / (dense_points - 1)
+        dense_heading_matrix = torch.cat(
+            (
+                torch.zeros(1, num_curvature_control_points),
+                unit_delta_heading.cumsum(dim=0),
+            ),
+            dim=0,
+        )
+        heading_control_matrix = dense_heading_matrix[
+            ::CURVE_INTEGRATION_OVERSAMPLE_FACTOR
+        ]
+        self.register_buffer(
+            "heading_control_matrix",
+            heading_control_matrix,
+            persistent=True,
+        )
+        heading_design = heading_control_matrix[1:]
+        first_difference = torch.zeros(
+            num_curvature_control_points - 1,
+            num_curvature_control_points,
+        )
+        difference_index = torch.arange(num_curvature_control_points - 1)
+        first_difference[difference_index, difference_index] = -1.0
+        first_difference[difference_index, difference_index + 1] = 1.0
+        normal_matrix = (
+            heading_design.T @ heading_design
+            + CURVATURE_VARIATION_REGULARIZATION
+            * (first_difference.T @ first_difference)
+        )
+        self.register_buffer(
+            "heading_fit_regularized_inverse",
+            torch.linalg.solve(normal_matrix, heading_design.T),
+            persistent=True,
+        )
     @staticmethod
     def path_geometry(path: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Return arc length, segment heading, and vertex-centered curvature."""
@@ -93,16 +112,9 @@ class BoundedCurvatureTrajectory(nn.Module):
         )
         support_length = 0.5 * (segment_length[:, 1:] + segment_length[:, :-1])
         vertex_curvature = turn / support_length.clamp_min(1e-6)
-        initial_turn = torch.atan2(
-            torch.sin(segment_heading[:, 0]),
-            torch.cos(segment_heading[:, 0]),
-        )
-        initial_curvature = (
-            2.0 * initial_turn / segment_length[:, 0].clamp_min(1e-6)
-        )
         curvature = torch.cat(
             (
-                initial_curvature[:, None],
+                vertex_curvature[:, :1],
                 vertex_curvature,
                 vertex_curvature[:, -1:],
             ),
@@ -110,82 +122,61 @@ class BoundedCurvatureTrajectory(nn.Module):
         )
         return segment_length.sum(dim=1), segment_heading, curvature
 
-    def encode_target(self, reference_path: Tensor, point_goal: Tensor) -> Tensor:
-        """Project an expert path into the single feasible curve coordinate space."""
-        if reference_path.shape[1:] != (self.num_path_points, 2):
-            raise ValueError("reference path does not match the curve codec")
-        if point_goal.shape != (reference_path.shape[0], 2):
-            raise ValueError("point_goal does not match the reference path")
-        reference_path = reference_path.float()
-        point_goal = point_goal.float()
-        length, _, reference_curvature = self.path_geometry(
-            reference_path
+    def values_from_coordinates(self, coordinates: Tensor) -> Tensor:
+        """Map Euclidean Flow coordinates to physical curve values."""
+        if coordinates.ndim != 2 or coordinates.shape[1] != self.num_curve_tokens:
+            raise ValueError("coordinates do not match the curve codec")
+        coordinates = coordinates.float()
+        length_pretransform = (
+            self.length_pretransform_mean
+            + self.length_pretransform_std * coordinates[:, :1]
         )
-        goal_distance = torch.linalg.vector_norm(point_goal, dim=-1)
-        maximum_length = torch.minimum(
-            torch.full_like(goal_distance, self.planning_horizon_m),
-            MAXIMUM_LOCAL_DETOUR_RATIO * goal_distance,
+        return torch.cat(
+            (
+                torch.nn.functional.softplus(length_pretransform),
+                self.curvature_control_mean_inv_m
+                + self.curvature_control_std_inv_m * coordinates[:, 1:],
+            ),
+            dim=-1,
         )
-        positive_length = maximum_length > 0
-        safe_maximum = torch.where(
-            positive_length,
-            maximum_length,
-            torch.ones_like(maximum_length),
-        )
-        length_fraction = torch.where(
-            positive_length,
-            length / safe_maximum,
-            0.5 * torch.ones_like(length),
-        )
-        epsilon = torch.finfo(reference_path.dtype).eps
-        length_fraction = length_fraction.clamp(epsilon, 1.0 - epsilon)
 
-        coordinates = torch.zeros(
-            reference_path.shape[0],
-            self.num_curve_tokens,
-            device=reference_path.device,
-            dtype=reference_path.dtype,
+    def coordinates_from_values(self, values: Tensor) -> Tensor:
+        """Map positive metric length and physical curvature to Flow space."""
+        if values.ndim != 2 or values.shape[1] != self.num_curve_tokens:
+            raise ValueError("values do not match the curve codec")
+        values = values.float()
+        length = values[:, :1]
+        length_pretransform = length + torch.log(-torch.expm1(-length))
+        return torch.cat(
+            (
+                (length_pretransform - self.length_pretransform_mean)
+                / self.length_pretransform_std,
+                (values[:, 1:] - self.curvature_control_mean_inv_m)
+                / self.curvature_control_std_inv_m,
+            ),
+            dim=-1,
         )
-        coordinates[:, 0] = torch.logit(length_fraction) / LENGTH_LOGIT_SCALE
-        projection = self.target_curvature_projection.to(
-            device=reference_path.device,
-            dtype=reference_path.dtype,
-        )
-        curvature_controls = (
-            projection[None] * reference_curvature[:, None]
-        ).sum(dim=-1)
-        bounded_fraction = (
-            curvature_controls / self.maximum_curvature_inv_m
-        ).clamp(-1.0 + epsilon, 1.0 - epsilon)
-        coordinates[:, 1:] = torch.atanh(bounded_fraction)
-        return coordinates
 
     def decode(
         self,
         coordinates: Tensor,
-        point_goal: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Decode coordinates into path, heading, and bounded curvature."""
-        if coordinates.ndim != 2 or coordinates.shape[1] != self.num_curve_tokens:
-            raise ValueError("coordinates do not match the curve codec")
-        if point_goal.shape != (coordinates.shape[0], 2):
-            raise ValueError("point_goal does not match the curve coordinates")
-        coordinates = coordinates.float()
-        point_goal = point_goal.float()
-        goal_distance = torch.linalg.vector_norm(point_goal, dim=-1)
-        maximum_length = torch.minimum(
-            torch.full_like(goal_distance, self.planning_horizon_m),
-            MAXIMUM_LOCAL_DETOUR_RATIO * goal_distance,
-        )
-        length = maximum_length * torch.sigmoid(
-            LENGTH_LOGIT_SCALE * coordinates[:, 0]
-        )
-        curvature_controls = self.maximum_curvature_inv_m * torch.tanh(
-            coordinates[:, 1:]
-        )
+        """Decode Euclidean Flow coordinates into physical curve geometry."""
+        return self.decode_values(self.values_from_coordinates(coordinates))
+
+    def decode_values(
+        self,
+        values: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Decode physical length and curvature controls."""
+        if values.ndim != 2 or values.shape[1] != self.num_curve_tokens:
+            raise ValueError("values do not match the curve codec")
+        values = values.float()
+        length = values[:, 0]
+        curvature_controls = values[:, 1:]
         basis = self.integration_basis.to(
-            device=coordinates.device,
-            dtype=coordinates.dtype,
+            device=values.device,
+            dtype=values.dtype,
         )
         dense_curvature = (
             basis[None] * curvature_controls[:, None]
@@ -212,11 +203,11 @@ class BoundedCurvatureTrajectory(nn.Module):
         dense_path = torch.cat(
             (
                 torch.zeros(
-                    coordinates.shape[0],
+                    values.shape[0],
                     1,
                     2,
-                    device=coordinates.device,
-                    dtype=coordinates.dtype,
+                    device=values.device,
+                    dtype=values.dtype,
                 ),
                 delta_position.cumsum(dim=1),
             ),
@@ -229,9 +220,73 @@ class BoundedCurvatureTrajectory(nn.Module):
             dense_curvature[:, ::stride],
         )
 
+    @torch.no_grad()
+    def project_expert(
+        self,
+        reference_path: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Project an equal-arc expert path into the production curve manifold.
+
+        For fixed arc length, sampled heading is linear in the seven curvature
+        controls.  A fixed Tikhonov solve minimizes heading error plus the
+        squared first difference of adjacent curvature controls.  This removes
+        non-identifiable alternating controls while retaining the production
+        codec's zero-heading boundary condition.  The metric projection is
+        decoded by the same function used at inference.
+        """
+        if reference_path.shape[1:] != (self.num_path_points, 2):
+            raise ValueError("expert path does not match the curve codec")
+        reference_path = reference_path.float()
+        segment = reference_path[:, 1:] - reference_path[:, :-1]
+        segment_length = torch.linalg.vector_norm(segment, dim=-1)
+        length = segment_length.sum(dim=1)
+        wrapped_heading = torch.atan2(segment[..., 1], segment[..., 0])
+        heading_change = torch.atan2(
+            torch.sin(wrapped_heading[:, 1:] - wrapped_heading[:, :-1]),
+            torch.cos(wrapped_heading[:, 1:] - wrapped_heading[:, :-1]),
+        )
+        unwrapped_heading = torch.cat(
+            (
+                wrapped_heading[:, :1],
+                wrapped_heading[:, :1] + heading_change.cumsum(dim=1),
+            ),
+            dim=1,
+        )
+        interior_heading = 0.5 * (
+            unwrapped_heading[:, :-1] + unwrapped_heading[:, 1:]
+        )
+        terminal_heading = unwrapped_heading[:, -1:] + 0.5 * (
+            unwrapped_heading[:, -1:] - unwrapped_heading[:, -2:-1]
+        )
+        target_heading = torch.cat(
+            (
+                torch.zeros_like(length[:, None]),
+                interior_heading,
+                terminal_heading,
+            ),
+            dim=1,
+        )
+        inverse = self.heading_fit_regularized_inverse.to(
+            device=reference_path.device,
+            dtype=reference_path.dtype,
+        )
+        curvature_controls = torch.einsum(
+            "kn,bn->bk",
+            inverse,
+            target_heading[:, 1:] / length[:, None].clamp_min(1e-6),
+        )
+        values = torch.cat(
+            (
+                length[:, None],
+                curvature_controls,
+            ),
+            dim=1,
+        )
+        path, heading, curvature = self.decode_values(values)
+        return values, path, heading, curvature
+
     def forward(
         self,
         coordinates: Tensor,
-        point_goal: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        return self.decode(coordinates, point_goal)
+        return self.decode(coordinates)

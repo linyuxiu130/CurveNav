@@ -12,13 +12,13 @@ def build_optimizer(
     learning_rate: float,
     weight_decay: float,
 ) -> AdamW:
-    """Build fused AdamW without decaying biases, norms, or embeddings."""
+    """Build fused AdamW without decaying one-dimensional norms and biases."""
     decay = []
     no_decay = []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if parameter.ndim < 2 or name.endswith("bias") or "embedding" in name:
+        if parameter.ndim < 2 or name.endswith("bias"):
             no_decay.append(parameter)
         else:
             decay.append(parameter)

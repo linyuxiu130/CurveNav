@@ -21,8 +21,11 @@ from curvenav.data.depth import depth_camera_contract
 from curvenav.data.prepared import (
     policy_dataset_contract,
 )
-from curvenav.data.trajectory import collate_metric_paths
-from curvenav.trajectory import PlanarBSplineCodec
+from curvenav.data.trajectory import (
+    MAXIMUM_EXPERT_PROJECTION_ADE_RATIO,
+    collate_metric_paths,
+)
+from curvenav.trajectory import MetricCurvatureTrajectory
 
 
 @dataclass(frozen=True)
@@ -115,7 +118,11 @@ def _observation_to_current(
         raise ValueError("local frame origins do not match observation count")
     if frame_yaw.shape != (observation_frames,):
         raise ValueError("frame yaw does not match observation count")
-    delta_yaw = frame_yaw - float(current_yaw)
+    # Habitat routes live in the world XZ plane.  ``atan2(dz, dx)`` increases
+    # towards the robot's right because world Y, not world Z, is up.  CurveNav
+    # uses the ROS/Isaac body convention x-forward, y-left, so body yaw is the
+    # negative of that stored route angle.
+    delta_yaw = float(current_yaw) - frame_yaw
     return np.column_stack(
         (
             local_origins,
@@ -131,7 +138,7 @@ def _planar_local(points: np.ndarray, origin: np.ndarray, yaw: float) -> np.ndar
     return np.stack(
         (
             delta[..., 0] * cosine - delta[..., 1] * sine,
-            delta[..., 0] * sine + delta[..., 1] * cosine,
+            -(delta[..., 0] * sine + delta[..., 1] * cosine),
         ),
         axis=-1,
     ).astype(np.float32, copy=False)
@@ -298,28 +305,56 @@ def _compile_split(
         [example.observation_valid for example in examples]
     ).astype(np.bool_)
 
-    codec = PlanarBSplineCodec(
-        num_control_points=config.trajectory.num_target_control_points,
-        degree=config.trajectory.target_spline_degree,
+    codec = MetricCurvatureTrajectory(
+        num_curvature_control_points=config.trajectory.num_curvature_control_points,
+        degree=config.trajectory.curvature_spline_degree,
         num_path_points=config.trajectory.num_path_points,
+        length_pretransform_mean=config.trajectory.length_pretransform_mean,
+        length_pretransform_std=config.trajectory.length_pretransform_std,
+        curvature_control_mean_inv_m=(
+            config.trajectory.curvature_control_mean_inv_m
+        ),
+        curvature_control_std_inv_m=config.trajectory.curvature_control_std_inv_m,
     )
+    curve_batches = []
     reference_batches = []
-    control_batches = []
+    projection_error_batches = []
     for start in range(0, len(examples), 2048):
         paths = [
             torch.from_numpy(example.metric_path)
             for example in examples[start : start + 2048]
         ]
-        reference_path, controls = collate_metric_paths(paths, codec)
+        curve_values, reference_path, projection_error = collate_metric_paths(
+            paths,
+            codec,
+        )
+        curve_batches.append(curve_values.numpy())
         reference_batches.append(reference_path.numpy())
-        control_batches.append(controls.numpy())
+        projection_error_batches.append(projection_error.numpy())
+    curve_values = np.concatenate(curve_batches).astype(np.float32)
     reference_path = np.concatenate(reference_batches).astype(np.float32)
-    control_points = np.concatenate(control_batches).astype(np.float32)
+    projection_error = np.concatenate(projection_error_batches).astype(np.float32)
+    maximum_projection_error = (
+        config.data.expert_waypoint_spacing_m * MAXIMUM_EXPERT_PROJECTION_ADE_RATIO
+    )
+    keep = projection_error <= maximum_projection_error
+    rejected_projection_count = int((~keep).sum())
+    examples = [example for example, selected in zip(examples, keep, strict=True) if selected]
+    depth_indices = depth_indices[keep]
+    point_goal = point_goal[keep]
+    observation_to_current = observation_to_current[keep]
+    observation_valid = observation_valid[keep]
+    curve_values = curve_values[keep]
+    reference_path = reference_path[keep]
+    projection_error = projection_error[keep]
     with torch.no_grad():
-        decoded, _, curvature = codec(torch.from_numpy(control_points))
-        reference_tensor = torch.from_numpy(reference_path)
-        fit_rmse = (decoded - reference_tensor).square().mean((1, 2)).sqrt().numpy()
+        decoded, heading, curvature = codec.decode_values(
+            torch.from_numpy(curve_values),
+        )
+        if not torch.equal(decoded, torch.from_numpy(reference_path)):
+            raise RuntimeError("stored expert controls do not reproduce their path")
         maximum_curvature = curvature.abs().amax(1).numpy()
+        total_turn = (heading[:, 1:] - heading[:, :-1]).abs().sum(1).numpy()
 
     arrays = {
         "depth_indices": _save_array(split_root, "depth_indices", depth_indices),
@@ -330,14 +365,13 @@ def _compile_split(
         "observation_valid": _save_array(
             split_root, "observation_valid", observation_valid
         ),
-        "control_points": _save_array(split_root, "control_points", control_points),
-        "reference_path": _save_array(
-            split_root,
-            "reference_path",
-            reference_path,
-        ),
+        "curve_values": _save_array(split_root, "curve_values", curve_values),
     }
     local_arc = np.asarray([_arc_length(example.metric_path) for example in examples])
+    length_pretransform = curve_values[:, 0] + np.log(
+        -np.expm1(-curve_values[:, 0])
+    )
+    curvature_controls = curve_values[:, 1:]
     goal_distance = np.linalg.norm(point_goal, axis=1)
     endpoint = reference_path[:, -1]
     goal_angle = np.degrees(
@@ -369,16 +403,29 @@ def _compile_split(
             "p95": float(np.quantile(goal_angle, 0.95)),
             "max": float(goal_angle.max()),
         },
-        "bspline_fit_rmse_m": {
-            "mean": float(fit_rmse.mean()),
-            "p95": float(np.quantile(fit_rmse, 0.95)),
-            "max": float(fit_rmse.max()),
+        "production_curve_projection_ade_m": {
+            "mean": float(projection_error.mean()),
+            "p95": float(np.quantile(projection_error, 0.95)),
+            "max": float(projection_error.max()),
         },
-        "bspline_max_curvature_inv_m": {
+        "production_curve_projection_rejected": rejected_projection_count,
+        "production_curve_coordinate_statistics": {
+            "length_pretransform_mean": float(length_pretransform.mean()),
+            "length_pretransform_std": float(length_pretransform.std()),
+            "curvature_control_mean_inv_m": float(curvature_controls.mean()),
+            "curvature_control_std_inv_m": float(curvature_controls.std()),
+        },
+        "production_curve_max_curvature_inv_m": {
             "p50": float(np.quantile(maximum_curvature, 0.50)),
             "p95": float(np.quantile(maximum_curvature, 0.95)),
             "p99": float(np.quantile(maximum_curvature, 0.99)),
             "max": float(maximum_curvature.max()),
+        },
+        "production_curve_total_turn_rad": {
+            "p50": float(np.quantile(total_turn, 0.50)),
+            "p95": float(np.quantile(total_turn, 0.95)),
+            "p99": float(np.quantile(total_turn, 0.99)),
+            "max": float(total_turn.max()),
         },
         "near_goal_fraction": float(
             np.mean([example.reached_goal for example in examples])
@@ -432,8 +479,8 @@ def compile_policy_dataset(
             "contract": {
                 **policy_dataset_contract(config.data, config.trajectory),
                 "point_goal_semantics": "mission_destination_in_current_robot_xy",
-                "reference_path_source": "fixed_future_expert_waypoints_or_true_goal",
-                "reference_endpoint_policy": "implicit_local_subgoal_unless_near_goal",
+                "expert_path_source": "fixed_future_waypoints_or_true_goal",
+                "expert_endpoint_policy": "implicit_local_subgoal_unless_near_goal",
                 "metric_scale_forced": False,
             },
             "splits": {

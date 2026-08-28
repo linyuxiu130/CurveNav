@@ -38,7 +38,7 @@
 
 当前 prepared dataset、checkpoint 合同和部署输入统一使用上述 Dingo D455 标定。旧 `0.40 m` 水平相机 checkpoint 与当前合同不兼容，必须直接拒绝，不能通过二维缩放或兼容分支继续评测。
 
-CurveNav 在固定 `y=8x` 无量纲空间用八个有序 curve query 直接预测一条条件有界曲率轨迹，生产坐标、解码后的 metric path 和 tangent 共同监督这个唯一输出。部署只做一次相同 Transformer 前向和一次解析几何解码；不存在 Flow/ODE、episode 随机状态、候选集、候选排序、历史重建打分、learned critic 或碰撞启发式。SanD 的随机候选由 ESDF 评价器选择，NavDP/X-NavDP 的多样候选由 critic/Q 机制约束；当前单专家阶段没有这些监督，因此路线选择由同一个 geometry-supervised 解码器直接承担。离线报告实际部署轨迹的 ADE、弧长、目标进展、终端航向误差、延迟，以及弧长域曲率 B-spline 直接给出的连续曲率；同时单独报告参考曲率最高 10% 样本的 ADE、终端航向、预测/参考曲率比和全体曲率相关系数，避免总体均值掩盖强转弯失败。ADE 仍按 1/2/3/4 帧有效观测分组，直接检查部署冷启动与完整历史条件下的轨迹质量。这些分组只读取现有标签或 `observation_valid`，不参与训练或推理；不再用 XY 控制多边形离散转角冒充轨迹曲率界。
+CurveNav 用八维无界 flow state 表示一个长度和七个曲率控制。训练从独立高斯先验做标准条件 Flow Matching；每次速度场求值都将状态解码为 16 个路径锚点，并用当前深度、机器人半径和净空构造 learned metric cross-attention。部署从先验均值固定执行 8 步 Heun，避免闭环重规划噪声。历史位姿只用于把深度几何对齐到当前机器人系，不进入独立状态 token。不存在 route 辅助轨迹、DDPM、随机候选、learned critic、碰撞 loss 或碰撞启发式。离线报告部署轨迹的 ADE、弧长、目标进展、累计航向、连续曲率和端到端 8 步延迟，并单独报告高转向样本。
 
 模型内部 64 点路径的第 0 点是当前机器人原点。官方 evaluator 会统一在 policy 返回值前追加当前原点，因此 CurveNav 的部署边界只发送内部路径的 `1:64` 共 63 个未来点；MPC 最终仍接收 64 点路径，且只有一个原点。NavDP/X-NavDP 的累积位移输出本来就不含当前点。若 CurveNav 发送内部第 0 点，evaluator 会制造两个连续原点，使 MPC 的起始离散曲率退化。
 

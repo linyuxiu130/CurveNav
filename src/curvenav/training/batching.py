@@ -72,12 +72,14 @@ class DistributedStepBatchSampler(Sampler[list[int]]):
     def __iter__(self) -> Iterator[list[int]]:
         rank_size = self.layout.rank_batch_sizes[self.rank]
         rank_offset = self.layout.rank_offsets[self.rank]
+        micro_count = self.layout.micro_batches_per_step
+        base_micro_size, larger_micro_batches = divmod(rank_size, micro_count)
         for step in range(self.optimizer_steps):
             step_offset = step * self.global_batch_size + rank_offset
-            for micro_offset in range(0, rank_size, self.per_device_batch_size):
-                micro_size = min(
-                    self.per_device_batch_size,
-                    rank_size - micro_offset,
+            micro_offset = 0
+            for micro_index in range(micro_count):
+                micro_size = base_micro_size + int(
+                    micro_index < larger_micro_batches
                 )
                 yield list(
                     range(
@@ -85,3 +87,4 @@ class DistributedStepBatchSampler(Sampler[list[int]]):
                         step_offset + micro_offset + micro_size,
                     )
                 )
+                micro_offset += micro_size
