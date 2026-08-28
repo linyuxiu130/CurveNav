@@ -217,9 +217,9 @@ def base_config() -> dict:
     return {
         "selected_scenes": [],
         "endpoint_distance_bands_m": {
-            "near": [3.0, 7.0],
-            "middle": [7.0, 11.0],
-            "far": [11.0, 15.0],
+            "near": [3.0, 6.0],
+            "middle": [6.0, 8.5],
+            "far": [8.5, 10.5],
         },
         "routes_per_scene_by_distance": {"near": 5, "middle": 10, "far": 10},
         "routes_per_scene": 25,

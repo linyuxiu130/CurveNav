@@ -440,6 +440,19 @@ def validate_config(config: dict[str, Any]) -> None:
     quotas = config["routes_per_scene_by_distance"]
     if list(bands) != ["near", "middle", "far"] or set(quotas) != set(bands):
         raise ValueError("endpoint distance bands must be near, middle, and far")
+    distance_ranges = list(bands.values())
+    if not all(
+        len(bounds) == 2
+        and all(math.isfinite(float(value)) for value in bounds)
+        and 0 < bounds[0] < bounds[1]
+        for bounds in distance_ranges
+    ):
+        raise ValueError("endpoint distance ranges must be finite positive intervals")
+    if not all(
+        math.isclose(left[1], right[0])
+        for left, right in zip(distance_ranges[:-1], distance_ranges[1:])
+    ):
+        raise ValueError("endpoint distance ranges must be contiguous")
     if sum(quotas.values()) != config["routes_per_scene"]:
         raise ValueError("route distance quotas must equal routes_per_scene")
     if config["routes_per_scene"] * len(scenes) != config["expected_routes"]:
