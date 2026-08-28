@@ -188,7 +188,7 @@ L = L_CFM + L_clear
 
 `o_j` 是当前深度中落入 Dingo 实际碰撞竖直区间的有效障碍点。具体地，地面在基座坐标中为 `-0.044000001 m`，所以越过 `0.05 m` 高低障碍后的下界是 `0.005999999 m`，上界为碰撞顶面 `0.117981499 m`；这与 Habitat 的“相对地面高度”定义严格对齐。无有效障碍的样本贡献零。`L_clear` 无量纲且位于 `[0,1]`，是对机器人圆形 footprint 加 `0.10 m` 裕量的软惩罚，不是曲率、长度或输出的硬约束。训练只额外执行一次 64×96 的 batch 距离计算和一次八维曲线解码；推理图、Heun 次数和输出完全不变。代码中仍不存在 candidate、critic、评价头、轨迹修补或第二生成链路。
 
-训练固定 FP16 autocast、FP32 residual carrier、GPU 常驻 depth bank、异步 prefetch、fused AdamW、cosine schedule、EMA、静态 `torch.compile` 和 DDP。global batch 为 1024，每卡 batch 上限 256；1–8 卡通过精确 rank 分片保持同一全局样本流、更新次数和学习率。生产模型在 RTX 3090 上以 batch 256、真实 optimizer、compile 及 1.63 GiB 常驻深度库测试，峰值显存为 13.916 GiB。
+训练固定 FP16 autocast、FP32 residual carrier、GPU 常驻 depth bank、异步 prefetch、fused AdamW、cosine schedule、EMA、静态 `torch.compile` 和 DDP。global batch 为 1024，每卡 batch 上限 256；1–8 卡通过精确 rank 分片保持同一全局样本流、更新次数和学习率。提交 `ef33b9c` 在四张 RTX 4090 上完成正式 200 epoch：每卡单次 batch 256、无梯度累积，稳态总吞吐 `5.25–5.58k samples/s`，单卡显存 `15.58–16.86 GiB`，训练期瞬时利用率通常 `85–99%`；含首次 fullgraph 编译和周期 checkpoint 的 8000 次更新约 33 分钟完成。
 
 必要验证固定为：
 
