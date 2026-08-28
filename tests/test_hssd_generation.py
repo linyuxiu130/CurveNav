@@ -27,6 +27,7 @@ from curvenav.data_generation.geometry import (
 )
 from curvenav.physical import (
     MAXIMUM_TRAVERSABLE_HEIGHT_M,
+    MAXIMUM_TRAVERSABLE_SLOPE_DEGREES,
     ROBOT_COLLISION_HEIGHT_M,
     ROBOT_BASE_HEIGHT_ABOVE_GROUND_M,
     ROBOT_FOOTPRINT_RADIUS_M,
@@ -122,6 +123,7 @@ def test_hssd_expert_navmesh_includes_static_scene_objects() -> None:
     assert settings.agent_radius == ROBOT_FOOTPRINT_RADIUS_M
     assert settings.agent_height == ROBOT_COLLISION_HEIGHT_M
     assert settings.agent_max_climb == MAXIMUM_TRAVERSABLE_HEIGHT_M
+    assert settings.agent_max_slope == MAXIMUM_TRAVERSABLE_SLOPE_DEGREES
     assert settings.cell_size == settings.cell_height == 0.05
 
 

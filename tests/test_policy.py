@@ -466,10 +466,10 @@ def test_metric_xyz_backprojection_uses_camera_height_and_observation_transform(
 def test_body_obstacle_pooling_cannot_be_occluded_by_nearer_floor() -> None:
     policy = build_policy(tiny_config()).eval()
     depth = torch.ones(1, 4, 1, 126, 224)
-    # These pixels share one adaptive cell.  The 1.5 m lower pixel reaches the
-    # ground, while the slightly farther 1.6 m pixel intersects the body.
+    # These surfaces share one adaptive cell.  The 1.5 m lower pixel reaches
+    # the ground, while the slightly farther 1.6 m patch is a vertical face.
     depth[:, -1, 0, 109, 100] = 1.5 / 5.0
-    depth[:, -1, 0, 95, 100] = 1.6 / 5.0
+    depth[:, -1, 0, 93:98, 98:103] = 1.6 / 5.0
     projection = policy.depth_encoder.metric_projector(
         depth,
         identity_observation_transform(1),
@@ -481,6 +481,26 @@ def test_body_obstacle_pooling_cannot_be_occluded_by_nearer_floor() -> None:
         projection.depth[:, -1][valid],
         torch.tensor([1.6]),
     )
+
+
+def test_walkable_surface_normal_is_not_a_body_obstacle() -> None:
+    projector = build_policy(tiny_config()).depth_encoder.metric_projector
+    row = torch.arange(126, dtype=torch.float32)
+    pitch = math.radians(10.0)
+    denominator = (
+        math.cos(pitch) * (row - 63.0) / 166.80851063829786
+        + math.sin(pitch)
+    )
+    depth_m = torch.where(
+        denominator > 0,
+        (0.62532 - 0.05) / denominator,
+        torch.tensor(5.0),
+    ).clamp_max(5.0)
+    depth = depth_m[None, None, None, :, None].expand(1, 4, 1, 126, 224) / 5.0
+
+    projection = projector(depth, identity_observation_transform(1))
+
+    assert not projection.obstacle_valid.any()
 
 
 def test_nearest_depth_is_backprojected_with_its_own_pixel_ray() -> None:

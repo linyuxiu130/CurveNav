@@ -25,6 +25,7 @@ ROBOT_COLLISION_HEIGHT_M = (
 # height from the ground plane; depth points use base-link z and therefore need
 # the translated lower bound below.
 MAXIMUM_TRAVERSABLE_HEIGHT_M = 0.05
+MAXIMUM_TRAVERSABLE_SLOPE_DEGREES = 45.0
 BODY_OBSTACLE_MIN_Z_M = (
     ROBOT_COLLISION_BOTTOM_Z_M + MAXIMUM_TRAVERSABLE_HEIGHT_M
 )

@@ -7,7 +7,11 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from curvenav.physical import BODY_OBSTACLE_MIN_Z_M, ROBOT_COLLISION_TOP_Z_M
+from curvenav.physical import (
+    BODY_OBSTACLE_MIN_Z_M,
+    MAXIMUM_TRAVERSABLE_SLOPE_DEGREES,
+    ROBOT_COLLISION_TOP_Z_M,
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,37 @@ class MetricDepthProjector(nn.Module):
         pitch = math.radians(camera_downward_pitch_degrees)
         self.pitch_sine = math.sin(pitch)
         self.pitch_cosine = math.cos(pitch)
+        self.walkable_normal_vertical = math.cos(
+            math.radians(MAXIMUM_TRAVERSABLE_SLOPE_DEGREES)
+        )
+
+    def _vertical_normal_alignment(self, dense_depth_m: Tensor) -> Tensor:
+        """Return |n·z| for each dense surface in the robot body frame."""
+        _, height, width = dense_depth_m.shape
+        row = torch.arange(height, device=dense_depth_m.device, dtype=torch.float32)
+        column = torch.arange(width, device=dense_depth_m.device, dtype=torch.float32)
+        ray_x = (column - width / 2.0) / self.focal_x_px
+        ray_y = (row - height / 2.0) / self.focal_y_px
+        optical_y = dense_depth_m * ray_y[None, :, None]
+        points = torch.stack(
+            (
+                self.camera_forward_offset_m
+                + self.pitch_cosine * dense_depth_m
+                - self.pitch_sine * optical_y,
+                -dense_depth_m * ray_x[None, None, :],
+                self.camera_height_m
+                - self.pitch_cosine * optical_y
+                - self.pitch_sine * dense_depth_m,
+            ),
+            dim=-1,
+        )
+        horizontal = points[:, 1:-1, 2:] - points[:, 1:-1, :-2]
+        vertical = points[:, 2:, 1:-1] - points[:, :-2, 1:-1]
+        normal = torch.linalg.cross(horizontal, vertical, dim=-1)
+        alignment = normal[..., 2].abs() / torch.linalg.vector_norm(
+            normal, dim=-1
+        ).clamp_min(1e-6)
+        return F.pad(alignment, (1, 1, 1, 1))
 
     def _backproject(
         self,
@@ -139,10 +174,20 @@ class MetricDepthProjector(nn.Module):
             - self.pitch_cosine * dense_depth_m * ray_y[None, :, None]
             - self.pitch_sine * dense_depth_m
         )
+        walkable_surface = F.max_pool2d(
+            (
+                self._vertical_normal_alignment(dense_depth_m)
+                >= self.walkable_normal_vertical
+            ).unsqueeze(1).float(),
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        ).squeeze(1).bool()
         body_pixel = (
             (normalized_depth.float() < 1.0)
             & (vertical >= BODY_OBSTACLE_MIN_Z_M)
             & (vertical <= ROBOT_COLLISION_TOP_Z_M)
+            & ~walkable_surface
         )
         masked_negative_depth = torch.where(
             body_pixel,

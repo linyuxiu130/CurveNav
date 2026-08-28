@@ -8,6 +8,7 @@ from curvenav.physical import (
     DINGO_WHEEL_BASE_M,
     DINGO_WHEEL_RADIUS_M,
     MAXIMUM_TRAVERSABLE_HEIGHT_M,
+    MAXIMUM_TRAVERSABLE_SLOPE_DEGREES,
     ROBOT_COLLISION_BOTTOM_Z_M,
     ROBOT_BASE_HEIGHT_ABOVE_GROUND_M,
     ROBOT_COLLISION_HEIGHT_M,
@@ -35,4 +36,5 @@ def expert_navigation_geometry_contract() -> dict[str, float | str]:
         "collision_height_m": ROBOT_COLLISION_HEIGHT_M,
         "body_obstacle_min_z_m": BODY_OBSTACLE_MIN_Z_M,
         "maximum_traversable_height_m": MAXIMUM_TRAVERSABLE_HEIGHT_M,
+        "maximum_traversable_slope_degrees": MAXIMUM_TRAVERSABLE_SLOPE_DEGREES,
     }

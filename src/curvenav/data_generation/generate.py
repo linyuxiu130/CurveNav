@@ -40,6 +40,7 @@ from curvenav.data_generation.geometry import (
 )
 from curvenav.physical import (
     MAXIMUM_TRAVERSABLE_HEIGHT_M,
+    MAXIMUM_TRAVERSABLE_SLOPE_DEGREES,
     ROBOT_COLLISION_HEIGHT_M,
     ROBOT_BASE_HEIGHT_ABOVE_GROUND_M,
     ROBOT_FOOTPRINT_RADIUS_M,
@@ -160,6 +161,7 @@ def configure_navmesh_settings(settings: Any) -> None:
     settings.agent_radius = ROBOT_FOOTPRINT_RADIUS_M
     settings.agent_height = ROBOT_COLLISION_HEIGHT_M
     settings.agent_max_climb = MAXIMUM_TRAVERSABLE_HEIGHT_M
+    settings.agent_max_slope = MAXIMUM_TRAVERSABLE_SLOPE_DEGREES
     settings.cell_size = GRID_CELL_M
     settings.cell_height = GRID_CELL_M
     settings.include_static_objects = True
