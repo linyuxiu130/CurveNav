@@ -234,6 +234,13 @@ def measure_policy(
                 current_obstacle_valid,
             )
         )
+        reference_obstacle_metrics = observed_obstacle_metrics(
+            reference_path,
+            projection.obstacle_points[:, -1],
+            current_obstacle_valid,
+        )
+        for name, value in reference_obstacle_metrics.items():
+            metrics[f"reference_{name}"] = value
         goal_shuffle_error = torch.linalg.vector_norm(
             goal_shuffle_prediction.path.float() - reference_path,
             dim=-1,
@@ -444,6 +451,15 @@ def evaluate_policy(
         ][observed].float().mean().item(),
         "observed_safety_margin_violation_fraction": metrics[
             "observed_safety_margin_violation"
+        ][observed].float().mean().item(),
+        "reference_observed_min_clearance_m_mean": metrics[
+            "reference_observed_min_clearance_m"
+        ][observed].mean().item(),
+        "reference_observed_footprint_collision_fraction": metrics[
+            "reference_observed_footprint_collision"
+        ][observed].float().mean().item(),
+        "reference_observed_safety_margin_violation_fraction": metrics[
+            "reference_observed_safety_margin_violation"
         ][observed].float().mean().item(),
         "batch32_latency_ms_mean": measurements.batch_latency_ms.mean().item(),
         "throughput_observations_per_second": measurements.samples / seconds,
