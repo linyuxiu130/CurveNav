@@ -185,7 +185,7 @@ L=L_MF+L_safe
 
 训练数据只来自 CurveNav 按 benchmark Dingo 配置生成的 HSSD 专家路线，不读取 SanD/NavDP 数据。当前 canonical dataset 为训练 `25,928`、验证 `6,087` 条；深度 bank 在编译时硬链接，不重复复制图像。
 
-训练固定 global batch `1024`、每卡 micro-batch 上限 `256`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。没有 `torch.compile` 或第二训练实现。
+训练固定 global batch `1024`、每卡 micro-batch 上限 `256`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。没有 `torch.compile` 或第二训练实现。
 
 当前必要验证：
 
