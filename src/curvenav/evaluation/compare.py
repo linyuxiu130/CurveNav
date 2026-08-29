@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch import Tensor
+from scipy.ndimage import distance_transform_edt
 
 from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
+from curvenav.data_generation.geometry import Grid, points_at_arc, polyline
 from curvenav.evaluation.metrics import (
-    observed_safety_metrics,
+    EVALUATION_SPACING_M,
     summarize_metrics,
     summarize_paired_safety,
     trajectory_metrics,
@@ -22,56 +23,111 @@ from curvenav.evaluation.metrics import (
 from curvenav.evaluation.protocol import summarize_strata
 
 
-def load_common_geometry(
+def load_common_protocol(
     common: np.lib.npyio.NpzFile,
-    planning_horizon_m: float,
-) -> tuple[Tensor, Tensor, Tensor, np.ndarray]:
+) -> tuple[Tensor, Tensor, np.ndarray]:
     required = {
         "axis",
-        "configuration_field",
-        "configuration_channels",
-        "configuration_extent_m",
+        "origin_xy",
         "point_goal",
         "reference_path",
+        "route_id",
+        "route_yaw",
         "scene_id",
     }
     missing = sorted(required - set(common.files))
     if missing:
         raise ValueError(
-            "common evaluation set lacks frozen metric geometry: "
-            f"{missing}; regenerate it instead of reconstructing camera semantics "
-            "inside the comparator"
+            "common evaluation set lacks metric protocol: "
+            f"{missing}; regenerate its protocol metadata instead of guessing axes"
         )
     if str(common["axis"]) != "x_forward_y_left":
         raise ValueError("common evaluation axis must be x_forward_y_left")
-    if not math.isclose(
-        float(common["configuration_extent_m"]),
-        planning_horizon_m,
-        rel_tol=0.0,
-        abs_tol=1e-6,
-    ):
-        raise ValueError("common configuration-space extent does not match config")
-    channels = [str(value) for value in common["configuration_channels"].tolist()]
-    if channels != [
-        "signed_clearance_m",
-        "gradient_x",
-        "gradient_y",
-        "observed",
-        "forbidden",
-    ]:
-        raise ValueError("common configuration-space channels are invalid")
-    field = np.asarray(common["configuration_field"], dtype=np.float32)
     reference = np.asarray(common["reference_path"], dtype=np.float32)
     point_goal = np.asarray(common["point_goal"], dtype=np.float32)
     scene_id = common["scene_id"]
-    if field.shape != (len(reference), 5, 64, 64):
-        raise ValueError("common configuration_field must have shape [N,5,64,64]")
-    return (
-        torch.from_numpy(field),
-        torch.from_numpy(reference),
-        torch.from_numpy(point_goal),
-        scene_id,
-    )
+    return torch.from_numpy(reference), torch.from_numpy(point_goal), scene_id
+
+
+class SourceGridSafety:
+    """Privileged Dingo configuration-space truth for cross-model comparison."""
+
+    def __init__(self, common: np.lib.npyio.NpzFile, source_root: Path) -> None:
+        self.common = common
+        self.grids = {}
+        self.signed_clearance = {}
+        for route_id in np.unique(common["route_id"]):
+            route = str(route_id)
+            grid = Grid.load(
+                (source_root / route).parent / "navigation_grid.npz"
+            )
+            outside = distance_transform_edt(~grid.free) * grid.cell_size_m
+            signed = np.where(grid.free, grid.clearance_m, -outside)
+            self.grids[route] = grid
+            self.signed_clearance[route] = signed.astype(np.float32)
+
+    @staticmethod
+    def _world(local_xy: np.ndarray, origin: np.ndarray, yaw: float) -> np.ndarray:
+        cosine, sine = np.cos(yaw), np.sin(yaw)
+        x, y = local_xy[:, 0], local_xy[:, 1]
+        return np.column_stack(
+            (
+                origin[0] + cosine * x + sine * y,
+                origin[1] + sine * x - cosine * y,
+            )
+        )
+
+    def measure(self, paths: Tensor, horizon_m: float) -> dict[str, Tensor]:
+        values = {
+            "observed_path_fraction": [],
+            "observed_min_clearance_m": [],
+            "observed_footprint_collision": [],
+            "observed_safety_margin_violation": [],
+            "observed_max_margin_violation_m": [],
+            "arc_length_beyond_local_horizon_m": [],
+        }
+        for index, raw_path in enumerate(paths.numpy()):
+            path, cumulative = polyline(raw_path)
+            evaluated_length = min(float(cumulative[-1]), horizon_m)
+            query = np.linspace(
+                0.0,
+                evaluated_length,
+                max(2, int(np.ceil(evaluated_length / EVALUATION_SPACING_M)) + 1),
+            )
+            local = points_at_arc(path, query)
+            world = self._world(
+                local,
+                self.common["origin_xy"][index],
+                float(self.common["route_yaw"][index]),
+            )
+            route = str(self.common["route_id"][index])
+            grid = self.grids[route]
+            cells = grid.world_to_grid(world)
+            inside = (
+                (cells[:, 0] >= 0)
+                & (cells[:, 0] < grid.free.shape[0])
+                & (cells[:, 1] >= 0)
+                & (cells[:, 1] < grid.free.shape[1])
+            )
+            clearance = np.full(len(cells), -horizon_m, dtype=np.float32)
+            clearance[inside] = self.signed_clearance[route][
+                cells[inside, 0], cells[inside, 1]
+            ]
+            minimum = float(clearance.min())
+            values["observed_path_fraction"].append(float(inside.mean()))
+            values["observed_min_clearance_m"].append(minimum)
+            values["observed_footprint_collision"].append(minimum < 0.0)
+            values["observed_safety_margin_violation"].append(minimum < 0.10)
+            values["observed_max_margin_violation_m"].append(
+                max(0.0, 0.10 - minimum)
+            )
+            values["arc_length_beyond_local_horizon_m"].append(
+                max(0.0, float(cumulative[-1]) - horizon_m)
+            )
+        return {
+            name: torch.tensor(parts)
+            for name, parts in values.items()
+        }
 
 
 def _canonical_paths(result_path: Path, samples: int) -> tuple[str, Tensor, str]:
@@ -95,16 +151,12 @@ def _measure(
     path: Tensor,
     reference: Tensor,
     point_goal: Tensor,
-    configuration_field: Tensor,
+    safety: SourceGridSafety,
     planning_horizon_m: float,
 ) -> dict[str, Tensor]:
     metrics = trajectory_metrics(path, reference, point_goal)
-    metrics.update(
-        observed_safety_metrics(path, configuration_field, planning_horizon_m)
-    )
-    reference_safety = observed_safety_metrics(
-        reference, configuration_field, planning_horizon_m
-    )
+    metrics.update(safety.measure(path, planning_horizon_m))
+    reference_safety = safety.measure(reference, planning_horizon_m)
     metrics.update(
         {f"reference_{name}": value for name, value in reference_safety.items()}
     )
@@ -112,9 +164,7 @@ def _measure(
     straight = reference[:, :1] + progress * (
         reference[:, -1:] - reference[:, :1]
     )
-    straight_safety = observed_safety_metrics(
-        straight, configuration_field, planning_horizon_m
-    )
+    straight_safety = safety.measure(straight, planning_horizon_m)
     metrics.update(
         {f"straight_{name}": value for name, value in straight_safety.items()}
     )
@@ -155,19 +205,21 @@ def _scene_robustness(by_scene: dict[str, dict[str, object]]) -> dict[str, float
 def compare_outputs(
     config: CurveNavConfig,
     common_path: Path,
+    source_root: Path,
     result_paths: list[Path],
     output_path: Path,
 ) -> dict[str, object]:
     common = np.load(common_path, allow_pickle=False)
     horizon = config.data.future_steps * config.data.expert_waypoint_spacing_m
-    field, reference, point_goal, scene_id = load_common_geometry(common, horizon)
+    reference, point_goal, scene_id = load_common_protocol(common)
+    safety = SourceGridSafety(common, source_root)
 
     models: dict[str, object] = {}
     for result_path in result_paths:
         name, path, checkpoint = _canonical_paths(result_path, len(reference))
         if name in models:
             raise ValueError(f"duplicate model output: {name}")
-        metrics = _measure(path, reference, point_goal, field, horizon)
+        metrics = _measure(path, reference, point_goal, safety, horizon)
         scenes = {}
         for scene in sorted(np.unique(scene_id).tolist()):
             selected = torch.from_numpy(scene_id == scene)
@@ -183,6 +235,7 @@ def compare_outputs(
     report = {
         "protocol": "curvenav_common_metric_local_validation",
         "common_dataset": str(common_path.resolve()),
+        "safety_source": str(source_root.resolve()),
         "models": models,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -198,12 +251,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
     parser.add_argument("common", type=Path)
+    parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("results", type=Path, nargs="+")
     args = parser.parse_args()
     compare_outputs(
         load_config(args.config),
         args.common,
+        args.source,
         args.results,
         args.output,
     )

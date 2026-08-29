@@ -25,8 +25,8 @@ def select_cases(metrics: dict[str, Tensor]) -> list[tuple[str, int]]:
     strata = evaluation_strata(metrics)
     requested = (
         ("forward_direct_median", "forward_direct", 0.5),
-        ("forward_visible_detour_median", "forward_visible_detour", 0.5),
-        ("forward_visible_detour_hard", "forward_visible_detour", 1.0),
+        ("forward_detour_median", "forward_detour", 0.5),
+        ("forward_detour_hard", "forward_detour", 1.0),
         ("rear_goal_median", "rear_goal", 0.5),
         ("expert_moves_away_median", "expert_moves_away_from_goal", 0.5),
     )

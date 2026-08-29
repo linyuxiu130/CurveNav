@@ -46,7 +46,7 @@
 
 - `forward`：PointGoal 在机器人前半平面；这是基础 PointGoal 跟随结果。
 - `forward_direct`：前向目标，专家连续轨迹与通向局部专家终点的直线都不触及感知安全边界。
-- `forward_visible_detour`：前向目标，专家连续轨迹安全，而起点到局部专家终点的直线被当前深度障碍阻断；这是不引入人造障碍的基础避障结果。
+- `forward_detour`：前向目标，专家连续轨迹安全，而起点到局部专家终点的直线被安全场阻断；在 CurveNav 验证中安全场来自四帧可见深度，在跨模型比较中来自冻结 HSSD 配置空间真值。
 - `rear_goal`：PointGoal 位于后半平面，单独报告，不与基础前向结果混淆。
 - `expert_moves_away_from_goal`：专家局部段本身暂时远离任务目标，表示真实绕行或部分可观测情形，单独报告。
 
@@ -54,7 +54,7 @@
 
 碰撞测量与训练共用四帧配准的 `64×64` 配置空间场。场值是障碍欧氏距离减 Dingo footprint radius；评测先把路径以不大于 `0.025 m` 的独立间距稠密化，再做双线性查询，负值为 footprint collision，小于额外 `0.10 m` 为安全裕度违例。安全结果同时报告专家在同一感知场上的基线和模型相对专家新增的风险，避免把遮挡、深度噪声或感知场误报归因于生成器。`observed_path_fraction` 单列，未知空间不能被解释为安全。
 
-代表案例固定选择各层固定距离 ADE 中位样本，并额外显示 `forward_visible_detour` 的最难样本，避免人工挑图。案例 JSON 直接保存产生安全指标的同一四帧融合 clearance/observed/forbidden 网格，不再用仅当前帧稀疏障碍点画一张与判定真源不同的图。
+代表案例固定选择各层固定距离 ADE 中位样本，并额外显示 `forward_detour` 的最难样本，避免人工挑图。案例 JSON 直接保存产生安全指标的同一四帧融合 clearance/observed/forbidden 网格，不再用仅当前帧稀疏障碍点画一张与判定真源不同的图。
 
 ```bash
 scripts/evaluate_policy.sh configs/base.yaml CHECKPOINT \
@@ -70,10 +70,10 @@ scripts/evaluate_policy.sh configs/base.yaml CHECKPOINT \
 
 四帧模型额外用“只保留当前帧有效”的同网络消融测历史输入净增益；该项只用于 CurveNav 架构诊断，不参与 SanD/NavDP/X-NavDP 横向排名。旧的 batch 内 PointGoal/depth 随机错配会制造训练分布外条件，已经删除。
 
-跨模型比较使用 `scripts/compare_offline.sh`。公共 NPZ 必须冻结 `axis=x_forward_y_left`、`reference_path`、`point_goal`、`scene_id`、`configuration_field[N,5,64,64]`、五个有序通道名和 `configuration_extent_m=3.6`；每个映射结果 NPZ 必须显式写入相同 `axis`、`base_path`、`base_length`、模型名和 checkpoint。比较器不再从一份缺少相机外参语义的旧 RGB-D 文件临时猜测安全场。旧 `common-hssd-current-64.npz` 缺少 axis 与配置空间场，因此只能作为历史产物，不能进入新排名。
+跨模型比较使用 `scripts/compare_offline.sh`。公共 NPZ 必须冻结 `axis=x_forward_y_left`、`reference_path`、`point_goal`、`scene_id`、`route_id`、`origin_xy` 和 `route_yaw`；每个映射结果 NPZ 必须显式写入相同 `axis`、`base_path`、`base_length`、模型名和 checkpoint。安全真值直接查询生成专家时冻结的 Dingo 膨胀 HSSD navigation grid，路径按 `0.025 m` 稠密化后映射回世界坐标；不再从缺少完整外参语义的 RGB-D 文件临时猜测安全场。旧公共集和四模型结果缺少显式 axis，只能作为历史产物，补齐协议字段后才能进入新排名。
 
 ```bash
-scripts/compare_offline.sh configs/base.yaml COMMON.npz REPORT.json \
+scripts/compare_offline.sh configs/base.yaml COMMON.npz HSSD_SOURCE REPORT.json \
   CURVENAV.npz SAND.npz NAVDP.npz XNAVDP.npz
 ```
 
@@ -102,7 +102,7 @@ offline:    /mnt/data/huangshibo/H/navigation_three_projects/curvenav/outputs/st
 
 该基线 checkpoint step 为 8,000，使用 EMA；严格离线覆盖全部 6,087 条验证样本。总体 `ADE=0.11556 m`，前向/前向开阔/可见绕行层分别为 `0.10328/0.10651/0.17563 m`；坡度感知障碍定义下 footprint collision 为 `3.083%`、安全裕量违例为 `5.252%`。P95 最大曲率为 `3.7250 m⁻¹`，专家为 `1.8148 m⁻¹`，切向反转保持 `0%`。PointGoal 与当前深度打乱分别令 ADE 增加 `0.56703/0.15140 m`。其 8-step eager FP16 延迟 P50/P95 为 `382.1/502.0 ms`。当前 1-NFE 新图在 V100S、batch 1、FP16 预热后实测纯模型 `33.89 ms`、完整 runtime step `40.18 ms`；该数值只说明执行开销，最终 EMA 效果与 4090 空闲态延迟仍以本轮训练完成后的独立测评为准。
 
-当前主要失败层不是普通前向跟随，而是 `forward_visible_detour`：其 footprint collision/safety violation 为 `12.17%/21.22%`。`rear_goal` 与 `expert_moves_away_from_goal` 的旧索引对齐 ADE 为 `0.4592/0.5987 m`，作为历史定位信息保留；新模型只按上述固定物理距离合同重新计算，不与这些旧口径数值直接横比。
+当前主要失败层不是普通前向跟随，而是旧报告中的可见绕行层：其 footprint collision/safety violation 为 `12.17%/21.22%`。`rear_goal` 与 `expert_moves_away_from_goal` 的旧索引对齐 ADE 为 `0.4592/0.5987 m`，作为历史定位信息保留；新模型统一使用 `forward_detour` 和固定物理距离合同重新计算，不与这些旧口径数值直接横比。
 
 同日公共离线对比中的 CurveNav 同样是该历史基线。公共集从修正后的 HSSD 专家路线重新渲染，包含 64 个样本、595 帧 RGB-D，并按专家累计转向分成四个等量难度层；四模型读取完全相同的历史观测和 PointGoal。统一按物理弧长比较前 `2 m`，并用当前深度的坡度感知 body obstacle 做逐段净空统计：
 

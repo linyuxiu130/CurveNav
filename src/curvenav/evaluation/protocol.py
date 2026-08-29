@@ -20,7 +20,7 @@ def evaluation_strata(metrics: dict[str, Tensor]) -> dict[str, Tensor]:
         "all": torch.ones_like(forward),
         "forward": forward,
         "forward_direct": forward & reference_safe & ~straight_blocked,
-        "forward_visible_detour": (
+        "forward_detour": (
             forward & reference_safe & straight_blocked
         ),
         "rear_goal": ~forward,

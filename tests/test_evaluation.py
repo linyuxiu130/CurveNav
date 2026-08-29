@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from curvenav.evaluation.compare import load_common_geometry
+from curvenav.evaluation.compare import SourceGridSafety, load_common_protocol
 from curvenav.evaluation.metrics import (
     observed_safety_metrics,
     resample_path_at_distance,
@@ -14,15 +14,49 @@ from curvenav.evaluation.metrics import (
 from curvenav.evaluation.protocol import evaluation_strata
 
 
-def test_cross_model_set_requires_frozen_configuration_geometry(
+def test_cross_model_set_requires_explicit_axis_and_source_geometry(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "common.npz"
     np.savez(path, point_goal=np.zeros((1, 2), dtype=np.float32))
     common = np.load(path, allow_pickle=False)
 
-    with pytest.raises(ValueError, match="lacks frozen metric geometry"):
-        load_common_geometry(common, 3.6)
+    with pytest.raises(ValueError, match="lacks metric protocol"):
+        load_common_protocol(common)
+
+
+def test_cross_model_safety_queries_frozen_source_grid(tmp_path: Path) -> None:
+    route = "validation/dataset/route"
+    grid_root = tmp_path / "source/validation/dataset"
+    grid_root.mkdir(parents=True)
+    free = np.ones((9, 9), dtype=np.bool_)
+    free[6, 4] = False
+    clearance = np.ones((9, 9), dtype=np.float32)
+    clearance[~free] = 0.0
+    np.savez(
+        grid_root / "navigation_grid.npz",
+        free=free,
+        clearance_m=clearance,
+        origin_xy=np.asarray([-1.0, -1.0]),
+        cell_size_m=np.asarray(0.25),
+    )
+    common_path = tmp_path / "common.npz"
+    np.savez(
+        common_path,
+        route_id=np.asarray([route]),
+        origin_xy=np.zeros((1, 2), dtype=np.float32),
+        route_yaw=np.zeros(1, dtype=np.float32),
+    )
+    common = np.load(common_path, allow_pickle=False)
+    safety = SourceGridSafety(common, tmp_path / "source")
+
+    metrics = safety.measure(
+        torch.tensor([[[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]]]),
+        horizon_m=1.0,
+    )
+
+    assert metrics["observed_footprint_collision"].item()
+    assert metrics["observed_path_fraction"].item() == 1.0
 
 
 def test_fixed_distance_metrics_match_identical_paths() -> None:
@@ -127,6 +161,6 @@ def test_strata_separate_visible_detours_and_rear_goals() -> None:
     strata = evaluation_strata(metrics)
 
     assert strata["forward_direct"].tolist() == [True, False, False]
-    assert strata["forward_visible_detour"].tolist() == [False, True, False]
+    assert strata["forward_detour"].tolist() == [False, True, False]
     assert strata["rear_goal"].tolist() == [False, False, True]
     assert strata["expert_moves_away_from_goal"].tolist() == [False, False, True]
