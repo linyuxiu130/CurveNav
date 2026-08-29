@@ -14,6 +14,10 @@ from curvenav.conditioning import (
     CONDITION_ENCODER_TYPE,
     HISTORICAL_STATE_FEATURES,
 )
+from curvenav.encoders.configuration import (
+    CONFIGURATION_ENCODER_TYPE,
+    CONFIGURATION_TOKEN_GRID_SIZE,
+)
 from curvenav.encoders.geometry import CONFIGURATION_GRID_SIZE
 from curvenav.encoders.depth import DEPTH_ENCODER_TYPE
 from curvenav.encoders import POINT_GOAL_ENCODER_TYPE
@@ -99,6 +103,10 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
                 depth.frame_tokens_height,
                 depth.frame_tokens_width,
             ],
+            "configuration_token_grid": [
+                CONFIGURATION_TOKEN_GRID_SIZE,
+                CONFIGURATION_TOKEN_GRID_SIZE,
+            ],
             "depth_dropout": depth.dropout,
             "point_goal_hidden_dim": point_goal.hidden_dim,
             "condition_heads": condition.transformer_heads,
@@ -144,7 +152,8 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         ),
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
         "visual_context": (
-            "goal_independent_current_metric_tokens_plus_causal_motion_state"
+            "goal_independent_current_metric_tokens_plus_complete_"
+            "configuration_space_tokens_plus_causal_motion_state"
         ),
         "depth_token_pooling": (
             "nearest_nontraversable_body_height_surface_else_nearest_surface_metric_xyz"
@@ -156,9 +165,12 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             "planar_rigid_transform_used_for_metric_xyz_alignment_and_motion_state"
         ),
         "visual_compression": "current_frame_visual_grid_only",
-        "condition_context": "four_layer_joint_goal_current_motion_transformer",
+        "condition_context": (
+            "complete_configuration_cross_attention_then_four_layer_"
+            "joint_goal_current_motion_transformer"
+        ),
         "trajectory_condition_interaction": (
-            "decoded_path_tokens_with_continuous_configuration_field_queries_and_condition_cross_attention"
+            "decoded_path_tokens_cross_attend_complete_configuration_memory"
         ),
         "goal_conditioning": "unbounded_goal_token_plus_path_anchor_goal_delta",
         "temporal_modeling": (
@@ -175,6 +187,11 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             + data.observation_frames
             - 1
         ),
+        "configuration_encoder_type": CONFIGURATION_ENCODER_TYPE,
+        "configuration_token_grid": [
+            CONFIGURATION_TOKEN_GRID_SIZE,
+            CONFIGURATION_TOKEN_GRID_SIZE,
+        ],
         "configuration_space_field": {
             "grid_size": CONFIGURATION_GRID_SIZE,
             "extent_m": data.future_steps * data.expert_waypoint_spacing_m,

@@ -11,8 +11,9 @@
 3. 稀疏 cell 最近点和全局最近障碍 penalty 不能表示机器人 footprint、可见自由空间或整条路径的最坏风险。
 4. PointGoal 距离曾被硬截断，远目标失去距离顺序；视觉 backbone 重复计算四帧，而短时历史真正需要的是已经配准的几何与运动状态。
 5. 深度可见性曾把归一化深度同米制阈值比较，令无回波区域错误变成已观测空间。该单位错误已从投影根源消除。
+6. 一步生成器曾只在解码后的 Flow 状态路径上查询配置空间。部署的状态恒为同一个典型高斯 latent，因此显式安全输入只覆盖固定 `1.75 m` 左弯附近的 `38/4096=0.93%` 栅格；修改其余 99.07% 场值不能改变网络输出。这使最终轨迹附近的障碍只能由当前图像隐式猜测，是可见绕行失败的结构根因。
 
-唯一方案是：差分航向曲线坐标、当前帧 SanD 风格视觉特征、四帧配准的机器人配置空间场、显式历史 SE(2) token、路径对连续场的双线性查询，以及部署对齐的一步 improved MeanFlow。当前不增加 critic、多候选、RL 后训练或长期地图。
+唯一方案是：差分航向曲线坐标、当前帧 SanD 风格视觉特征、四帧配准的机器人配置空间场、完整配置空间 token、显式历史 SE(2) token，以及部署对齐的一步 improved MeanFlow。当前不增加 critic、多候选、RL 后训练或长期地图。
 
 ## 2. 张量与模块合同
 
@@ -27,7 +28,7 @@ mean-flow coordinates  float [B,8]     # standardized log L and Δθ
 prediction path        float [B,64,2]
 ```
 
-生产模型维度固定为 `D=384`、39,284,296 个可训练参数：
+生产模型维度固定为 `D=384`、40,394,440 个可训练参数：
 
 ```text
 current depth
@@ -39,12 +40,15 @@ four aligned depths
   └─ slope-aware body-obstacle extraction
   └─ exact 64×64 Euclidean distance transform
        └─ [clearance,gx,gy,observed,forbidden]
+       └─ 3-stage strided metric CNN
+            └─ 64 complete configuration-space tokens
 
-PointGoal token + 96 visual tokens + 3 historical SE(2) tokens
+PointGoal token + 96 visual tokens + 3 historical SE(2) tokens [100 queries]
+  └─ cross-attend all 64 configuration-space tokens once
   └─ 4 condition Transformer blocks
        └─ condition memory [B,100,384]
 
-8 curve tokens + 16 decoded path/field tokens
+8 curve tokens + 16 decoded path/goal tokens
   └─ 12 self-attention + condition cross-attention + SwiGLU blocks
        └─ 8-D average velocity
 
@@ -57,9 +61,10 @@ fixed typical Gaussian latent
 
 - `encoders/depth.py`：只对当前图运行视觉 backbone，并融合当前帧标定几何。
 - `encoders/geometry.py`：四帧反投影、坡度分类、刚体配准和配置空间场。
+- `encoders/configuration.py`：把完整配置空间场编码为带二维度量位置的全局安全 token。
 - `conditioning/transformer.py`、`conditioning/motion.py`：目标、当前视觉和因果历史状态。
 - `trajectory/heading.py`：训练与推理共用的八维正则曲线双射。
-- `models/decoder.py`、`models/blocks.py`：路径—配置空间连续交互和平均速度网络。
+- `models/decoder.py`、`models/blocks.py`：路径/目标交互和读取完整条件记忆的平均速度网络。
 - `models/policy.py`：唯一 MeanFlow 恒等式、损失和一步采样。
 - `models/safety.py`：配置空间场查询与路径最坏风险；不修改推理轨迹。
 
@@ -111,15 +116,16 @@ forbidden(q)=[c(q)≤0]
 
 ## 5. 路径条件生成器
 
-每次平均速度求值都把八维状态解码为物理路径，并取 16 个固定弧进度锚点。每个路径 token 包含：
+完整 `64×64×5` 配置空间先把 clearance 除以 `3.6 m`，再经过三个 `3×3,stride=2` 卷积得到 `8×8` token；每个 token 加入覆盖 `[-3.6,3.6]²` 的二维正弦度量位置。PointGoal、96 个当前视觉 token 和三个历史状态 token 作为 100 个 query，对全部 64 个配置 token 做一次 cross-attention，再经过四层联合条件 Transformer。于是任何配置空间单元都能在一步轨迹生成之前影响条件记忆。
+
+每次平均速度求值把八维状态解码为物理路径，并取 16 个固定弧进度锚点。每个路径 token 只包含：
 
 ```text
 position/3.6, sin heading, cos heading, arc progress,
-(PointGoal-position)/3.6,
-clearance/3.6, gx, gy, observed, forbidden
+(PointGoal-position)/3.6
 ```
 
-配置空间特征在连续路径坐标处双线性查询。路径 token 与八个 curve token 一起通过 12 层 Transformer，并在每层对 100 个条件 token 做 cross-attention。相比旧 all-cell 最近点注意力，这一设计让场景几何先形成明确的欧氏空间函数，再由任意路径位置连续查询；没有 `argmin` 切换、稀疏最近点或单独规划器。
+路径 token 与八个 curve token 一起通过 12 层 Transformer，并在每层对 100 个已经融合全局安全几何的条件 token 做 cross-attention。删除旧的 Flow-state 路径场查询至关重要：训练中的随机 `z_t` 和部署的固定高斯源都不是最终轨迹，只查询它们会造成安全信息与输出位置错位。完整场只在条件侧编码一次，也避免在 MeanFlow JVP 内重复扩大 12 层 memory。
 
 ## 6. Boundary-complete improved MeanFlow
 
@@ -181,7 +187,7 @@ L=L_MF+L_safe
 
 | 来源 | 吸收 | CurveNav 的改进/取舍 |
 |---|---|---|
-| [SanD](https://arxiv.org/abs/2602.00923) | ResNet 视觉、小样本轨迹先验、cubic spline、配置空间净空 | 保留解析平滑曲线，但改用严格正弧长和差分航向；把安全几何放入唯一生成器，不复制候选 evaluator。 |
+| [SanD](https://arxiv.org/abs/2602.00923) | ResNet 视觉、小样本轨迹先验、cubic spline、配置空间净空 | 保留解析平滑曲线，但改用严格正弧长和差分航向；完整配置空间在生成前进入唯一生成器，不复制候选 evaluator。 |
 | [NavDP](https://arxiv.org/abs/2505.08712) | 轨迹 token 与视觉 memory 的深层交互、历史条件 | 保留深交互；以标定连续配置空间场替代要求 latent token 隐式恢复的碰撞几何。 |
 | [X-NavDP](https://arxiv.org/abs/2607.28560) | 后训练用于恢复和分布外行为 | 当前先验证单生成器；不以 critic/RL 掩盖生成器的监督与几何错误。 |
 | [Flow Matching](https://arxiv.org/abs/2210.02747) | 合法随机高斯源和条件概率路径 | 禁止零源/固定源训练；确定性只在推理时选择典型 latent。 |
@@ -197,10 +203,10 @@ L=L_MF+L_safe
 当前必要验证：
 
 - `compileall`、`git diff --check`；
-- 87 个数学、数据、前向、梯度和合同测试；
-- 生产 39,284,296 参数图的 FP16 前向、精确 JVP 与反向检查：311/311 个可训练参数张量均有有限梯度；
+- 91 个数学、数据、前向、梯度和合同测试；
+- 生产 40,394,440 参数图的 FP16 前向、精确 JVP 与反向检查；
 - 6,087 条验证专家的四帧配置空间审计：当前帧单独识别专家 footprint collision `0` 条、裕度违例 `89` 条、直线裕度违例 `787` 条；四帧静态融合后分别为 `9`、`143`、`1,325` 条。9 条碰撞均可由具体单独历史帧复现，位姿为正常的约 `0.45/0.89/1.33 m` 后向平移，不是跨帧符号或偶然 observed 拼接错误；
-- 四张 RTX 4090 按 `256/256/256/256` 分片，每 rank 使用一次前后向，稳定占用约 `22.0 GiB/GPU`。固定几何投影器局部 A/B 为 eager `41.54 ms/batch`、编译后 `7.31 ms/batch`；完整训练 step 60--120 为 `2,229--2,347 samples/s`，相对未编译同阶段 `1,602--2,029 samples/s` 提升约 `16--39%`，按 8,000 step 估算纯训练约 `0.97 h`；
+- 三张 V100S 按 `342/341/341` 分片，每 rank 单次前后向，占用约 `28.9 GiB/GPU`；完整全局场模型在 step 40--140 稳定为 `1,730--1,757 samples/s`。相比被替代模型后半程约 `1,552--1,644 samples/s`，完整读取安全场没有牺牲吞吐，删除 JVP 内错误路径查询后反而提高约 `5--13%`；
 - 新模型最终 200 epoch 墙钟时间和离线指标必须由本次训练实测，不沿用旧 checkpoint。
 
 ## 10. 正确性边界

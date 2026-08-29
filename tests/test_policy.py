@@ -16,6 +16,7 @@ from curvenav.config import (
 )
 from curvenav.training.optimizer import build_optimizer
 from curvenav.models import TRAINING_LOSS_NAMES
+from curvenav.encoders import CONFIGURATION_TOKEN_COUNT
 
 
 def tiny_config() -> CurveNavConfig:
@@ -361,6 +362,58 @@ def test_decoder_has_no_generated_history_candidate_or_second_stage() -> None:
     assert not hasattr(policy, "curve_proposal")
     assert not hasattr(policy, "candidate_bases")
     assert not hasattr(decoder, "metric_path_attention")
+    assert decoder.path_geometry_embedding[0].in_features == 7
+
+
+def test_complete_configuration_space_changes_condition_memory() -> None:
+    encoder = build_policy(tiny_config()).condition_encoder.configuration_encoder
+    empty = torch.zeros(2, 5, 64, 64)
+    changed = empty.clone()
+    changed[0, 0, 4:12, 48:56] = -0.2
+    changed[0, 3:, 4:12, 48:56] = 1.0
+    with torch.no_grad():
+        baseline = encoder(empty)
+        encoded = encoder(changed)
+    assert baseline.shape == (2, CONFIGURATION_TOKEN_COUNT, 32)
+    assert not torch.allclose(encoded[0], baseline[0])
+    torch.testing.assert_close(encoded[1], baseline[1])
+
+
+def test_obstacle_far_from_flow_source_changes_one_step_velocity() -> None:
+    policy = build_policy(tiny_config()).eval()
+    inputs = condition(batch=1)
+    with torch.no_grad():
+        observation = policy.depth_encoder(
+            inputs.depth,
+            inputs.observation_to_current,
+            inputs.observation_valid,
+        )
+        baseline = policy.condition_encoder(
+            observation,
+            inputs.point_goal,
+            inputs.observation_valid,
+            inputs.observation_to_current,
+        )
+        changed_field = observation.configuration_field.clone()
+        changed_field[:, 0, :8, 56:] = -0.2
+        changed_field[:, 3:, :8, 56:] = 1.0
+        changed = policy.condition_encoder(
+            replace(observation, configuration_field=changed_field),
+            inputs.point_goal,
+            inputs.observation_valid,
+            inputs.observation_to_current,
+        )
+        source = policy.inference_source.clone()
+        zero = torch.zeros(1)
+        velocity = policy._predict_mean_velocity(source, zero, zero + 1.0, baseline)
+        changed_velocity = policy._predict_mean_velocity(
+            source,
+            zero,
+            zero + 1.0,
+            changed,
+        )
+    assert not torch.allclose(changed.tokens, baseline.tokens)
+    assert not torch.allclose(changed_velocity, velocity)
 
 
 def test_heading_curve_coordinates_are_semantic_and_not_path_gram_values() -> None:

@@ -57,7 +57,7 @@ scripts/evaluate_policy.sh configs/base.yaml CHECKPOINT \
   --artifact-dir outputs/strict-offline
 ```
 
-CurveNav 用 8 维无界 Flow state 表示标准化 `log` 正弧长和 7 个 cubic B-spline 局部航向增量；单位切向积分保证轨迹正则、初始前向且曲率连续。训练采用随机高斯源和闭区间时间 collocation，同时监督瞬时边界与数据锚定 improved MeanFlow；部署从固定高斯典型 latent 只做一次平均速度输运。每次求值都将状态解码为 16 个路径锚点，并连续查询四帧配准的坡度感知配置空间场。历史位姿既用于障碍配准，也以三个因果 SE(2) token 提供近期运动；训练和部署使用同一变换定义，不读取未来专家状态。不存在 ODE solver、随机候选、learned critic、在线碰撞修补或 fallback。
+CurveNav 用 8 维无界 Flow state 表示标准化 `log` 正弧长和 7 个 cubic B-spline 局部航向增量；单位切向积分保证轨迹正则、初始前向且曲率连续。训练采用随机高斯源和闭区间时间 collocation，同时监督瞬时边界与数据锚定 improved MeanFlow；部署从固定高斯典型 latent 只做一次平均速度输运。四帧配准的坡度感知配置空间场完整编码为 `8×8` 度量安全 token，并在生成前融合进条件记忆；不再只沿更新前的 Flow 源路径读取不足 1% 的场。历史位姿既用于障碍配准，也以三个因果 SE(2) token 提供近期运动；训练和部署使用同一变换定义，不读取未来专家状态。不存在 ODE solver、随机候选、learned critic、在线碰撞修补或 fallback。
 
 模型内部 64 点路径的第 0 点是当前机器人原点。官方 evaluator 会统一在 policy 返回值前追加当前原点，因此 CurveNav 的部署边界只发送内部路径的 `1:64` 共 63 个未来点；MPC 最终仍接收 64 点路径，且只有一个原点。NavDP/X-NavDP 的累积位移输出本来就不含当前点。若 CurveNav 发送内部第 0 点，evaluator 会制造两个连续原点，使 MPC 的起始离散曲率退化。
 

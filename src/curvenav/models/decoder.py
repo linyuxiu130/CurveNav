@@ -5,11 +5,12 @@ from torch import Tensor, nn
 
 from curvenav.layers import RMSNorm
 from curvenav.models.blocks import ConditionalTrajectoryBlock
-from curvenav.models.safety import sample_configuration_field
 from curvenav.types import ConditionFeatures
 
 
-TRAJECTORY_DECODER_TYPE = "configuration_field_conditioned_curve_mean_flow_transformer"
+TRAJECTORY_DECODER_TYPE = (
+    "complete_configuration_memory_conditioned_curve_mean_flow_transformer"
+)
 
 
 class MeanFlowIntervalEmbedding(nn.Module):
@@ -62,7 +63,7 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         self.state_embedding = nn.Linear(1, model_dim)
         self.position_embedding = nn.Parameter(torch.empty(1, curve_tokens, model_dim))
         self.path_geometry_embedding = nn.Sequential(
-            nn.Linear(12, model_dim),
+            nn.Linear(7, model_dim),
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
@@ -112,15 +113,6 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         anchor_points = path[:, indices]
         anchor_heading = heading[:, indices]
         goal_delta = condition.point_goal[:, None] - anchor_points
-        field = sample_configuration_field(
-            condition.configuration_field,
-            anchor_points,
-            self.planning_horizon_m,
-        )
-        field_geometry = torch.cat(
-            (field[..., :1] / self.planning_horizon_m, field[..., 1:]),
-            dim=-1,
-        )
         path_geometry = torch.cat(
             (
                 anchor_points / self.planning_horizon_m,
@@ -128,7 +120,6 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
                 anchor_heading.cos()[..., None],
                 self.path_progress.to(path.dtype).expand(path.shape[0], -1, -1),
                 goal_delta / self.planning_horizon_m,
-                field_geometry,
             ),
             dim=-1,
         )

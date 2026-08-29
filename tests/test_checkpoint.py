@@ -87,7 +87,7 @@ def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
     assert "extra" not in checkpoint
     assert (
         contract["trajectory_decoder_type"]
-        == "configuration_field_conditioned_curve_mean_flow_transformer"
+        == "complete_configuration_memory_conditioned_curve_mean_flow_transformer"
     )
     assert contract["flow_source"] == (
         "standard_gaussian_training_and_fixed_typical_set_inference"
@@ -141,6 +141,10 @@ def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
     assert contract["num_curve_tokens"] == 8
     assert "route_query_count" not in contract
     assert contract["condition_token_count"] == 100
+    assert contract["configuration_encoder_type"] == (
+        "complete_metric_configuration_space_tokens"
+    )
+    assert contract["configuration_token_grid"] == [8, 8]
     assert contract["configuration_space_field"] == {
         "grid_size": 64,
         "extent_m": pytest.approx(3.6),
@@ -187,6 +191,7 @@ def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
     assert contract["model_architecture"] == {
         "model_dim": 384,
         "depth_token_grid": [8, 12],
+        "configuration_token_grid": [8, 8],
         "depth_dropout": 0.0,
         "point_goal_hidden_dim": 384,
         "condition_heads": 8,

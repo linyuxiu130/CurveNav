@@ -10,7 +10,7 @@ from .motion import HistoricalMotionEncoder
 
 
 CONDITION_ENCODER_TYPE = (
-    "goal_token_plus_current_metric_visual_tokens_plus_causal_motion"
+    "goal_current_visual_complete_configuration_space_and_causal_motion"
 )
 
 
@@ -20,9 +20,11 @@ class PolicyConditionEncoder(nn.Module):
     def __init__(
         self,
         point_goal_encoder: nn.Module,
+        configuration_encoder: nn.Module,
         *,
         observation_frames: int,
         spatial_tokens: int,
+        configuration_tokens: int,
         history_horizon_m: float,
         model_dim: int = 384,
         transformer_layers: int = 4,
@@ -31,8 +33,18 @@ class PolicyConditionEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.point_goal_encoder = point_goal_encoder
+        self.configuration_encoder = configuration_encoder
         self.observation_frames = observation_frames
         self.spatial_tokens = spatial_tokens
+        self.configuration_tokens = configuration_tokens
+        self.configuration_query_norm = RMSNorm(model_dim)
+        self.configuration_memory_norm = RMSNorm(model_dim)
+        self.configuration_attention = nn.MultiheadAttention(
+            model_dim,
+            transformer_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
         self.motion_encoder = HistoricalMotionEncoder(
             observation_frames=observation_frames,
             history_horizon_m=history_horizon_m,
@@ -57,8 +69,23 @@ class PolicyConditionEncoder(nn.Module):
         if observation.configuration_field.ndim != 4:
             raise ValueError("configuration field must have shape [B,C,H,W]")
         goal = self.point_goal_encoder(point_goal).unsqueeze(1)
+        configuration = self.configuration_encoder(
+            observation.configuration_field
+        )
+        if configuration.shape[:2] != (batch, self.configuration_tokens):
+            raise ValueError(
+                "configuration tokens do not match the condition contract"
+            )
         motion = self.motion_encoder(observation_to_current, observation_valid)
         tokens = torch.cat((goal, observation.tokens, motion), dim=1).float()
+        normalized_configuration = self.configuration_memory_norm(configuration)
+        configuration_context = self.configuration_attention(
+            self.configuration_query_norm(tokens),
+            normalized_configuration,
+            normalized_configuration,
+            need_weights=False,
+        )[0]
+        tokens = tokens + configuration_context
         for block in self.context_blocks:
             tokens = block(tokens)
         return ConditionFeatures(
