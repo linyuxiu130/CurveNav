@@ -13,14 +13,16 @@ from scipy.ndimage import distance_transform_edt
 
 from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
-from curvenav.data_generation.geometry import Grid, points_at_arc, polyline
+from curvenav.data_generation.geometry import Grid
 from curvenav.evaluation.metrics import (
     EVALUATION_SPACING_M,
+    resample_path_at_distance,
     summarize_metrics,
     summarize_paired_safety,
     trajectory_metrics,
 )
 from curvenav.evaluation.protocol import summarize_strata
+from curvenav.trajectory import path_arc_length
 
 
 def load_common_protocol(
@@ -86,15 +88,19 @@ class SourceGridSafety:
             "observed_max_margin_violation_m": [],
             "arc_length_beyond_local_horizon_m": [],
         }
-        for index, raw_path in enumerate(paths.numpy()):
-            path, cumulative = polyline(raw_path)
-            evaluated_length = min(float(cumulative[-1]), horizon_m)
-            query = np.linspace(
+        lengths = path_arc_length(paths)
+        for index, (raw_path, total_length) in enumerate(
+            zip(paths, lengths, strict=True)
+        ):
+            total = float(total_length)
+            evaluated_length = min(total, horizon_m)
+            query = torch.from_numpy(np.linspace(
                 0.0,
                 evaluated_length,
                 max(2, int(np.ceil(evaluated_length / EVALUATION_SPACING_M)) + 1),
-            )
-            local = points_at_arc(path, query)
+                dtype=np.float32,
+            ))[None]
+            local = resample_path_at_distance(raw_path[None], query)[0].numpy()
             world = self._world(
                 local,
                 self.common["origin_xy"][index],
@@ -122,7 +128,7 @@ class SourceGridSafety:
                 max(0.0, 0.10 - minimum)
             )
             values["arc_length_beyond_local_horizon_m"].append(
-                max(0.0, float(cumulative[-1]) - horizon_m)
+                max(0.0, total - horizon_m)
             )
         return {
             name: torch.tensor(parts)

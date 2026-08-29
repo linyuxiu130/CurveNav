@@ -58,6 +58,9 @@ def test_cross_model_safety_queries_frozen_source_grid(tmp_path: Path) -> None:
     assert metrics["observed_footprint_collision"].item()
     assert metrics["observed_path_fraction"].item() == 1.0
 
+    stationary = safety.measure(torch.zeros(1, 3, 2), horizon_m=1.0)
+    assert not stationary["observed_footprint_collision"].item()
+
 
 def test_fixed_distance_metrics_match_identical_paths() -> None:
     target = torch.tensor([[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]])
