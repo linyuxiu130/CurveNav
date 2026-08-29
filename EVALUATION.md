@@ -72,6 +72,8 @@ scripts/evaluate_policy.sh configs/base.yaml CHECKPOINT \
 
 跨模型比较使用 `scripts/compare_offline.sh`。公共 NPZ 必须冻结 `axis=x_forward_y_left`、`reference_path`、`point_goal`、`scene_id`、`route_id`、`origin_xy` 和 `route_yaw`；每个映射结果 NPZ 必须显式写入相同 `axis`、`base_path`、`base_length`、模型名和 checkpoint。安全真值直接查询生成专家时冻结的 Dingo 膨胀 HSSD navigation grid，路径按 `0.025 m` 稠密化后映射回世界坐标；不再从缺少完整外参语义的 RGB-D 文件临时猜测安全场。旧公共集和四模型结果缺少显式 axis，只能作为历史产物，补齐协议字段后才能进入新排名。
 
+比较开始前，公共集中的专家路径必须在该冻结地图上同时满足 `0` footprint collision、`0` 个 `0.10 m` 裕度违例以及 `100%` 地图覆盖；任一条件不满足就拒绝整份输入。这个门禁用于发现公共样本与地图版本、route pose 或坐标轴错配，禁止把协议错误计为模型错误。
+
 ```bash
 scripts/compare_offline.sh configs/base.yaml COMMON.npz HSSD_SOURCE REPORT.json \
   CURVENAV.npz SAND.npz NAVDP.npz XNAVDP.npz
@@ -91,6 +93,29 @@ CurveNav 用 8 维无界 Flow state 表示标准化 `log` 正弧长和 7 个 cub
 general-navigation-benchmark/baselines/x-navdp/eval
 ```
 
+## 当前终态离线结果（2026-08-30）
+
+最终 EMA checkpoint 为 step 8,000。完整自然分布验证集含 6,087 条 held-out HSSD 样本：固定 `2 m` ADE mean/P90 为 `0.05776/0.15277 m`，FDE mean/P90 为 `0.16284/0.42437 m`，覆盖率 `97.94%`，footprint collision `1.544%`，`0.10 m` 裕度违例 `4.436%`，负目标进度 `2.399%`。直接前向层的 ADE/collision 为 `0.03539 m/0.282%`；前向绕障层为 `0.12266 m/4.919%`；后向目标层为 `0.16808 m/10.00%`。只保留当前深度帧会把 ADE 从 `0.05776 m` 提高到 `0.06995 m`，碰撞从 `1.544%` 提高到 `2.776%`，说明四帧历史在同一模型上的净增益成立。空闲 4090 上纯模型 batch-1 FP16 延迟 P50/P95 为 `50.21/50.58 ms`，批量 32 的观测吞吐为 `596.59 obs/s`。
+
+跨模型压力集含相同的 64 条样本和四个 held-out scene，刻意提高了绕障、后向目标和短时背离目标样本的比例，因此只用于比较能力边界，不代表自然场景频率。所有输出都按同一物理弧长、坐标轴和冻结 Dingo 配置空间地图重新计分；专家门禁结果是 `0` collision、`0` 裕度违例、`100%` 覆盖。
+
+| 模型 | ADE mean/P90 (m) | FDE mean (m) | 路径覆盖 | footprint collision | 裕度违例 | 曲率 P95 中位数 (m⁻¹) | 最差场景 ADE / collision |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| CurveNav | **0.1181 / 0.2515** | **0.3160** | 98.33% | **32.81%** | **37.50%** | **0.908** | **0.1700 / 45.45%** |
+| NavDP | 0.3660 / 0.6284 | 0.6270 | 97.78% | 64.06% | 68.75% | 3.297 | 0.4016 / 75.76% |
+| SanD | 0.2339 / 0.4757 | 0.4805 | **99.66%** | 60.94% | 64.06% | 1.922 | 0.2997 / 75.76% |
+| X-NavDP | 0.2812 / 0.5629 | 0.4375 | 93.95% | 40.62% | 45.31% | 1.721 | 0.3209 / 51.52% |
+
+压力集不能仅按目标进度排名：NavDP、SanD 和 X-NavDP 的平均 progress regret 分别为 `-0.377/-0.252/-0.116 m`，但更直接地朝目标推进同时显著增加了碰撞；CurveNav 为 `+0.031 m`。因此任务性、几何拟合、安全和可执行性保持分组报告，不合成一个可以被激进直行投机的总分。
+
+```text
+final checkpoint: /DataDisk2/hsb/curvenav-f19ba8a/outputs/train_policy/checkpoint.pt
+full CurveNav:    /DataDisk2/hsb/curvenav-f19ba8a/outputs/offline-evaluation-8000-d56068c-20260830/offline-metrics.json
+cross-model:      /DataDisk2/hsb/offline-cross-model/results/full-20260830-metric-12612de/comparison.json
+common dataset:   /DataDisk2/hsb/offline-cross-model/data/offline-common-hssd-64-metric-12612de.npz
+safety source:    /DataDisk2/hsb/offline-cross-model/source-metric-12612de
+```
+
 ## 历史基线与当前在线状态
 
 以下 2026-08-29 数值来自已被当前 iMeanFlow 合同替代的瞬时 CFM 基线，只用于同数据问题定位，不能作为当前代码成绩：
@@ -100,7 +125,7 @@ checkpoint: /mnt/data/huangshibo/H/navigation_three_projects/curvenav/outputs/ar
 offline:    /mnt/data/huangshibo/H/navigation_three_projects/curvenav/outputs/strict-offline-state-20260829
 ```
 
-该基线 checkpoint step 为 8,000，使用 EMA；严格离线覆盖全部 6,087 条验证样本。总体 `ADE=0.11556 m`，前向/前向开阔/可见绕行层分别为 `0.10328/0.10651/0.17563 m`；坡度感知障碍定义下 footprint collision 为 `3.083%`、安全裕量违例为 `5.252%`。P95 最大曲率为 `3.7250 m⁻¹`，专家为 `1.8148 m⁻¹`，切向反转保持 `0%`。PointGoal 与当前深度打乱分别令 ADE 增加 `0.56703/0.15140 m`。其 8-step eager FP16 延迟 P50/P95 为 `382.1/502.0 ms`。当前 1-NFE 新图在 V100S、batch 1、FP16 预热后实测纯模型 `33.89 ms`、完整 runtime step `40.18 ms`；该数值只说明执行开销，最终 EMA 效果与 4090 空闲态延迟仍以本轮训练完成后的独立测评为准。
+该基线 checkpoint step 为 8,000，使用 EMA；严格离线覆盖全部 6,087 条验证样本。总体 `ADE=0.11556 m`，前向/前向开阔/可见绕行层分别为 `0.10328/0.10651/0.17563 m`；坡度感知障碍定义下 footprint collision 为 `3.083%`、安全裕量违例为 `5.252%`。P95 最大曲率为 `3.7250 m⁻¹`，专家为 `1.8148 m⁻¹`，切向反转保持 `0%`。PointGoal 与当前深度打乱分别令 ADE 增加 `0.56703/0.15140 m`。其 8-step eager FP16 延迟 P50/P95 为 `382.1/502.0 ms`。
 
 当前主要失败层不是普通前向跟随，而是旧报告中的可见绕行层：其 footprint collision/safety violation 为 `12.17%/21.22%`。`rear_goal` 与 `expert_moves_away_from_goal` 的旧索引对齐 ADE 为 `0.4592/0.5987 m`，作为历史定位信息保留；新模型统一使用 `forward_detour` 和固定物理距离合同重新计算，不与这些旧口径数值直接横比。
 
