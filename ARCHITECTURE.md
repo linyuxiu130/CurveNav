@@ -198,7 +198,7 @@ L=L_MF+L_safe
 
 训练数据只来自 CurveNav 按 benchmark Dingo 配置生成的 HSSD 专家路线，不读取 SanD/NavDP 数据。当前 canonical dataset 为训练 `25,928`、验证 `6,087` 条；深度 bank 在编译时硬链接，不重复复制图像。
 
-训练固定 global batch `1024`、每卡 micro-batch 上限 `384`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。完整 MeanFlow/JVP 保持 eager；训练运行时只编译 JVP 外固定形状的 ResNet-18、度量几何投影和配置空间 CNN，分别融合视觉卷积/归一化与静态几何小算子。它们仍是同一组模块和参数，state dict、损失、梯度与推理数学图不变，没有第二训练实现。溢出结果直接读取 Accelerate 已记录的 `step_was_skipped`，正常 step 不再用 `GradScaler.get_scale()` 和 Python CUDA 布尔值造成三次额外同步。
+训练固定 global batch `1024`、每卡 micro-batch 上限 `384`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。完整 MeanFlow/JVP 保持 eager；训练运行时只用 `torch.compile(fullgraph=True, mode="reduce-overhead")` 融合无参数、静态形状的度量几何投影器，因此 checkpoint 和推理数学图不变，也没有第二训练实现。溢出结果直接读取 Accelerate 已记录的 `step_was_skipped`，正常 step 不再用 `GradScaler.get_scale()` 和 Python CUDA 布尔值造成三次额外同步。
 
 当前必要验证：
 
@@ -206,7 +206,7 @@ L=L_MF+L_safe
 - 90 个数学、数据、前向、梯度和合同测试；
 - 生产 40,394,440 参数图的 FP16 前向、精确 JVP 与反向检查；
 - 6,087 条验证专家的四帧配置空间审计：当前帧单独识别专家 footprint collision `0` 条、裕度违例 `89` 条、直线裕度违例 `787` 条；四帧静态融合后分别为 `9`、`143`、`1,325` 条。9 条碰撞均可由具体单独历史帧复现，位姿为正常的约 `0.45/0.89/1.33 m` 后向平移，不是跨帧符号或偶然 observed 拼接错误；
-- 三张 V100S 按 `342/341/341` 分片，每 rank 单次前后向；编译 JVP 外静态子图后实测约 `26.7 GiB/GPU`，缓存命中的 step 40--120 稳定为 `1,890--1,915 samples/s`。相对同一全局场图未编译的 `1,745--1,755 samples/s` 提高约 `8.3--9.7%`；首次 kernel 编译约一分钟，只发生在新硬件/新图首次启动，8,000-step 正式训练能摊薄该成本；
+- 三张 V100S 按 `342/341/341` 分片，每 rank 单次前后向，占用约 `28.9 GiB/GPU`；完整全局场模型在 step 40--140 稳定为 `1,730--1,757 samples/s`。额外编译 ResNet 与配置空间 CNN 虽在 V100S 达到 `1,890--1,915 samples/s`，但 4 张 RTX 4090 实测降至 `1,784--2,033 samples/s`，低于同机 eager 子图的常见 `2,300--2,460 samples/s`，因此已删除，生产链不保留硬件分支；
 - 当前图在 V100S、batch 1、FP16、预热后的纯 `policy.sample()` CUDA 延迟为 `33.89 ms`；包含深度重采样、四帧上下文、张量传输与路径回传的 runtime step 为 `40.18 ms`。4090 空闲态延迟必须在本轮训练结束后实测，不用训练占卡时的争用数据代替；
 - 新模型最终 200 epoch 墙钟时间和离线指标必须由本次训练实测，不沿用旧 checkpoint。
 

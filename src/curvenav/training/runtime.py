@@ -17,22 +17,10 @@ def configure_cuda_training_backend() -> None:
 
 
 def compile_static_geometry_preprocessing(policy: nn.Module) -> None:
-    """Fuse fixed-shape visual and metric preprocessing outside the MeanFlow JVP."""
-    backbone = policy.depth_encoder.backbone
-    backbone.forward = torch.compile(
-        backbone.forward,
-        fullgraph=True,
-        mode="default",
-    )
+    """Fuse the parameter-free, fixed-shape metric projection for training."""
     projector = policy.depth_encoder.metric_projector
     projector.forward = torch.compile(
         projector.forward,
         fullgraph=True,
         mode="reduce-overhead",
-    )
-    configuration_encoder = policy.condition_encoder.configuration_encoder
-    configuration_encoder.forward = torch.compile(
-        configuration_encoder.forward,
-        fullgraph=True,
-        mode="default",
     )
