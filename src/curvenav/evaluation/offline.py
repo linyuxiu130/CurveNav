@@ -13,10 +13,14 @@ from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
 from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.loader import build_policy_validation_loader
+from curvenav.evaluation.protocol import summarize_strata
+from curvenav.evaluation.report import write_case_report
 from curvenav.factory import build_policy
 from curvenav.models import CurveNavPolicy
-from curvenav.models.safety import SAFETY_CLEARANCE_M
-from curvenav.physical import ROBOT_FOOTPRINT_RADIUS_M
+from curvenav.models.safety import (
+    SAFETY_CLEARANCE_M,
+    sample_configuration_field,
+)
 from curvenav.training.checkpoint import validate_policy_contract
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.prefetch import CudaPrefetchLoader
@@ -34,25 +38,20 @@ class PolicyMeasurements:
     batch_latency_ms: Tensor
     online_latency_ms: Tensor
     samples: int
+    sample_data: dict[str, Tensor]
 
 
 def trajectory_batch_metrics(
     path: Tensor,
-    curvature: Tensor,
     reference_path: Tensor,
-    reference_curvature: Tensor,
     point_goal: Tensor,
 ) -> dict[str, Tensor]:
     """Return aligned per-observation geometry for one predicted trajectory."""
     if path.ndim != 3 or path.shape[-1] != 2:
         raise ValueError("path must have shape [B,P,2]")
-    batch_size, path_points, _ = path.shape
-    if curvature.shape != (batch_size, path_points):
-        raise ValueError("curvature shape must match path")
+    batch_size = path.shape[0]
     if reference_path.shape != path.shape:
         raise ValueError("reference_path shape must match path")
-    if reference_curvature.shape != curvature.shape:
-        raise ValueError("reference_curvature shape must match reference_path")
     if point_goal.shape != (batch_size, 2):
         raise ValueError("point_goal must have shape [B,2]")
 
@@ -65,15 +64,24 @@ def trajectory_batch_metrics(
     reference_delta = reference_path[:, 1:] - reference_path[:, :-1]
     path_segment_length = torch.linalg.vector_norm(path_delta, dim=-1)
     reference_segment_length = torch.linalg.vector_norm(reference_delta, dim=-1)
-    total_abs_heading_change = (
-        0.5 * (curvature[:, :-1].abs() + curvature[:, 1:].abs())
-        * path_segment_length
-    ).sum(dim=-1)
-    reference_total_abs_heading_change = (
-        0.5
-        * (reference_curvature[:, :-1].abs() + reference_curvature[:, 1:].abs())
-        * reference_segment_length
-    ).sum(dim=-1)
+    path_heading = torch.atan2(path_delta[..., 1], path_delta[..., 0])
+    reference_heading = torch.atan2(
+        reference_delta[..., 1], reference_delta[..., 0]
+    )
+    path_turn = torch.atan2(
+        (path_heading[:, 1:] - path_heading[:, :-1]).sin(),
+        (path_heading[:, 1:] - path_heading[:, :-1]).cos(),
+    )
+    reference_turn = torch.atan2(
+        (reference_heading[:, 1:] - reference_heading[:, :-1]).sin(),
+        (reference_heading[:, 1:] - reference_heading[:, :-1]).cos(),
+    )
+    path_support = 0.5 * (path_segment_length[:, 1:] + path_segment_length[:, :-1])
+    reference_support = 0.5 * (
+        reference_segment_length[:, 1:] + reference_segment_length[:, :-1]
+    )
+    path_curvature = path_turn / path_support.clamp_min(1e-6)
+    reference_curvature = reference_turn / reference_support.clamp_min(1e-6)
     tangent_dot = (path_delta[:, 1:] * path_delta[:, :-1]).sum(dim=-1)
     final_predicted_direction = path_delta[:, -1] / torch.linalg.vector_norm(
         path_delta[:, -1], dim=-1, keepdim=True
@@ -98,12 +106,10 @@ def trajectory_batch_metrics(
         - torch.linalg.vector_norm(point_goal - reference_path[:, -1], dim=-1),
         "point_goal_distance_m": goal_distance,
         "point_goal_is_behind": point_goal[:, 0] < 0,
-        "max_abs_curvature_inv_m": curvature.abs().amax(dim=-1),
+        "max_abs_curvature_inv_m": path_curvature.abs().amax(dim=-1),
         "reference_max_abs_curvature_inv_m": reference_curvature.abs().amax(dim=-1),
-        "total_abs_heading_change_rad": total_abs_heading_change,
-        "reference_total_abs_heading_change_rad": (
-            reference_total_abs_heading_change
-        ),
+        "total_abs_heading_change_rad": path_turn.abs().sum(dim=-1),
+        "reference_total_abs_heading_change_rad": reference_turn.abs().sum(dim=-1),
         "terminal_heading_error_rad": torch.atan2(final_cross, final_dot).abs(),
         "has_tangent_reversal": (tangent_dot < 0).any(dim=-1),
     }
@@ -111,28 +117,25 @@ def trajectory_batch_metrics(
 
 def observed_obstacle_metrics(
     path: Tensor,
-    obstacle_points: Tensor,
-    obstacle_valid: Tensor,
+    configuration_field: Tensor,
+    planning_horizon_m: float,
 ) -> dict[str, Tensor]:
-    """Measure path clearance against body-height surfaces in current depth."""
+    """Measure continuous-path clearance in the footprint-inflated local field."""
     if path.ndim != 3 or path.shape[-1] != 2:
         raise ValueError("path must have shape [B,P,2]")
-    if obstacle_points.ndim != 3 or obstacle_points.shape[-1] != 2:
-        raise ValueError("obstacle_points must have shape [B,O,2]")
-    if obstacle_valid.shape != obstacle_points.shape[:2]:
-        raise ValueError("obstacle_valid must have shape [B,O]")
-    if obstacle_valid.dtype != torch.bool or path.shape[0] != obstacle_points.shape[0]:
-        raise ValueError("obstacle mask and batch dimensions must match")
-
-    distance = torch.cdist(path.float(), obstacle_points.float())
-    distance = distance.masked_fill(~obstacle_valid[:, None], torch.inf)
-    nearest = distance.amin(dim=(-1, -2))
-    has_obstacle = obstacle_valid.any(dim=-1)
+    sampled = sample_configuration_field(
+        configuration_field,
+        path,
+        planning_horizon_m,
+    )
+    observed = sampled[..., 3] > 0.5
+    nearest = sampled[..., 0].masked_fill(~observed, torch.inf).amin(dim=-1)
+    has_obstacle = configuration_field[:, 4].flatten(1).any(dim=-1)
     return {
         "observed_obstacle_available": has_obstacle,
         "observed_min_clearance_m": nearest,
         "observed_footprint_collision": has_obstacle
-        & (nearest < ROBOT_FOOTPRINT_RADIUS_M),
+        & (nearest < 0.0),
         "observed_safety_margin_violation": has_obstacle
         & (nearest < SAFETY_CLEARANCE_M),
     }
@@ -181,6 +184,7 @@ def measure_policy(
 
     values: dict[str, list[Tensor]] = {}
     current_frame_values: dict[str, list[Tensor]] = {}
+    sample_data: dict[str, list[Tensor]] = {}
     batch_latency = []
     samples = 0
     for batch in loader:
@@ -206,14 +210,12 @@ def measure_policy(
         shuffled_depth[:, -1] = torch.roll(batch["depth"][:, -1], shifts=1, dims=0)
         depth_shuffle_batch["depth"] = shuffled_depth
         _, depth_shuffle_prediction = _sample(policy, depth_shuffle_batch)
-        reference_path, _, reference_curvature = policy.curve_codec.decode_values(
+        reference_path, _ = policy.curve_codec.decode_values(
             prepared.target.curve_values.float(),
         )
         metrics = trajectory_batch_metrics(
             prediction.path.float(),
-            prediction.curvature.float(),
             reference_path,
-            reference_curvature,
             prepared.condition.point_goal.float(),
         )
         metrics["valid_observation_frames"] = (
@@ -222,6 +224,7 @@ def measure_policy(
         projection = policy.depth_encoder.metric_projector(
             prepared.condition.depth,
             prepared.condition.observation_to_current.float(),
+            prepared.condition.observation_valid,
         )
         current_obstacle_valid = (
             projection.obstacle_valid[:, -1]
@@ -230,17 +233,34 @@ def measure_policy(
         metrics.update(
             observed_obstacle_metrics(
                 prediction.path.float(),
-                projection.obstacle_points[:, -1],
-                current_obstacle_valid,
+                projection.configuration_field,
+                policy.planning_horizon_m,
             )
         )
         reference_obstacle_metrics = observed_obstacle_metrics(
             reference_path,
-            projection.obstacle_points[:, -1],
-            current_obstacle_valid,
+            projection.configuration_field,
+            policy.planning_horizon_m,
         )
         for name, value in reference_obstacle_metrics.items():
             metrics[f"reference_{name}"] = value
+        straight_progress = torch.linspace(
+            0.0,
+            1.0,
+            reference_path.shape[1],
+            device=reference_path.device,
+        )[None, :, None]
+        straight_path = (
+            reference_path[:, :1]
+            + straight_progress * (reference_path[:, -1:] - reference_path[:, :1])
+        )
+        straight_obstacle_metrics = observed_obstacle_metrics(
+            straight_path,
+            projection.configuration_field,
+            policy.planning_horizon_m,
+        )
+        for name, value in straight_obstacle_metrics.items():
+            metrics[f"straight_{name}"] = value
         goal_shuffle_error = torch.linalg.vector_norm(
             goal_shuffle_prediction.path.float() - reference_path,
             dim=-1,
@@ -261,9 +281,7 @@ def measure_policy(
         ).mean(dim=-1)
         current_metrics = trajectory_batch_metrics(
             current_prediction.path.float(),
-            current_prediction.curvature.float(),
             reference_path,
-            reference_curvature,
             current_prepared.condition.point_goal.float(),
         )
         current_metrics["valid_observation_frames"] = (
@@ -273,6 +291,14 @@ def measure_policy(
             values.setdefault(name, []).append(value.cpu())
         for name, value in current_metrics.items():
             current_frame_values.setdefault(name, []).append(value.cpu())
+        for name, value in {
+            "predicted_path": prediction.path.float(),
+            "reference_path": reference_path,
+            "point_goal": prepared.condition.point_goal.float(),
+            "obstacle_points": projection.obstacle_points[:, -1],
+            "obstacle_valid": current_obstacle_valid,
+        }.items():
+            sample_data.setdefault(name, []).append(value.cpu())
         samples += len(prediction.path)
 
     return PolicyMeasurements(
@@ -291,6 +317,7 @@ def measure_policy(
             else torch.empty(0, dtype=torch.float64)
         ),
         samples=samples,
+        sample_data={name: torch.cat(parts) for name, parts in sample_data.items()},
     )
 
 
@@ -384,17 +411,10 @@ def summarize_policy_metrics(metrics: dict[str, Tensor]) -> dict[str, float | in
     return result
 
 
-def evaluate_policy(
-    policy: CurveNavPolicy,
-    loader,
-    device: torch.device,
-    expected_samples: int,
-) -> dict[str, float | int | str]:
-    measurements = measure_policy(policy, loader, device)
-    if measurements.samples != expected_samples:
-        raise RuntimeError(
-            f"evaluated {measurements.samples} samples, expected {expected_samples}"
-        )
+def evaluate_measurements(
+    measurements: PolicyMeasurements,
+) -> dict[str, object]:
+    """Summarize a single inference pass without evaluating the policy twice."""
     seconds = measurements.batch_latency_ms.sum().item() / 1000.0
     current_frame_summary = summarize_policy_metrics(
         measurements.current_frame_metrics
@@ -469,10 +489,29 @@ def evaluate_policy(
         "online_latency_ms_p95": torch.quantile(
             measurements.online_latency_ms, 0.95
         ).item(),
+        "strict_strata": summarize_strata(metrics),
     }
 
 
-def run_evaluation(config: CurveNavConfig, checkpoint_path: Path) -> dict[str, object]:
+def evaluate_policy(
+    policy: CurveNavPolicy,
+    loader,
+    device: torch.device,
+    expected_samples: int,
+) -> dict[str, object]:
+    measurements = measure_policy(policy, loader, device)
+    if measurements.samples != expected_samples:
+        raise RuntimeError(
+            f"evaluated {measurements.samples} samples, expected {expected_samples}"
+        )
+    return evaluate_measurements(measurements)
+
+
+def run_evaluation(
+    config: CurveNavConfig,
+    checkpoint_path: Path,
+    artifact_dir: Path | None = None,
+) -> dict[str, object]:
     if not torch.cuda.is_available():
         raise RuntimeError("CurveNav evaluation requires CUDA")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -489,17 +528,32 @@ def run_evaluation(config: CurveNavConfig, checkpoint_path: Path) -> dict[str, o
         num_workers=config.training.num_workers,
     )
     loader = CudaPrefetchLoader(bundle.loader, bundle.depth_bank, torch.device("cuda"))
-    result = evaluate_policy(
-        policy,
-        loader,
-        torch.device("cuda"),
-        bundle.samples,
-    )
+    measurements = measure_policy(policy, loader, torch.device("cuda"))
+    if measurements.samples != bundle.samples:
+        raise RuntimeError(
+            f"evaluated {measurements.samples} samples, expected {bundle.samples}"
+        )
+    result = evaluate_measurements(measurements)
     result.update(
         checkpoint=str(checkpoint_path.resolve()),
         checkpoint_step=int(checkpoint["step"]),
         weights="ema",
     )
+    if artifact_dir is not None:
+        artifact_dir = artifact_dir.expanduser().resolve()
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        case_path = write_case_report(
+            artifact_dir,
+            measurements.metrics,
+            measurements.sample_data,
+        )
+        metrics_path = artifact_dir / "strict-offline-metrics.json"
+        metrics_path.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        result["case_report"] = str(case_path)
+        result["metrics_report"] = str(metrics_path)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
     return result
 
@@ -508,8 +562,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
     parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("--artifact-dir", type=Path)
     args = parser.parse_args()
-    run_evaluation(load_config(args.config), args.checkpoint)
+    run_evaluation(load_config(args.config), args.checkpoint, args.artifact_dir)
 
 
 if __name__ == "__main__":

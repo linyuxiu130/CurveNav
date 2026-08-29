@@ -1,4 +1,4 @@
-"""CurveNav: Curvature-aware Local Navigation.
+"""CurveNav: regular-curve MeanFlow for local navigation.
 
 Model symbols are imported lazily so the CPU-only expert manifest builder can
 run without importing PyTorch or initializing a CUDA runtime.

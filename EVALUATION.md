@@ -7,7 +7,7 @@
 - 深度：`224×126`，光轴距离，最大值 `5 m`
 - 内参：`fx=fy=166.80851, cx=112, cy=63`
 - 外参：前移 `0.28618 m`、高度 `0.62532 m`、下俯 `10°`
-- 模型视觉输入：四帧均按上述参数反投影并对齐到当前机器人系
+- 模型视觉输入：四帧均按上述参数反投影并对齐到当前机器人系；局部表面法向坡度不超过 Dingo 合同 `45°` 的深度面视为可通行地形，不进入二维障碍集合
 
 ## 官方 wheeled PointGoal 口径
 
@@ -38,7 +38,26 @@
 
 当前 prepared dataset、checkpoint 合同和部署输入统一使用上述 Dingo D455 标定。旧 `0.40 m` 水平相机 checkpoint 与当前合同不兼容，必须直接拒绝，不能通过二维缩放或兼容分支继续评测。
 
-CurveNav 用八维无界 flow state 表示一个长度和七个曲率控制。训练从独立高斯先验做标准条件 Flow Matching；每次速度场求值都将状态解码为 16 个路径锚点，并用当前深度、机器人半径和净空构造 learned metric cross-attention。部署从先验均值固定执行 8 步 Heun，避免闭环重规划噪声。历史位姿只用于把深度几何对齐到当前机器人系，不进入独立状态 token。不存在 route 辅助轨迹、DDPM、随机候选、learned critic、碰撞 loss 或碰撞启发式。离线报告部署轨迹的 ADE、弧长、目标进展、累计航向、连续曲率和端到端 8 步延迟，并单独报告高转向样本。
+## 严格离线协议
+
+离线测评不生成随机目标，也不把 PointGoal 投影到局部专家终点。验证集中的每个 PointGoal 都是对应 HSSD 专家路线的真实任务终点；起终点均由同一份 Dingo 膨胀 NavMesh 采样，A* 连通，完整专家路线以 `0.025 m` 间隔验证连续净空。训练集和验证集按场景及 source family 隔离。
+
+完整验证集只按已有物理情形分层，不删除困难样本：
+
+- `forward`：PointGoal 在机器人前半平面；这是基础 PointGoal 跟随结果。
+- `forward_open`：前向目标、当前深度存在有效障碍点，但专家弦线不触及安全边界。
+- `forward_visible_detour`：前向目标，专家连续轨迹安全，而起点到局部专家终点的直线被当前深度障碍阻断；这是不引入人造障碍的基础避障结果。
+- `rear_goal`：PointGoal 位于后半平面，单独报告，不与基础前向结果混淆。
+- `expert_moves_away_from_goal`：专家局部段本身暂时远离任务目标，表示真实绕行或部分可观测情形，单独报告。
+
+碰撞测量与训练共用四帧配准的 `64×64` 配置空间场。场值是障碍欧氏距离减 Dingo footprint radius；64 个等弧长轨迹点做双线性查询，负值为 footprint collision，小于额外 `0.10 m` 为安全裕度违例。代表案例固定选择各层 ADE 中位样本，并额外显示 `forward_visible_detour` 的最难样本，避免人工挑图。
+
+```bash
+scripts/evaluate_policy.sh configs/base.yaml CHECKPOINT \
+  --artifact-dir outputs/strict-offline
+```
+
+CurveNav 用 8 维无界 Flow state 表示标准化 `log` 正弧长和 7 个 cubic B-spline 局部航向增量；单位切向积分保证轨迹正则、初始前向且曲率连续。训练采用随机高斯源和闭区间时间 collocation，同时监督瞬时边界与数据锚定 improved MeanFlow；部署从固定高斯典型 latent 只做一次平均速度输运。每次求值都将状态解码为 16 个路径锚点，并连续查询四帧配准的坡度感知配置空间场。历史位姿既用于障碍配准，也以三个因果 SE(2) token 提供近期运动；训练和部署使用同一变换定义，不读取未来专家状态。不存在 ODE solver、随机候选、learned critic、在线碰撞修补或 fallback。
 
 模型内部 64 点路径的第 0 点是当前机器人原点。官方 evaluator 会统一在 policy 返回值前追加当前原点，因此 CurveNav 的部署边界只发送内部路径的 `1:64` 共 63 个未来点；MPC 最终仍接收 64 点路径，且只有一个原点。NavDP/X-NavDP 的累积位移输出本来就不含当前点。若 CurveNav 发送内部第 0 点，evaluator 会制造两个连续原点，使 MPC 的起始离散曲率退化。
 
@@ -49,3 +68,31 @@ CurveNav 用八维无界 flow state 表示一个长度和七个曲率控制。�
 ```text
 general-navigation-benchmark/baselines/x-navdp/eval
 ```
+
+## 历史基线与当前在线状态
+
+以下 2026-08-29 数值来自已被当前 iMeanFlow 合同替代的瞬时 CFM 基线，只用于同数据问题定位，不能作为当前代码成绩：
+
+```text
+checkpoint: /mnt/data/huangshibo/H/navigation_three_projects/curvenav/outputs/archive/train_policy-cumulative-heading-baseline-20260829/checkpoint.pt
+offline:    /mnt/data/huangshibo/H/navigation_three_projects/curvenav/outputs/strict-offline-state-20260829
+```
+
+该基线 checkpoint step 为 8,000，使用 EMA；严格离线覆盖全部 6,087 条验证样本。总体 `ADE=0.11556 m`，前向/前向开阔/可见绕行层分别为 `0.10328/0.10651/0.17563 m`；坡度感知障碍定义下 footprint collision 为 `3.083%`、安全裕量违例为 `5.252%`。P95 最大曲率为 `3.7250 m⁻¹`，专家为 `1.8148 m⁻¹`，切向反转保持 `0%`。PointGoal 与当前深度打乱分别令 ADE 增加 `0.56703/0.15140 m`。其 8-step eager FP16 延迟 P50/P95 为 `382.1/502.0 ms`；当前代码是 1-NFE，必须在重新训练后单独实测。
+
+当前主要失败层不是普通前向跟随，而是 `forward_visible_detour`：其 footprint collision/safety violation 为 `12.17%/21.22%`。`rear_goal` 与 `expert_moves_away_from_goal` 的 ADE 为 `0.4592/0.5987 m`，作为部分可观测困难层单列，不用随机后向目标稀释基础结果。
+
+同日公共离线对比中的 CurveNav 同样是该历史基线。公共集从修正后的 HSSD 专家路线重新渲染，包含 64 个样本、595 帧 RGB-D，并按专家累计转向分成四个等量难度层；四模型读取完全相同的历史观测和 PointGoal。统一按物理弧长比较前 `2 m`，并用当前深度的坡度感知 body obstacle 做逐段净空统计：
+
+| 模型 | ADE / 高转向 ADE (m) | 覆盖 2 m | footprint collision | 安全裕量违例 | 曲率 P95 中位数 (m⁻¹) | 目标旋转响应 |
+|---|---:|---:|---:|---:|---:|---:|
+| CurveNav | **0.0817 / 0.1716** | 92.19% | 8.47% | 11.86% | **0.704** | 41.44° |
+| NavDP | 0.2717 / 0.4062 | **95.31%** | **5.08%** | **8.47%** | 3.341 | 31.69° |
+| SanD | 0.2342 / 0.3284 | 93.75% | 6.78% | **8.47%** | 1.929 | **50.13°** |
+| X-NavDP | 0.2256 / 0.3004 | 76.56% | 8.47% | 11.86% | 1.827 | 1.02° |
+
+该公共集的专家参考在单帧可见深度统计下本身为 `5.08%/8.47%`；这是可见点云遮挡、相机外区域与完整地图专家的观测合同差异，不等同于地图碰撞。因此安全结果必须相对专家基线解释：CurveNav 比参考多 2 个 footprint collision 样本和 2 个安全裕量违例样本；NavDP 与参考相同，SanD 多 1 个 collision 样本，X-NavDP 与 CurveNav 相同。当前 CurveNav 的优势是轨迹拟合和几何平滑，仍需重点降低可见绕行层的额外风险。完整数值、逐模型原始输出和交互对比位于 `outputs/offline-cross-model/full-20260829-safe-expert/`；各 runner 记录的总工作负载时间因 CurveNav 批处理而基线逐样本执行，不作为延迟横比。
+
+旧固定高度障碍定义曾把同一段可通行坡面误报为 206 条专家碰撞。当前四帧坡度感知配置空间场在 6,087 条验证样本中识别出 4,983 条含可见障碍样本；专家 footprint collision 为 5 条、额外 `0.10 m` 裕度违例为 129 条，而起点到专家局部终点的直线裕度违例为 1,259 条。后续新 checkpoint 必须使用这一合同，不能与旧稀疏点或固定高度统计横向混算。
+
+4090 的 Isaac Sim 4.2 headless Vulkan/RTX/物理/深度 annotator 已用用户态 EGL ICD 与 NVIDIA 官方驱动校验开关通过 warm smoke；`64×64` 深度张量生成、world step 和清理均正常，进程状态为 0。唯一 benchmark checkout 位于 `/DataDisk2/hsb/general-navigation-benchmark-resident`，运行时参数在其 ignored `config/local.env`。锁定 commit `48e223e85f0408ebfd1d8c6d6fb0589e9c41b3aa` 的 acados 已在用户目录 Release 构建，`libblasfeo/libhpipm/libacados` 均从 Isaac Python 动态加载成功。launcher 单场景 dry-run 也已正确解析 GPU、权重、scene、evaluator 与 Kit 参数。正式固定协议尚未启动的唯一已确认阻塞是 4090 缺少官方 Scene-N1 资产树；资产同步并通过静态门禁后，必须在原固定场景、episode 0--9、相机、MPC、timeout 和 metric 合同下运行。

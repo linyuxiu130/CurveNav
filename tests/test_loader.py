@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from curvenav.config import DataConfig, TrajectoryConfig
+from curvenav.config import CurveNavConfig, DataConfig, TrajectoryConfig
 from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data.depth_bank import gather_depth_observations, load_packed_depth_bank
 from curvenav.data.loader import (
@@ -19,6 +19,7 @@ from curvenav.data.prepare import (
     _planar_local,
 )
 from curvenav.data.prepared import PreparedPolicyDataset, RepeatedPolicyDataset
+from curvenav.deployment.runtime import DepthContextBuffer
 from curvenav.training.batching import (
     DistributedStepBatchSampler,
     build_distributed_batch_layout,
@@ -44,13 +45,17 @@ def _write_dataset(root, count: int = 4) -> None:
         "camera_downward_pitch_degrees": 10.0,
         "num_curve_values": 8,
         "num_path_points": 64,
-        "curve_value_semantics": "metric_arc_length_m_then_curvature_controls_inv_m",
-        "flow_length_transform": "standardized_inverse_softplus",
-        "length_pretransform_mean": 2.900325059890747,
-        "length_pretransform_std": 1.2550740242004395,
-        "curvature_control_mean_inv_m": -0.012702565640211105,
-        "curvature_control_std_inv_m": 0.35367658734321594,
-        "expert_projection": "production_smooth_heading_regularized_least_squares",
+        "curve_value_semantics": "metric_arc_length_then_seven_cubic_heading_control_increments_rad",
+        "flow_coordinate_transform": "standardized_log_length_and_heading_increments",
+        "log_length_mean": TrajectoryConfig().log_length_mean,
+        "log_length_std": TrajectoryConfig().log_length_std,
+        "heading_increment_mean_rad": list(
+            TrajectoryConfig().heading_increment_mean_rad
+        ),
+        "heading_increment_std_rad": list(
+            TrajectoryConfig().heading_increment_std_rad
+        ),
+        "expert_projection": "equal_arc_heading_field_least_squares",
         "maximum_expert_projection_ade_m": 0.03,
     }
     root.mkdir()
@@ -133,6 +138,40 @@ def test_habitat_xz_routes_are_converted_to_x_forward_y_left() -> None:
     np.testing.assert_allclose(transform[0, 2:], [-1.0, 0.0], atol=1e-6)
 
 
+def test_training_and_deployment_history_transforms_are_identical() -> None:
+    route_xz = np.array(
+        [[0.0, 0.0], [0.45, 0.0], [0.45, 0.45], [0.9, 0.45]],
+        dtype=np.float32,
+    )
+    route_yaw = np.array([0.0, np.pi / 2, 0.0, -np.pi / 2], dtype=np.float32)
+    local_origins = _planar_local(route_xz, route_xz[-1], float(route_yaw[-1]))
+    prepared_transform = _observation_to_current(
+        local_origins,
+        route_yaw,
+        float(route_yaw[-1]),
+        4,
+    )
+
+    context = DepthContextBuffer(CurveNavConfig())
+    context.reset(1)
+    depth = np.ones((1, 360, 640, 1), dtype=np.float32)
+    selected = None
+    for position_xz, yaw in zip(route_xz, route_yaw, strict=True):
+        # Habitat +Z is physical right, while deployment world +Y is left.
+        position_xy = np.array([[position_xz[0], -position_xz[1]]], dtype=np.float32)
+        selected = context.update(
+            depth,
+            position_xy,
+            np.array([-yaw], dtype=np.float32),
+        )
+    assert selected is not None
+    np.testing.assert_allclose(
+        selected.observation_to_current[0],
+        prepared_transform,
+        atol=1e-6,
+    )
+
+
 def test_prepared_dataset_rejects_geometry_contract_mismatch(tmp_path) -> None:
     root = tmp_path / "policy"
     _write_dataset(root)
@@ -144,6 +183,18 @@ def test_prepared_dataset_rejects_geometry_contract_mismatch(tmp_path) -> None:
             data,
             TrajectoryConfig(num_path_points=65),
         )
+
+
+def test_prepared_dataset_rejects_non_positive_arc_length(tmp_path) -> None:
+    root = tmp_path / "policy"
+    _write_dataset(root)
+    curve_values_path = root / "train" / "curve_values.npy"
+    curve_values = np.load(curve_values_path)
+    curve_values[0, 0] = 0.0
+    np.save(curve_values_path, curve_values)
+
+    with pytest.raises(ValueError, match="non-positive arc length"):
+        PreparedPolicyDataset(root, "train", DataConfig(root=str(root)), TrajectoryConfig())
 
 
 def test_training_and_validation_preserve_deterministic_batch_order(tmp_path) -> None:
@@ -218,7 +269,7 @@ def test_six_rank_batches_cover_exact_global_step_without_padding() -> None:
     assert ddp_weight / 6 == pytest.approx(1.0)
 
 
-def test_micro_batches_are_balanced_for_one_static_compiled_shape() -> None:
+def test_micro_batches_are_balanced_for_one_static_shape() -> None:
     four_gpu = DistributedStepBatchSampler(1, 1024, 192, rank=0, world_size=4)
     assert list(map(len, four_gpu)) == [128, 128]
 

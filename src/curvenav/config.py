@@ -58,37 +58,52 @@ class DataConfig:
 
 @dataclass(frozen=True)
 class TrajectoryConfig:
-    num_curvature_control_points: int = 7
-    curvature_spline_degree: int = 3
+    num_heading_control_points: int = 8
+    spline_degree: int = 3
     num_path_points: int = 64
-    length_pretransform_mean: float = 2.900325059890747
-    length_pretransform_std: float = 1.2550740242004395
-    curvature_control_mean_inv_m: float = -0.012702565640211105
-    curvature_control_std_inv_m: float = 0.35367658734321594
+    log_length_mean: float = 0.9411997728025253
+    log_length_std: float = 0.6578984994694861
+    heading_increment_mean_rad: tuple[float, ...] = (
+        0.0027091927181629527,
+        0.005207439937511474,
+        0.006545409534199333,
+        0.005466179133750451,
+        0.0027312263638442787,
+        0.0029715759159046357,
+        -0.0006079559277851468,
+    )
+    heading_increment_std_rad: tuple[float, ...] = (
+        0.1039597669108465,
+        0.2211581749264293,
+        0.2887267459379414,
+        0.2893491499417256,
+        0.30020639618179806,
+        0.26251125436301076,
+        0.14751645522709783,
+    )
 
     def validate(self) -> None:
-        if self.num_curvature_control_points != 7:
-            raise ValueError("CurveNav uses exactly seven curvature controls")
-        if self.curvature_spline_degree != 3:
-            raise ValueError("CurveNav uses one cubic curvature B-spline")
-        if self.num_path_points < self.num_curvature_control_points + 1:
-            raise ValueError("num_path_points must cover the curve controls")
-        if not all(
-            math.isfinite(value)
-            for value in (
-                self.length_pretransform_mean,
-                self.curvature_control_mean_inv_m,
-            )
+        if self.num_heading_control_points != 8:
+            raise ValueError("CurveNav uses exactly eight heading control points")
+        if self.spline_degree != 3:
+            raise ValueError("CurveNav uses one clamped cubic heading spline")
+        if self.num_path_points < self.num_heading_control_points:
+            raise ValueError("num_path_points must cover the heading controls")
+        if not math.isfinite(self.log_length_mean):
+            raise ValueError("log-length mean must be finite")
+        if not math.isfinite(self.log_length_std) or self.log_length_std <= 0:
+            raise ValueError("log-length standard deviation must be positive")
+        if len(self.heading_increment_mean_rad) != 7 or not all(
+            math.isfinite(value) for value in self.heading_increment_mean_rad
         ):
-            raise ValueError("trajectory coordinate means must be finite")
-        if not all(
+            raise ValueError("heading-increment mean must contain seven finite values")
+        if len(self.heading_increment_std_rad) != 7 or not all(
             math.isfinite(value) and value > 0
-            for value in (
-                self.length_pretransform_std,
-                self.curvature_control_std_inv_m,
-            )
+            for value in self.heading_increment_std_rad
         ):
-            raise ValueError("trajectory coordinate standard deviations must be positive")
+            raise ValueError(
+                "heading-increment standard deviation must contain seven positive values"
+            )
 
 
 @dataclass(frozen=True)
@@ -103,7 +118,6 @@ class DepthEncoderConfig:
 class PointGoalEncoderConfig:
     model_dim: int = 384
     hidden_dim: int = 384
-    goal_clip_distance_m: float = 25.0
 
 
 @dataclass(frozen=True)
@@ -121,11 +135,8 @@ class TrajectoryDecoderConfig:
     transformer_heads: int = 8
     path_tokens: int = 16
     dropout: float = 0.0
-    flow_steps: int = 8
 
     def validate(self) -> None:
-        if self.flow_steps != 8:
-            raise ValueError("CurveNav uses exactly eight Heun flow steps")
         if self.path_tokens != 16:
             raise ValueError("CurveNav uses exactly sixteen path tokens")
 
@@ -186,11 +197,6 @@ class CurveNavConfig:
             raise ValueError("depth encoder token grid dimensions must be positive")
         if self.point_goal_encoder.hidden_dim < 1:
             raise ValueError("point_goal_encoder.hidden_dim must be positive")
-        if (
-            not math.isfinite(self.point_goal_encoder.goal_clip_distance_m)
-            or self.point_goal_encoder.goal_clip_distance_m <= 0
-        ):
-            raise ValueError("point_goal_encoder.goal_clip_distance_m must be positive")
         dims = {
             self.depth_encoder.model_dim,
             self.point_goal_encoder.model_dim,

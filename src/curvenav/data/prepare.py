@@ -26,7 +26,7 @@ from curvenav.data.trajectory import (
     MAXIMUM_EXPERT_PROJECTION_ADE_RATIO,
     collate_metric_paths,
 )
-from curvenav.trajectory import MetricCurvatureTrajectory
+from curvenav.trajectory import MetricHeadingTrajectory
 
 
 @dataclass(frozen=True)
@@ -312,16 +312,14 @@ def _compile_split(
         [example.observation_valid for example in examples]
     ).astype(np.bool_)
 
-    codec = MetricCurvatureTrajectory(
-        num_curvature_control_points=config.trajectory.num_curvature_control_points,
-        degree=config.trajectory.curvature_spline_degree,
+    codec = MetricHeadingTrajectory(
+        num_heading_control_points=config.trajectory.num_heading_control_points,
+        degree=config.trajectory.spline_degree,
         num_path_points=config.trajectory.num_path_points,
-        length_pretransform_mean=config.trajectory.length_pretransform_mean,
-        length_pretransform_std=config.trajectory.length_pretransform_std,
-        curvature_control_mean_inv_m=(
-            config.trajectory.curvature_control_mean_inv_m
-        ),
-        curvature_control_std_inv_m=config.trajectory.curvature_control_std_inv_m,
+        log_length_mean=config.trajectory.log_length_mean,
+        log_length_std=config.trajectory.log_length_std,
+        heading_increment_mean_rad=config.trajectory.heading_increment_mean_rad,
+        heading_increment_std_rad=config.trajectory.heading_increment_std_rad,
     )
     curve_batches = []
     reference_batches = []
@@ -355,13 +353,23 @@ def _compile_split(
     reference_path = reference_path[keep]
     projection_error = projection_error[keep]
     with torch.no_grad():
-        decoded, heading, curvature = codec.decode_values(
+        decoded, heading = codec.decode_values(
             torch.from_numpy(curve_values),
         )
         if not torch.equal(decoded, torch.from_numpy(reference_path)):
             raise RuntimeError("stored expert controls do not reproduce their path")
-        maximum_curvature = curvature.abs().amax(1).numpy()
-        total_turn = (heading[:, 1:] - heading[:, :-1]).abs().sum(1).numpy()
+        heading_delta = heading[:, 1:] - heading[:, :-1]
+        wrapped_turn = torch.atan2(
+            heading_delta.sin(), heading_delta.cos()
+        )
+        total_turn = wrapped_turn.abs().sum(1).numpy()
+        segment = torch.linalg.vector_norm(
+            decoded[:, 1:] - decoded[:, :-1], dim=-1
+        )
+        support = 0.5 * (segment[:, 1:] + segment[:, :-1])
+        maximum_curvature = (
+            wrapped_turn[:, 1:].abs() / support.clamp_min(1e-6)
+        ).amax(1).numpy()
 
     arrays = {
         "depth_indices": _save_array(split_root, "depth_indices", depth_indices),
@@ -375,10 +383,9 @@ def _compile_split(
         "curve_values": _save_array(split_root, "curve_values", curve_values),
     }
     local_arc = np.asarray([_arc_length(example.metric_path) for example in examples])
-    length_pretransform = curve_values[:, 0] + np.log(
-        -np.expm1(-curve_values[:, 0])
-    )
-    curvature_controls = curve_values[:, 1:]
+    flow_coordinates = codec.coordinates_from_values(
+        torch.from_numpy(curve_values)
+    ).numpy()
     goal_distance = np.linalg.norm(point_goal, axis=1)
     endpoint = reference_path[:, -1]
     goal_angle = np.degrees(
@@ -417,10 +424,11 @@ def _compile_split(
         },
         "production_curve_projection_rejected": rejected_projection_count,
         "production_curve_coordinate_statistics": {
-            "length_pretransform_mean": float(length_pretransform.mean()),
-            "length_pretransform_std": float(length_pretransform.std()),
-            "curvature_control_mean_inv_m": float(curvature_controls.mean()),
-            "curvature_control_std_inv_m": float(curvature_controls.std()),
+            "log_length_mean": float(np.log(curve_values[:, 0]).mean()),
+            "log_length_std": float(np.log(curve_values[:, 0]).std(ddof=1)),
+            "heading_increment_mean_rad": curve_values[:, 1:].mean(0).tolist(),
+            "heading_increment_std_rad": curve_values[:, 1:].std(0, ddof=1).tolist(),
+            "standardized_coordinate_rms": float(np.sqrt(np.mean(flow_coordinates**2))),
         },
         "production_curve_max_curvature_inv_m": {
             "p50": float(np.quantile(maximum_curvature, 0.50)),

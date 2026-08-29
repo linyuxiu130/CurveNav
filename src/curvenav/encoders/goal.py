@@ -1,6 +1,4 @@
-"""Direction and smoothly compressed range of a mission-level PointGoal."""
-
-import math
+"""Direction and unbounded log range of a mission-level PointGoal."""
 
 import torch
 from torch import Tensor, nn
@@ -8,7 +6,7 @@ from torch import Tensor, nn
 from curvenav.layers import RMSNorm
 
 
-POINT_GOAL_ENCODER_TYPE = "direction_and_log_range"
+POINT_GOAL_ENCODER_TYPE = "direction_and_unbounded_log_range"
 
 
 class PointGoalEncoder(nn.Module):
@@ -16,13 +14,12 @@ class PointGoalEncoder(nn.Module):
         self,
         model_dim: int = 256,
         hidden_dim: int = 256,
-        goal_clip_distance_m: float = 25.0,
+        range_scale_m: float = 3.6,
     ) -> None:
         super().__init__()
-        if not math.isfinite(goal_clip_distance_m) or goal_clip_distance_m <= 0:
-            raise ValueError("goal_clip_distance_m must be positive")
-        self.goal_clip_distance_m = goal_clip_distance_m
-        self.log_range_scale = math.log1p(goal_clip_distance_m)
+        if range_scale_m <= 0:
+            raise ValueError("range_scale_m must be positive")
+        self.range_scale_m = float(range_scale_m)
         self.encoder = nn.Sequential(
             nn.Linear(3, hidden_dim),
             nn.SiLU(),
@@ -38,9 +35,6 @@ class PointGoalEncoder(nn.Module):
         direction = torch.where(
             distance > 1e-6, direction, torch.zeros_like(direction)
         )
-        log_range = (
-            torch.log1p(distance.clamp_max(self.goal_clip_distance_m))
-            / self.log_range_scale
-        )
+        log_range = torch.log1p(distance / self.range_scale_m)
         features = torch.cat((direction, log_range), dim=-1)
         return self.encoder(features)

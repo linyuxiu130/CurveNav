@@ -42,9 +42,7 @@ def resample_path_by_arc_length(
     lower_distance = cumulative.gather(1, lower)
     upper_distance = cumulative.gather(1, upper)
     fraction = (targets - lower_distance) / (upper_distance - lower_distance).clamp_min(1e-8)
-    result = lower_point + fraction.unsqueeze(-1) * (upper_point - lower_point)
-    result[:, 0] = 0
-    return result
+    return lower_point + fraction.unsqueeze(-1) * (upper_point - lower_point)
 
 
 def _validate_path(path: Tensor) -> None:

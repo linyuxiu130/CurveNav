@@ -13,7 +13,15 @@ export CPATH="${PYTHON_INCLUDE_ROOT}/python${PYTHON_ABI}:${PYTHON_INCLUDE_ROOT}$
 export TORCHINDUCTOR_CACHE_DIR="${ENV_ROOT}/curvenav/torchinductor"
 export TORCHINDUCTOR_COMPILE_THREADS=2
 cd "${PROJECT_ROOT}"
+config_path="${1:-configs/base.yaml}"
+checkpoint_path="${2:-outputs/train_policy/checkpoint.pt}"
+if (( $# >= 2 )); then
+  shift 2
+else
+  shift "$#"
+fi
 exec "${ENV_ROOT}/curvenav/bin/python" \
   -m curvenav.evaluation.offline \
-  "${1:-configs/base.yaml}" \
-  "${2:-outputs/train_policy/checkpoint.pt}"
+  "${config_path}" \
+  "${checkpoint_path}" \
+  "$@"

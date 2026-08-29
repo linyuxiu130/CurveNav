@@ -1,6 +1,6 @@
 # CurveNav
 
-CurveNav 是 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal；当前帧 96 个 metric token 完整保留，历史由 32 个 query 压缩，再经四层联合条件 Transformer 上下文化。标准条件 Flow Matching 从高斯先验向一个正弧长和七个物理曲率控制运输；每次速度场求值都把中间状态解码为 16 个实际路径 token，并与当前深度障碍做带机器人净空的度量 cross-attention。固定 8 步 Heun 从高斯典型集中的固定 latent 生成唯一一条起始切向朝前、连续曲率的局部轨迹。弧长不与 PointGoal 距离硬绑定，曲率不经过 clip 或 `tanh` 饱和。专家目标和推理共用同一个曲率 codec，不生成 route 辅助轨迹、候选集、DDPM 或评价头。
+CurveNav 是 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal。当前帧经 SanD 风格 ResNet 形成 96 个视觉 token；四帧标定深度统一反投影、坡度分类并配准成连续机器人配置空间场，三个因果 SE(2) token 描述近期运动。生成器在标准化正弧长与七个局部航向增量中学习 boundary-complete improved MeanFlow：随机高斯用于训练，固定典型 latent 用于确定性 1-NFE 推理。每次求值把状态解码为 16 个物理路径 token，并连续查询 signed clearance、梯度、可见性与禁行占据。弧长不与 PointGoal 距离硬绑定，目标距离不截断，航向不经过 clip 或 `tanh`。不存在 ODE solver、候选集、评价头或推理修补。
 
 当前目标只有一个：先在现有深度合同下验证 PointGoal 局部规划，再在完全相同的 episode、相机、异步 MPC 和指标口径下对比 NavDP 与 X-NavDP。局部基线成立前不专项扩展长距离或脱困能力。
 
@@ -40,7 +40,7 @@ CUDA_VISIBLE_DEVICES="${GPU_IDS}" scripts/train_policy.sh configs/base.yaml
 CUDA_VISIBLE_DEVICES=0 scripts/evaluate_policy.sh configs/base.yaml outputs/train_policy/checkpoint.pt
 ```
 
-训练固定全局 batch 为 1024、每卡 micro-batch 上限为 256；1–8 张 GPU 都保持每次更新严格覆盖 1024 个不重复样本以及相同的 8000 个优化器更新。不能整除时只允许相邻 rank 相差一个样本，并按样本数缩放 loss 后再做 DDP 平均。4 卡时每 rank 单次 B256；6 卡为 `171×4 + 170×2`，同样每个 rank 只执行一次前后向并立即 DDP 同步。当前 prepared dataset 只包含我们在固定 HSSD 资产上生成的 Dingo 深度与专家轨迹，不混入 SanD/NavDP 数据。
+训练固定全局 batch 为 1024、每卡 micro-batch 上限为 256；1–8 张 GPU 都保持每次更新严格覆盖 1024 个不重复样本以及相同的 8000 个优化器更新。不能整除时只允许相邻 rank 相差一个样本，并按样本数缩放 loss 后再做 DDP 平均。每个 rank 的份额均衡拆成相同数量的 micro-batch；当前三卡训练为 `342/341/341`，各拆成两个约 B171 的前后向；四卡时每 rank 直接使用 B256。当前 prepared dataset 只包含我们在固定 HSSD 资产上生成的 Dingo 深度与专家轨迹，不混入 SanD/NavDP 数据。
 
 ## 目录
 
@@ -51,9 +51,9 @@ scripts/build_dataset.sh   唯一数据构建入口
 src/curvenav/data/         标定深度、统一数据编译与 loader
 src/curvenav/data_generation/ HSSD 资产、几何、生成与正式审计
 src/curvenav/encoders/     深度与 PointGoal 编码
-src/curvenav/conditioning/ 目标相对几何与历史视觉压缩
+src/curvenav/conditioning/ 目标、当前视觉与因果运动状态融合
 src/curvenav/models/       有序曲线 Transformer 与 policy
-src/curvenav/trajectory/   专家/推理共用的度量曲率轨迹几何
+src/curvenav/trajectory/   专家/推理共用的正弧长度量航向场几何
 src/curvenav/training/     DDP、AMP、EMA 与 checkpoint
 src/curvenav/evaluation/   固定离线评测
 src/curvenav/deployment/   多帧观测状态与严格推理接口

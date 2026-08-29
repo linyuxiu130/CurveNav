@@ -11,7 +11,7 @@ from .geometry import MetricDepthProjector
 
 
 DEPTH_ENCODER_TYPE = (
-    "sand_resnet18_groupnorm_stage3_body_first_metric_geometry_tokens_8x12"
+    "current_resnet18_plus_aligned_four_frame_configuration_space_field"
 )
 
 
@@ -93,6 +93,7 @@ class DepthObservationEncoder(nn.Module):
         camera_forward_offset_m: float = 0.28618,
         camera_height_m: float = 0.62532,
         camera_downward_pitch_degrees: float = 10.0,
+        planning_horizon_m: float = 3.6,
     ) -> None:
         super().__init__()
         if model_dim % 4:
@@ -124,6 +125,7 @@ class DepthObservationEncoder(nn.Module):
             camera_forward_offset_m,
             camera_height_m,
             camera_downward_pitch_degrees,
+            planning_horizon_m,
         )
         self.geometry_projection = nn.Sequential(
             nn.Linear(6, model_dim),
@@ -178,17 +180,18 @@ class DepthObservationEncoder(nn.Module):
         ):
             raise ValueError("observation_valid must be boolean with shape [B, T]")
         batch, frames = depth.shape[:2]
-        features = self.backbone(depth.flatten(0, 1))
+        features = self.backbone(depth[:, -1])
         features = self.adaptive_pool(self.spatial_projection(features))
         features = features.flatten(2).transpose(1, 2)
         position = self.position_2d.to(device=features.device, dtype=features.dtype)
         projection = self.metric_projector(
             depth,
             observation_to_current,
+            observation_valid,
         )
-        metric_points = projection.points
-        pooled_depth = projection.depth
-        body_obstacle = projection.obstacle_valid & observation_valid[..., None]
+        metric_points = projection.points[:, -1]
+        pooled_depth = projection.depth[:, -1]
+        body_obstacle = projection.obstacle_valid[:, -1] & observation_valid[:, -1, None]
         surface_valid = pooled_depth < self.metric_projector.max_depth_m
         geometry = torch.cat(
             (
@@ -202,16 +205,12 @@ class DepthObservationEncoder(nn.Module):
             dim=-1,
         )
         geometry_tokens = self.geometry_projection(geometry.to(features.dtype))
-        features = self.output_norm(features + position + geometry_tokens.flatten(0, 1))
-        tokens = self.dropout(features).reshape(batch, frames, -1, self.model_dim)
-        tokens = torch.where(
-            observation_valid[:, :, None, None],
-            tokens,
-            torch.zeros_like(tokens),
-        )
+        features = self.output_norm(features + position + geometry_tokens)
+        tokens = self.dropout(features)
         return DepthFeatures(
             tokens=tokens,
             points=metric_points,
             depth=pooled_depth,
             obstacle_valid=body_obstacle,
+            configuration_field=projection.configuration_field,
         )

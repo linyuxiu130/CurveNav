@@ -15,13 +15,13 @@ data:
 
 model:
   trajectory:
-    num_curvature_control_points: 7
-    curvature_spline_degree: 3
+    num_heading_control_points: 8
+    spline_degree: 3
     num_path_points: 64
-    length_pretransform_mean: 2.900325059890747
-    length_pretransform_std: 1.2550740242004395
-    curvature_control_mean_inv_m: -0.012702565640211105
-    curvature_control_std_inv_m: 0.35367658734321594
+    log_length_mean: 0.9411997728025253
+    log_length_std: 0.6578984994694861
+    heading_increment_mean_rad: [0.0027091927181629527, 0.005207439937511474, 0.006545409534199333, 0.005466179133750451, 0.0027312263638442787, 0.0029715759159046357, -0.0006079559277851468]
+    heading_increment_std_rad: [0.1039597669108465, 0.2211581749264293, 0.2887267459379414, 0.2893491499417256, 0.30020639618179806, 0.26251125436301076, 0.14751645522709783]
   depth_encoder:
     model_dim: 384
     frame_tokens_height: 8
@@ -30,7 +30,6 @@ model:
   point_goal_encoder:
     model_dim: 384
     hidden_dim: 384
-    goal_clip_distance_m: 25.0
   condition_encoder:
     model_dim: 384
     transformer_layers: 4
@@ -42,7 +41,6 @@ model:
     transformer_heads: 8
     path_tokens: 16
     dropout: 0.0
-    flow_steps: 8
 training:
   seed: 42
   global_batch_size: 1024

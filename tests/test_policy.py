@@ -1,5 +1,6 @@
 from dataclasses import replace
 import math
+from types import MethodType
 
 import torch
 
@@ -59,7 +60,7 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
     torch.manual_seed(0)
     policy = build_policy(tiny_config())
     inputs = condition(batch=8)
-    curve_coordinates = 0.2 * torch.randn(8, 8)
+    curve_coordinates = 0.2 * torch.randn(8, policy.curve_codec.num_curve_tokens)
     target_values = policy.curve_codec.values_from_coordinates(curve_coordinates)
     losses = policy(
         inputs,
@@ -67,14 +68,14 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
     )
     for value in (
         losses.loss,
-        losses.flow_loss,
-        losses.clearance_loss,
+        losses.mean_flow_loss,
+        losses.safety_loss,
     ):
         assert value.ndim == 0 and torch.isfinite(value)
     assert len(losses.logging_values()) == len(TRAINING_LOSS_NAMES)
     torch.testing.assert_close(
         losses.loss,
-        losses.flow_loss + losses.clearance_loss,
+        losses.mean_flow_loss + losses.safety_loss,
     )
     losses.loss.backward()
     gradients = [
@@ -90,21 +91,18 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
     torch.manual_seed(999)
     second = policy.sample(inputs)
     assert first.path.shape == (8, 16, 2)
-    assert first.heading.shape == (8, 16)
-    assert first.curvature.shape == (8, 16)
     assert torch.equal(first.path, second.path)
     assert torch.isfinite(first.path).all()
     assert torch.equal(first.path[:, 0], torch.zeros(8, 2))
-    assert torch.isfinite(first.curvature).all()
 
 
-def test_point_goal_encoder_retains_range_until_xnavdp_clip_distance() -> None:
+def test_point_goal_encoder_retains_unbounded_log_range() -> None:
     encoder = build_policy(tiny_config()).condition_encoder.point_goal_encoder.eval()
     with torch.no_grad():
         far = encoder(torch.tensor([[4.0, 0.0], [20.0, 0.0], [40.0, 0.0], [80.0, 0.0]]))
         near = encoder(torch.tensor([[1.0, 0.0]]))
     assert not torch.allclose(far[0], far[1])
-    torch.testing.assert_close(far[2], far[3])
+    assert not torch.allclose(far[2], far[3])
     assert not torch.allclose(far[0], near[0])
 
 
@@ -125,23 +123,36 @@ def test_invalid_padded_frames_cannot_change_the_prediction() -> None:
     first_encoded = policy.encode_condition(first)
     second_encoded = policy.encode_condition(second)
     torch.testing.assert_close(first_encoded.tokens, second_encoded.tokens)
-    assert first_encoded.tokens.shape[1] == 37
+    assert first_encoded.tokens.shape[1] == 8
 
 
-def test_history_attention_mask_has_kernel_contiguous_last_dimension() -> None:
-    compressor = build_policy(tiny_config()).condition_encoder.history_compressor
-    observed: list[tuple[int, ...]] = []
-    handle = compressor.attention.register_forward_pre_hook(
-        lambda _module, inputs, kwargs: observed.append(kwargs["attn_mask"].stride()),
-        with_kwargs=True,
+def test_valid_causal_motion_changes_condition_but_current_pose_is_not_a_state_token() -> None:
+    policy = build_policy(tiny_config()).eval()
+    baseline = condition(batch=1)
+    changed = PolicyCondition(
+        depth=baseline.depth.clone(),
+        point_goal=baseline.point_goal.clone(),
+        observation_to_current=baseline.observation_to_current.clone(),
+        observation_valid=baseline.observation_valid.clone(),
     )
-    query = torch.randn(2, 32, 32)
-    memory = torch.randn(2, 13, 32)
-    padding = torch.zeros(2, 13, dtype=torch.bool)
-    padding[:, :4] = True
-    compressor(query, memory, padding)
-    handle.remove()
-    assert observed[0][-1] == 1
+    changed.observation_to_current[:, 1, :] = torch.tensor(
+        [0.3, -0.2, math.sin(0.4), math.cos(0.4)]
+    )
+    with torch.no_grad():
+        baseline_tokens = policy.encode_condition(baseline).tokens
+        changed_tokens = policy.encode_condition(changed).tokens
+    assert not torch.allclose(baseline_tokens, changed_tokens)
+
+    motion = policy.condition_encoder.motion_encoder
+    with torch.no_grad():
+        baseline_state = motion(
+            baseline.observation_to_current,
+            baseline.observation_valid,
+        )
+        current_changed = baseline.observation_to_current.clone()
+        current_changed[:, -1] = torch.tensor([10.0, -4.0, 1.0, 0.0])
+        current_changed_state = motion(current_changed, baseline.observation_valid)
+    torch.testing.assert_close(baseline_state, current_changed_state)
 
 
 def test_depth_tokens_do_not_depend_on_other_batch_members() -> None:
@@ -163,111 +174,183 @@ def test_depth_tokens_do_not_depend_on_other_batch_members() -> None:
     )
 
 
-def test_seven_curvature_control_contract_is_unique() -> None:
+def test_eight_control_point_heading_contract_is_unique() -> None:
     invalid = replace(
         tiny_config(),
         trajectory=replace(
             tiny_config().trajectory,
-            num_curvature_control_points=8,
+            num_heading_control_points=7,
         ),
     )
     try:
         invalid.validate()
     except ValueError as error:
-        assert "exactly seven" in str(error)
+        assert "exactly eight" in str(error)
     else:
         raise AssertionError("an alternate curve token shape must be rejected")
 
 
-def test_flow_source_and_solver_contract_is_gaussian_train_deterministic_inference() -> None:
+def test_typical_source_and_one_step_mean_flow_are_deterministic() -> None:
     policy = build_policy(tiny_config())
-    assert policy.flow_steps == 8
-    assert policy.inference_source.shape == (1, 8)
+    curve_tokens = policy.curve_codec.num_curve_tokens
+    assert policy.inference_source.shape == (1, curve_tokens)
     torch.testing.assert_close(
         torch.linalg.vector_norm(policy.inference_source),
-        torch.tensor(math.sqrt(8.0)),
+        torch.tensor(math.sqrt(float(curve_tokens))),
     )
-    assert torch.count_nonzero(policy.inference_source) == 8
-    assert not hasattr(policy.curve_codec, "flow_velocity_metric")
+    assert torch.count_nonzero(policy.inference_source) == curve_tokens
+
+    constant_average_velocity = torch.linspace(-0.2, 0.2, curve_tokens)
+
+    def constant_field(self, state, start_time, end_time, encoded):
+        return constant_average_velocity.expand_as(state)
+
+    policy._predict_mean_velocity = MethodType(constant_field, policy)
+    expected_state = policy.inference_source - constant_average_velocity
+    expected_path, _ = policy.curve_codec.decode(expected_state)
+    prediction = policy.sample(condition(batch=2))
+    torch.testing.assert_close(
+        prediction.path,
+        expected_path.expand(2, -1, -1),
+    )
 
 
-def test_training_uses_gaussian_conditional_flow_matching() -> None:
+def test_training_uses_random_source_and_closed_interval_collocation() -> None:
     policy = build_policy(tiny_config())
-    observed: dict[str, torch.Tensor] = {}
 
-    class RecordingVelocity(torch.nn.Module):
-        curve_tokens = 8
+    class ZeroMeanVelocity(torch.nn.Module):
+        curve_tokens = policy.curve_codec.num_curve_tokens
+        planning_horizon_m = policy.planning_horizon_m
 
-        def forward(self, state, time, encoded, path, heading, curvature):
-            observed["state"] = state.detach()
-            observed["time"] = time.detach()
-            return torch.zeros_like(state)
+        def forward(
+            self, state, start_time, end_time, encoded, path, heading
+        ):
+            return state * 0.0 + (end_time - start_time)[:, None] * 0.0
 
-    policy.trajectory_decoder = RecordingVelocity()
+    policy.trajectory_decoder = ZeroMeanVelocity()
     inputs = condition(batch=2)
-    target_values = torch.tensor(
-        [
-            [0.8, 0.1, 0.05, 0.0, -0.05, -0.1, -0.05, 0.0],
-            [0.6, -0.1, -0.05, 0.0, 0.05, 0.1, 0.05, 0.0],
-        ]
+    target_values = policy.curve_codec.values_from_coordinates(
+        torch.linspace(-0.5, 0.5, 2 * policy.curve_codec.num_curve_tokens).reshape(
+            2, policy.curve_codec.num_curve_tokens
+        )
     )
     clean = policy.curve_codec.coordinates_from_values(target_values)
     torch.manual_seed(123)
-    source = torch.randn_like(clean)
-    expected_time = torch.rand(clean.shape[0])
-    endpoint = torch.rand_like(expected_time) < (1.0 / 9.0)
-    expected_time = torch.where(endpoint, torch.zeros_like(expected_time), expected_time)
+    random_source = torch.randn_like(clean)
     torch.manual_seed(123)
     losses = policy.training_loss(inputs, TrajectoryTarget(target_values))
 
     torch.testing.assert_close(
-        observed["state"],
-        (1.0 - expected_time[:, None]) * source + expected_time[:, None] * clean,
+        policy._closed_interval_times(2, clean),
+        torch.tensor([0.0, 1.0]),
     )
-    torch.testing.assert_close(observed["time"], expected_time)
-    expected = (clean - source).square().mean()
-    torch.testing.assert_close(losses.flow_loss, expected)
+    expected = (random_source - clean).square().mean()
+    torch.testing.assert_close(losses.mean_flow_loss, expected)
+
+
+def test_improved_mean_flow_jvp_has_the_exact_sign_and_interval_tangent() -> None:
+    policy = build_policy(tiny_config())
+
+    class AnalyticMeanVelocity(torch.nn.Module):
+        curve_tokens = policy.curve_codec.num_curve_tokens
+        planning_horizon_m = policy.planning_horizon_m
+
+        def forward(
+            self, state, start_time, end_time, encoded, path, heading
+        ):
+            return state + (end_time - start_time)[:, None]
+
+    policy.trajectory_decoder = AnalyticMeanVelocity()
+    inputs = condition(batch=2)
+    clean = torch.linspace(-0.5, 0.5, 2 * policy.curve_codec.num_curve_tokens).reshape(
+        2, policy.curve_codec.num_curve_tokens
+    )
+    target_values = policy.curve_codec.values_from_coordinates(clean)
+    torch.manual_seed(321)
+    source = torch.randn_like(clean)
+    time = torch.tensor([0.0, 1.0])
+    state = (1.0 - time[:, None]) * clean + time[:, None] * source
+    conditional_velocity = source - clean
+    instantaneous = state
+    average = state + time[:, None]
+    total_derivative = instantaneous + 1.0
+    reparameterized = average + time[:, None] * total_derivative
+    expected = 0.5 * (
+        (instantaneous - conditional_velocity).square().mean()
+        + (reparameterized - conditional_velocity).square().mean()
+    )
+
+    torch.manual_seed(321)
+    losses = policy.training_loss(inputs, TrajectoryTarget(target_values))
+    torch.testing.assert_close(losses.mean_flow_loss, expected)
 
 
 def test_configuration_space_loss_is_soft_differentiable_and_masked() -> None:
-    from curvenav.models.safety import configuration_space_clearance_loss
+    from curvenav.models.safety import configuration_space_risk_loss
 
-    colliding = torch.tensor(
-        [[[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]]], requires_grad=True
+    path = torch.tensor(
+        [[[-1.0, 0.0], [0.0, 0.0], [1.0, 0.0]]], requires_grad=True
     )
-    obstacle = torch.tensor([[[0.5, 0.0], [10.0, 10.0]]])
-    valid = torch.tensor([[True, False]])
-    loss = configuration_space_clearance_loss(colliding, obstacle, valid)
+    field = torch.zeros(1, 5, 9, 9)
+    field[:, 0] = 1.0
+    field[:, 0, 4, 4] = 0.0
+    field[:, 3] = 1.0
+    field[:, 4, 4, 4] = 1.0
+    loss = configuration_space_risk_loss(path, field, 1.0)
     assert loss > 0
     loss.backward()
-    assert torch.isfinite(colliding.grad).all()
+    assert torch.isfinite(path.grad).all()
 
-    safe = colliding.detach() + torch.tensor([[[0.0, 1.0]]])
+    safe = path.detach() + torch.tensor([[[0.0, 1.0]]])
     torch.testing.assert_close(
-        configuration_space_clearance_loss(safe, obstacle, valid),
+        configuration_space_risk_loss(safe, field, 1.0),
         torch.tensor(0.0),
     )
+    unobserved = field.clone()
+    unobserved[:, 3] = 0.0
     torch.testing.assert_close(
-        configuration_space_clearance_loss(
-            colliding.detach(), obstacle, torch.zeros_like(valid)
-        ),
+        configuration_space_risk_loss(path.detach(), unobserved, 1.0),
         torch.tensor(0.0),
     )
+
+
+def test_configuration_space_risk_tracks_worst_path_violation() -> None:
+    from curvenav.models.safety import (
+        SAFETY_CLEARANCE_M,
+        configuration_space_risk_loss,
+        sample_configuration_field,
+    )
+
+    field = torch.zeros(1, 5, 9, 9)
+    field[:, 0] = 2.0 * SAFETY_CLEARANCE_M
+    field[:, 0, 4, 4] = -SAFETY_CLEARANCE_M
+    field[:, 3] = 1.0
+    field[:, 4, 4, 4] = 1.0
+    colliding = torch.tensor([[[-1.0, 0.0], [0.0, 0.0], [1.0, 0.0]]])
+    safe = torch.tensor([[[-1.0, 1.0], [0.0, 1.0], [1.0, 1.0]]])
+    assert configuration_space_risk_loss(colliding, field, 1.0) > 0
+    torch.testing.assert_close(
+        configuration_space_risk_loss(safe, field, 1.0), torch.tensor(0.0)
+    )
+    sampled = sample_configuration_field(field, colliding, 1.0)
+    assert sampled.shape == (1, 3, 5)
 
 
 def test_conditioned_decoder_returns_one_smooth_metric_curve() -> None:
     policy = build_policy(tiny_config())
     inputs = condition(batch=2)
     encoded = policy.encode_condition(inputs)
-    noisy = torch.randn(2, 8)
+    noisy = torch.randn(2, policy.curve_codec.num_curve_tokens)
     time = torch.tensor([0.2, 0.7])
-    predicted_velocity = policy._predict_velocity(noisy, time, encoded)
-    repeated = policy._predict_velocity(noisy, time, encoded)
+    predicted_velocity = policy._predict_mean_velocity(
+        noisy, torch.zeros_like(time), time, encoded
+    )
+    repeated = policy._predict_mean_velocity(
+        noisy, torch.zeros_like(time), time, encoded
+    )
     torch.testing.assert_close(predicted_velocity, repeated)
     prediction = policy.sample(inputs)
     assert prediction.path.shape == (2, 16, 2)
-    assert prediction.heading.shape == (2, 16)
-    assert torch.isfinite(prediction.curvature).all()
 
 
 def test_decoder_has_no_generated_history_candidate_or_second_stage() -> None:
@@ -277,41 +360,38 @@ def test_decoder_has_no_generated_history_candidate_or_second_stage() -> None:
     assert not hasattr(policy, "trajectory_flow")
     assert not hasattr(policy, "curve_proposal")
     assert not hasattr(policy, "candidate_bases")
+    assert not hasattr(decoder, "metric_path_attention")
 
 
-def test_curve_length_is_independent_of_pointgoal_distance() -> None:
+def test_heading_curve_coordinates_are_semantic_and_not_path_gram_values() -> None:
     codec = build_policy(tiny_config()).curve_codec
-    zero_coordinates = torch.zeros(1, codec.num_curve_tokens)
-    path, _, _ = codec(zero_coordinates)
-    values = codec.values_from_coordinates(zero_coordinates)
-    torch.testing.assert_close(
-        torch.linalg.vector_norm(path[:, 1:] - path[:, :-1], dim=-1).sum(1),
-        values[:, 0],
-    )
+    coordinates = torch.randn(3, codec.num_curve_tokens)
+    values = codec.values_from_coordinates(coordinates)
+    assert torch.all(values[:, 0] > 0)
+    torch.testing.assert_close(codec.coordinates_from_values(values), coordinates)
+    assert not hasattr(codec, "path_orthonormalizer")
     assert not hasattr(codec, "planning_horizon_m")
 
 
-def test_curvature_bspline_is_smooth_without_a_model_saturation() -> None:
+def test_heading_spline_has_origin_forward_tangent_and_regular_arc_parameter() -> None:
     codec = build_policy(tiny_config()).curve_codec
-    coordinates = 20.0 * torch.ones(32, 8)
-    path, heading, curvature = codec.decode(coordinates)
+    coordinates = torch.zeros(32, codec.num_curve_tokens)
+    path, heading = codec.decode(coordinates)
     torch.testing.assert_close(heading[:, 0], torch.zeros_like(heading[:, 0]))
-    assert curvature.abs().max() > 4.0
     torch.testing.assert_close(path[:, 0], torch.zeros_like(path[:, 0]))
-    assert not hasattr(codec, "free_mask")
+    segment = path[:, 1:] - path[:, :-1]
+    assert torch.all(torch.linalg.vector_norm(segment, dim=-1) > 0)
     assert codec.num_curve_tokens == 8
 
 
 def test_metric_curve_values_round_trip_through_flow_coordinates() -> None:
     codec = build_policy(tiny_config()).curve_codec
-    values = torch.tensor(
-        [[2.2, -0.8, -0.4, -0.1, 0.0, 0.2, 0.5, 0.9]]
-    )
+    values = torch.tensor([[2.4, -0.2, -0.1, 0.0, 0.2, 0.4, 0.5, 0.6]])
     coordinates = codec.coordinates_from_values(values)
     torch.testing.assert_close(codec.values_from_coordinates(coordinates), values)
 
 
-def test_sand_spatial_tokens_and_geometry_query_compression_have_fixed_contract() -> (
+def test_spatial_history_and_causal_motion_tokens_have_fixed_contract() -> (
     None
 ):
     policy = build_policy(tiny_config())
@@ -324,26 +404,31 @@ def test_sand_spatial_tokens_and_geometry_query_compression_have_fixed_contract(
     projection = policy.depth_encoder.metric_projector(
         depth,
         identity_observation_transform(1),
+        torch.ones(1, 4, dtype=torch.bool),
     )
-    assert observation.tokens.shape == (1, 4, 4, 32)
+    assert observation.tokens.shape == (1, 4, 32)
     assert projection.obstacle_points.shape == (1, 4, 4, 2)
     assert projection.obstacle_valid.shape == (1, 4, 4)
+    assert projection.configuration_field.shape == (1, 5, 64, 64)
     assert projection.obstacle_valid.any()
     far = policy.depth_encoder.metric_projector(
         torch.ones_like(depth),
         identity_observation_transform(1),
+        torch.ones(1, 4, dtype=torch.bool),
     )
     assert not far.obstacle_valid.any()
+    assert not far.configuration_field[:, 4].any()
 
     encoded = policy.encode_condition(condition(batch=1))
     encoder = policy.condition_encoder
-    assert encoder.history_query_embedding.shape == (1, 32, 32)
-    assert encoder.history_null_token.shape == (1, 1, 32)
-    assert not hasattr(encoder, "state_encoder")
-    assert not hasattr(encoder, "route_query_embedding")
-    assert encoded.tokens.shape == (1, 1 + 4 + 32, 32)
+    assert encoder.motion_encoder.slot_embedding.shape == (1, 3, 32)
+    assert encoded.tokens.shape == (1, 1 + 4 + 3, 32)
     assert policy.trajectory_decoder.position_embedding.shape == (1, 8, 32)
     assert policy.trajectory_decoder.path_position_embedding.shape == (1, 16, 32)
+    torch.testing.assert_close(
+        policy.trajectory_decoder.path_progress.flatten(),
+        policy.trajectory_decoder.path_indices.float() / 15.0,
+    )
     assert len(encoder.context_blocks) == 1
 
 
@@ -351,36 +436,26 @@ def test_continuous_learned_token_embeddings_are_weight_decayed() -> None:
     policy = build_policy(tiny_config())
     optimizer = build_optimizer(policy, learning_rate=4e-4, weight_decay=1e-2)
     decay = {id(parameter) for parameter in optimizer.param_groups[0]["params"]}
-    learned_token_names = ("position_embedding", "history_query_embedding")
+    learned_token_names = ("position_embedding", "slot_embedding")
     for name, parameter in policy.named_parameters():
         if name.endswith(learned_token_names):
             assert id(parameter) in decay, name
 
 
-def test_flow_decoder_depends_on_state_and_time() -> None:
+def test_mean_flow_decoder_depends_on_state_and_interval() -> None:
     policy = build_policy(tiny_config()).eval()
     encoded = policy.encode_condition(condition(batch=2))
     decoder = policy.trajectory_decoder
-    noisy = torch.zeros(2, 8)
+    noisy = torch.zeros(2, policy.curve_codec.num_curve_tokens)
     with torch.no_grad():
-        reference = policy._predict_velocity(noisy, torch.zeros(2), encoded)
-        changed_curve = policy._predict_velocity(noisy + 1.0, torch.zeros(2), encoded)
-        changed_time = policy._predict_velocity(noisy, torch.ones(2), encoded)
+        zero = torch.zeros(2)
+        one = torch.ones(2)
+        reference = policy._predict_mean_velocity(noisy, zero, zero, encoded)
+        changed_curve = policy._predict_mean_velocity(noisy + 1.0, zero, zero, encoded)
+        changed_time = policy._predict_mean_velocity(noisy, zero, one, encoded)
 
     assert not torch.allclose(changed_curve, reference)
     assert not torch.allclose(changed_time, reference)
-
-
-def test_history_query_radius_is_not_a_model_input() -> None:
-    policy = build_policy(tiny_config()).eval()
-    inputs = condition(batch=2)
-    encoder = policy.condition_encoder
-    with torch.no_grad():
-        reference = policy.encode_condition(inputs)
-        encoder.history_query_embedding.mul_(100_000.0)
-        scaled = policy.encode_condition(inputs)
-
-    torch.testing.assert_close(scaled.tokens, reference.tokens, atol=2e-5, rtol=2e-5)
 
 
 def test_curve_residual_carrier_stays_float32_under_fp16_autocast() -> None:
@@ -401,8 +476,11 @@ def test_curve_residual_carrier_stays_float32_under_fp16_autocast() -> None:
         lambda _module, inputs: observed_dtype.append(inputs[0].dtype)
     )
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-        output = policy._predict_velocity(
-            torch.randn(2, 8, device="cuda"),
+        output = policy._predict_mean_velocity(
+            torch.randn(
+                2, policy.curve_codec.num_curve_tokens, device="cuda"
+            ),
+            torch.zeros(2, device="cuda"),
             torch.tensor([0.2, 0.7], device="cuda"),
             encoded,
         )
@@ -414,35 +492,28 @@ def test_curve_residual_carrier_stays_float32_under_fp16_autocast() -> None:
 
 def test_expert_projection_uses_the_production_curve_manifold() -> None:
     codec = build_policy(tiny_config()).curve_codec
-    goal = torch.tensor([[5.0, 1.0], [4.0, -2.0]])
-    values = torch.tensor(
-        [
-            [0.8, 0.02, 0.04, 0.06, 0.08, 0.06, 0.04, 0.02],
-            [0.7, -0.03, -0.05, -0.08, -0.08, -0.05, -0.03, -0.01],
-        ]
+    values = codec.values_from_coordinates(
+        0.2 * torch.randn(2, codec.num_curve_tokens)
     )
-    source, _, _ = codec.decode_values(values)
-    projected_values, projected, _, curvature = codec.project_expert(source)
+    source, _ = codec.decode_values(values)
+    projected_values, projected = codec.project_expert(source)
     assert projected_values.shape == values.shape
-    assert torch.linalg.vector_norm(projected - source, dim=-1).mean() < 0.01
-    assert torch.isfinite(curvature).all()
+    projection_ade = torch.linalg.vector_norm(projected - source, dim=-1).mean()
+    assert projection_ade < 2e-3
+    torch.testing.assert_close(projected[:, 0], torch.zeros_like(projected[:, 0]))
 
 
-def test_expert_projection_uses_the_regularized_heading_solve() -> None:
+def test_heading_basis_fixes_the_initial_direction_and_has_continuous_curvature() -> None:
     codec = build_policy(tiny_config()).curve_codec
-    design = codec.heading_control_matrix[1:]
-    controls = codec.num_curvature_control_points
-    difference = torch.zeros(controls - 1, controls)
-    index = torch.arange(controls - 1)
-    difference[index, index] = -1.0
-    difference[index, index + 1] = 1.0
-    normal = design.T @ design + 1e-3 * (difference.T @ difference)
     torch.testing.assert_close(
-        normal @ codec.heading_fit_regularized_inverse,
-        design.T,
-        atol=2e-5,
-        rtol=2e-5,
+        codec.dense_basis[0],
+        torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
     )
+    values = codec.values_from_coordinates(torch.zeros(2, codec.num_curve_tokens))
+    path, heading, curvature = codec._decode_values(values)
+    assert path.shape == (2, 16, 2)
+    assert heading.shape == curvature.shape == (2, 16)
+    assert torch.isfinite(curvature).all()
 
 
 def test_metric_xyz_backprojection_uses_camera_height_and_observation_transform() -> None:
@@ -452,8 +523,9 @@ def test_metric_xyz_backprojection_uses_camera_height_and_observation_transform(
     translated = identity.clone()
     translated[:, 0, 0] = -1.0
     with torch.no_grad():
-        first = policy.depth_encoder.metric_projector(depth, identity).points
-        second = policy.depth_encoder.metric_projector(depth, translated).points
+        valid = torch.ones(1, 4, dtype=torch.bool)
+        first = policy.depth_encoder.metric_projector(depth, identity, valid).points
+        second = policy.depth_encoder.metric_projector(depth, translated, valid).points
     assert first.shape[-1] == 3
     assert policy.depth_encoder.metric_projector.camera_height_m == 0.62532
     torch.testing.assert_close(
@@ -473,6 +545,7 @@ def test_body_obstacle_pooling_cannot_be_occluded_by_nearer_floor() -> None:
     projection = policy.depth_encoder.metric_projector(
         depth,
         identity_observation_transform(1),
+        torch.ones(1, 4, dtype=torch.bool),
     )
     valid = projection.obstacle_valid[:, -1]
 
@@ -483,7 +556,31 @@ def test_body_obstacle_pooling_cannot_be_occluded_by_nearer_floor() -> None:
     )
 
 
-def test_walkable_surface_normal_is_not_a_body_obstacle() -> None:
+def test_surface_below_traversable_height_is_not_a_body_obstacle() -> None:
+    projector = build_policy(tiny_config()).depth_encoder.metric_projector
+    row = torch.arange(126, dtype=torch.float32)
+    pitch = math.radians(10.0)
+    denominator = (
+        math.cos(pitch) * (row - 63.0) / 166.80851063829786
+        + math.sin(pitch)
+    )
+    depth_m = torch.where(
+        denominator > 0,
+        (0.62532 - 0.005) / denominator,
+        torch.tensor(5.0),
+    ).clamp_max(5.0)
+    depth = depth_m[None, None, None, :, None].expand(1, 4, 1, 126, 224) / 5.0
+
+    projection = projector(
+        depth,
+        identity_observation_transform(1),
+        torch.ones(1, 4, dtype=torch.bool),
+    )
+
+    assert not projection.obstacle_valid.any()
+
+
+def test_horizontal_surface_is_not_mislabeled_by_height_alone() -> None:
     projector = build_policy(tiny_config()).depth_encoder.metric_projector
     row = torch.arange(126, dtype=torch.float32)
     pitch = math.radians(10.0)
@@ -498,16 +595,48 @@ def test_walkable_surface_normal_is_not_a_body_obstacle() -> None:
     ).clamp_max(5.0)
     depth = depth_m[None, None, None, :, None].expand(1, 4, 1, 126, 224) / 5.0
 
-    projection = projector(depth, identity_observation_transform(1))
+    projection = projector(
+        depth,
+        identity_observation_transform(1),
+        torch.ones(1, 4, dtype=torch.bool),
+    )
 
     assert not projection.obstacle_valid.any()
+
+
+def test_surface_normals_separate_traversable_slope_from_steep_obstacle() -> None:
+    projector = build_policy(tiny_config()).depth_encoder.metric_projector
+    row, column = torch.meshgrid(
+        torch.arange(8, dtype=torch.float32),
+        torch.arange(12, dtype=torch.float32),
+        indexing="ij",
+    )
+    x = column * 0.05
+    y = row * 0.05
+    valid = torch.ones(1, 8, 12, dtype=torch.bool)
+
+    gentle = torch.stack(
+        (x, y, math.tan(math.radians(30.0)) * x),
+        dim=-1,
+    ).unsqueeze(0)
+    steep = torch.stack(
+        (x, y, math.tan(math.radians(60.0)) * x),
+        dim=-1,
+    ).unsqueeze(0)
+
+    assert projector._traversable_surface(gentle, valid).all()
+    assert not projector._traversable_surface(steep, valid).any()
 
 
 def test_nearest_depth_is_backprojected_with_its_own_pixel_ray() -> None:
     projector = build_policy(tiny_config()).depth_encoder.metric_projector
     depth = torch.ones(1, 4, 1, 126, 224)
     depth[:, :, :, 10, 20] = 0.4
-    projection = projector(depth, identity_observation_transform(1))
+    projection = projector(
+        depth,
+        identity_observation_transform(1),
+        torch.ones(1, 4, dtype=torch.bool),
+    )
     optical_y = 2.0 * (10.0 - 63.0) / 166.80851063829786
     pitch = math.radians(10.0)
     expected = torch.tensor(

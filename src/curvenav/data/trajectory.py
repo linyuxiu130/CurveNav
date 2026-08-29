@@ -4,7 +4,7 @@ import torch
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 
-from curvenav.trajectory import MetricCurvatureTrajectory, resample_path_by_arc_length
+from curvenav.trajectory import MetricHeadingTrajectory, resample_path_by_arc_length
 
 
 MAXIMUM_EXPERT_PROJECTION_ADE_RATIO = 0.2
@@ -12,7 +12,7 @@ MAXIMUM_EXPERT_PROJECTION_ADE_RATIO = 0.2
 
 def collate_metric_paths(
     metric_paths: list[Tensor],
-    codec: MetricCurvatureTrajectory,
+    codec: MetricHeadingTrajectory,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Return metric controls, decoded targets, and source projection error."""
     if not metric_paths or any(
@@ -22,6 +22,8 @@ def collate_metric_paths(
     lengths = torch.tensor([path.shape[0] for path in metric_paths])
     if torch.any(lengths < 2):
         raise ValueError("every metric path must contain at least two points")
+    if any(torch.count_nonzero(path[0]).item() for path in metric_paths):
+        raise ValueError("every metric path must start at the robot origin")
     padded = pad_sequence(metric_paths, batch_first=True)
     padding = torch.arange(padded.shape[1]).unsqueeze(0) >= lengths.unsqueeze(1)
     endpoints = torch.stack([path[-1] for path in metric_paths])
@@ -30,7 +32,7 @@ def collate_metric_paths(
         padded,
         num_samples=codec.num_path_points,
     )
-    values, reference_path, _, _ = codec.project_expert(source_reference)
+    values, reference_path = codec.project_expert(source_reference)
     projection_error = torch.linalg.vector_norm(
         reference_path - source_reference,
         dim=-1,

@@ -61,7 +61,7 @@ def test_optimizer_step_uses_loss_scale_as_the_overflow_signal(
     assert _optimizer_step_succeeded(optimizer, scaler) is succeeded
 
 
-def test_checkpoint_records_the_metric_curvature_flow_contract() -> None:
+def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
     config = CurveNavConfig()
     model = nn.Linear(2, 2)
     optimizer = AdamW(model.parameters())
@@ -81,42 +81,57 @@ def test_checkpoint_records_the_metric_curvature_flow_contract() -> None:
     contract = checkpoint["policy_contract"]
     assert (
         checkpoint["checkpoint_type"]
-        == "curvenav_metric_curve_flow_policy"
+        == "curvenav_metric_curve_mean_flow_policy"
     )
     assert {"model", "optimizer", "scheduler", "ema", "grad_scaler"} <= set(checkpoint)
     assert "extra" not in checkpoint
     assert (
         contract["trajectory_decoder_type"]
-        == "metric_path_conditioned_curve_flow_transformer"
+        == "configuration_field_conditioned_curve_mean_flow_transformer"
     )
-    assert contract["flow_steps"] == 8
     assert contract["flow_source"] == (
-        "isotropic_gaussian_training_prior_with_fixed_typical_set_inference"
+        "standard_gaussian_training_and_fixed_typical_set_inference"
     )
     assert contract["flow_path"] == (
-        "conditional_optimal_transport_displacement_interpolation"
+        "data_anchored_linear_stochastic_interpolant"
     )
-    assert contract["flow_solver"] == "fixed_step_heun"
-    assert contract["flow_time_embedding"] == "smooth_scalar_mlp"
+    assert contract["flow_solver"] == "none_direct_average_velocity_transport"
+    assert contract["flow_time_embedding"] == "end_time_and_interval_width_mlp"
+    assert contract["flow_time_sampling"] == (
+        "closed_interval_deterministic_collocation"
+    )
+    assert contract["mean_flow_identity"] == (
+        "instantaneous_boundary_plus_data_anchored_improved_mean_flow_v_loss"
+    )
     assert contract["training_objective"] == (
-        "conditional_flow_matching_velocity_mse_plus_soft_configuration_space_clearance"
+        "standardized_boundary_complete_improved_mean_flow_mse_plus_"
+        "pathwise_configuration_space_risk"
     )
     assert contract["safety_objective_type"] == (
-        "predicted_clean_curve_current_depth_configuration_space_clearance_hinge"
+        "maximum_observed_configuration_space_margin_violation"
     )
-    assert contract["safety_clearance_m"] == pytest.approx(0.267584539)
+    assert contract["safety_clearance_m"] == pytest.approx(0.10)
     assert (
         contract["trajectory_prediction"]
-        == "single_flow_generated_smooth_metric_curvature_trajectory"
+        == "single_mean_flow_generated_regular_metric_heading_curve"
+    )
+    assert contract["curve_boundary_conditions"] == (
+        "origin_and_robot_longitudinal_initial_heading"
+    )
+    assert contract["trajectory_endpoint_policy"] == (
+        "single_evaluation_conditional_average_flow_curve"
+    )
+    assert contract["body_obstacle_selection"] == (
+        "robot_collision_height_band_excluding_local_traversable_surface_triangles"
     )
     assert contract["temporal_modeling"] == (
-        "history_transforms_only_align_geometry_without_a_route_state_token"
+        "aligned_four_frame_configuration_field_plus_causal_se2_motion_tokens"
     )
-    assert contract["history_training_distribution"] == (
-        "uniform_valid_observation_suffix_marginalization"
-    )
-    assert contract["state_token_count"] == 0
-    assert contract["flow_steps"] == 8
+    assert "history_training_distribution" not in contract
+    assert contract["state_token_features"] == "normalized_xy_sine_cosine"
+    assert contract["state_translation_scale_m"] == pytest.approx(1.35)
+    assert contract["state_token_count"] == 3
+    assert "flow_steps" not in contract
     assert "trajectory_candidate_samples" not in contract
     assert contract["camera_extrinsics"] == {
         "forward_offset_m": pytest.approx(0.28618),
@@ -125,7 +140,19 @@ def test_checkpoint_records_the_metric_curvature_flow_contract() -> None:
     }
     assert contract["num_curve_tokens"] == 8
     assert "route_query_count" not in contract
-    assert contract["condition_token_count"] == 129
+    assert contract["condition_token_count"] == 100
+    assert contract["configuration_space_field"] == {
+        "grid_size": 64,
+        "extent_m": pytest.approx(3.6),
+        "channels": [
+            "signed_clearance_m",
+            "gradient_x",
+            "gradient_y",
+            "observed",
+            "forbidden",
+        ],
+        "footprint_inflated": True,
+    }
     assert contract["body_obstacle_geometry"] == {
         "footprint_radius_m": pytest.approx(0.167584539),
         "extra_clearance_m": pytest.approx(0.10),
@@ -134,26 +161,29 @@ def test_checkpoint_records_the_metric_curvature_flow_contract() -> None:
         "collision_height_m": pytest.approx(0.161981500),
         "body_obstacle_min_z_m": pytest.approx(0.005999999),
         "maximum_traversable_height_m": pytest.approx(0.05),
+        "maximum_traversable_slope_degrees": pytest.approx(45.0),
     }
-    assert contract["num_curvature_control_points"] == 7
-    assert contract["path_sampling"] == "fixed_uniform_metric_arc_progress"
+    assert contract["num_heading_control_points"] == 8
+    assert contract["path_sampling"] == "fixed_uniform_arc_progress"
     assert contract["curve_coordinates"] == (
-        "shared_expert_and_policy_softplus_arc_length_cubic_curvature_bspline"
+        "positive_log_arc_length_and_cubic_heading_increment_coordinates"
     )
     assert contract["visual_planning_scale_m"] == pytest.approx(3.6)
     assert contract["curve_value_semantics"] == (
-        "metric_arc_length_m_then_curvature_controls_inv_m"
+        "metric_arc_length_then_seven_cubic_heading_control_increments_rad"
     )
-    assert contract["flow_length_transform"] == "standardized_inverse_softplus"
-    assert contract["length_pretransform_mean"] == pytest.approx(2.9003251)
-    assert contract["length_pretransform_std"] == pytest.approx(1.2550740)
-    assert contract["curvature_control_mean_inv_m"] == pytest.approx(-0.01270257)
-    assert contract["curvature_control_std_inv_m"] == pytest.approx(0.35367659)
+    assert contract["flow_coordinate_transform"] == (
+        "standardized_log_length_and_heading_increments"
+    )
+    assert contract["log_length_mean"] == pytest.approx(0.94119977)
+    assert contract["log_length_std"] == pytest.approx(0.65789850)
+    assert len(contract["heading_increment_mean_rad"]) == 7
+    assert len(contract["heading_increment_std_rad"]) == 7
     assert contract["inference_source_seed"] == 20_260_828
-    assert contract["training_source_endpoint_probability"] == pytest.approx(1 / 9)
+    assert "deployment_boundary_fraction" not in contract
+    assert "training_source_endpoint_probability" not in contract
     assert "maximum_local_detour_ratio" not in contract
     assert "maximum_continuous_curvature_inv_m" not in contract
-    assert contract["curvature_variation_regularization"] == pytest.approx(1e-3)
     assert contract["model_architecture"] == {
         "model_dim": 384,
         "depth_token_grid": [8, 12],
@@ -169,18 +199,18 @@ def test_checkpoint_records_the_metric_curvature_flow_contract() -> None:
     }
     assert (
         contract["visual_compression"]
-        == "full_current_grid_plus_32_history_geometry_queries"
+        == "current_frame_visual_grid_only"
     )
     assert (
         contract["observation_to_current"]
-        == "planar_rigid_transform_used_for_metric_xyz_alignment"
+        == "planar_rigid_transform_used_for_metric_xyz_alignment_and_motion_state"
     )
 
 
 def test_checkpoint_contract_catches_geometry_mismatch() -> None:
     config = CurveNavConfig()
     checkpoint = {
-        "checkpoint_type": "curvenav_metric_curve_flow_policy",
+        "checkpoint_type": "curvenav_metric_curve_mean_flow_policy",
         "policy_contract": build_policy_contract(config),
     }
     validate_policy_contract(checkpoint, config)

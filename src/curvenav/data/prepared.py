@@ -38,17 +38,23 @@ def policy_dataset_contract(
         "expert_waypoint_spacing_m": data.expert_waypoint_spacing_m,
         "future_steps": data.future_steps,
         "planar_axis_convention": "x_forward_y_left",
-        "observation_to_current_semantics": "planar_rigid_transform_from_observation_to_current_frame",
+        "observation_to_current_semantics": (
+            "planar_rigid_transform_from_observation_to_current_frame"
+        ),
         **depth_camera_contract(data),
-        "num_curve_values": trajectory.num_curvature_control_points + 1,
+        "num_curve_values": trajectory.num_heading_control_points,
         "num_path_points": trajectory.num_path_points,
-        "curve_value_semantics": "metric_arc_length_m_then_curvature_controls_inv_m",
-        "flow_length_transform": "standardized_inverse_softplus",
-        "length_pretransform_mean": trajectory.length_pretransform_mean,
-        "length_pretransform_std": trajectory.length_pretransform_std,
-        "curvature_control_mean_inv_m": trajectory.curvature_control_mean_inv_m,
-        "curvature_control_std_inv_m": trajectory.curvature_control_std_inv_m,
-        "expert_projection": "production_smooth_heading_regularized_least_squares",
+        "curve_value_semantics": (
+            "metric_arc_length_then_seven_cubic_heading_control_increments_rad"
+        ),
+        "flow_coordinate_transform": (
+            "standardized_log_length_and_heading_increments"
+        ),
+        "log_length_mean": trajectory.log_length_mean,
+        "log_length_std": trajectory.log_length_std,
+        "heading_increment_mean_rad": list(trajectory.heading_increment_mean_rad),
+        "heading_increment_std_rad": list(trajectory.heading_increment_std_rad),
+        "expert_projection": "equal_arc_heading_field_least_squares",
         "maximum_expert_projection_ade_m": (
             data.expert_waypoint_spacing_m * MAXIMUM_EXPERT_PROJECTION_ADE_RATIO
         ),
@@ -115,7 +121,7 @@ class PreparedPolicyDataset(Dataset):
             "observation_valid": (self.count, data.observation_frames),
             "curve_values": (
                 self.count,
-                trajectory.num_curvature_control_points + 1,
+                trajectory.num_heading_control_points,
             ),
         }
         invalid_shapes = {
@@ -136,7 +142,9 @@ class PreparedPolicyDataset(Dataset):
             )
         curve_values = self.arrays["curve_values"]
         if np.any(curve_values[:, 0] <= 0):
-            raise ValueError(f"prepared curve lengths must be positive: {split}")
+            raise ValueError(
+                f"prepared policy split contains non-positive arc length: {split}"
+            )
         if not self.arrays["observation_valid"][:, -1].all():
             raise ValueError(
                 f"prepared policy split has an invalid current frame: {split}"

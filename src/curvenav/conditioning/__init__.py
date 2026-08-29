@@ -1,13 +1,17 @@
 """PointGoal-aware multi-frame conditioning."""
 
+from .motion import (
+    HISTORICAL_STATE_FEATURES,
+    HistoricalMotionEncoder,
+)
 from .transformer import (
     CONDITION_ENCODER_TYPE,
-    HISTORY_GEOMETRY_QUERY_COUNT,
     PolicyConditionEncoder,
 )
 
 __all__ = [
     "CONDITION_ENCODER_TYPE",
-    "HISTORY_GEOMETRY_QUERY_COUNT",
+    "HISTORICAL_STATE_FEATURES",
+    "HistoricalMotionEncoder",
     "PolicyConditionEncoder",
 ]

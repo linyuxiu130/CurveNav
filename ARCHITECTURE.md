@@ -1,206 +1,203 @@
-# CurveNav 轨迹生成架构
+# CurveNav 模型架构
 
-本文是当前代码的唯一模型合同。CurveNav 输入四帧度量深度、历史观测到当前帧的刚体变换和当前机器人系 PointGoal，以条件 Flow Matching 生成一条正弧长、连续曲率的二维局部轨迹。当前阶段没有评价头、多候选选择、RL 后训练或推理轨迹修补。
+本文是当前代码的唯一模型合同。CurveNav 读取四帧标定深度、对应的历史观测到当前帧 SE(2) 变换和机器人系 PointGoal，以一次 improved MeanFlow 输运生成一条二维短程轨迹。模型没有候选集、评价头、ODE solver、硬长度/曲率裁剪、推理碰撞投影、旧模型兼容或 fallback。
 
-## 1. 失败证据与根因
+## 1. 问题判断与唯一设计
 
-上一版同场景 10 回合闭环为 `SR=5/10`，成功回合 SPL 为 `0.9055–0.9815`，证明坐标、HTTP、MPC 和成功判定链路能够工作。失败回合约 `91%` 的采样状态实际速度低于 `0.05 m/s`，但 MPC 约 `98%` 时间仍请求明显前进；失败轨迹 95% 最大曲率均值约 `0.48 m⁻¹`，成功轨迹反而约 `0.60 m⁻¹`。离线高转弯样本的预测总转角仅为专家的 `45%`。失败不是触碰 `4 m⁻¹` 曲率边界，而是困难状态下系统性欠转弯并重复同一条错误轨迹。
+旧模型的主要问题不是 Transformer 不够大，而是几何变量和场景交互不适合一步 Flow：
 
-进一步对 checkpoint、失败轨迹和训练数据做边界与因果审计得到三个直接根因：
+1. 七个累计航向控制量高度相关，训练集协方差条件数约为 `315`；各局部航向增量的条件数约为 `2.86`。同一条曲线流形用差分坐标表示后，Flow 不再重复运输累计误差。
+2. 旧历史压缩器先把三帧度量几何压成 32 个潜变量，再要求路径 token 从潜变量中重新发现障碍位置。它丢失了避障最需要的连续空间对应关系。
+3. 稀疏 cell 最近点和全局最近障碍 penalty 不能表示机器人 footprint、可见自由空间或整条路径的最坏风险。
+4. PointGoal 距离曾被硬截断，远目标失去距离顺序；视觉 backbone 重复计算四帧，而短时历史真正需要的是已经配准的几何与运动状态。
+5. 深度可见性曾把归一化深度同米制阈值比较，令无回波区域错误变成已观测空间。该单位错误已从投影根源消除。
 
-1. 训练曾固定 `x₀=0`，并使用 `x_t=t x₁`、`u*=x₁`。任意 `t>0` 都有 `x₁=x_t/t`，解码器可从带噪状态直接恢复标签而绕过深度与 PointGoal；真正需要条件的推理起点 `t=0` 在连续均匀训练中概率为零。实测速度 MSE 从 `t=0` 的 `1.337×10⁻³` 降到 `t=0.5` 的 `2.492×10⁻⁶`，相差约 537 倍。
-2. 解码器只处理八个抽象标量，完整 Flow 积分结束后才首次解码路径。网络虽然读取视觉 token，却不知道当前中间状态对应的哪一段曲线靠近哪个障碍，因此没有 NavDP 式“当前生成轨迹与视觉逐层交互”。离线打乱当前深度仅使 ADE 增加 `0.00013 m`，而打乱 PointGoal 会使输出路径变化 `0.478 m`，说明模型主要学成了目标方向回归器。
-3. HSSD 专家生成调用 `NavMeshSettings.set_defaults()` 后没有打开 `include_static_objects`；Habitat-Sim 的默认值为 false，而且默认 `agent_max_climb=0.20 m`，因此规划网格忽略静态家具并把部分低矮障碍视为可跨越。复现样本中，深度在前方 `1.42 m` 正确看到大型静态物体，旧专家却穿过该物体；将静态碰撞网格纳入机器人配置空间后，原路线后半段明确变为不可通行。旧训练监督因此直接教模型忽略可见障碍。
-4. 生成器曾把 navmesh 地面点直接设为 Habitat agent 的位置，但生产投影把深度解释在 Dingo `base_link` 中；真实 `base_link` 比碰撞体底部高 `0.044000001 m`。这使训练深度中的地面整体抬高 4.4 cm，并被误判为机身障碍。仅修正该外参后，验证集专家安全冲突由 930 降至 238；其余冲突来自仅按高度把可行斜面也当成障碍。当前深度障碍定义与 navmesh 共用显式 `45°` 最大可行坡度，并以度量表面法向区分可行面与碰撞面，最终 6071 条验证样本的专家安全冲突和足迹碰撞均为 0。
+唯一方案是：差分航向曲线坐标、当前帧 SanD 风格视觉特征、四帧配准的机器人配置空间场、显式历史 SE(2) token、路径对连续场的双线性查询，以及部署对齐的一步 improved MeanFlow。当前不增加 critic、多候选、RL 后训练或长期地图。
 
-当前实现从数学链路上删除这些问题：训练源使用独立高斯随机变量，部署从同一先验典型集中的固定 latent 出发；Flow 的每一次速度场求值都先解码当前曲线，并显式建立路径锚点与当前深度障碍之间的度量注意力；专家 navmesh 强制包含 stage 和全部静态刚体；预测的干净轨迹还接受可微配置空间净空监督。轨迹坐标不使用 PointGoal 距离截断弧长，也不使用 `tanh` 饱和曲率。
-
-## 2. 唯一张量合同
+## 2. 张量与模块合同
 
 ```text
 depth                  float [B,4,1,126,224]
 point_goal             float [B,2]
-observation_to_current float [B,4,4]  (x,y,sin Δyaw,cos Δyaw)
+observation_to_current float [B,4,4]   # x,y,sin Δyaw,cos Δyaw
 observation_valid      bool  [B,4]
 
-expert curve values    float [B,8]    (metric arc length + 7 curvature controls)
+expert curve values    float [B,8]     # L, Δθ1,...,Δθ7
+mean-flow coordinates  float [B,8]     # standardized log L and Δθ
 prediction path        float [B,64,2]
-prediction heading     float [B,64]
-prediction curvature   float [B,64]
 ```
 
-二维坐标固定为机器人系 `x` 向前、`y` 向左、yaw 向左为正。训练只读取 `data/policy_dataset`；它是当前 CurveNav 自行生成并编译的唯一 prepared dataset，不在运行时混用 SanD、NavDP 或其他来源数据。`expert_navigation_geometry` 数据合同固定 Dingo USD 哈希、轮半径、轮距、完整 collision 包络和最大可跨越高度，旧的忽略家具数据或猜测机器人尺寸的数据会在加载前被拒绝。旧 checkpoint 因损失和模型合同不同同样直接拒绝，没有兼容分支。
-
-生产图固定为 `D=384`、8 heads、42,847,312 参数：
+生产模型维度固定为 `D=384`、39,284,296 个可训练参数：
 
 ```text
-4 × calibrated metric depth
-  └─ shared GroupNorm ResNet-18 stage-3 → 每帧 8×12=96 token
-       ├─ 当前 96 token 保留
-       └─ 三帧历史 288 token + null → 32 query 压缩
+current depth
+  └─ GroupNorm ResNet-18 stage3 + 8×12 pooling
+  └─ calibrated current metric geometry
+       └─ 96 current visual tokens
 
-[PointGoal, current 96, history 32] = 129 token
-  └─ 4 × joint self-attention condition encoder
+four aligned depths
+  └─ slope-aware body-obstacle extraction
+  └─ exact 64×64 Euclidean distance transform
+       └─ [clearance,gx,gy,observed,forbidden]
 
-8-D Gaussian-to-curve Flow state
-  ├─ 平滑解码为 64 点连续曲率曲线
-  ├─ 等弧长抽取 16 个 path token
-  ├─ path-to-current-depth metric cross-attention
-  └─ [8 control token, 16 path token]
-       └─ 12 × (trajectory self-attention + condition cross-attention + SwiGLU)
-            └─ 8-slot velocity → 8-step Heun → 唯一 64 点轨迹
+PointGoal token + 96 visual tokens + 3 historical SE(2) tokens
+  └─ 4 condition Transformer blocks
+       └─ condition memory [B,100,384]
+
+8 curve tokens + 16 decoded path/field tokens
+  └─ 12 self-attention + condition cross-attention + SwiGLU blocks
+       └─ 8-D average velocity
+
+fixed typical Gaussian latent
+  └─ one average-velocity evaluation
+       └─ one 64-point path
 ```
 
-## 3. 视觉、时序与目标融合
+模块职责：
 
-专家数据只建立一次障碍几何。机器人配置直接来自固定测评实际加载的 `dingo.usd`（SHA256 `43db9c…bcce20`），该资产与 NavDP、X-NavDP 仓库中的副本逐字节相同。启用的运动碰撞体给出 `0.167584539 m` 最小包围圆、基座坐标 `z∈[-0.044000001,0.117981499] m` 和 `0.161981500 m` 总高；轮半径为 `0.06125 m`、轮距为 `0.22616 m`。相机相对基座的 `0.28618 m` 前移和 `0.62532 m` 高度属于传感器外参，不再被误当机器人碰撞高度。
+- `encoders/depth.py`：只对当前图运行视觉 backbone，并融合当前帧标定几何。
+- `encoders/geometry.py`：四帧反投影、坡度分类、刚体配准和配置空间场。
+- `conditioning/transformer.py`、`conditioning/motion.py`：目标、当前视觉和因果历史状态。
+- `trajectory/heading.py`：训练与推理共用的八维正则曲线双射。
+- `models/decoder.py`、`models/blocks.py`：路径—配置空间连续交互和平均速度网络。
+- `models/policy.py`：唯一 MeanFlow 恒等式、损失和一步采样。
+- `models/safety.py`：配置空间场查询与路径最坏风险；不修改推理轨迹。
 
-Habitat-Sim 将 stage 和全部静态物体 collision mesh 一同体素化；实测 footprint 半径负责水平配置空间膨胀，碰撞包络总高负责上方净空。统一的 `0.05 m` 最大可跨越高度低于真实轮半径，并决定低矮表面是否构成障碍；最大可行坡度显式固定为 Habitat navmesh 与深度投影共用的 `45°`。navmesh 返回的是地面点，渲染位姿先沿世界竖直方向抬高 `0.044000001 m`，使相机外参与生产 Dingo `base_link` 严格一致。该 navmesh 投影出的最大连通二维网格是端点采样、A*、平滑、轨迹采样和最终审计的唯一几何来源，不再要求任意的“最大岛占比 80%”，不再先调用另一套 Habitat shortest-path，也不在渲染深度后过滤错误专家。
+## 3. 正弧长差分航向曲线
 
-PointGoal 端点距离固定从所有 20 个场景共同支持的连续区间采样：near `[3,6) m`、middle `[6,8.5) m`、far `[8.5,10.5) m`，每场景分别生成 `5/10/10` 条。距离分布不按场景缩放，也不存在候选耗尽后的改档或重试；因此距离标签含义跨场景一致，同时不会要求小场景生成数学上不存在的 `[11,15) m` 安全端点对。
-
-A* 只优化一个固定目标。若相邻网格步长为 `Δs`，其已膨胀障碍净空为 `c`，边代价为：
-
-```text
-ΔJ = Δs [1 + exp(-c / 0.167584539)]
-```
-
-第一项最小化长度，第二项以机器人半径为唯一尺度连续排斥贴障路线；可行域本身要求额外净空至少 `0.10 m`。网格折线仅在直连段仍满足净空且同一个积分代价不增加时才被化简，之后的 spline 平滑也必须在同一网格上保持净空。旧实现的独立 Habitat 路径预检、无目标一致性的贪心 shortcut、五组净空权重、曲率硬筛选、绕路比例和 Pareto 二次选择均已删除；曲率、转角和净空只作为数据审计统计，不决定隐藏分支。
-
-共享单通道 ResNet-18 使用 GroupNorm，因此单样本输出不依赖 batch 或 DDP rank 的运行统计。每个 adaptive cell 保留最近的本体高度障碍；若没有障碍则保留最近可见表面。相机光轴深度为 `z`，像素为 `(u,v)`，下俯角为 `α`，相机前移为 `a`、高度为 `h`：
+令 `L>0`，八个 clamped cubic B-spline 航向控制为 `θ0,...,θ7`，其中 `θ0=0`。网络的七个物理转向值是局部增量：
 
 ```text
-x_o = z(u-cx)/fx
-y_o = z(v-cy)/fy
-p_body = (a + cos(α)z - sin(α)y_o,
-          -x_o,
-          h - cos(α)y_o - sin(α)z)
-```
-
-对当前深度图的相邻反投影点，以中心差分构造两个度量切向量 `t_u,t_v`，表面单位法向为 `n=(t_u×t_v)/||t_u×t_v||`。与 navmesh 相同，`|n·e_z|≥cos(45°)` 的水平或缓斜表面属于可行支撑面；只有位于 Dingo 碰撞高度区间且不满足该坡度条件的点才进入 `obstacle_valid`。这保留墙面、家具立面和台阶碰撞面，同时不再把地面或可行斜面作为净空损失的负样本。`surface_valid` 仍保留所有可见表面供视觉编码使用，所以该分类不会删除深度视觉信息。
-
-历史点用 `p_current=R(Δyaw)p_observation+t` 对齐到当前机器人系。历史仅补充已观测几何，由 32 个 learned query 压缩；`observation_to_current` 不作为独立状态 token，避免专家历史运动方向泄露未来路线。无效历史通过 attention mask 排除，额外 null token 使冷启动 memory 始终定义良好。
-
-对每个视觉点 `p_i` 和目标单位方向 `ĝ`，输入显式包含：
-
-```text
-longitudinal_i = p_i · ĝ
-lateral_i      = ĝ_x p_i,y - ĝ_y p_i,x
-radius_i       = ||p_i||
-goal_range, surface_valid, obstacle_valid
-```
-
-目标 token、当前 96 个空间 token 和 32 个历史 token 再通过四层联合 self-attention。与旧版只拼接未经上下文化 memory 不同，这一步允许当前障碍在生成开始前同时读取目标方向和历史遮挡信息，吸收 SanD 深度序列 Transformer 的有效设计。
-
-## 4. 共享度量曲率流形
-
-数据保存真实物理值 `q=[L,c₁,…,c₇]`：`L>0` 为米制总弧长，`c_i` 为 `m⁻¹` 曲率控制。Flow 状态位于无界坐标 `z∈R⁸`。长度使用无硬上限、数值稳定的 softplus 双射，曲率使用训练集统计量线性标准化：
-
-```text
-a = μL + σL z₀
-L = softplus(a)
-c_i = μκ + σκ z_i
-κ(u) = Σ_i B_i,3(u)c_i
-
-μL=2.9003251, σL=1.2550740
-μκ=-0.01270257 m⁻¹, σκ=0.35367659 m⁻¹
-```
-
-这些统计量来自当前唯一训练集的物理专家控制。反变换为 `z₀=(softplus⁻¹(L)-μL)/σL`、`z_i=(c_i-μκ)/σκ`，因此正弧长与欧氏 Flow 空间一一对应；不存在 `L≤2||g||`、弧长截断、曲率 clip 或 `tanh` 饱和。PointGoal 只进入条件网络，不改变轨迹坐标定义。
-
-三次 B-spline 保证曲率连续；它不再人为限制曲率幅值。轨迹由 Frenet 方程积分：
-
-```text
-θ(0)=0
-θ(u)=L∫₀ᵘκ(v)dv
+θ0=0
+θi=Σ_{k=1}^i Δθk
+θ(u)=Σ_i B_i(u)θi
 p(u)=L∫₀ᵘ[cos θ(v), sin θ(v)]dv
+κ(u)=(1/L)dθ/du
 ```
 
-实现使用四倍密集弧长网格、梯形航向积分和 circular-chord 位置积分，再抽取 64 点。平滑性、正弧长和前向初始切向来自参数化本身，不依赖输出裁剪或推理后处理。专家投影和生产解码共用同一套曲率 basis 与积分实现。
+所以任意有限网络输出都满足 `||dp/ds||=1`、起点为原点、初始方向向前；`θ∈C²`，因此 `p∈C³`、曲率连续。64 点之间用四倍过采样和线性航向圆弧弦公式积分。没有最大规划长度、`L≤2d_goal`、最大曲率、`tanh` 或 clip。
 
-## 5. 数学正确的条件 Flow Matching
-
-对专家曲线坐标 `x₁`，训练定义：
+Flow 的无界欧氏坐标为：
 
 ```text
-x₀ ~ N(0,I₈)
-t = 0 with probability 1/9; otherwise t ~ Uniform([0,1])
-x_t = (1-t)x₀ + t x₁
-u* = d x_t/dt = x₁-x₀
-L_CFM = E ||uθ(x_t,t,c)-u*||²₂
+zL=(log L-μL)/σL
+zi=(Δθi-μi)/σi
 ```
 
-这是 Flow Matching 的 Optimal-Transport displacement interpolation。随机 `x₀` 使给定 `(x_t,t)` 不再能代数恢复专家标签；条件 `c` 在整个 `t<1` 区间都必须消除源不确定性。`1/9` 的训练样本显式落在 `t=0`，对应八步积分的九个时间节点之一，使第一次数值速度求值进入训练支持。
+`log L` 保证长度严格为正；差分是从航向控制到局部转向的满秩线性双射，不改变 B-spline 曲线族。专家等弧长重采样后先拟合累计航向，再取控制差分。训练集统计写入唯一配置与数据 manifest。
 
-推理求解同一个 ODE `dx/dt=uθ(x,t,c)`，使用固定 8 步 Heun。单轨迹部署使用 seed `20260828` 生成一次标准高斯方向，再严格缩放到八维高斯典型半径 `||x(0)||₂=√8`；该 buffer 随 checkpoint 保存，每次闭环重规划完全确定。它属于训练源的典型集合，不再使用高维高斯中非典型的零向量。
+## 4. 标定视觉与配置空间场
 
-训练还从当前速度场一次重建其预测终点：
+四帧深度使用同一 Dingo 相机标定反投影到机器人系。每个像素参与相邻四个图像三角面；重力方向法向坡度不超过 `45°` 的表面视为可通行地形。其余落在机器人碰撞高度带内的点是 body obstacle。所有有效历史点经 `observation_to_current` 对齐到当前机器人系。
+
+局部场覆盖 `[-3.6,3.6]²` 的 `64×64` 网格。对栅格化障碍集合 `O` 使用可分离的精确欧氏距离变换：
 
 ```text
-x̂₁ = x_t + (1-t)uθ(x_t,t,c)
-P̂ = Decode(x̂₁)
+d(q)=min_{o∈O} ||q-o||₂
+c(q)=d(q)-r_robot
+forbidden(q)=[c(q)≤0]
 ```
 
-对正确的直线 OT 条件路径，真实速度满足 `x₁=x_t+(1-t)u*`，所以该式不是额外生成器或第二阶段，而是直接检查当前速度预测最终会生成什么物理曲线。
+其中 `r_robot=0.167584539 m`。场的五个通道是：footprint signed clearance、其单位梯度 `gx,gy`、由相机到有效深度表面的射线覆盖 `observed`、以及 `forbidden`。前四帧共同构场，因而过去看见但当前遮挡的近程障碍仍存在；无长期地图。
 
-## 6. 路径—障碍生成器
+视觉 ResNet 只处理当前帧，避免四倍重复卷积。当前 `8×12` 特征同每个 cell 的 metric XYZ、深度、表面有效位和障碍位融合。三个过去位姿另以 `(x/h,y/h,sin Δyaw,cos Δyaw)` 编码；无效历史使用一个学习 null token。PointGoal 使用方向和无截断 `log1p(distance/3.6)`，因此任意有限距离保持顺序。
 
-每次训练速度回归以及 Heun 的 predictor/corrector 求值，都会把当前 `x_t` 解码为实际路径。沿 64 点曲线固定抽取 16 个锚点，每个 path token 输入：
+## 5. 路径条件生成器
+
+每次平均速度求值都把八维状态解码为物理路径，并取 16 个固定弧进度锚点。每个路径 token 包含：
 
 ```text
-[x/H, y/H, sinθ, cosθ, κ/σκ, arc_progress,
- (goal_x-x)/H, (goal_y-y)/H]
+position/3.6, sin heading, cos heading, arc progress,
+(PointGoal-position)/3.6,
+clearance/3.6, gx, gy, observed, forbidden
 ```
 
-对路径点 `p_j` 和当前帧深度 cell `o_i`，度量注意力偏置由 learned MLP 处理：
+配置空间特征在连续路径坐标处双线性查询。路径 token 与八个 curve token 一起通过 12 层 Transformer，并在每层对 100 个条件 token 做 cross-attention。相比旧 all-cell 最近点注意力，这一设计让场景几何先形成明确的欧氏空间函数，再由任意路径位置连续查询；没有 `argmin` 切换、稀疏最近点或单独规划器。
+
+## 6. Boundary-complete improved MeanFlow
+
+采用数据端 `t=0`、高斯端 `t=1`。专家标准坐标为 `x`，源为 `e~N(0,I)`：
 
 ```text
-r_ji = [
-  (o_i-p_j)/H,
-  ||o_i-p_j||/H,
-  (||o_i-p_j||-(0.167584539+0.10))/H,
-  obstacle_valid_i
-]
-
-A_ji = softmax_i(q_j k_iᵀ/√d_h + MLP(r_ji))
+z_t=(1-t)x+t e
+v_c=e-x
 ```
 
-`0.167584539 m` 是实测机器人 footprint 半径，`0.10 m` 是训练/几何合同中的额外净空。它们既作为生成器的度量输入，也定义训练期的软配置空间监督；不执行轨迹投影、硬拒绝或 fallback。由此网络能直接回答“当前这条中间曲线的第 j 段与哪个障碍相交或余量不足”。
+网络 `uθ(z,r,t,c)` 表示区间 `[r,t]` 的平均速度，瞬时速度由退化区间定义：
 
-八个 control token 与十六个 path token 拼成 24-token 轨迹序列，进入十二层 pre-norm Transformer。每层先做轨迹 self-attention，再对 129 个已上下文化条件 token cross-attention，最后做 SwiGLU；只从前八个 control token 读取八维速度。该结构吸收 NavDP 将显式带噪轨迹作为 decoder token 的关键优点，同时保留 CurveNav/SanD 紧凑曲线空间的平滑性和低输出维度。
+```text
+vθ(z,t,c)=uθ(z,t,t,c)
+```
 
-## 7. 相对论文与官方源码
+部署使用的数据锚定区间为 `[0,t]`。沿概率路径的总导数通过精确 forward-mode JVP 计算：
 
-| 来源 | 吸收的有效设计 | CurveNav 的当前取舍与改进 |
+```text
+D_tuθ = JVP(uθ; vθ,0,1)
+Vθ = uθ(z_t,0,t,c)+t·stopgrad(D_tuθ)
+```
+
+由平均流恒等式 `v=u+(t-r)D_tu`，训练损失是：
+
+```text
+L_MF = 1/2 E[||vθ-v_c||² + ||Vθ-v_c||²]
+```
+
+每个 batch 用闭区间等距 collocation 覆盖 `[0,1]`，不使用固定源训练、时间端点概率、课程开关或有限差分。推理选择训练高斯典型集内范数为 `√8` 的固定 latent：
+
+```text
+x_hat=e* - uθ(e*,0,1,c)
+P_hat=Decode(x_hat)
+```
+
+这是严格 1-NFE，不存在 Euler、Heun、midpoint 或 `flow_steps`。
+
+## 7. 生成路径安全目标
+
+训练时同样从当前平均流估计数据端：
+
+```text
+x_hat_t=z_t-t·uθ(z_t,0,t,c)
+P_hat_t=Decode(x_hat_t)
+```
+
+对 64 个等弧长路径点查询配置空间场，只在已观测位置计算 footprint 外的 `0.10 m` 软裕度，并取整条路径的最大违例：
+
+```text
+vj=[relu((0.10-c(pj))/0.10)]²
+L_safe=mean_batch max_j (observed(pj)·vj)
+L=L_MF+L_safe
+```
+
+取最大值针对任何单点碰撞都不能被长安全段平均稀释；配置空间距离已经减去机器人半径，因此阈值只剩额外净空。该项不裁剪、不重规划、不拒绝模型输出，也不对不可见空间声称安全保证。
+
+## 8. 相对公开工作的依据
+
+| 来源 | 吸收 | CurveNav 的改进/取舍 |
 |---|---|---|
-| [SanD-Planner](https://arxiv.org/abs/2602.00923) | 从零训练的共享 ResNet-18、深度序列 Transformer、紧凑 B-spline 空间、少数据归纳偏置，以及 ESDF 净空评分 | 使用连续曲率 B-spline，专家与生产共用同一流形；把其安全几何转为训练期净空监督，不复制 16 候选和在线 ESDF 选择器。 |
-| [NavDP](https://arxiv.org/abs/2505.08712) | `D=384` 深层 Transformer、显式带噪轨迹 token 与视觉 memory 的逐层交互；专家由 ESDF 安全路径生成 | 以 8 个曲率控制加 16 个可执行路径 token 取代 24 个自由 waypoint；HSSD 专家同样在完整静态场景配置空间规划，但当前不增加 critic。 |
-| [X-NavDP](https://arxiv.org/abs/2607.28560) | 识别专家预训练在陷阱、长障碍绕行和时间一致性上的局限 | 当前不引入 GQRM、critic 或行为扰动；其后训练属于下一阶段，避免用价值头掩盖生成器基本错误。 |
-| [Flow Matching](https://arxiv.org/abs/2210.02747) | 从先验抽样、条件概率路径速度回归、OT 路径与 ODE 采样 | 删除会泄露标签的固定训练源；无界曲线坐标保证整个 ODE 中间态都可由光滑映射解码为合法曲线。 |
-| [Motion Planning Diffusion](https://arxiv.org/abs/2308.01557) / [Safe Flow Matching](https://arxiv.org/abs/2504.08661) | 用 SDF 代价梯度或 barrier 在生成过程中增强安全性 | 当前不引入逐步引导、QP 或 CBF 求解；一次训练期 `x̂₁` 净空监督保留零额外推理成本。 |
+| [SanD](https://arxiv.org/abs/2602.00923) | ResNet 视觉、小样本轨迹先验、cubic spline、配置空间净空 | 保留解析平滑曲线，但改用严格正弧长和差分航向；把安全几何放入唯一生成器，不复制候选 evaluator。 |
+| [NavDP](https://arxiv.org/abs/2505.08712) | 轨迹 token 与视觉 memory 的深层交互、历史条件 | 保留深交互；以标定连续配置空间场替代要求 latent token 隐式恢复的碰撞几何。 |
+| [X-NavDP](https://arxiv.org/abs/2607.28560) | 后训练用于恢复和分布外行为 | 当前先验证单生成器；不以 critic/RL 掩盖生成器的监督与几何错误。 |
+| [Flow Matching](https://arxiv.org/abs/2210.02747) | 合法随机高斯源和条件概率路径 | 禁止零源/固定源训练；确定性只在推理时选择典型 latent。 |
+| [Improved MeanFlow](https://arxiv.org/abs/2512.02012) | 平均速度和 JVP 重参数化 | 同时监督瞬时边界与部署区间，单步训练/推理公式严格对齐。 |
+| [Riemannian Flow Matching Policy](https://arxiv.org/abs/2412.10855) | 动作空间几何应进入 Flow | 先解析删除零切向奇点，再在标准化、良态的欧氏差分坐标中训练。 |
 
-## 8. 唯一损失、训练与验证
+## 9. 数据、效率与验证合同
 
-训练目标固定为：
+训练数据只来自 CurveNav 按 benchmark Dingo 配置生成的 HSSD 专家路线，不读取 SanD/NavDP 数据。当前 canonical dataset 为训练 `25,928`、验证 `6,087` 条；深度 bank 在编译时硬链接，不重复复制图像。
 
-```text
-d_i = min_j ||P̂_i-o_j||₂
-L_clear = mean_i [relu((0.267584539-d_i)/0.267584539)]²
-L = L_CFM + L_clear
-```
+训练固定 global batch `1024`、每卡 micro-batch 上限 `256`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。没有 `torch.compile` 或第二训练实现。
 
-`o_j` 是当前深度中落入 Dingo 实际碰撞竖直区间、且表面坡度不可行的有效障碍点。具体地，地面在基座坐标中为 `-0.044000001 m`，所以越过 `0.05 m` 高低障碍后的下界是 `0.005999999 m`，上界为碰撞顶面 `0.117981499 m`；这与 Habitat 的“相对地面高度”定义严格对齐。无有效障碍的样本贡献零。`L_clear` 无量纲且位于 `[0,1]`，是对机器人圆形 footprint 加 `0.10 m` 裕量的软惩罚，不是曲率、长度或输出的硬约束。训练只额外执行一次 64×96 的 batch 距离计算和一次八维曲线解码；推理图、Heun 次数和输出完全不变。代码中仍不存在 candidate、critic、评价头、轨迹修补或第二生成链路。
+当前必要验证：
 
-训练固定 FP16 autocast、FP32 residual carrier、GPU 常驻 depth bank、异步 prefetch、fused AdamW、cosine schedule、EMA、静态 `torch.compile` 和 DDP。global batch 为 1024，每卡 batch 上限 256；1–8 卡通过精确 rank 分片保持同一全局样本流、更新次数和学习率。提交 `ef33b9c` 在四张 RTX 4090 上完成正式 200 epoch：每卡单次 batch 256、无梯度累积，稳态总吞吐 `5.25–5.58k samples/s`，单卡显存 `15.58–16.86 GiB`，训练期瞬时利用率通常 `85–99%`；含首次 fullgraph 编译和周期 checkpoint 的 8000 次更新约 33 分钟完成。
+- `compileall`、`git diff --check`；
+- 87 个数学、数据、前向、梯度和合同测试；
+- 生产 39,284,296 参数图的 FP16 前向、精确 JVP 与反向检查：311/311 个可训练参数张量均有有限梯度；
+- 6,087 条验证专家的配置空间审计：4,983 条含可见障碍，专家 footprint collision 5 条，额外 `0.10 m` 裕度违例 129 条，直线裕度违例 1,259 条；
+- 本机三张 V100S 的生产训练按 `342/341/341` 分片并各拆成两个约 B171 的 micro-batch，稳定占用约 `14.4 GiB/GPU`；step 20--60 聚合吞吐 `1,156--1,169 samples/s`，按 8,000 step 估算纯训练约 `1.95 h`；
+- 新模型最终 200 epoch 墙钟时间和离线指标必须由本次训练实测，不沿用旧 checkpoint。
 
-必要验证固定为：
+## 10. 正确性边界
 
-1. 标定反投影、历史刚体对齐、障碍高度选择、历史 mask 与 PointGoal 几何；
-2. 物理值与无界 Flow 坐标往返、专家投影、正弧长、连续曲率和 PointGoal 弧长解耦；
-3. 随机源 CFM 插值、`t=0` 覆盖、固定典型集部署源、`x̂₁` 重建、净空 loss 的掩码与有限梯度、完整前向、FP16 与 compile；
-4. held-out 总体及高累计转向 ADE、预测/参考累计转向比、历史长度与 PointGoal 距离/后向目标分层、当前深度与目标打乱因果审计、预测和专家相对当前深度障碍的配置空间净空对照；
-5. 固定场景闭环 10 回合 SR/SPL 和精简轨迹 trace。
+代码保证：标定与坐标一致；历史变换同时用于障碍配准和因果状态；`L>0`；起点为原点；初始切向前向；路径正则且曲率连续；Flow 训练源合法；时间端点属于训练域；MeanFlow JVP 符号与一步推理一致；安全损失作用于实际生成曲线。
 
-本次 8000-step EMA 在全部 6071 条 held-out 样本上的最终离线结果为：总体 ADE `0.1048 m`，高转弯 10% ADE `0.3075 m`，预测/专家高转弯累计转角比 `0.7844`，弧长绝对误差 `0.0513 m`，切向反转率为零。将 PointGoal 在 batch 内确定性错位后，ADE 增加 `0.5744 m`、输出路径平均变化 `0.6728 m`；只错位当前深度帧后，ADE 增加 `0.1417 m`、路径变化 `0.2347 m`。因此模型确实因果使用目标和当前视觉，不再是只依赖目标的回归器。
-
-上述 checkpoint 属于修复前的数据坐标合同，不能用于当前数据结论。新数据在全部 6071 条 held-out 样本中仍提取出 80,983 个机身高度障碍点，但专家 footprint 冲突与 `0.10 m` 额外安全裕量违例均为 0；这说明监督轨迹与模型看到的避障几何已经一致，而不是通过删除全部障碍得到零违例。该合同需要从头训练，旧 checkpoint 不提供兼容加载分支。PointGoal 位于车后方时仍是无长期空间记忆条件下的部分可观测困难，当前阶段不引入全局拓扑输入。
+代码不保证：有限数据必然复现专家；深度可见空间等价完整地图；无长期记忆时一定走出迷宫或死胡同；软损失等价控制屏障函数；离线 ADE 必然转化为闭环成功率。这些必须由严格离线分层和固定协议闭环测评验证。

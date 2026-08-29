@@ -36,28 +36,27 @@ class PolicyCondition:
 
 @dataclass
 class DepthFeatures:
-    """Per-frame visual and metric geometry tokens."""
+    """Current visual tokens plus the aligned short-horizon metric field."""
 
     tokens: Tensor
     points: Tensor
     depth: Tensor
     obstacle_valid: Tensor
+    configuration_field: Tensor
 
 
 @dataclass
 class ConditionFeatures:
-    """Contextual condition memory plus current metric visual geometry."""
+    """Contextual memory and one aligned configuration-space field."""
 
     tokens: Tensor
-    current_tokens: Tensor
-    current_points: Tensor
-    current_obstacle_valid: Tensor
+    configuration_field: Tensor
     point_goal: Tensor
 
 
 @dataclass
 class TrajectoryTarget:
-    """Expert metric length and curvature controls used by the production codec."""
+    """Expert metric length and heading-field values used by the codec."""
 
     curve_values: Tensor
 
@@ -69,5 +68,3 @@ class TrajectoryTarget:
 @dataclass
 class TrajectoryPrediction:
     path: Tensor
-    heading: Tensor
-    curvature: Tensor
