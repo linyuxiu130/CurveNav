@@ -40,7 +40,7 @@ CUDA_VISIBLE_DEVICES="${GPU_IDS}" scripts/train_policy.sh configs/base.yaml
 CUDA_VISIBLE_DEVICES=0 scripts/evaluate_policy.sh configs/base.yaml outputs/train_policy/checkpoint.pt
 ```
 
-训练固定全局 batch 为 1024、每卡 micro-batch 上限为 256；1–8 张 GPU 都保持每次更新严格覆盖 1024 个不重复样本以及相同的 8000 个优化器更新。不能整除时只允许相邻 rank 相差一个样本，并按样本数缩放 loss 后再做 DDP 平均。每个 rank 的份额均衡拆成相同数量的 micro-batch；当前三卡训练为 `342/341/341`，各拆成两个约 B171 的前后向；四卡时每 rank 直接使用 B256。当前 prepared dataset 只包含我们在固定 HSSD 资产上生成的 Dingo 深度与专家轨迹，不混入 SanD/NavDP 数据。
+训练固定全局 batch 为 1024、每卡 micro-batch 上限为 384；1–8 张 GPU 都保持每次更新严格覆盖 1024 个不重复样本以及相同的 8000 个优化器更新。不能整除时只允许相邻 rank 相差一个样本，并按样本数缩放 loss 后再做 DDP 平均。每个 rank 的份额均衡拆成相同数量的 micro-batch；当前三卡训练为 `342/341/341`，每 rank 一次前后向；四卡时每 rank 使用 B256。当前 prepared dataset 只包含我们在固定 HSSD 资产上生成的 Dingo 深度与专家轨迹，不混入 SanD/NavDP 数据。
 
 ## 目录
 

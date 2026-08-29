@@ -185,7 +185,7 @@ L=L_MF+L_safe
 
 训练数据只来自 CurveNav 按 benchmark Dingo 配置生成的 HSSD 专家路线，不读取 SanD/NavDP 数据。当前 canonical dataset 为训练 `25,928`、验证 `6,087` 条；深度 bank 在编译时硬链接，不重复复制图像。
 
-训练固定 global batch `1024`、每卡 micro-batch 上限 `256`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。没有 `torch.compile` 或第二训练实现。
+训练固定 global batch `1024`、每卡 micro-batch 上限 `384`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。没有 `torch.compile` 或第二训练实现。
 
 当前必要验证：
 
@@ -193,7 +193,7 @@ L=L_MF+L_safe
 - 87 个数学、数据、前向、梯度和合同测试；
 - 生产 39,284,296 参数图的 FP16 前向、精确 JVP 与反向检查：311/311 个可训练参数张量均有有限梯度；
 - 6,087 条验证专家的配置空间审计：4,983 条含可见障碍，专家 footprint collision 5 条，额外 `0.10 m` 裕度违例 129 条，直线裕度违例 1,259 条；
-- 本机三张 V100S 的生产训练按 `342/341/341` 分片并各拆成两个约 B171 的 micro-batch，稳定占用约 `14.4 GiB/GPU`；step 20--60 聚合吞吐 `1,156--1,169 samples/s`，按 8,000 step 估算纯训练约 `1.95 h`；
+- 本机三张 V100S 的生产训练按 `342/341/341` 分片，每 rank 使用一次前后向，稳定占用约 `25.4 GiB/GPU`；step 20 实测聚合吞吐 `1,548 samples/s`，相对两次约 B171 的 `1,136 samples/s` 提升约 `36%`，按 8,000 step 估算纯训练约 `1.47 h`；
 - 新模型最终 200 epoch 墙钟时间和离线指标必须由本次训练实测，不沿用旧 checkpoint。
 
 ## 10. 正确性边界
