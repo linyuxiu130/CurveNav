@@ -1,6 +1,7 @@
 """Fixed CUDA runtime settings for CurveNav training."""
 
 import torch
+from torch import nn
 
 
 def configure_cuda_training_backend() -> None:
@@ -13,3 +14,13 @@ def configure_cuda_training_backend() -> None:
     # transient workspace exhaustion seen on the discarded NHWC route.
     torch.backends.cudnn.benchmark_limit = 10
     torch.backends.cudnn.benchmark = True
+
+
+def compile_static_geometry_preprocessing(policy: nn.Module) -> None:
+    """Fuse the parameter-free, fixed-shape metric projection for training."""
+    projector = policy.depth_encoder.metric_projector
+    projector.forward = torch.compile(
+        projector.forward,
+        fullgraph=True,
+        mode="reduce-overhead",
+    )

@@ -93,6 +93,6 @@ offline:    /mnt/data/huangshibo/H/navigation_three_projects/curvenav/outputs/st
 
 该公共集的专家参考在单帧可见深度统计下本身为 `5.08%/8.47%`；这是可见点云遮挡、相机外区域与完整地图专家的观测合同差异，不等同于地图碰撞。因此安全结果必须相对专家基线解释：CurveNav 比参考多 2 个 footprint collision 样本和 2 个安全裕量违例样本；NavDP 与参考相同，SanD 多 1 个 collision 样本，X-NavDP 与 CurveNav 相同。当前 CurveNav 的优势是轨迹拟合和几何平滑，仍需重点降低可见绕行层的额外风险。完整数值、逐模型原始输出和交互对比位于 `outputs/offline-cross-model/full-20260829-safe-expert/`；各 runner 记录的总工作负载时间因 CurveNav 批处理而基线逐样本执行，不作为延迟横比。
 
-旧固定高度障碍定义曾把同一段可通行坡面误报为 206 条专家碰撞。当前四帧坡度感知配置空间场在 6,087 条验证样本中识别出 4,983 条含可见障碍样本；专家 footprint collision 为 5 条、额外 `0.10 m` 裕度违例为 129 条，而起点到专家局部终点的直线裕度违例为 1,259 条。后续新 checkpoint 必须使用这一合同，不能与旧稀疏点或固定高度统计横向混算。
+旧固定高度障碍定义曾把同一段可通行坡面误报为 206 条专家碰撞。当前四帧坡度感知配置空间场用连续的 64 点标定射线覆盖可见栅格，并把已知障碍 `0.167584539 m` 机器人包络外再加 `0.10 m` 的已知风险域直接标为 observed。在 6,087 条验证样本中，当前帧单独计算的专家 footprint collision、裕度违例、直线裕度违例依次为 `0/89/787`；四帧融合后为 `9/143/1325`。9 条专家碰撞都能由具体单独历史帧复现，不是跨帧坐标拼接产生。后续新 checkpoint 必须使用这一合同，不能与旧 32 点射线、仅障碍中心 observed、稀疏点或固定高度统计横向混算。
 
 4090 的 Isaac Sim 4.2 headless Vulkan/RTX/物理/深度 annotator 已用用户态 EGL ICD 与 NVIDIA 官方驱动校验开关通过 warm smoke；`64×64` 深度张量生成、world step 和清理均正常，进程状态为 0。唯一 benchmark checkout 位于 `/DataDisk2/hsb/general-navigation-benchmark-resident`，运行时参数在其 ignored `config/local.env`。锁定 commit `48e223e85f0408ebfd1d8c6d6fb0589e9c41b3aa` 的 acados 已在用户目录 Release 构建，`libblasfeo/libhpipm/libacados` 均从 Isaac Python 动态加载成功。launcher 单场景 dry-run 也已正确解析 GPU、权重、scene、evaluator 与 Kit 参数。正式固定协议尚未启动的唯一已确认阻塞是 4090 缺少官方 Scene-N1 资产树；资产同步并通过静态门禁后，必须在原固定场景、episode 0--9、相机、MPC、timeout 和 metric 合同下运行。

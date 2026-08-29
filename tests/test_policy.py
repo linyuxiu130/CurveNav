@@ -535,6 +535,43 @@ def test_metric_xyz_backprojection_uses_camera_height_and_observation_transform(
     torch.testing.assert_close(second[..., 2], first[..., 2])
 
 
+def test_historical_pose_rotation_maps_points_into_the_current_body_frame() -> None:
+    projector = build_policy(tiny_config()).depth_encoder.metric_projector
+    center = 63 * 224 + 112
+    depth_m = torch.full((1, 2, 1, 1), 2.0)
+    pixel = torch.full((1, 2, 1, 1), center)
+    transforms = torch.tensor(
+        [[[1.0, 2.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]]
+    )
+
+    points = projector._backproject(depth_m, pixel, 126, 224, transforms)
+    current = points[0, 1, 0]
+    historical = points[0, 0, 0]
+
+    torch.testing.assert_close(historical[0], 1.0 - current[1])
+    torch.testing.assert_close(historical[1], 2.0 + current[0])
+    torch.testing.assert_close(historical[2], current[2])
+
+
+def test_configuration_distance_transform_is_exact_for_an_obstacle_union() -> None:
+    projector = build_policy(tiny_config()).depth_encoder.metric_projector
+    first = torch.zeros(1, 1, 64, 64, dtype=torch.bool)
+    second = torch.zeros_like(first)
+    first[0, 0, 11, 17] = True
+    second[0, 0, 45, 38] = True
+
+    first_distance = projector._euclidean_distance_transform(first)
+    second_distance = projector._euclidean_distance_transform(second)
+    union_distance = projector._euclidean_distance_transform(first | second)
+
+    torch.testing.assert_close(
+        union_distance,
+        torch.minimum(first_distance, second_distance),
+    )
+    assert union_distance[0, 11, 17] == 0.0
+    assert union_distance[0, 45, 38] == 0.0
+
+
 def test_body_obstacle_pooling_cannot_be_occluded_by_nearer_floor() -> None:
     policy = build_policy(tiny_config()).eval()
     depth = torch.ones(1, 4, 1, 126, 224)
@@ -554,6 +591,8 @@ def test_body_obstacle_pooling_cannot_be_occluded_by_nearer_floor() -> None:
         projection.depth[:, -1][valid],
         torch.tensor([1.6]),
     )
+    known_risk = projection.configuration_field[:, 0] <= 0.10
+    assert torch.all(projection.configuration_field[:, 3][known_risk] == 1.0)
 
 
 def test_surface_below_traversable_height_is_not_a_body_obstacle() -> None:

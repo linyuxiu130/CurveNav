@@ -88,7 +88,14 @@ zi=(Δθi-μi)/σi
 
 ## 4. 标定视觉与配置空间场
 
-四帧深度使用同一 Dingo 相机标定反投影到机器人系。每个像素参与相邻四个图像三角面；重力方向法向坡度不超过 `45°` 的表面视为可通行地形。其余落在机器人碰撞高度带内的点是 body obstacle。所有有效历史点经 `observation_to_current` 对齐到当前机器人系。
+四帧深度使用同一 Dingo 相机标定反投影到机器人系。每个像素参与相邻四个图像三角面；重力方向法向坡度不超过 `45°` 的表面视为可通行地形。其余落在机器人碰撞高度带内的点是 body obstacle。所有有效历史点使用同一个刚体合同
+
+```text
+p_current = t_observation_to_current
+          + R(yaw_observation-yaw_current) p_observation
+```
+
+对齐到当前机器人系。训练的 Habitat XZ 角度是右转为正，因此在写入该合同时先转换成左转为正；部署的 Isaac XY yaw 已是左转为正。两端最终张量语义完全相同。
 
 局部场覆盖 `[-3.6,3.6]²` 的 `64×64` 网格。对栅格化障碍集合 `O` 使用可分离的精确欧氏距离变换：
 
@@ -98,7 +105,7 @@ c(q)=d(q)-r_robot
 forbidden(q)=[c(q)≤0]
 ```
 
-其中 `r_robot=0.167584539 m`。场的五个通道是：footprint signed clearance、其单位梯度 `gx,gy`、由相机到有效深度表面的射线覆盖 `observed`、以及 `forbidden`。前四帧共同构场，因而过去看见但当前遮挡的近程障碍仍存在；无长期地图。
+其中 `r_robot=0.167584539 m`。场的五个通道是：footprint signed clearance、其单位梯度 `gx,gy`、由相机到有效深度表面的射线覆盖 `observed`、以及 `forbidden`。每条最大平面长度小于 `6.3 m` 的标定射线使用 `64` 个点栅格化，相邻点间距小于 `64×64` 场的 `7.2/63 m` 单元宽度。障碍一旦被观测，其 `c(q)≤0.10 m` 的机器人包络与安全裕度影响域也直接属于已观测已知区域；不能只把障碍点中心标成 observed。前四帧对障碍和可见区域取静态并集，因而过去看见但当前遮挡的近程障碍仍存在；无长期地图。
 
 视觉 ResNet 只处理当前帧，避免四倍重复卷积。当前 `8×12` 特征同每个 cell 的 metric XYZ、深度、表面有效位和障碍位融合。三个过去位姿另以 `(x/h,y/h,sin Δyaw,cos Δyaw)` 编码；无效历史使用一个学习 null token。PointGoal 使用方向和无截断 `log1p(distance/3.6)`，因此任意有限距离保持顺序。
 
@@ -185,15 +192,15 @@ L=L_MF+L_safe
 
 训练数据只来自 CurveNav 按 benchmark Dingo 配置生成的 HSSD 专家路线，不读取 SanD/NavDP 数据。当前 canonical dataset 为训练 `25,928`、验证 `6,087` 条；深度 bank 在编译时硬链接，不重复复制图像。
 
-训练固定 global batch `1024`、每卡 micro-batch 上限 `384`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。没有 `torch.compile` 或第二训练实现。
+训练固定 global batch `1024`、每卡 micro-batch 上限 `384`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。完整 MeanFlow/JVP 保持 eager；训练运行时只用 `torch.compile(fullgraph=True, mode="reduce-overhead")` 融合无参数、静态形状的度量几何投影器，因此 checkpoint 和推理数学图不变，也没有第二训练实现。
 
 当前必要验证：
 
 - `compileall`、`git diff --check`；
 - 87 个数学、数据、前向、梯度和合同测试；
 - 生产 39,284,296 参数图的 FP16 前向、精确 JVP 与反向检查：311/311 个可训练参数张量均有有限梯度；
-- 6,087 条验证专家的配置空间审计：4,983 条含可见障碍，专家 footprint collision 5 条，额外 `0.10 m` 裕度违例 129 条，直线裕度违例 1,259 条；
-- 本机三张 V100S 的生产训练按 `342/341/341` 分片，每 rank 使用一次前后向，稳定占用约 `25.4 GiB/GPU`；step 20 实测聚合吞吐 `1,548 samples/s`，相对两次约 B171 的 `1,136 samples/s` 提升约 `36%`，按 8,000 step 估算纯训练约 `1.47 h`；
+- 6,087 条验证专家的四帧配置空间审计：当前帧单独识别专家 footprint collision `0` 条、裕度违例 `89` 条、直线裕度违例 `787` 条；四帧静态融合后分别为 `9`、`143`、`1,325` 条。9 条碰撞均可由具体单独历史帧复现，位姿为正常的约 `0.45/0.89/1.33 m` 后向平移，不是跨帧符号或偶然 observed 拼接错误；
+- 四张 RTX 4090 按 `256/256/256/256` 分片，每 rank 使用一次前后向，稳定占用约 `22.0 GiB/GPU`。固定几何投影器局部 A/B 为 eager `41.54 ms/batch`、编译后 `7.31 ms/batch`；完整训练 step 60--120 为 `2,229--2,347 samples/s`，相对未编译同阶段 `1,602--2,029 samples/s` 提升约 `16--39%`，按 8,000 step 估算纯训练约 `0.97 h`；
 - 新模型最终 200 epoch 墙钟时间和离线指标必须由本次训练实测，不沿用旧 checkpoint。
 
 ## 10. 正确性边界

@@ -29,7 +29,10 @@ from curvenav.training.batching import build_distributed_batch_layout
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.optimizer import build_cosine_schedule, build_optimizer
 from curvenav.training.prefetch import CudaPrefetchLoader
-from curvenav.training.runtime import configure_cuda_training_backend
+from curvenav.training.runtime import (
+    compile_static_geometry_preprocessing,
+    configure_cuda_training_backend,
+)
 
 
 def _save_checkpoint(
@@ -149,6 +152,7 @@ def run_training(
     )
     loader = loader_bundle.loader
     policy = build_policy(config)
+    compile_static_geometry_preprocessing(policy)
     optimizer = build_optimizer(
         policy,
         learning_rate=config.training.learning_rate,

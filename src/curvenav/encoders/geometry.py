@@ -9,6 +9,7 @@ from torch.nn import functional as F
 
 from curvenav.physical import (
     BODY_OBSTACLE_MIN_Z_M,
+    EXTRA_CLEARANCE_M,
     MAXIMUM_TRAVERSABLE_SLOPE_DEGREES,
     ROBOT_COLLISION_TOP_Z_M,
     ROBOT_FOOTPRINT_RADIUS_M,
@@ -16,7 +17,10 @@ from curvenav.physical import (
 
 
 CONFIGURATION_GRID_SIZE = 64
-VISIBILITY_RAY_SAMPLES = 32
+# The canonical camera's longest planar ray is below 6.3 m.  Sixty-four
+# samples keep adjacent ray points closer than one 7.2/63 m grid cell, so the
+# rounded visibility raster cannot skip a cell along a valid sensor ray.
+VISIBILITY_RAY_SAMPLES = 64
 
 
 @dataclass(frozen=True)
@@ -302,7 +306,11 @@ class MetricDepthProjector(nn.Module):
             surface_valid & observation_valid[..., None]
         )[..., None].expand_as(ray[..., 0])
         observed = self._rasterize(ray, ray_valid)
-        observed |= occupancy
+        # A measured obstacle makes every robot-centre configuration inside
+        # its footprint plus safety margin known-unsafe, even if that centre
+        # cell is not itself crossed by the camera ray.  Gating only on the
+        # obstacle pixel incorrectly hides most of the inflated C-obstacle.
+        observed |= signed_clearance[:, None] <= EXTRA_CLEARANCE_M
 
         clearance = signed_clearance[:, None]
         padded = F.pad(clearance, (1, 1, 1, 1), mode="replicate")
