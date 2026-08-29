@@ -177,6 +177,30 @@ def _measure(
     return metrics
 
 
+def validate_reference_safety(
+    reference: Tensor,
+    safety: SourceGridSafety,
+    planning_horizon_m: float,
+) -> dict[str, float]:
+    """Reject a common set whose expert route disagrees with source geometry."""
+    metrics = safety.measure(reference, planning_horizon_m)
+    collision = float(metrics["observed_footprint_collision"].float().mean())
+    margin = float(metrics["observed_safety_margin_violation"].float().mean())
+    observed = float(metrics["observed_path_fraction"].float().mean())
+    if collision > 0.0 or margin > 0.0 or observed < 1.0:
+        raise ValueError(
+            "common expert paths do not match the frozen source geometry: "
+            f"collision_fraction={collision:.6f}, "
+            f"margin_violation_fraction={margin:.6f}, "
+            f"observed_path_fraction={observed:.6f}"
+        )
+    return {
+        "expert_footprint_collision_fraction": collision,
+        "expert_safety_margin_violation_fraction": margin,
+        "expert_observed_path_fraction": observed,
+    }
+
+
 def _summary(metrics: dict[str, Tensor]) -> dict[str, object]:
     return {
         **summarize_metrics(metrics),
@@ -219,6 +243,7 @@ def compare_outputs(
     horizon = config.data.future_steps * config.data.expert_waypoint_spacing_m
     reference, point_goal, scene_id = load_common_protocol(common)
     safety = SourceGridSafety(common, source_root)
+    reference_contract = validate_reference_safety(reference, safety, horizon)
 
     models: dict[str, object] = {}
     for result_path in result_paths:
@@ -242,6 +267,7 @@ def compare_outputs(
         "protocol": "curvenav_common_metric_local_validation",
         "common_dataset": str(common_path.resolve()),
         "safety_source": str(source_root.resolve()),
+        "reference_contract": reference_contract,
         "models": models,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)

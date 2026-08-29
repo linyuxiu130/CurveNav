@@ -4,7 +4,11 @@ import numpy as np
 import pytest
 import torch
 
-from curvenav.evaluation.compare import SourceGridSafety, load_common_protocol
+from curvenav.evaluation.compare import (
+    SourceGridSafety,
+    load_common_protocol,
+    validate_reference_safety,
+)
 from curvenav.evaluation.metrics import (
     observed_safety_metrics,
     resample_path_at_distance,
@@ -60,6 +64,17 @@ def test_cross_model_safety_queries_frozen_source_grid(tmp_path: Path) -> None:
 
     stationary = safety.measure(torch.zeros(1, 3, 2), horizon_m=1.0)
     assert not stationary["observed_footprint_collision"].item()
+
+    with pytest.raises(ValueError, match="do not match the frozen source geometry"):
+        validate_reference_safety(
+            torch.tensor([[[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]]]),
+            safety,
+            planning_horizon_m=1.0,
+        )
+    contract = validate_reference_safety(
+        torch.zeros(1, 3, 2), safety, planning_horizon_m=1.0
+    )
+    assert contract["expert_observed_path_fraction"] == 1.0
 
 
 def test_fixed_distance_metrics_match_identical_paths() -> None:
