@@ -20,6 +20,7 @@ dependencies = [
 curvenav-train = "curvenav.training.train:main"
 curvenav-prepare-data = "curvenav.data.prepare:main"
 curvenav-evaluate = "curvenav.evaluation.offline:main"
+curvenav-compare = "curvenav.evaluation.compare:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]

@@ -24,7 +24,7 @@ def select_cases(metrics: dict[str, Tensor]) -> list[tuple[str, int]]:
     """Choose deterministic median cases plus the hardest visible detour."""
     strata = evaluation_strata(metrics)
     requested = (
-        ("forward_open_median", "forward_open", 0.5),
+        ("forward_direct_median", "forward_direct", 0.5),
         ("forward_visible_detour_median", "forward_visible_detour", 0.5),
         ("forward_visible_detour_hard", "forward_visible_detour", 1.0),
         ("rear_goal_median", "rear_goal", 0.5),
@@ -32,7 +32,9 @@ def select_cases(metrics: dict[str, Tensor]) -> list[tuple[str, int]]:
     )
     selected = []
     for label, stratum, quantile in requested:
-        index = _representative_index(strata[stratum], metrics["ade_m"], quantile)
+        index = _representative_index(
+            strata[stratum], metrics["fixed_horizon_ade_m"], quantile
+        )
         if index is not None and index not in {item[1] for item in selected}:
             selected.append((label, index))
     return selected
@@ -47,13 +49,21 @@ def write_case_report(
     output_dir.mkdir(parents=True, exist_ok=True)
     records = []
     for label, index in select_cases(metrics):
-        valid = sample_data["obstacle_valid"][index]
         goal = sample_data["point_goal"][index]
+        field = sample_data["configuration_field"][index].float()
         records.append(
             {
                 "label": label,
                 "sample_index": index,
-                "ade_m": float(metrics["ade_m"][index]),
+                "fixed_horizon_ade_m": float(
+                    metrics["fixed_horizon_ade_m"][index]
+                ),
+                "fixed_horizon_fde_m": float(
+                    metrics["fixed_horizon_fde_m"][index]
+                ),
+                "horizon_coverage_fraction": float(
+                    metrics["horizon_coverage_fraction"][index]
+                ),
                 "goal_distance_m": float(metrics["point_goal_distance_m"][index]),
                 "goal_bearing_deg": float(
                     np.degrees(np.arctan2(float(goal[1]), float(goal[0])))
@@ -64,12 +74,17 @@ def write_case_report(
                 "reference_min_clearance_m": float(
                     metrics["reference_observed_min_clearance_m"][index]
                 ),
+                "configuration_extent_m": float(
+                    sample_data["configuration_extent_m"][index]
+                ),
                 "point_goal": goal.tolist(),
                 "predicted_path": sample_data["predicted_path"][index].tolist(),
                 "reference_path": sample_data["reference_path"][index].tolist(),
-                "obstacle_points": sample_data["obstacle_points"][index][valid].tolist(),
+                "configuration_clearance_m": field[0].tolist(),
+                "configuration_observed": (field[1] > 0.5).tolist(),
+                "configuration_forbidden": (field[2] > 0.5).tolist(),
             }
         )
-    path = output_dir / "strict-offline-cases.json"
+    path = output_dir / "offline-cases.json"
     path.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
     return path

@@ -14,15 +14,14 @@ def evaluation_strata(metrics: dict[str, Tensor]) -> dict[str, Tensor]:
     situations present in that fixed validation set.
     """
     forward = ~metrics["point_goal_is_behind"]
-    obstacle = metrics["observed_obstacle_available"]
     reference_safe = ~metrics["reference_observed_safety_margin_violation"]
     straight_blocked = metrics["straight_observed_safety_margin_violation"]
     return {
         "all": torch.ones_like(forward),
         "forward": forward,
-        "forward_open": forward & obstacle & reference_safe & ~straight_blocked,
+        "forward_direct": forward & reference_safe & ~straight_blocked,
         "forward_visible_detour": (
-            forward & obstacle & reference_safe & straight_blocked
+            forward & reference_safe & straight_blocked
         ),
         "rear_goal": ~forward,
         "expert_moves_away_from_goal": (
@@ -39,11 +38,18 @@ def summarize_strata(metrics: dict[str, Tensor]) -> dict[str, dict[str, float | 
         values: dict[str, float | int] = {"samples": count}
         if count:
             values.update(
-                ade_m=metrics["ade_m"][selected].mean().item(),
-                goal_progress_m=metrics["goal_progress_m"][selected].mean().item(),
-                reference_goal_progress_m=(
-                    metrics["reference_goal_progress_m"][selected].mean().item()
-                ),
+                fixed_horizon_ade_m=metrics["fixed_horizon_ade_m"][selected]
+                .mean()
+                .item(),
+                fixed_horizon_fde_m=metrics["fixed_horizon_fde_m"][selected]
+                .mean()
+                .item(),
+                horizon_coverage_fraction=metrics["horizon_coverage_fraction"][
+                    selected
+                ].mean().item(),
+                goal_progress_regret_m=metrics["goal_progress_regret_m"][selected]
+                .mean()
+                .item(),
                 footprint_collision_fraction=(
                     metrics["observed_footprint_collision"][selected]
                     .float()
@@ -56,6 +62,13 @@ def summarize_strata(metrics: dict[str, Tensor]) -> dict[str, dict[str, float | 
                     .mean()
                     .item()
                 ),
+                extra_footprint_collision_fraction=(
+                    metrics["observed_footprint_collision"][selected]
+                    & ~metrics["reference_observed_footprint_collision"][selected]
+                )
+                .float()
+                .mean()
+                .item(),
             )
         result[name] = values
     return result
