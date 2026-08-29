@@ -121,12 +121,15 @@ class CurveNavPolicy(nn.Module):
         self,
         condition: PolicyCondition,
         target: TrajectoryTarget,
+        source: Tensor,
     ) -> CurveNavLoss:
         target.validate()
         clean = self.curve_codec.coordinates_from_values(target.curve_values.float())
         if clean.shape[1] != self.curve_codec.num_curve_tokens:
             raise ValueError("target curve values do not match the production codec")
-        source = torch.randn_like(clean)
+        if source.shape != clean.shape:
+            raise ValueError("flow source must match the standardized curve coordinates")
+        source = source.float()
         time = self._closed_interval_times(clean.shape[0], clean)
         state = (1.0 - time[:, None]) * clean + time[:, None] * source
         conditional_velocity = source - clean
@@ -196,5 +199,10 @@ class CurveNavPolicy(nn.Module):
         path, _ = self.curve_codec.decode(state)
         return TrajectoryPrediction(path=path)
 
-    def forward(self, condition: PolicyCondition, target: TrajectoryTarget) -> CurveNavLoss:
-        return self.training_loss(condition, target)
+    def forward(
+        self,
+        condition: PolicyCondition,
+        target: TrajectoryTarget,
+        source: Tensor,
+    ) -> CurveNavLoss:
+        return self.training_loss(condition, target, source)

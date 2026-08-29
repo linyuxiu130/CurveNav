@@ -19,21 +19,13 @@ from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.train import _optimizer_step_succeeded
 
 
-class _TestGradScaler:
-    def __init__(self, scale: float) -> None:
-        self.scale = scale
-
-    def get_scale(self) -> float:
-        return self.scale
-
-
 class _TestOptimizer:
-    def __init__(self, scaler: _TestGradScaler, next_scale: float) -> None:
-        self.scaler = scaler
-        self.next_scale = next_scale
+    def __init__(self, step_was_skipped: bool) -> None:
+        self.step_was_skipped = step_was_skipped
+        self.steps = 0
 
     def step(self) -> None:
-        self.scaler.scale = self.next_scale
+        self.steps += 1
 
 
 def _distributed_state(
@@ -49,16 +41,16 @@ def _distributed_state(
 
 
 @pytest.mark.parametrize(
-    ("next_scale", "succeeded"),
-    ((32768.0, False), (65536.0, True), (131072.0, True)),
+    ("step_was_skipped", "succeeded"),
+    ((True, False), (False, True)),
 )
-def test_optimizer_step_uses_loss_scale_as_the_overflow_signal(
-    next_scale: float,
+def test_optimizer_step_uses_accelerate_overflow_state_without_scaler_sync(
+    step_was_skipped: bool,
     succeeded: bool,
 ) -> None:
-    scaler = _TestGradScaler(65536.0)
-    optimizer = _TestOptimizer(scaler, next_scale)
-    assert _optimizer_step_succeeded(optimizer, scaler) is succeeded
+    optimizer = _TestOptimizer(step_was_skipped)
+    assert _optimizer_step_succeeded(optimizer) is succeeded
+    assert optimizer.steps == 1
 
 
 def test_checkpoint_records_the_regular_heading_flow_contract() -> None:

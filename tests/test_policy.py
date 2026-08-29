@@ -66,6 +66,7 @@ def test_policy_trains_every_module_and_returns_one_deterministic_trajectory() -
     losses = policy(
         inputs,
         TrajectoryTarget(target_values),
+        torch.randn_like(curve_coordinates),
     )
     for value in (
         losses.loss,
@@ -238,8 +239,11 @@ def test_training_uses_random_source_and_closed_interval_collocation() -> None:
     clean = policy.curve_codec.coordinates_from_values(target_values)
     torch.manual_seed(123)
     random_source = torch.randn_like(clean)
-    torch.manual_seed(123)
-    losses = policy.training_loss(inputs, TrajectoryTarget(target_values))
+    losses = policy.training_loss(
+        inputs,
+        TrajectoryTarget(target_values),
+        random_source,
+    )
 
     torch.testing.assert_close(
         policy._closed_interval_times(2, clean),
@@ -281,8 +285,7 @@ def test_improved_mean_flow_jvp_has_the_exact_sign_and_interval_tangent() -> Non
         + (reparameterized - conditional_velocity).square().mean()
     )
 
-    torch.manual_seed(321)
-    losses = policy.training_loss(inputs, TrajectoryTarget(target_values))
+    losses = policy.training_loss(inputs, TrajectoryTarget(target_values), source)
     torch.testing.assert_close(losses.mean_flow_loss, expected)
 
 

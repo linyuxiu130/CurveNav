@@ -82,11 +82,10 @@ def _advance_schedule_and_ema(
     ema.update()
 
 
-def _optimizer_step_succeeded(optimizer: Any, grad_scaler: Any) -> bool:
-    """Step once and detect FP16 overflow from the scaler's authoritative state."""
-    scale_before = float(grad_scaler.get_scale())
+def _optimizer_step_succeeded(optimizer: Any) -> bool:
+    """Step once and read Accelerate's overflow result without synchronizing CUDA."""
     optimizer.step()
-    return float(grad_scaler.get_scale()) >= scale_before
+    return not optimizer.step_was_skipped
 
 
 def run_training(
@@ -234,16 +233,21 @@ def run_training(
     checkpoint_interval = config.training.checkpoint_every_epochs * steps_per_epoch
     loader_iterator = iter(loader)
     for _ in range(start_step, total_steps):
-        batches = tuple(
-            next(loader_iterator) for _ in range(micro_batches_per_step)
+        prepared_batches = tuple(
+            unpack_policy_batch(next(loader_iterator))
+            for _ in range(micro_batches_per_step)
         )
-        cuda_rng_state = torch.cuda.get_rng_state(accelerator.device)
+        flow_sources = tuple(
+            torch.randn_like(prepared.target.curve_values)
+            for prepared in prepared_batches
+        )
         overflow_retries = 0
         while True:
-            torch.cuda.set_rng_state(cuda_rng_state, accelerator.device)
             optimizer.zero_grad(set_to_none=True)
             current_losses = torch.zeros_like(window_losses)
-            for micro_step, batch in enumerate(batches):
+            for micro_step, (prepared, flow_source) in enumerate(
+                zip(prepared_batches, flow_sources, strict=True)
+            ):
                 synchronize = micro_step + 1 == micro_batches_per_step
                 synchronization_context = (
                     nullcontext()
@@ -251,21 +255,11 @@ def run_training(
                     else accelerator.no_sync(policy)
                 )
                 with synchronization_context:
-                    prepared = unpack_policy_batch(batch)
                     with accelerator.autocast():
-                        losses = policy(prepared.condition, prepared.target)
-                    detached_losses = torch.stack(losses.logging_values()).detach()
-                    if not torch.isfinite(detached_losses).all():
-                        values = {
-                            name: float(value)
-                            for name, value in zip(
-                                TRAINING_LOSS_NAMES,
-                                detached_losses,
-                                strict=True,
-                            )
-                        }
-                        raise FloatingPointError(
-                            f"CurveNav training loss is non-finite: {values}"
+                        losses = policy(
+                            prepared.condition,
+                            prepared.target,
+                            flow_source,
                         )
                     batch_weight = (
                         accelerator.num_processes
@@ -282,8 +276,20 @@ def run_training(
             grad_norm = accelerator.clip_grad_norm_(
                 policy.parameters(), config.training.grad_clip_norm
             )
-            if _optimizer_step_succeeded(optimizer, grad_scaler):
+            if _optimizer_step_succeeded(optimizer):
                 break
+            if not torch.isfinite(current_losses).all():
+                values = {
+                    name: float(value)
+                    for name, value in zip(
+                        TRAINING_LOSS_NAMES,
+                        current_losses,
+                        strict=True,
+                    )
+                }
+                raise FloatingPointError(
+                    f"CurveNav training loss is non-finite: {values}"
+                )
             overflow_retries += 1
         _advance_schedule_and_ema(scheduler, ema)
 
