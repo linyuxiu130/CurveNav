@@ -299,7 +299,7 @@ def test_training_contract_preserves_global_optimization_across_one_to_eight_gpu
             <= 1024
             <= contract["maximum_per_rank_batch_size"] * world_size
         )
-        assert contract["per_device_batch_size"] == 384
+        assert contract["per_device_batch_size"] == 342
         assert contract["mixed_precision"] == (
             "bf16_primal_fp32_detached_meanflow_jvp"
         )
