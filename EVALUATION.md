@@ -199,4 +199,12 @@ offline:    /mnt/data/huangshibo/H/navigation_three_projects/curvenav/outputs/st
 
 旧固定高度障碍定义曾把同一段可通行坡面误报为 206 条专家碰撞。当前四帧坡度感知配置空间场用连续的 64 点标定射线覆盖可见栅格，并把已知障碍 `0.167584539 m` 机器人包络外再加 `0.10 m` 的已知风险域直接标为 observed。在 6,087 条验证样本中，当前帧单独计算的专家 footprint collision、裕度违例、直线裕度违例依次为 `0/89/787`；四帧融合后为 `9/143/1325`。9 条专家碰撞都能由具体单独历史帧复现，不是跨帧坐标拼接产生。后续新 checkpoint 必须使用这一合同，不能与旧 32 点射线、仅障碍中心 observed、稀疏点或固定高度统计横向混算。
 
-4090 的 Isaac Sim 4.2 headless Vulkan/RTX/物理/深度 annotator 已用用户态 EGL ICD 与 NVIDIA 官方驱动校验开关通过 warm smoke；`64×64` 深度张量生成、world step 和清理均正常。唯一 benchmark checkout 位于 `/DataDisk2/hsb/general-navigation-benchmark-resident`，运行时参数在其 ignored `config/local.env`。锁定 commit `48e223e85f0408ebfd1d8c6d6fb0589e9c41b3aa` 的 acados 已在用户目录 Release 构建，`libblasfeo/libhpipm/libacados` 均从 Isaac Python 动态加载成功。Scene-N1 资产已同步并通过静态门禁；SanD、X-NavDP 正在以 `num_envs=1` 对同一 home 场景执行 episode `0--99`，NavDP 在首个基线释放 GPU 后自动接续。三者各自达到精确 100 回合且日志、metric、逐回合 trace 完整前，不写最终 SR/SPL，也不把此前 `num_envs=10` 诊断值混入固定协议表。
+4090 的 Isaac Sim 4.2 headless Vulkan/RTX/物理/深度 annotator 已用用户态 EGL ICD 与 NVIDIA 官方驱动校验开关通过 warm smoke；`64×64` 深度张量生成、world step 和清理均正常。唯一 benchmark checkout 位于 `/DataDisk2/hsb/general-navigation-benchmark-resident`，运行时参数在其 ignored `config/local.env`。锁定 commit `48e223e85f0408ebfd1d8c6d6fb0589e9c41b3aa` 的 acados 已在用户目录 Release 构建，`libblasfeo/libhpipm/libacados` 均从 Isaac Python 动态加载成功。Scene-N1 资产已同步并通过静态门禁。固定协议为同一 `home/MVUCSQAKTKJ5EAABAAAAABA8_usd`、seed `1234`、episode `0--99`、`num_envs=1`；不混入此前 `num_envs=10` 吞吐诊断：
+
+| 模型 | 当前完成 | success | SR | mean SPL | 状态 |
+|---|---:|---:|---:|---:|---|
+| X-NavDP | 100/100 | 90 | 90.00% | 0.762712 | 完整 |
+| SanD | 44/100 | 32 | 72.73% | 0.554173 | 四卡训练期间暂停，可续跑 |
+| NavDP | 7/100 | 5 | 71.43% | 0.693114 | 四卡训练期间暂停，可续跑 |
+
+X-NavDP 的完整 metric 位于 `/DataDisk2/hsb/eval-server-audit/runs/x-navdp-b100-numenv1-r3/pointgoal-v2/x-navdp/20260830_045722/models/x-navdp/00-x-navdp-981ae026d7f4/scenes/home/MVUCSQAKTKJ5EAABAAAAABA8_usd/metric.csv`。SanD 与 NavDP 的比例只是恢复断点事实，不作为最终模型横比；两者达到精确 100 回合并核验 trace 后再固化最终值。当前四张 4090 用于从头训练路径相对配置空间模型，训练完成后从上述 episode 断点恢复两个基线。
