@@ -32,7 +32,7 @@ def tiny_config() -> CurveNavConfig:
         ),
         trajectory_decoder=TrajectoryDecoderConfig(
             model_dim=32,
-            transformer_layers=1,
+            transformer_layers=3,
             transformer_heads=4,
         ),
     )
@@ -125,7 +125,7 @@ def test_invalid_padded_frames_cannot_change_the_prediction() -> None:
     first_encoded = policy.encode_condition(first)
     second_encoded = policy.encode_condition(second)
     torch.testing.assert_close(first_encoded.tokens, second_encoded.tokens)
-    assert first_encoded.tokens.shape[1] == 8
+    assert first_encoded.tokens.shape[1] == 8 + CONFIGURATION_TOKEN_COUNT
 
 
 def test_valid_causal_motion_changes_condition_but_current_pose_is_not_a_state_token() -> None:
@@ -225,7 +225,7 @@ def test_training_uses_random_source_and_closed_interval_collocation() -> None:
         planning_horizon_m = policy.planning_horizon_m
 
         def forward(
-            self, state, start_time, end_time, encoded, path, heading
+            self, state, start_time, end_time, encoded, curve_codec
         ):
             return state * 0.0 + (end_time - start_time)[:, None] * 0.0
 
@@ -261,7 +261,7 @@ def test_improved_mean_flow_jvp_has_the_exact_sign_and_interval_tangent() -> Non
         planning_horizon_m = policy.planning_horizon_m
 
         def forward(
-            self, state, start_time, end_time, encoded, path, heading
+            self, state, start_time, end_time, encoded, curve_codec
         ):
             return state + (end_time - start_time)[:, None]
 
@@ -318,7 +318,7 @@ def test_configuration_space_loss_is_soft_differentiable_and_masked() -> None:
     )
 
 
-def test_configuration_space_risk_tracks_worst_path_violation() -> None:
+def test_configuration_space_risk_smoothly_aggregates_dangerous_path_points() -> None:
     from curvenav.models.safety import (
         SAFETY_CLEARANCE_M,
         configuration_space_risk_loss,
@@ -339,6 +339,12 @@ def test_configuration_space_risk_tracks_worst_path_violation() -> None:
     sampled = sample_configuration_field(field, colliding, 1.0)
     assert sampled.shape == (1, 3, 5)
 
+    second_collision = field.clone()
+    second_collision[:, 0, 4, 0] = -SAFETY_CLEARANCE_M
+    assert configuration_space_risk_loss(
+        colliding, second_collision, 1.0
+    ) > configuration_space_risk_loss(colliding, field, 1.0)
+
 
 def test_conditioned_decoder_returns_one_smooth_metric_curve() -> None:
     policy = build_policy(tiny_config())
@@ -357,7 +363,7 @@ def test_conditioned_decoder_returns_one_smooth_metric_curve() -> None:
     assert prediction.path.shape == (2, 16, 2)
 
 
-def test_decoder_has_no_generated_history_candidate_or_second_stage() -> None:
+def test_decoder_has_one_internal_path_relative_refinement_route() -> None:
     policy = build_policy(tiny_config())
     decoder = policy.trajectory_decoder
     assert decoder.curve_tokens == policy.curve_codec.num_curve_tokens
@@ -365,7 +371,9 @@ def test_decoder_has_no_generated_history_candidate_or_second_stage() -> None:
     assert not hasattr(policy, "curve_proposal")
     assert not hasattr(policy, "candidate_bases")
     assert not hasattr(decoder, "metric_path_attention")
-    assert decoder.path_geometry_embedding[0].in_features == 7
+    assert decoder.path_geometry_embedding[0].in_features == 12
+    assert decoder.layers_per_stage == 1
+    assert hasattr(decoder, "velocity_readout")
 
 
 def test_complete_configuration_space_changes_condition_memory() -> None:
@@ -417,6 +425,26 @@ def test_obstacle_far_from_flow_source_changes_one_step_velocity() -> None:
         )
     assert not torch.allclose(changed.tokens, baseline.tokens)
     assert not torch.allclose(changed_velocity, velocity)
+
+
+def test_exact_path_field_changes_velocity_without_changing_context_tokens() -> None:
+    policy = build_policy(tiny_config()).eval()
+    encoded = policy.encode_condition(condition(batch=1))
+    changed_field = encoded.configuration_field.clone()
+    changed_field[:, 0] = -0.2
+    changed_field[:, 3:] = 1.0
+    changed = replace(encoded, configuration_field=changed_field)
+    source = policy.inference_source.clone()
+    zero = torch.zeros(1)
+    with torch.no_grad():
+        baseline_velocity = policy._predict_mean_velocity(
+            source, zero, zero + 1.0, encoded
+        )
+        changed_velocity = policy._predict_mean_velocity(
+            source, zero, zero + 1.0, changed
+        )
+    torch.testing.assert_close(changed.tokens, encoded.tokens)
+    assert not torch.allclose(changed_velocity, baseline_velocity)
 
 
 def test_heading_curve_coordinates_are_semantic_and_not_path_gram_values() -> None:
@@ -478,7 +506,11 @@ def test_spatial_history_and_causal_motion_tokens_have_fixed_contract() -> (
     encoded = policy.encode_condition(condition(batch=1))
     encoder = policy.condition_encoder
     assert encoder.motion_encoder.slot_embedding.shape == (1, 3, 32)
-    assert encoded.tokens.shape == (1, 1 + 4 + 3, 32)
+    assert encoded.tokens.shape == (
+        1,
+        1 + 4 + 3 + CONFIGURATION_TOKEN_COUNT,
+        32,
+    )
     assert policy.trajectory_decoder.position_embedding.shape == (1, 8, 32)
     assert policy.trajectory_decoder.path_position_embedding.shape == (1, 16, 32)
     torch.testing.assert_close(

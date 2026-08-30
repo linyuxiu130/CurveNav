@@ -5,12 +5,14 @@ from torch import Tensor, nn
 
 from curvenav.layers import RMSNorm
 from curvenav.models.blocks import ConditionalTrajectoryBlock
+from curvenav.models.safety import sample_configuration_field
 from curvenav.types import ConditionFeatures
 
 
 TRAJECTORY_DECODER_TYPE = (
-    "complete_configuration_memory_conditioned_curve_mean_flow_transformer"
+    "path_relative_configuration_refined_curve_mean_flow_transformer"
 )
+DECODER_REFINEMENT_STAGES = 3
 
 
 class MeanFlowIntervalEmbedding(nn.Module):
@@ -43,7 +45,7 @@ class StructuredCurveReadout(nn.Module):
 
 
 class ConditionalCurveMeanFlowDecoder(nn.Module):
-    """Predict conditional average velocity over a continuous flow interval."""
+    """Predict average velocity while refining its own data-end trajectory."""
 
     def __init__(
         self,
@@ -57,13 +59,16 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         dropout: float,
     ) -> None:
         super().__init__()
+        if layers % DECODER_REFINEMENT_STAGES:
+            raise ValueError("decoder layers must divide into three refinement stages")
         self.curve_tokens = curve_tokens
         self.path_tokens = path_tokens
         self.planning_horizon_m = float(planning_horizon_m)
+        self.layers_per_stage = layers // DECODER_REFINEMENT_STAGES
         self.state_embedding = nn.Linear(1, model_dim)
         self.position_embedding = nn.Parameter(torch.empty(1, curve_tokens, model_dim))
         self.path_geometry_embedding = nn.Sequential(
-            nn.Linear(7, model_dim),
+            nn.Linear(12, model_dim),
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
@@ -90,14 +95,63 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             persistent=True,
         )
 
+    def _read_velocity(self, controls: Tensor) -> Tensor:
+        return self.velocity_readout(self.output_norm(controls))
+
+    def _path_tokens(
+        self,
+        state: Tensor,
+        end_time: Tensor,
+        velocity: Tensor,
+        condition: ConditionFeatures,
+        flow_time: Tensor,
+        curve_codec: nn.Module,
+    ) -> Tensor:
+        # For the production data-anchored field, z_t - t*u estimates the
+        # actual data endpoint.  Geometry is therefore queried on the curve
+        # being generated, never on the independent Gaussian flow state.
+        estimated_clean = state - end_time[:, None] * velocity
+        path, heading = curve_codec.decode_path(estimated_clean)
+        indices = self.path_indices
+        anchor_points = path[:, indices]
+        anchor_heading = heading[:, indices]
+        goal_delta = condition.point_goal[:, None] - anchor_points
+        field = sample_configuration_field(
+            condition.configuration_field,
+            anchor_points,
+            self.planning_horizon_m,
+        )
+        normalized_field = torch.cat(
+            (
+                field[..., :1] / self.planning_horizon_m,
+                field[..., 1:],
+            ),
+            dim=-1,
+        )
+        geometry = torch.cat(
+            (
+                anchor_points / self.planning_horizon_m,
+                anchor_heading.sin()[..., None],
+                anchor_heading.cos()[..., None],
+                self.path_progress.to(path.dtype).expand(path.shape[0], -1, -1),
+                goal_delta / self.planning_horizon_m,
+                normalized_field,
+            ),
+            dim=-1,
+        )
+        return (
+            self.path_geometry_embedding(geometry)
+            + self.path_position_embedding
+            + flow_time
+        ).float()
+
     def forward(
         self,
         state: Tensor,
         start_time: Tensor,
         end_time: Tensor,
         condition: ConditionFeatures,
-        path: Tensor,
-        heading: Tensor,
+        curve_codec: nn.Module,
     ) -> Tensor:
         if state.ndim != 2 or state.shape[1] != self.curve_tokens:
             raise ValueError("flow state does not match decoder tokens")
@@ -109,27 +163,25 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             + self.position_embedding
             + flow_time
         ).float()
-        indices = self.path_indices
-        anchor_points = path[:, indices]
-        anchor_heading = heading[:, indices]
-        goal_delta = condition.point_goal[:, None] - anchor_points
-        path_geometry = torch.cat(
-            (
-                anchor_points / self.planning_horizon_m,
-                anchor_heading.sin()[..., None],
-                anchor_heading.cos()[..., None],
-                self.path_progress.to(path.dtype).expand(path.shape[0], -1, -1),
-                goal_delta / self.planning_horizon_m,
-            ),
-            dim=-1,
-        )
-        path_tokens = (
-            self.path_geometry_embedding(path_geometry)
-            + self.path_position_embedding
-            + flow_time
-        ).float()
-        trajectory = torch.cat((controls, path_tokens), dim=1)
-        for block in self.blocks:
-            trajectory = block(trajectory, condition.tokens)
-        controls = self.output_norm(trajectory[:, : self.curve_tokens])
-        return self.velocity_readout(controls)
+        trajectory = controls
+        for stage in range(DECODER_REFINEMENT_STAGES):
+            if stage:
+                proposal = self._read_velocity(
+                    trajectory[:, : self.curve_tokens]
+                )
+                path_tokens = self._path_tokens(
+                    state,
+                    end_time,
+                    proposal,
+                    condition,
+                    flow_time,
+                    curve_codec,
+                )
+                trajectory = torch.cat(
+                    (trajectory[:, : self.curve_tokens], path_tokens), dim=1
+                )
+            begin = stage * self.layers_per_stage
+            end = begin + self.layers_per_stage
+            for block in self.blocks[begin:end]:
+                trajectory = block(trajectory, condition.tokens)
+        return self._read_velocity(trajectory[:, : self.curve_tokens])

@@ -16,6 +16,7 @@ from curvenav.conditioning import (
 )
 from curvenav.encoders.configuration import (
     CONFIGURATION_ENCODER_TYPE,
+    CONFIGURATION_TOKEN_COUNT,
     CONFIGURATION_TOKEN_GRID_SIZE,
 )
 from curvenav.encoders.geometry import CONFIGURATION_GRID_SIZE
@@ -166,11 +167,10 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         ),
         "visual_compression": "current_frame_visual_grid_only",
         "condition_context": (
-            "complete_configuration_cross_attention_then_four_layer_"
-            "joint_goal_current_motion_transformer"
+            "four_layer_joint_goal_current_motion_and_configuration_transformer"
         ),
         "trajectory_condition_interaction": (
-            "decoded_path_tokens_cross_attend_complete_configuration_memory"
+            "coarse_flow_then_two_exact_path_configuration_queries"
         ),
         "goal_conditioning": "unbounded_goal_token_plus_path_anchor_goal_delta",
         "temporal_modeling": (
@@ -186,7 +186,9 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             + depth.frame_tokens_height * depth.frame_tokens_width
             + data.observation_frames
             - 1
+            + CONFIGURATION_TOKEN_COUNT
         ),
+        "decoder_refinement_stages": 3,
         "configuration_encoder_type": CONFIGURATION_ENCODER_TYPE,
         "configuration_token_grid": [
             CONFIGURATION_TOKEN_GRID_SIZE,

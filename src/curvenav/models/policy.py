@@ -94,14 +94,12 @@ class CurveNavPolicy(nn.Module):
         end_time: Tensor,
         condition: ConditionFeatures,
     ) -> Tensor:
-        path, heading = self.curve_codec.decode_path(state)
         return self.trajectory_decoder(
             state,
             start_time,
             end_time,
             condition,
-            path,
-            heading,
+            self.curve_codec,
         )
 
     @staticmethod

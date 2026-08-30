@@ -139,13 +139,17 @@ class TrajectoryDecoderConfig:
     def validate(self) -> None:
         if self.path_tokens != 16:
             raise ValueError("CurveNav uses exactly sixteen path tokens")
+        if self.transformer_layers < 3 or self.transformer_layers % 3:
+            raise ValueError(
+                "trajectory decoder layers must form three equal refinement stages"
+            )
 
 
 @dataclass(frozen=True)
 class TrainingConfig:
     seed: int = 42
     global_batch_size: int = 1_024
-    per_device_batch_size: int = 384
+    per_device_batch_size: int = 256
     samples_per_epoch: int = 40_960
     epochs: int = 200
     num_workers: int = 2

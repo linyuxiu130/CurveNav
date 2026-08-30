@@ -9,9 +9,7 @@ from curvenav.types import ConditionFeatures, DepthFeatures
 from .motion import HistoricalMotionEncoder
 
 
-CONDITION_ENCODER_TYPE = (
-    "goal_current_visual_complete_configuration_space_and_causal_motion"
-)
+CONDITION_ENCODER_TYPE = "joint_goal_visual_configuration_and_causal_motion_tokens"
 
 
 class PolicyConditionEncoder(nn.Module):
@@ -37,14 +35,6 @@ class PolicyConditionEncoder(nn.Module):
         self.observation_frames = observation_frames
         self.spatial_tokens = spatial_tokens
         self.configuration_tokens = configuration_tokens
-        self.configuration_query_norm = RMSNorm(model_dim)
-        self.configuration_memory_norm = RMSNorm(model_dim)
-        self.configuration_attention = nn.MultiheadAttention(
-            model_dim,
-            transformer_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
         self.motion_encoder = HistoricalMotionEncoder(
             observation_frames=observation_frames,
             history_horizon_m=history_horizon_m,
@@ -77,15 +67,12 @@ class PolicyConditionEncoder(nn.Module):
                 "configuration tokens do not match the condition contract"
             )
         motion = self.motion_encoder(observation_to_current, observation_valid)
-        tokens = torch.cat((goal, observation.tokens, motion), dim=1).float()
-        normalized_configuration = self.configuration_memory_norm(configuration)
-        configuration_context = self.configuration_attention(
-            self.configuration_query_norm(tokens),
-            normalized_configuration,
-            normalized_configuration,
-            need_weights=False,
-        )[0]
-        tokens = tokens + configuration_context
+        # Keep configuration cells as first-class memory.  Folding them into
+        # visual/goal queries and then discarding them destroys the spatial
+        # correspondence needed by the trajectory decoder.
+        tokens = torch.cat(
+            (goal, observation.tokens, motion, configuration), dim=1
+        ).float()
         for block in self.context_blocks:
             tokens = block(tokens)
         return ConditionFeatures(

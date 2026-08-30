@@ -11,9 +11,9 @@
 3. 稀疏 cell 最近点和全局最近障碍 penalty 不能表示机器人 footprint、可见自由空间或整条路径的最坏风险。
 4. PointGoal 距离曾被硬截断，远目标失去距离顺序；视觉 backbone 重复计算四帧，而短时历史真正需要的是已经配准的几何与运动状态。
 5. 深度可见性曾把归一化深度同米制阈值比较，令无回波区域错误变成已观测空间。该单位错误已从投影根源消除。
-6. 一步生成器曾只在解码后的 Flow 状态路径上查询配置空间。部署的状态恒为同一个典型高斯 latent，因此显式安全输入只覆盖固定 `1.75 m` 左弯附近的 `38/4096=0.93%` 栅格；修改其余 99.07% 场值不能改变网络输出。这使最终轨迹附近的障碍只能由当前图像隐式猜测，是可见绕行失败的结构根因。
+6. 把完整配置空间先压成 `8×8` token，再以它们更新视觉/目标 query，随后丢弃配置 token，仍然没有建立“输出路径点—障碍场位置”的直接对应。100 回合闭环中 CurveNav 只有 `32%` SR；失败回合仍给出约 `0.41 m/s` 前进命令，但实际速度约 `0.041 m/s` 且 87% 时间近乎静止。离线分支消融中，完整模型碰撞率为 `1.54%`，只保留当前帧视觉为 `4.70%`，只保留显式四帧配置空间却为 `15.67%`，与全空输入的 `16.31%` 几乎相同。这证明配置空间计算本身存在，但它在间接融合中没有成为可独立使用的规划变量。
 
-唯一方案是：差分航向曲线坐标、当前帧 SanD 风格视觉特征、四帧配准的机器人配置空间场、完整配置空间 token、显式历史 SE(2) token，以及部署对齐的一步 improved MeanFlow。当前不增加 critic、多候选、RL 后训练或长期地图。
+唯一方案是：差分航向曲线坐标、当前帧 SanD 风格视觉特征、四帧配准的机器人配置空间场、保留到解码端的完整配置 token、显式历史 SE(2) token，以及在一次 improved MeanFlow 函数调用内部进行粗到细路径相对几何查询。当前不增加 critic、多候选、RL 后训练或长期地图。
 
 ## 2. 张量与模块合同
 
@@ -28,7 +28,7 @@ mean-flow coordinates  float [B,8]     # standardized log L and Δθ
 prediction path        float [B,64,2]
 ```
 
-生产模型维度固定为 `D=384`、40,394,440 个可训练参数：
+生产模型维度固定为 `D=384`、39,804,232 个可训练参数：
 
 ```text
 current depth
@@ -43,14 +43,16 @@ four aligned depths
        └─ 3-stage strided metric CNN
             └─ 64 complete configuration-space tokens
 
-PointGoal token + 96 visual tokens + 3 historical SE(2) tokens [100 queries]
-  └─ cross-attend all 64 configuration-space tokens once
-  └─ 4 condition Transformer blocks
-       └─ condition memory [B,100,384]
+PointGoal + 96 visual + 3 historical SE(2) + 64 configuration tokens
+  └─ 4 joint condition Transformer blocks
+       └─ heterogeneous condition memory [B,164,384]
 
-8 curve tokens + 16 decoded path/goal tokens
-  └─ 12 self-attention + condition cross-attention + SwiGLU blocks
-       └─ 8-D average velocity
+8 curve tokens
+  └─ decoder blocks 1--4 ── shared readout ── coarse data-end curve
+       └─ 16 path anchors query exact 64×64×5 field
+  └─ decoder blocks 5--8 ── shared readout ── refined data-end curve
+       └─ 16 path anchors query exact 64×64×5 field
+  └─ decoder blocks 9--12 ── shared readout ── 8-D average velocity
 
 fixed typical Gaussian latent
   └─ one average-velocity evaluation
@@ -62,9 +64,9 @@ fixed typical Gaussian latent
 - `encoders/depth.py`：只对当前图运行视觉 backbone，并融合当前帧标定几何。
 - `encoders/geometry.py`：四帧反投影、坡度分类、刚体配准和配置空间场。
 - `encoders/configuration.py`：把完整配置空间场编码为带二维度量位置的全局安全 token。
-- `conditioning/transformer.py`、`conditioning/motion.py`：目标、当前视觉和因果历史状态。
+- `conditioning/transformer.py`、`conditioning/motion.py`：目标、当前视觉、配置空间和因果历史状态的联合 token memory。
 - `trajectory/heading.py`：训练与推理共用的八维正则曲线双射。
-- `models/decoder.py`、`models/blocks.py`：路径/目标交互和读取完整条件记忆的平均速度网络。
+- `models/decoder.py`、`models/blocks.py`：一次函数调用内的共享-readout平均速度细化与路径相对配置空间查询。
 - `models/policy.py`：唯一 MeanFlow 恒等式、损失和一步采样。
 - `models/safety.py`：配置空间场查询与路径最坏风险；不修改推理轨迹。
 
@@ -114,18 +116,26 @@ forbidden(q)=[c(q)≤0]
 
 视觉 ResNet 只处理当前帧，避免四倍重复卷积。当前 `8×12` 特征同每个 cell 的 metric XYZ、深度、表面有效位和障碍位融合。三个过去位姿另以 `(x/h,y/h,sin Δyaw,cos Δyaw)` 编码；无效历史使用一个学习 null token。PointGoal 使用方向和无截断 `log1p(distance/3.6)`，因此任意有限距离保持顺序。
 
-## 5. 路径条件生成器
+## 5. 路径相对配置空间 MeanFlow
 
-完整 `64×64×5` 配置空间先把 clearance 除以 `3.6 m`，再经过三个 `3×3,stride=2` 卷积得到 `8×8` token；每个 token 加入覆盖 `[-3.6,3.6]²` 的二维正弦度量位置。PointGoal、96 个当前视觉 token 和三个历史状态 token 作为 100 个 query，对全部 64 个配置 token 做一次 cross-attention，再经过四层联合条件 Transformer。于是任何配置空间单元都能在一步轨迹生成之前影响条件记忆。
+完整 `64×64×5` 配置空间先把 clearance 除以 `3.6 m`，再经过三个 `3×3,stride=2` 卷积得到带二维度量位置的 `8×8` token。它们不再被提前折叠并丢弃，而是与 PointGoal、96 个当前视觉 token 和三个历史状态 token 直接拼成 164 个一等 token，共同通过四层 condition Transformer；decoder 每层都能读取原始空间语义仍然存在的 memory。
 
-每次平均速度求值把八维状态解码为物理路径，并取 16 个固定弧进度锚点。每个路径 token 只包含：
+12 层 decoder 分为三个连续的四层阶段，三个阶段使用同一个归一化和八维速度 readout，不存在中间辅助头。第一阶段只根据 Flow 控制 token 和完整条件 memory 形成粗平均速度 `u¹`。对数据锚定时刻 `t`，其粗数据端估计为：
+
+```text
+x_hat¹=z_t-t·u¹
+P_hat¹=Decode(x_hat¹)
+```
+
+从 `P_hat¹` 取 16 个固定弧进度锚点，直接在原始 `64×64×5` 场上做连续双线性查询。送入第二阶段的每个路径 token 为：
 
 ```text
 position/3.6, sin heading, cos heading, arc progress,
-(PointGoal-position)/3.6
+(PointGoal-position)/3.6,
+clearance/3.6, gradient_x, gradient_y, observed, forbidden
 ```
 
-路径 token 与八个 curve token 一起通过 12 层 Transformer，并在每层对 100 个已经融合全局安全几何的条件 token 做 cross-attention。删除旧的 Flow-state 路径场查询至关重要：训练中的随机 `z_t` 和部署的固定高斯源都不是最终轨迹，只查询它们会造成安全信息与输出位置错位。完整场只在条件侧编码一次，也避免在 MeanFlow JVP 内重复扩大 12 层 memory。
+第八层再用同一个 readout 得到 `u²`，重建 `P_hat²` 并重复一次精确场查询；最后四层输出 `u³`。因此后续层修正的依据始终是当前网络实际准备生成的曲线，而不是独立 Gaussian `z_t` 解码出的随机曲线。三个阶段只是一个可微函数 `uθ` 内部的深度计算，MeanFlow 的 NFE 仍严格为 1；JVP 会穿过曲线解码和连续场查询，不存在训练/推理之外的投影、优化器或评价链。
 
 ## 6. Boundary-complete improved MeanFlow
 
@@ -173,15 +183,15 @@ x_hat_t=z_t-t·uθ(z_t,0,t,c)
 P_hat_t=Decode(x_hat_t)
 ```
 
-对 64 个等弧长路径点查询配置空间场，只在已观测位置计算 footprint 外的 `0.10 m` 软裕度，并取整条路径的最大违例：
+对 64 个等弧长路径点查询配置空间场，只在已观测位置计算 footprint 外的 `0.10 m` 软裕度。硬 `max` 只把梯度传给一个最坏采样点，不足以训练整段扫掠路径；当前使用温度 `τ=0.10` 的稳定 smooth maximum：
 
 ```text
-vj=[relu((0.10-c(pj))/0.10)]²
-L_safe=mean_batch max_j (observed(pj)·vj)
+vj=observed(pj)·[relu((0.10-c(pj))/0.10)]²
+L_safe=mean_batch τ[logsumexp_j(vj/τ)-log 64]
 L=L_MF+L_safe
 ```
 
-取最大值针对任何单点碰撞都不能被长安全段平均稀释；配置空间距离已经减去机器人半径，因此阈值只剩额外净空。该项不裁剪、不重规划、不拒绝模型输出，也不对不可见空间声称安全保证。
+该式在全安全时严格为零，逼近最坏风险，同时让所有近危险点获得梯度；配置空间距离已经减去机器人半径，因此阈值只剩额外净空。该项不裁剪、不重规划、不拒绝模型输出，也不对不可见空间声称安全保证。
 
 ## 8. 相对公开工作的依据
 
@@ -198,13 +208,13 @@ L=L_MF+L_safe
 
 训练数据只来自 CurveNav 按 benchmark Dingo 配置生成的 HSSD 专家路线，不读取 SanD/NavDP 数据。当前 canonical dataset 为训练 `25,928`、验证 `6,087` 条；深度 bank 在编译时硬链接，不重复复制图像。
 
-训练固定 global batch `1024`、每卡 micro-batch 上限 `384`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。完整 MeanFlow/JVP 保持 eager；训练运行时只用 `torch.compile(fullgraph=True, mode="reduce-overhead")` 融合无参数、静态形状的度量几何投影器，因此 checkpoint 和推理数学图不变，也没有第二训练实现。溢出结果直接读取 Accelerate 已记录的 `step_was_skipped`，正常 step 不再用 `GradScaler.get_scale()` 和 Python CUDA 布尔值造成三次额外同步。
+训练固定 global batch `1024`、每卡 micro-batch 上限 `256`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。四张 24 GiB RTX 4090 时每 rank 恰为一个 256 样本 micro-batch；三卡时自动均衡拆分，不改变全局 batch 或优化数学。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。完整 MeanFlow/JVP 保持 eager；训练运行时只用 `torch.compile(fullgraph=True, mode="reduce-overhead")` 融合无参数、静态形状的度量几何投影器，因此 checkpoint 和推理数学图不变，也没有第二训练实现。溢出结果直接读取 Accelerate 已记录的 `step_was_skipped`，正常 step 不再用 `GradScaler.get_scale()` 和 Python CUDA 布尔值造成三次额外同步。
 
 当前必要验证：
 
 - `compileall`、`git diff --check`；
-- 94 个数学、数据、前向、梯度和合同测试；
-- 生产 40,394,440 参数图的 FP16 前向、精确 JVP 与反向检查；
+- 95 个数学、数据、前向、梯度和合同测试；
+- 生产 39,804,232 参数图的 FP16 前向、精确 JVP 与反向检查；
 - 离线轨迹精度不按模型输出索引直接对齐，而是把所有模型和专家统一按绝对弧长重采样到前 `min(2 m, 专家局部长度)`；预测不足该距离时保持其终点继续计算误差，同时单列 horizon coverage，避免短轨迹靠少走获得低 ADE。安全评测独立以不大于 `0.025 m` 的间距覆盖前 `3.6 m` 局部轨迹，再查询与模型完全相同的四帧融合配置空间场；报告相对专家新增的 collision/margin violation，不把感知场自身对专家的误报归给模型；
 - 6,087 条验证专家的四帧配置空间审计：当前帧单独识别专家 footprint collision `0` 条、裕度违例 `89` 条、直线裕度违例 `787` 条；四帧静态融合后分别为 `9`、`143`、`1,325` 条。9 条碰撞均可由具体单独历史帧复现，位姿为正常的约 `0.45/0.89/1.33 m` 后向平移，不是跨帧符号或偶然 observed 拼接错误；
 - 三张 V100S 按 `342/341/341` 分片，每 rank 单次前后向，占用约 `28.9 GiB/GPU`；完整全局场模型在 step 40--140 稳定为 `1,730--1,757 samples/s`。额外编译 ResNet 与配置空间 CNN 虽在 V100S 达到 `1,890--1,915 samples/s`，但 4 张 RTX 4090 实测降至 `1,784--2,033 samples/s`，低于同机 eager 子图的常见 `2,300--2,460 samples/s`，因此已删除，生产链不保留硬件分支；

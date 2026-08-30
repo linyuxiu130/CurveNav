@@ -1,5 +1,7 @@
 """Continuous configuration-space queries and pathwise collision risk."""
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -7,7 +9,8 @@ from curvenav.physical import EXTRA_CLEARANCE_M
 
 
 SAFETY_CLEARANCE_M = EXTRA_CLEARANCE_M
-SAFETY_OBJECTIVE_TYPE = "maximum_observed_configuration_space_margin_violation"
+SAFETY_OBJECTIVE_TYPE = "smooth_maximum_observed_configuration_space_margin_violation"
+SAFETY_SMOOTH_MAX_TEMPERATURE = 0.10
 
 
 def sample_configuration_field(
@@ -60,7 +63,7 @@ def configuration_space_risk_loss(
     configuration_field: Tensor,
     planning_horizon_m: float,
 ) -> Tensor:
-    """Penalize the worst observed footprint-margin violation on each path."""
+    """Penalize a smooth maximum of observed footprint-margin violations."""
     field = sample_configuration_field(
         configuration_field,
         path,
@@ -71,5 +74,11 @@ def configuration_space_risk_loss(
     violation = (
         torch.relu(SAFETY_CLEARANCE_M - clearance) / SAFETY_CLEARANCE_M
     ).square()
-    path_risk = violation.masked_fill(~observed, 0.0).amax(dim=-1)
+    scaled = (
+        violation.masked_fill(~observed, 0.0)
+        / SAFETY_SMOOTH_MAX_TEMPERATURE
+    )
+    path_risk = SAFETY_SMOOTH_MAX_TEMPERATURE * (
+        torch.logsumexp(scaled, dim=-1) - math.log(path.shape[1])
+    )
     return path_risk.mean()

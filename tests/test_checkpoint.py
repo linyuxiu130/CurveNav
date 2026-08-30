@@ -79,7 +79,7 @@ def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
     assert "extra" not in checkpoint
     assert (
         contract["trajectory_decoder_type"]
-        == "complete_configuration_memory_conditioned_curve_mean_flow_transformer"
+        == "path_relative_configuration_refined_curve_mean_flow_transformer"
     )
     assert contract["flow_source"] == (
         "standard_gaussian_training_and_fixed_typical_set_inference"
@@ -100,7 +100,7 @@ def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
         "pathwise_configuration_space_risk"
     )
     assert contract["safety_objective_type"] == (
-        "maximum_observed_configuration_space_margin_violation"
+        "smooth_maximum_observed_configuration_space_margin_violation"
     )
     assert contract["safety_clearance_m"] == pytest.approx(0.10)
     assert (
@@ -132,7 +132,8 @@ def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
     }
     assert contract["num_curve_tokens"] == 8
     assert "route_query_count" not in contract
-    assert contract["condition_token_count"] == 100
+    assert contract["condition_token_count"] == 164
+    assert contract["decoder_refinement_stages"] == 3
     assert contract["configuration_encoder_type"] == (
         "complete_metric_configuration_space_tokens"
     )
@@ -311,7 +312,7 @@ def test_training_contract_preserves_global_optimization_across_one_to_eight_gpu
             <= 1024
             <= contract["maximum_per_rank_batch_size"] * world_size
         )
-        assert contract["per_device_batch_size"] == 384
+        assert contract["per_device_batch_size"] == 256
         assert contract["global_batch_size"] == 1024
         assert contract["steps_per_epoch"] == 40
         assert contract["total_steps"] == 8000

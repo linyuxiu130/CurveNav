@@ -47,7 +47,7 @@ class DepthFeatures:
 
 @dataclass
 class ConditionFeatures:
-    """Contextual memory and one aligned configuration-space field."""
+    """Heterogeneous context tokens and the exact aligned safety field."""
 
     tokens: Tensor
     configuration_field: Tensor
