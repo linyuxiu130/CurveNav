@@ -258,19 +258,13 @@ def run_training(
         grad_norm = accelerator.clip_grad_norm_(
             policy.parameters(), config.training.grad_clip_norm
         )
-        if not torch.isfinite(current_losses).all() or not torch.isfinite(grad_norm):
-            values = {
-                name: float(value)
-                for name, value in zip(
-                    TRAINING_LOSS_NAMES,
-                    current_losses,
-                    strict=True,
-                )
-            }
-            raise FloatingPointError(
-                f"CurveNav BF16 update is non-finite: losses={values}, "
-                f"gradient_norm={float(grad_norm)}"
-            )
+        finite_update = torch.isfinite(current_losses).all() & torch.isfinite(
+            grad_norm
+        )
+        torch._assert_async(
+            finite_update,
+            "CurveNav BF16 update contains a non-finite loss or gradient norm",
+        )
         optimizer.step()
         _advance_schedule_and_ema(scheduler, ema)
 

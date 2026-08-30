@@ -111,7 +111,7 @@ general-navigation-benchmark/baselines/x-navdp/eval
 压力集不能仅按目标进度排名：NavDP、SanD 和 X-NavDP 的平均 progress regret 分别为 `-0.377/-0.252/-0.116 m`，但更直接地朝目标推进同时显著增加了碰撞；CurveNav 为 `+0.031 m`。因此任务性、几何拟合、安全和可执行性保持分组报告，不合成一个可以被激进直行投机的总分。
 
 ```text
-final checkpoint: /DataDisk2/hsb/curvenav-f19ba8a/outputs/train_policy/checkpoint.pt
+final checkpoint: /DataDisk2/hsb/curvenav-f19ba8a/outputs/archive/train_policy-pre-path-relative-20260830/checkpoint.pt
 full CurveNav:    /DataDisk2/hsb/curvenav-f19ba8a/outputs/offline-evaluation-8000-d56068c-20260830/offline-metrics.json
 cross-model:      /DataDisk2/hsb/offline-cross-model/results/full-20260830-metric-12612de/comparison.json
 common dataset:   /DataDisk2/hsb/offline-cross-model/data/offline-common-hssd-64-metric-12612de.npz
