@@ -210,7 +210,7 @@ L=L_MF+L_safe
 
 训练数据只来自 CurveNav 按 benchmark Dingo 配置生成的 HSSD 专家路线，不读取 SanD/NavDP 数据。当前 canonical dataset 为训练 `25,928`、验证 `6,087` 条；深度 bank 在编译时硬链接，不重复复制图像。
 
-训练固定 global batch `1024`、每卡 micro-batch 上限 `256`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。四张 24 GiB RTX 4090 时每 rank 恰为一个 256 样本 micro-batch；三卡时自动均衡拆分，不改变全局 batch 或优化数学。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。完整 MeanFlow/JVP 保持 eager；训练运行时只用 `torch.compile(fullgraph=True, mode="reduce-overhead")` 融合无参数、静态形状的度量几何投影器，因此 checkpoint 和推理数学图不变，也没有第二训练实现。溢出结果直接读取 Accelerate 已记录的 `step_was_skipped`，正常 step 不再用 `GradScaler.get_scale()` 和 Python CUDA 布尔值造成三次额外同步。
+训练固定 global batch `1024`、每卡 micro-batch 上限 `256`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。四张 24 GiB RTX 4090 时每 rank 恰为一个 256 样本 micro-batch；三卡时自动均衡拆分，不改变全局 batch 或优化数学。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。完整 MeanFlow/JVP 保持 eager；训练运行时只用 `torch.compile(fullgraph=True, mode="reduce-overhead")` 融合无参数、静态形状的度量几何投影器，因此 checkpoint 和推理数学图不变，也没有第二训练实现。每次反向在 GradScaler 反缩放后先计算全局梯度范数；只有该范数有限时才计为真实优化更新。非有限梯度由 GradScaler 跳过并降低 scale，然后在同一 batch、同一 Flow source 上重算；scheduler 和 EMA 不前进。这不依赖当前 Accelerate 版本在包装 optimizer 上不可靠的 `step_was_skipped`。
 
 当前必要验证：
 

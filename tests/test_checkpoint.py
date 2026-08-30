@@ -20,8 +20,7 @@ from curvenav.training.train import _optimizer_step_succeeded
 
 
 class _TestOptimizer:
-    def __init__(self, step_was_skipped: bool) -> None:
-        self.step_was_skipped = step_was_skipped
+    def __init__(self) -> None:
         self.steps = 0
 
     def step(self) -> None:
@@ -41,15 +40,18 @@ def _distributed_state(
 
 
 @pytest.mark.parametrize(
-    ("step_was_skipped", "succeeded"),
-    ((True, False), (False, True)),
+    ("grad_norm", "succeeded"),
+    ((1.0, True), (float("inf"), False), (float("nan"), False)),
 )
-def test_optimizer_step_uses_accelerate_overflow_state_without_scaler_sync(
-    step_was_skipped: bool,
+def test_optimizer_step_uses_unscaled_global_gradient_finiteness(
+    grad_norm: float,
     succeeded: bool,
 ) -> None:
-    optimizer = _TestOptimizer(step_was_skipped)
-    assert _optimizer_step_succeeded(optimizer) is succeeded
+    optimizer = _TestOptimizer()
+    assert (
+        _optimizer_step_succeeded(optimizer, torch.tensor(grad_norm))
+        is succeeded
+    )
     assert optimizer.steps == 1
 
 

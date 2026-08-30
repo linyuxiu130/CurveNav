@@ -82,10 +82,11 @@ def _advance_schedule_and_ema(
     ema.update()
 
 
-def _optimizer_step_succeeded(optimizer: Any) -> bool:
-    """Step once and read Accelerate's overflow result without synchronizing CUDA."""
+def _optimizer_step_succeeded(optimizer: Any, grad_norm: torch.Tensor) -> bool:
+    """Step once and use the unscaled global gradient norm as overflow truth."""
+    gradients_are_finite = bool(torch.isfinite(grad_norm.detach()).item())
     optimizer.step()
-    return not optimizer.step_was_skipped
+    return gradients_are_finite
 
 
 def run_training(
@@ -276,7 +277,7 @@ def run_training(
             grad_norm = accelerator.clip_grad_norm_(
                 policy.parameters(), config.training.grad_clip_norm
             )
-            if _optimizer_step_succeeded(optimizer):
+            if _optimizer_step_succeeded(optimizer, grad_norm):
                 break
             if not torch.isfinite(current_losses).all():
                 values = {
