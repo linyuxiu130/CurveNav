@@ -102,6 +102,38 @@ class CurveNavPolicy(nn.Module):
             self.curve_codec,
         )
 
+    def _mean_flow_total_time_derivative(
+        self,
+        state: Tensor,
+        time: Tensor,
+        instantaneous_velocity: Tensor,
+        condition: ConditionFeatures,
+    ) -> Tensor:
+        """Evaluate the stopped MeanFlow material derivative in float32."""
+        zero = torch.zeros_like(time)
+
+        def mean_velocity(
+            flow_state: Tensor,
+            start_time: Tensor,
+            end_time: Tensor,
+        ) -> Tensor:
+            return self._predict_stage_velocities(
+                flow_state,
+                start_time,
+                end_time,
+                condition,
+            )
+
+        return torch.func.jvp(
+            mean_velocity,
+            (state, zero, time),
+            (
+                instantaneous_velocity,
+                zero,
+                torch.ones_like(time),
+            ),
+        )[1]
+
     @staticmethod
     def _closed_interval_times(batch_size: int, reference: Tensor) -> Tensor:
         """Deterministically collocate the complete data-to-noise interval."""
@@ -155,17 +187,14 @@ class CurveNavPolicy(nn.Module):
             device_type=state.device.type,
             enabled=False,
         ):
-            zero = torch.zeros_like(time)
             with sdpa_kernel([SDPBackend.MATH]):
-                _, total_time_derivatives = torch.func.jvp(
-                    mean_velocity,
-                    (state, zero, time),
-                    (
-                        instantaneous_velocity.detach(),
-                        zero,
-                        torch.ones_like(time),
-                    ),
+                total_time_derivatives = self._mean_flow_total_time_derivative(
+                    state,
+                    time,
+                    instantaneous_velocity.detach(),
+                    encoded,
                 )
+        zero = torch.zeros_like(time)
         average_velocities = mean_velocity(state, zero, time)
         reparameterized_velocities = average_velocities + time[:, None, None] * (
             total_time_derivatives.detach()

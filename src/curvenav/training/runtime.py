@@ -16,11 +16,16 @@ def configure_cuda_training_backend() -> None:
     torch.backends.cudnn.benchmark = True
 
 
-def compile_static_geometry_preprocessing(policy: nn.Module) -> None:
-    """Fuse the parameter-free, fixed-shape metric projection for training."""
+def compile_static_training_functions(policy: nn.Module) -> None:
+    """Fuse the fixed-shape geometry and stopped MeanFlow derivative."""
     projector = policy.depth_encoder.metric_projector
     projector.forward = torch.compile(
         projector.forward,
         fullgraph=True,
         mode="reduce-overhead",
+    )
+    policy._mean_flow_total_time_derivative = torch.compile(
+        policy._mean_flow_total_time_derivative,
+        fullgraph=True,
+        dynamic=False,
     )
