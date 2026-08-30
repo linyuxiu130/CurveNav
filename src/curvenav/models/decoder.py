@@ -4,7 +4,7 @@ import torch
 from torch import Tensor, nn
 
 from curvenav.layers import RMSNorm
-from curvenav.models.blocks import ConditionalTrajectoryBlock
+from curvenav.models.blocks import ConditionalTrajectoryBlock, ProjectedCondition
 from curvenav.models.safety import sample_configuration_field
 from curvenav.types import ConditionFeatures
 
@@ -83,20 +83,24 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         self.velocity_readout = StructuredCurveReadout(curve_tokens, model_dim)
         nn.init.normal_(self.position_embedding, std=0.02)
         nn.init.normal_(self.path_position_embedding, std=0.02)
-        path_indices = torch.linspace(
-            0, num_path_points - 1, path_tokens
-        ).round().long()
+        path_indices = (
+            torch.linspace(0, num_path_points - 1, path_tokens).round().long()
+        )
         self.register_buffer("path_indices", path_indices, persistent=True)
         self.register_buffer(
             "path_progress",
-            (path_indices.float() / (num_path_points - 1)).reshape(
-                1, path_tokens, 1
-            ),
+            (path_indices.float() / (num_path_points - 1)).reshape(1, path_tokens, 1),
             persistent=True,
         )
 
     def _read_velocity(self, controls: Tensor) -> Tensor:
         return self.velocity_readout(self.output_norm(controls))
+
+    def project_condition_memory(
+        self,
+        condition_tokens: Tensor,
+    ) -> tuple[ProjectedCondition, ...]:
+        return tuple(block.project_condition(condition_tokens) for block in self.blocks)
 
     def _path_tokens(
         self,
@@ -152,12 +156,15 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         start_time: Tensor,
         end_time: Tensor,
         condition: ConditionFeatures,
+        projected_condition: tuple[ProjectedCondition, ...],
         curve_codec: nn.Module,
     ) -> Tensor:
         if state.ndim != 2 or state.shape[1] != self.curve_tokens:
             raise ValueError("flow state does not match decoder tokens")
         if start_time.shape != state.shape[:1] or end_time.shape != state.shape[:1]:
             raise ValueError("mean-flow interval times must have shape [B]")
+        if len(projected_condition) != len(self.blocks):
+            raise ValueError("projected condition must cover every decoder block")
         flow_time = self.time_embedding(start_time, end_time)[:, None]
         controls = self.state_embedding(state[..., None])
         controls = (
@@ -182,8 +189,11 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
                 )
             begin = stage * self.layers_per_stage
             end = begin + self.layers_per_stage
-            for block in self.blocks[begin:end]:
-                trajectory = block(trajectory, condition.tokens)
+            for index in range(begin, end):
+                trajectory = self.blocks[index](
+                    trajectory,
+                    projected_condition[index],
+                )
             stage_velocities.append(
                 self._read_velocity(trajectory[:, : self.curve_tokens])
             )

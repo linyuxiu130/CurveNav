@@ -15,6 +15,7 @@ from curvenav.types import (
     TrajectoryTarget,
 )
 
+from .blocks import ProjectedCondition
 from .safety import configuration_space_risk_loss
 
 
@@ -93,12 +94,14 @@ class CurveNavPolicy(nn.Module):
         start_time: Tensor,
         end_time: Tensor,
         condition: ConditionFeatures,
+        projected_condition: tuple[ProjectedCondition, ...],
     ) -> Tensor:
         return self.trajectory_decoder(
             state,
             start_time,
             end_time,
             condition,
+            projected_condition,
             self.curve_codec,
         )
 
@@ -111,6 +114,9 @@ class CurveNavPolicy(nn.Module):
     ) -> Tensor:
         """Evaluate the stopped MeanFlow material derivative in float32."""
         zero = torch.zeros_like(time)
+        projected_condition = self.trajectory_decoder.project_condition_memory(
+            condition.tokens
+        )
 
         def mean_velocity(
             flow_state: Tensor,
@@ -122,6 +128,7 @@ class CurveNavPolicy(nn.Module):
                 start_time,
                 end_time,
                 condition,
+                projected_condition,
             )
 
         return torch.func.jvp(
@@ -158,12 +165,17 @@ class CurveNavPolicy(nn.Module):
         if clean.shape[1] != self.curve_codec.num_curve_tokens:
             raise ValueError("target curve values do not match the production codec")
         if source.shape != clean.shape:
-            raise ValueError("flow source must match the standardized curve coordinates")
+            raise ValueError(
+                "flow source must match the standardized curve coordinates"
+            )
         source = source.float()
         time = self._closed_interval_times(clean.shape[0], clean)
         state = (1.0 - time[:, None]) * clean + time[:, None] * source
         conditional_velocity = source - clean
         encoded = self.encode_condition(condition)
+        projected_condition = self.trajectory_decoder.project_condition_memory(
+            encoded.tokens
+        )
 
         def mean_velocity(
             flow_state: Tensor,
@@ -175,6 +187,7 @@ class CurveNavPolicy(nn.Module):
                 start_time,
                 end_time,
                 encoded,
+                projected_condition,
             )
 
         # Only the forward-mode tangent needs the full float32/MATH route.
@@ -183,9 +196,12 @@ class CurveNavPolicy(nn.Module):
         # from using the surrounding BF16 autocast route.
         instantaneous_velocities = mean_velocity(state, time, time)
         instantaneous_velocity = instantaneous_velocities[:, -1]
-        with torch.no_grad(), torch.autocast(
-            device_type=state.device.type,
-            enabled=False,
+        with (
+            torch.no_grad(),
+            torch.autocast(
+                device_type=state.device.type,
+                enabled=False,
+            ),
         ):
             with sdpa_kernel([SDPBackend.MATH]):
                 total_time_derivatives = self._mean_flow_total_time_derivative(
@@ -206,9 +222,7 @@ class CurveNavPolicy(nn.Module):
             instantaneous_error.square().mean() + average_error.square().mean()
         )
 
-        predicted_clean = (
-            state - time[:, None] * average_velocities[:, -1].float()
-        )
+        predicted_clean = state - time[:, None] * average_velocities[:, -1].float()
         predicted_path, _ = self.curve_codec.decode_path(predicted_clean)
         safety_loss = configuration_space_risk_loss(
             predicted_path,
@@ -232,6 +246,7 @@ class CurveNavPolicy(nn.Module):
             start_time,
             end_time,
             encoded,
+            self.trajectory_decoder.project_condition_memory(encoded.tokens),
         ).float()
         state = state - average_velocities[:, -1]
         path, _ = self.curve_codec.decode(state)

@@ -121,6 +121,8 @@ forbidden(q)=[c(q)≤0]
 
 完整 `64×64×5` 配置空间先把 clearance 除以 `3.6 m`，再经过三个 `3×3,stride=2` 卷积得到带二维度量位置的 `8×8` token。它们不再被提前折叠并丢弃，而是与 PointGoal、96 个当前视觉 token 和三个历史状态 token 直接拼成 164 个一等 token，共同通过四层 condition Transformer；decoder 每层都能读取原始空间语义仍然存在的 memory。
 
+同一个 MeanFlow 训练样本需要计算瞬时主值 `uθ(z_t,t,t,c)` 和区间主值 `uθ(z_t,0,t,c)`，两者的 condition memory 完全相同。第 `l` 层因此只计算一次 `M_l=Norm_l(c)` 和 `(K_l,V_l)=P_l^{KV}(M_l)`，两个主值各自只投影自己的 query，并共同读取 `(K_l,V_l)`。这不是近似缓存：对两项损失 `L₁,L₂`，共享图的梯度 `J_Pᵀ(g₁+g₂)` 与重复图的 `J_Pᵀg₁+J_Pᵀg₂` 严格相同。stop-gradient JVP 仍在禁用 autocast 的 FP32 图内独立投影 condition，避免把 BF16 K/V 混入十二层 Jacobian 连乘；推理只计算一个主值，也只投影一次。cross-attention 参数名、初始化、scaled dot-product attention 和 checkpoint 张量与 `MultiheadAttention` 完全一致，不存在旧 attention 分支。
+
 12 层 decoder 分为三个连续的四层阶段，三个阶段使用同一个归一化和八维速度 readout，不存在独立中间头。第一阶段只根据 Flow 控制 token 和完整条件 memory 形成粗平均速度 `u¹`。对数据锚定时刻 `t`，其粗数据端估计为：
 
 ```text
@@ -218,6 +220,7 @@ L=L_MF+L_safe
 - `compileall`、`git diff --check`；
 - 94 个数学、数据、前向、梯度和合同测试；
 - V100S batch `128` 的完整前后向交叉顺序 A/B：eager JVP 为 `94.97/91.40 samples/s`，完整 JVP 融合为 `100.31/100.68 samples/s`，即提升 `5.63%/10.15%`，峰值显存均约 `8.70 GiB`；单独 JVP 从 `181.70 ms` 降至 `70.15 ms`，输出最大绝对误差 `4.84e-6`。完整 loss 精确相同，318 个参数张量的梯度逐项通过 `rtol=2e-3, atol=2e-4` 检查，最大绝对梯度误差 `1.22e-4`；`reduce-overhead` 的 CUDA Graph 输出别名方案已拒绝，生产只使用无输出生命周期隐患的默认编译模式；
+- condition K/V 重用的 V100S batch `128` 交叉顺序 A/B：GPU0 完整前后向从 `1366.92 ms` 降至 `1308.45 ms`（`+4.46%` samples/s），GPU3 从 `1445.66 ms` 降至 `1358.71 ms`（`+6.40%`），峰值显存从 `8.69 GiB` 降至 `8.47 GiB`，loss 完全相同。单独 12 层、两个主值的 cross-attention 子系统从 `202--203 ms` 降至 `127--128 ms`；生产 BF16 单步训练、完整 checkpoint 和旧 attention state-dict 严格加载合同均通过；
 - 生产 39,804,232 参数图的 BF16 可训练主值、FP32 detached JVP 与反向检查；同一 RTX 4090、batch `256` 的交叉顺序 A/B 中，同步有限性检查为 `303.2/320.8 samples/s`，设备端异步断言为 `338.6/334.3 samples/s`，峰值显存均为 `13.89 GiB`，证明该修改只删除 host synchronization；
 - 离线轨迹精度不按模型输出索引直接对齐，而是把所有模型和专家统一按绝对弧长重采样到前 `min(2 m, 专家局部长度)`；预测不足该距离时保持其终点继续计算误差，同时单列 horizon coverage，避免短轨迹靠少走获得低 ADE。安全评测独立以不大于 `0.025 m` 的间距覆盖前 `3.6 m` 局部轨迹，再查询与模型完全相同的四帧融合配置空间场；报告相对专家新增的 collision/margin violation，不把感知场自身对专家的误报归给模型；
 - 6,087 条验证专家的四帧配置空间审计：当前帧单独识别专家 footprint collision `0` 条、裕度违例 `89` 条、直线裕度违例 `787` 条；四帧静态融合后分别为 `9`、`143`、`1,325` 条。9 条碰撞均可由具体单独历史帧复现，位姿为正常的约 `0.45/0.89/1.33 m` 后向平移，不是跨帧符号或偶然 observed 拼接错误；

@@ -16,6 +16,7 @@ from curvenav.config import (
 )
 from curvenav.training.optimizer import build_optimizer
 from curvenav.models import TRAINING_LOSS_NAMES
+from curvenav.models.blocks import ReusableConditionCrossAttention
 from curvenav.encoders import CONFIGURATION_TOKEN_COUNT
 
 
@@ -54,6 +55,16 @@ def condition(batch: int = 2) -> PolicyCondition:
         point_goal=point_goals,
         observation_to_current=identity_observation_transform(batch),
         observation_valid=torch.ones(batch, 4, dtype=torch.bool),
+    )
+
+
+def predict_stage_velocities(policy, state, start_time, end_time, encoded):
+    return policy._predict_stage_velocities(
+        state,
+        start_time,
+        end_time,
+        encoded,
+        policy.trajectory_decoder.project_condition_memory(encoded.tokens),
     )
 
 
@@ -230,10 +241,8 @@ def test_typical_source_and_one_step_mean_flow_are_deterministic() -> None:
 
     constant_average_velocity = torch.linspace(-0.2, 0.2, curve_tokens)
 
-    def constant_field(self, state, start_time, end_time, encoded):
-        return constant_average_velocity.expand_as(state)[:, None].expand(
-            -1, 3, -1
-        )
+    def constant_field(self, state, start_time, end_time, encoded, projected_condition):
+        return constant_average_velocity.expand_as(state)[:, None].expand(-1, 3, -1)
 
     policy._predict_stage_velocities = MethodType(constant_field, policy)
     expected_state = policy.inference_source - constant_average_velocity
@@ -253,10 +262,19 @@ def test_training_uses_random_source_and_closed_interval_collocation() -> None:
         planning_horizon_m = policy.planning_horizon_m
 
         def forward(
-            self, state, start_time, end_time, encoded, curve_codec
+            self,
+            state,
+            start_time,
+            end_time,
+            encoded,
+            projected_condition,
+            curve_codec,
         ):
             velocity = state * 0.0 + (end_time - start_time)[:, None] * 0.0
             return velocity[:, None].expand(-1, 3, -1)
+
+        def project_condition_memory(self, condition_tokens):
+            return ()
 
     policy.trajectory_decoder = ZeroMeanVelocity()
     inputs = condition(batch=2)
@@ -290,13 +308,22 @@ def test_improved_mean_flow_jvp_has_the_exact_sign_and_interval_tangent() -> Non
         planning_horizon_m = policy.planning_horizon_m
 
         def forward(
-            self, state, start_time, end_time, encoded, curve_codec
+            self,
+            state,
+            start_time,
+            end_time,
+            encoded,
+            projected_condition,
+            curve_codec,
         ):
             velocity = state + (end_time - start_time)[:, None]
             stage_offset = torch.tensor(
                 [-0.5, 0.0, 0.5], device=state.device, dtype=state.dtype
             )[None, :, None]
             return velocity[:, None] + stage_offset
+
+        def project_condition_memory(self, condition_tokens):
+            return ()
 
     policy.trajectory_decoder = AnalyticMeanVelocity()
     inputs = condition(batch=2)
@@ -387,16 +414,49 @@ def test_conditioned_decoder_returns_one_smooth_metric_curve() -> None:
     encoded = policy.encode_condition(inputs)
     noisy = torch.randn(2, policy.curve_codec.num_curve_tokens)
     time = torch.tensor([0.2, 0.7])
-    predicted_velocity = policy._predict_stage_velocities(
-        noisy, torch.zeros_like(time), time, encoded
+    predicted_velocity = predict_stage_velocities(
+        policy, noisy, torch.zeros_like(time), time, encoded
     )
-    repeated = policy._predict_stage_velocities(
-        noisy, torch.zeros_like(time), time, encoded
+    repeated = predict_stage_velocities(
+        policy, noisy, torch.zeros_like(time), time, encoded
     )
     torch.testing.assert_close(predicted_velocity, repeated)
     assert predicted_velocity.shape == (2, 3, policy.curve_codec.num_curve_tokens)
     prediction = policy.sample(inputs)
     assert prediction.path.shape == (2, 16, 2)
+
+
+def test_reused_condition_projection_is_exact_cross_attention() -> None:
+    torch.manual_seed(17)
+    reference = torch.nn.MultiheadAttention(32, 4, batch_first=True)
+    candidate = ReusableConditionCrossAttention(32, 4, 0.0)
+    candidate.load_state_dict(reference.state_dict(), strict=True)
+    reference_queries = [
+        torch.randn(3, 8, 32, requires_grad=True) for _ in range(2)
+    ]
+    candidate_queries = [
+        query.detach().clone().requires_grad_() for query in reference_queries
+    ]
+    reference_memory = torch.randn(3, 13, 32, requires_grad=True)
+    candidate_memory = reference_memory.detach().clone().requires_grad_()
+    expected = [
+        reference(query, reference_memory, reference_memory, need_weights=False)[0]
+        for query in reference_queries
+    ]
+    projected = candidate.project_condition(candidate_memory)
+    actual = [candidate(query, projected) for query in candidate_queries]
+    sum(output.square().mean() for output in expected).backward()
+    sum(output.square().mean() for output in actual).backward()
+    for left, right in zip(actual, expected, strict=True):
+        torch.testing.assert_close(left, right)
+    for left, right in zip(candidate_queries, reference_queries, strict=True):
+        torch.testing.assert_close(left.grad, right.grad)
+    torch.testing.assert_close(candidate_memory.grad, reference_memory.grad)
+    for name, parameter in candidate.named_parameters():
+        torch.testing.assert_close(
+            parameter.grad,
+            dict(reference.named_parameters())[name].grad,
+        )
 
 
 def test_decoder_has_one_internal_path_relative_refinement_route() -> None:
@@ -452,10 +512,9 @@ def test_obstacle_far_from_flow_source_changes_one_step_velocity() -> None:
         )
         source = policy.inference_source.clone()
         zero = torch.zeros(1)
-        velocity = policy._predict_stage_velocities(
-            source, zero, zero + 1.0, baseline
-        )
-        changed_velocity = policy._predict_stage_velocities(
+        velocity = predict_stage_velocities(policy, source, zero, zero + 1.0, baseline)
+        changed_velocity = predict_stage_velocities(
+            policy,
             source,
             zero,
             zero + 1.0,
@@ -475,11 +534,11 @@ def test_exact_path_field_changes_velocity_without_changing_context_tokens() -> 
     source = policy.inference_source.clone()
     zero = torch.zeros(1)
     with torch.no_grad():
-        baseline_velocity = policy._predict_stage_velocities(
-            source, zero, zero + 1.0, encoded
+        baseline_velocity = predict_stage_velocities(
+            policy, source, zero, zero + 1.0, encoded
         )
-        changed_velocity = policy._predict_stage_velocities(
-            source, zero, zero + 1.0, changed
+        changed_velocity = predict_stage_velocities(
+            policy, source, zero, zero + 1.0, changed
         )
     torch.testing.assert_close(changed.tokens, encoded.tokens)
     assert not torch.allclose(changed_velocity, baseline_velocity)
@@ -576,11 +635,11 @@ def test_mean_flow_decoder_depends_on_state_and_interval() -> None:
     with torch.no_grad():
         zero = torch.zeros(2)
         one = torch.ones(2)
-        reference = policy._predict_stage_velocities(noisy, zero, zero, encoded)
-        changed_curve = policy._predict_stage_velocities(
-            noisy + 1.0, zero, zero, encoded
+        reference = predict_stage_velocities(policy, noisy, zero, zero, encoded)
+        changed_curve = predict_stage_velocities(
+            policy, noisy + 1.0, zero, zero, encoded
         )
-        changed_time = policy._predict_stage_velocities(noisy, zero, one, encoded)
+        changed_time = predict_stage_velocities(policy, noisy, zero, one, encoded)
 
     assert not torch.allclose(changed_curve, reference)
     assert not torch.allclose(changed_time, reference)
@@ -604,10 +663,9 @@ def test_trainable_decoder_uses_bf16_but_returns_finite_curve_velocity() -> None
         lambda _module, inputs: observed_dtype.append(inputs[0].dtype)
     )
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        output = policy._predict_stage_velocities(
-            torch.randn(
-                2, policy.curve_codec.num_curve_tokens, device="cuda"
-            ),
+        output = predict_stage_velocities(
+            policy,
+            torch.randn(2, policy.curve_codec.num_curve_tokens, device="cuda"),
             torch.zeros(2, device="cuda"),
             torch.tensor([0.2, 0.7], device="cuda"),
             encoded,
