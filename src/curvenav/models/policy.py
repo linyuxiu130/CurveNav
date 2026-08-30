@@ -145,19 +145,24 @@ class CurveNavPolicy(nn.Module):
                 encoded,
             )
 
-        instantaneous_velocities = mean_velocity(state, time, time)
-        instantaneous_velocity = instantaneous_velocities[:, -1]
-        zero = torch.zeros_like(time)
-        with sdpa_kernel([SDPBackend.MATH]):
-            average_velocities, total_time_derivatives = torch.func.jvp(
-                mean_velocity,
-                (state, zero, time),
-                (
-                    instantaneous_velocity.detach(),
-                    zero,
-                    torch.ones_like(time),
-                ),
-            )
+        # Forward-mode tangents pass through all twelve refinement blocks and
+        # two decoded path-to-field queries.  Keep this exact derivative in
+        # float32: unlike ordinary activations, its dynamic range is a product
+        # of layer Jacobians and is not representable reliably in FP16/BF16.
+        with torch.autocast(device_type=state.device.type, enabled=False):
+            instantaneous_velocities = mean_velocity(state, time, time)
+            instantaneous_velocity = instantaneous_velocities[:, -1]
+            zero = torch.zeros_like(time)
+            with sdpa_kernel([SDPBackend.MATH]):
+                average_velocities, total_time_derivatives = torch.func.jvp(
+                    mean_velocity,
+                    (state, zero, time),
+                    (
+                        instantaneous_velocity.detach(),
+                        zero,
+                        torch.ones_like(time),
+                    ),
+                )
         reparameterized_velocities = average_velocities + time[:, None, None] * (
             total_time_derivatives.detach()
         )
