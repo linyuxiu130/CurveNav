@@ -64,7 +64,7 @@ def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
         "rng_states",
     }
     assert checkpoint["training_contract"]["mixed_precision"] == (
-        "bf16_condition_fp32_meanflow_jvp"
+        "bf16_primal_fp32_detached_meanflow_jvp"
     )
     assert (
         contract["trajectory_decoder_type"]
@@ -300,7 +300,9 @@ def test_training_contract_preserves_global_optimization_across_one_to_eight_gpu
             <= contract["maximum_per_rank_batch_size"] * world_size
         )
         assert contract["per_device_batch_size"] == 256
-        assert contract["mixed_precision"] == "bf16_condition_fp32_meanflow_jvp"
+        assert contract["mixed_precision"] == (
+            "bf16_primal_fp32_detached_meanflow_jvp"
+        )
         assert contract["global_batch_size"] == 1024
         assert contract["steps_per_epoch"] == 40
         assert contract["total_steps"] == 8000

@@ -45,7 +45,7 @@ from curvenav.models.safety import SAFETY_CLEARANCE_M, SAFETY_OBJECTIVE_TYPE
 
 
 CHECKPOINT_TYPE = "curvenav_metric_curve_mean_flow_policy"
-TRAINING_PRECISION = "bf16_condition_fp32_meanflow_jvp"
+TRAINING_PRECISION = "bf16_primal_fp32_detached_meanflow_jvp"
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
 

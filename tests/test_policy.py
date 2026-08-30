@@ -586,7 +586,7 @@ def test_mean_flow_decoder_depends_on_state_and_interval() -> None:
     assert not torch.allclose(changed_time, reference)
 
 
-def test_curve_residual_carrier_stays_float32_under_fp16_autocast() -> None:
+def test_trainable_decoder_uses_bf16_but_returns_finite_curve_velocity() -> None:
     if not torch.cuda.is_available():
         return
     policy = build_policy(tiny_config()).cuda().eval()
@@ -603,7 +603,7 @@ def test_curve_residual_carrier_stays_float32_under_fp16_autocast() -> None:
     handle = decoder.blocks[0].register_forward_pre_hook(
         lambda _module, inputs: observed_dtype.append(inputs[0].dtype)
     )
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         output = policy._predict_stage_velocities(
             torch.randn(
                 2, policy.curve_codec.num_curve_tokens, device="cuda"
@@ -614,7 +614,7 @@ def test_curve_residual_carrier_stays_float32_under_fp16_autocast() -> None:
         )
     handle.remove()
 
-    assert observed_dtype == [torch.float32]
+    assert observed_dtype == [torch.bfloat16]
     assert torch.isfinite(output).all()
 
 

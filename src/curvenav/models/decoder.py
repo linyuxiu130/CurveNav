@@ -139,11 +139,12 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             ),
             dim=-1,
         )
+        embedded = self.path_geometry_embedding(geometry)
         return (
-            self.path_geometry_embedding(geometry)
-            + self.path_position_embedding
-            + flow_time
-        ).float()
+            embedded
+            + self.path_position_embedding.to(dtype=embedded.dtype)
+            + flow_time.to(dtype=embedded.dtype)
+        )
 
     def forward(
         self,
@@ -158,11 +159,12 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         if start_time.shape != state.shape[:1] or end_time.shape != state.shape[:1]:
             raise ValueError("mean-flow interval times must have shape [B]")
         flow_time = self.time_embedding(start_time, end_time)[:, None]
+        controls = self.state_embedding(state[..., None])
         controls = (
-            self.state_embedding(state[..., None])
-            + self.position_embedding
-            + flow_time
-        ).float()
+            controls
+            + self.position_embedding.to(dtype=controls.dtype)
+            + flow_time.to(dtype=controls.dtype)
+        )
         trajectory = controls
         stage_velocities = []
         for stage in range(DECODER_REFINEMENT_STAGES):

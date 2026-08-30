@@ -47,7 +47,7 @@ def _sample(
     batch: dict[str, Tensor],
 ):
     prepared = unpack_policy_batch(batch)
-    with torch.autocast(device_type="cuda", dtype=torch.float16):
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         prediction = policy.sample(prepared.condition)
     return prepared, prediction
 

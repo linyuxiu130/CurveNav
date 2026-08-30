@@ -193,7 +193,7 @@ class CurveNavRuntime:
             torch.inference_mode(),
             torch.autocast(
                 device_type=self.device.type,
-                dtype=torch.float16,
+                dtype=torch.bfloat16,
                 enabled=self.device.type == "cuda",
             ),
         ):
@@ -253,7 +253,7 @@ class CurveNavRuntime:
         with (
             torch.inference_mode(),
             torch.autocast(
-                device_type=self.device.type, dtype=torch.float16, enabled=amp
+                device_type=self.device.type, dtype=torch.bfloat16, enabled=amp
             ),
         ):
             prediction = self.policy.sample(condition)

@@ -81,11 +81,11 @@ scripts/compare_offline.sh configs/base.yaml COMMON.npz HSSD_SOURCE REPORT.json 
 
 报告除全样本与物理分层外，还逐 held-out scene 输出同一指标，并给 scene-macro 与 worst-scene；样本数更多的场景不能淹没小场景上的完全失败。
 
-CurveNav 用 8 维无界 Flow state 表示标准化 `softplus` 弧长预激活和 7 个 cubic B-spline 局部航向增量；单位切向积分保证轨迹正则、初始前向且曲率连续。训练为每个优化器 batch 显式采样一次随机高斯源并做闭区间时间 collocation，同时监督瞬时边界与数据锚定 improved MeanFlow；视觉和条件编码使用 BF16，MeanFlow decoder 及精确 forward-mode JVP 固定 FP32。部署从固定高斯典型 latent 只做一次平均速度输运。四帧配准的坡度感知配置空间场完整编码为 `8×8` 度量安全 token，并在生成前融合进条件记忆；不再只沿更新前的 Flow 源路径读取不足 1% 的场。历史位姿既用于障碍配准，也以三个因果 SE(2) token 提供近期运动；训练和部署使用同一变换定义，不读取未来专家状态。不存在 ODE solver、随机候选、learned critic、在线碰撞修补或 fallback。
+CurveNav 用 8 维无界 Flow state 表示标准化 `softplus` 弧长预激活和 7 个 cubic B-spline 局部航向增量；单位切向积分保证轨迹正则、初始前向且曲率连续。训练为每个优化器 batch 显式采样一次随机高斯源并做闭区间时间 collocation，同时监督瞬时边界与数据锚定 improved MeanFlow；所有可训练主值与部署统一使用 BF16，只有 stop-gradient 的精确 forward-mode JVP 使用 FP32。部署从固定高斯典型 latent 只做一次平均速度输运。四帧配准的坡度感知配置空间场完整编码为 `8×8` 度量安全 token，并在生成前融合进条件记忆；不再只沿更新前的 Flow 源路径读取不足 1% 的场。历史位姿既用于障碍配准，也以三个因果 SE(2) token 提供近期运动；训练和部署使用同一变换定义，不读取未来专家状态。不存在 ODE solver、随机候选、learned critic、在线碰撞修补或 fallback。
 
 模型内部 64 点路径的第 0 点是当前机器人原点。官方 evaluator 会统一在 policy 返回值前追加当前原点，因此 CurveNav 的部署边界只发送内部路径的 `1:64` 共 63 个未来点；MPC 最终仍接收 64 点路径，且只有一个原点。NavDP/X-NavDP 的累积位移输出本来就不含当前点。若 CurveNav 发送内部第 0 点，evaluator 会制造两个连续原点，使 MPC 的起始离散曲率退化。
 
-官方 evaluator 在每个 scene worker 中只创建一次 Isaac 环境，episode 结束后原地 reset 对应 env；同场景 10 回合不得拆成 10 次 Isaac 启动。比较同一场景的一组 checkpoint 时，唯一 evaluator 进程继续常驻并让 USD、物理世界和渲染资源保持在 GPU；checkpoint 之间完整 reset 全部 env 并重启策略服务，但不重建 scene，列表结束后才关闭 evaluator。CurveNav 在线使用 eager FP16，并在每次策略服务的初始 `navigator_reset` 内按实际 `num_envs` 完成 CUDA kernel 预热；该过程必须在 episode 计时循环前完成，不得通过放宽 timeout 或首轮零动作来掩盖初始化开销。
+官方 evaluator 在每个 scene worker 中只创建一次 Isaac 环境，episode 结束后原地 reset 对应 env；同场景 10 回合不得拆成 10 次 Isaac 启动。比较同一场景的一组 checkpoint 时，唯一 evaluator 进程继续常驻并让 USD、物理世界和渲染资源保持在 GPU；checkpoint 之间完整 reset 全部 env 并重启策略服务，但不重建 scene，列表结束后才关闭 evaluator。CurveNav 在线使用 eager BF16，并在每次策略服务的初始 `navigator_reset` 内按实际 `num_envs` 完成 CUDA kernel 预热；该过程必须在 episode 计时循环前完成，不得通过放宽 timeout 或首轮零动作来掩盖初始化开销。
 
 上游评测真源是部署时固定 commit 的 benchmark checkout：
 
