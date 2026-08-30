@@ -248,14 +248,13 @@ def build_training_checkpoint(
     optimizer: Optimizer,
     scheduler: LRScheduler,
     ema: ExponentialMovingAverage,
-    grad_scaler: Any,
     config: CurveNavConfig,
     step: int,
     *,
     training_contract: Mapping[str, int],
     rng_states: Mapping[str, Tensor],
 ) -> dict[str, Any]:
-    """Build the complete state required to resume FP16 optimizer updates."""
+    """Build the complete state required to resume BF16 optimizer updates."""
     if step < 0:
         raise ValueError("checkpoint step cannot be negative")
     world_size = int(training_contract["world_size"])
@@ -280,7 +279,6 @@ def build_training_checkpoint(
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "ema": ema.state_dict(),
-        "grad_scaler": grad_scaler.state_dict(),
         "config": asdict(config),
         "policy_contract": build_policy_contract(config),
         "training_contract": expected_training_contract,
@@ -357,11 +355,10 @@ def restore_training_state(
     scheduler: Any,
     ema: ExponentialMovingAverage,
     config: CurveNavConfig,
-    grad_scaler: Any,
 ) -> int:
     """Restore the complete state needed to continue optimizer updates."""
     validate_policy_contract(checkpoint, config)
-    required = {"step", "model", "optimizer", "scheduler", "ema", "grad_scaler"}
+    required = {"step", "model", "optimizer", "scheduler", "ema"}
     missing = sorted(required.difference(checkpoint))
     if missing:
         raise ValueError(f"training checkpoint is missing state: {missing}")
@@ -369,7 +366,6 @@ def restore_training_state(
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     ema.load_state_dict(checkpoint["ema"])
-    grad_scaler.load_state_dict(checkpoint["grad_scaler"])
     step = int(checkpoint["step"])
     if step < 0:
         raise ValueError("checkpoint step cannot be negative")

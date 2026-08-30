@@ -16,15 +16,6 @@ from curvenav.training.checkpoint import (
     validate_training_resume,
 )
 from curvenav.training.ema import ExponentialMovingAverage
-from curvenav.training.train import _optimizer_step_succeeded
-
-
-class _TestOptimizer:
-    def __init__(self) -> None:
-        self.steps = 0
-
-    def step(self) -> None:
-        self.steps += 1
 
 
 def _distributed_state(
@@ -39,22 +30,6 @@ def _distributed_state(
     return training_contract, rng_states
 
 
-@pytest.mark.parametrize(
-    ("grad_norm", "succeeded"),
-    ((1.0, True), (float("inf"), False), (float("nan"), False)),
-)
-def test_optimizer_step_uses_unscaled_global_gradient_finiteness(
-    grad_norm: float,
-    succeeded: bool,
-) -> None:
-    optimizer = _TestOptimizer()
-    assert (
-        _optimizer_step_succeeded(optimizer, torch.tensor(grad_norm))
-        is succeeded
-    )
-    assert optimizer.steps == 1
-
-
 def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
     config = CurveNavConfig()
     model = nn.Linear(2, 2)
@@ -66,7 +41,6 @@ def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
         optimizer,
         scheduler,
         ExponentialMovingAverage(model),
-        torch.amp.GradScaler("cuda", enabled=False),
         config,
         step=0,
         training_contract=training_contract,
@@ -77,7 +51,8 @@ def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
         checkpoint["checkpoint_type"]
         == "curvenav_metric_curve_mean_flow_policy"
     )
-    assert {"model", "optimizer", "scheduler", "ema", "grad_scaler"} <= set(checkpoint)
+    assert {"model", "optimizer", "scheduler", "ema"} <= set(checkpoint)
+    assert "grad_scaler" not in checkpoint
     assert "extra" not in checkpoint
     assert (
         contract["trajectory_decoder_type"]
@@ -238,14 +213,12 @@ def test_training_checkpoint_restores_the_complete_optimizer_state() -> None:
     optimizer = AdamW(model.parameters())
     scheduler = LambdaLR(optimizer, lambda _: 1.0)
     ema = ExponentialMovingAverage(model)
-    scaler = torch.amp.GradScaler("cuda", enabled=False)
     training_contract, rng_states = _distributed_state(config)
     checkpoint = build_training_checkpoint(
         model,
         optimizer,
         scheduler,
         ema,
-        scaler,
         config,
         step=37,
         training_contract=training_contract,
@@ -257,7 +230,6 @@ def test_training_checkpoint_restores_the_complete_optimizer_state() -> None:
     restored_optimizer = AdamW(restored_model.parameters())
     restored_scheduler = LambdaLR(restored_optimizer, lambda _: 1.0)
     restored_ema = ExponentialMovingAverage(restored_model)
-    restored_scaler = torch.amp.GradScaler("cuda", enabled=False)
     restored_step = restore_training_state(
         checkpoint,
         restored_model,
@@ -265,7 +237,6 @@ def test_training_checkpoint_restores_the_complete_optimizer_state() -> None:
         restored_scheduler,
         restored_ema,
         config,
-        restored_scaler,
     )
 
     assert restored_step == 37
@@ -290,7 +261,6 @@ def test_resume_rejects_changed_configuration_or_world_size() -> None:
         optimizer,
         scheduler,
         ExponentialMovingAverage(model),
-        torch.amp.GradScaler("cuda", enabled=False),
         config,
         step=10,
         training_contract=training_contract,

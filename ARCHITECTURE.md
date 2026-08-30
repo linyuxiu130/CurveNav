@@ -168,7 +168,7 @@ Vθ = uθ(z_t,0,t,c)+t·stopgrad(D_tuθ)
 L_MF = 1/6 Σ_{k=1}^3 E[||vθᵏ-v_c||² + ||Vθᵏ-v_c||²]
 ```
 
-每个 batch 先显式采样一次 `e~N(0,I)`，并用闭区间等距 collocation 覆盖 `[0,1]`。该源属于当前优化器 batch；若 FP16 overflow，重试复用同一个源，不重新抽样，也不复制/恢复整份 CUDA RNG 状态。不使用固定源训练、时间端点概率、课程开关或有限差分。推理选择训练高斯典型集内范数为 `√8` 的固定 latent：
+每个 batch 先显式采样一次 `e~N(0,I)`，并用闭区间等距 collocation 覆盖 `[0,1]`。该源只属于当前优化器 batch；BF16 更新只执行一次，不重抽 source、不跳过 batch，也不复制/恢复整份 CUDA RNG 状态。不使用固定源训练、时间端点概率、课程开关或有限差分。推理选择训练高斯典型集内范数为 `√8` 的固定 latent：
 
 ```text
 x_hat=e* - uθ(e*,0,1,c)
@@ -211,13 +211,13 @@ L=L_MF+L_safe
 
 训练数据只来自 CurveNav 按 benchmark Dingo 配置生成的 HSSD 专家路线，不读取 SanD/NavDP 数据。当前 canonical dataset 为训练 `25,928`、验证 `6,087` 条；深度 bank 在编译时硬链接，不重复复制图像。
 
-训练固定 global batch `1024`、每卡 micro-batch 上限 `256`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。四张 24 GiB RTX 4090 时每 rank 恰为一个 256 样本 micro-batch；三卡时自动均衡拆分，不改变全局 batch 或优化数学。AMP 为 FP16，MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。完整 MeanFlow/JVP 保持 eager；训练运行时只用 `torch.compile(fullgraph=True, mode="reduce-overhead")` 融合无参数、静态形状的度量几何投影器，因此 checkpoint 和推理数学图不变，也没有第二训练实现。每次反向在 GradScaler 反缩放后先计算全局梯度范数；只有该范数有限时才计为真实优化更新。非有限梯度由 GradScaler 跳过并降低 scale，然后在同一 batch、同一 Flow source 上重算；scheduler 和 EMA 不前进。这不依赖当前 Accelerate 版本在包装 optimizer 上不可靠的 `step_was_skipped`。
+训练固定 global batch `1024`、每卡 micro-batch 上限 `256`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。四张 24 GiB RTX 4090 时每 rank 恰为一个 256 样本 micro-batch；三卡时自动均衡拆分，不改变全局 batch 或优化数学。AMP 唯一使用 BF16：它保持 16-bit Tensor Core 吞吐，同时以接近 FP32 的指数范围承载 12 层路径细化中的 forward-mode JVP；FP16 的主值仍有限时，切向已经可先上溢，因此不再使用 FP16 GradScaler 重试链。MeanFlow JVP 使用数学 SDPA，EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。完整 MeanFlow/JVP 保持 eager；训练运行时只用 `torch.compile(fullgraph=True, mode="reduce-overhead")` 融合无参数、静态形状的度量几何投影器，因此 checkpoint 和推理数学图不变，也没有第二训练实现。每次反向只接受有限的 loss 和全局梯度范数，否则直接终止；不存在跳过 batch、降低 scale 或重抽 Flow source 的第二更新路径。
 
 当前必要验证：
 
 - `compileall`、`git diff --check`；
-- 95 个数学、数据、前向、梯度和合同测试；
-- 生产 39,804,232 参数图的 FP16 前向、精确 JVP 与反向检查；
+- 94 个数学、数据、前向、梯度和合同测试；
+- 生产 39,804,232 参数图的 BF16 前向、精确 JVP 与反向检查；
 - 离线轨迹精度不按模型输出索引直接对齐，而是把所有模型和专家统一按绝对弧长重采样到前 `min(2 m, 专家局部长度)`；预测不足该距离时保持其终点继续计算误差，同时单列 horizon coverage，避免短轨迹靠少走获得低 ADE。安全评测独立以不大于 `0.025 m` 的间距覆盖前 `3.6 m` 局部轨迹，再查询与模型完全相同的四帧融合配置空间场；报告相对专家新增的 collision/margin violation，不把感知场自身对专家的误报归给模型；
 - 6,087 条验证专家的四帧配置空间审计：当前帧单独识别专家 footprint collision `0` 条、裕度违例 `89` 条、直线裕度违例 `787` 条；四帧静态融合后分别为 `9`、`143`、`1,325` 条。9 条碰撞均可由具体单独历史帧复现，位姿为正常的约 `0.45/0.89/1.33 m` 后向平移，不是跨帧符号或偶然 observed 拼接错误；
 - 当前路径相对模型在三张 RTX 4090 上按 `342/341/341` 分片，每 rank 均衡拆为两个 micro-batch，实测峰值约 `18.1 GiB/GPU`；与 GPU0 闭环测评并行时，step 20--40 为 `683.8 samples/s`。这是三卡并行起步值，不冒充四卡硬件上限；基线测评结束后须再以四卡单 micro-batch 实测。

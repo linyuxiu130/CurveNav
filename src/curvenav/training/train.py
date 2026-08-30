@@ -1,15 +1,13 @@
-"""Multi-GPU FP16 training for the single CurveNav policy route."""
+"""Multi-GPU BF16 training for the single CurveNav policy route."""
 
 import argparse
 import json
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
-
 import torch
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs, GradScalerKwargs, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 
 from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
@@ -41,7 +39,6 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     ema: ExponentialMovingAverage,
-    grad_scaler: Any,
     config: CurveNavConfig,
     step: int,
     training_contract: dict[str, int],
@@ -62,7 +59,6 @@ def _save_checkpoint(
         optimizer,
         scheduler,
         ema,
-        grad_scaler,
         config,
         step,
         training_contract=training_contract,
@@ -82,13 +78,6 @@ def _advance_schedule_and_ema(
     ema.update()
 
 
-def _optimizer_step_succeeded(optimizer: Any, grad_norm: torch.Tensor) -> bool:
-    """Step once and use the unscaled global gradient norm as overflow truth."""
-    gradients_are_finite = bool(torch.isfinite(grad_norm.detach()).item())
-    optimizer.step()
-    return gradients_are_finite
-
-
 def run_training(
     config: CurveNavConfig,
     resume_path: Path | None = None,
@@ -105,11 +94,10 @@ def run_training(
         gradient_as_bucket_view=True,
         static_graph=True,
     )
-    grad_scaler_options = GradScalerKwargs(init_scale=8192.0)
     accelerator = Accelerator(
-        mixed_precision="fp16",
+        mixed_precision="bf16",
         step_scheduler_with_optimizer=False,
-        kwargs_handlers=[ddp, grad_scaler_options],
+        kwargs_handlers=[ddp],
     )
     configure_cuda_training_backend()
     set_seed(config.training.seed, device_specific=True)
@@ -170,9 +158,6 @@ def run_training(
         scheduler,
         device_placement=[True, True, True],
     )
-    if accelerator.scaler is None:
-        raise RuntimeError("CurveNav FP16 training requires a gradient scaler")
-    grad_scaler = accelerator.scaler
     loader = CudaPrefetchLoader(
         loader,
         loader_bundle.depth_bank,
@@ -195,7 +180,6 @@ def run_training(
             scheduler,
             ema,
             config,
-            grad_scaler,
         )
         restore_process_rng_state(checkpoint, accelerator.process_index)
 
@@ -229,7 +213,6 @@ def run_training(
         len(TRAINING_LOSS_NAMES), device=accelerator.device
     )
     window_steps = 0
-    window_overflow_retries = 0
     window_start = time.perf_counter()
     checkpoint_interval = config.training.checkpoint_every_epochs * steps_per_epoch
     loader_iterator = iter(loader)
@@ -242,62 +225,58 @@ def run_training(
             torch.randn_like(prepared.target.curve_values)
             for prepared in prepared_batches
         )
-        overflow_retries = 0
-        while True:
-            optimizer.zero_grad(set_to_none=True)
-            current_losses = torch.zeros_like(window_losses)
-            for micro_step, (prepared, flow_source) in enumerate(
-                zip(prepared_batches, flow_sources, strict=True)
-            ):
-                synchronize = micro_step + 1 == micro_batches_per_step
-                synchronization_context = (
-                    nullcontext()
-                    if synchronize
-                    else accelerator.no_sync(policy)
-                )
-                with synchronization_context:
-                    with accelerator.autocast():
-                        losses = policy(
-                            prepared.condition,
-                            prepared.target,
-                            flow_source,
-                        )
-                    batch_weight = (
-                        accelerator.num_processes
-                        * prepared.condition.depth.shape[0]
-                        / global_batch_size
-                    )
-                    accelerator.backward(losses.loss * batch_weight)
-                current_losses += (
-                    torch.stack(losses.logging_values())
-                    .detach()
-                    .float()
-                    * batch_weight
-                )
-            grad_norm = accelerator.clip_grad_norm_(
-                policy.parameters(), config.training.grad_clip_norm
+        optimizer.zero_grad(set_to_none=True)
+        current_losses = torch.zeros_like(window_losses)
+        for micro_step, (prepared, flow_source) in enumerate(
+            zip(prepared_batches, flow_sources, strict=True)
+        ):
+            synchronize = micro_step + 1 == micro_batches_per_step
+            synchronization_context = (
+                nullcontext()
+                if synchronize
+                else accelerator.no_sync(policy)
             )
-            if _optimizer_step_succeeded(optimizer, grad_norm):
-                break
-            if not torch.isfinite(current_losses).all():
-                values = {
-                    name: float(value)
-                    for name, value in zip(
-                        TRAINING_LOSS_NAMES,
-                        current_losses,
-                        strict=True,
+            with synchronization_context:
+                with accelerator.autocast():
+                    losses = policy(
+                        prepared.condition,
+                        prepared.target,
+                        flow_source,
                     )
-                }
-                raise FloatingPointError(
-                    f"CurveNav training loss is non-finite: {values}"
+                batch_weight = (
+                    accelerator.num_processes
+                    * prepared.condition.depth.shape[0]
+                    / global_batch_size
                 )
-            overflow_retries += 1
+                accelerator.backward(losses.loss * batch_weight)
+            current_losses += (
+                torch.stack(losses.logging_values())
+                .detach()
+                .float()
+                * batch_weight
+            )
+        grad_norm = accelerator.clip_grad_norm_(
+            policy.parameters(), config.training.grad_clip_norm
+        )
+        if not torch.isfinite(current_losses).all() or not torch.isfinite(grad_norm):
+            values = {
+                name: float(value)
+                for name, value in zip(
+                    TRAINING_LOSS_NAMES,
+                    current_losses,
+                    strict=True,
+                )
+            }
+            raise FloatingPointError(
+                f"CurveNav BF16 update is non-finite: losses={values}, "
+                f"gradient_norm={float(grad_norm)}"
+            )
+        optimizer.step()
         _advance_schedule_and_ema(scheduler, ema)
 
         step += 1
         epoch = (step - 1) // steps_per_epoch + 1
         window_steps += 1
-        window_overflow_retries += overflow_retries
         window_losses += current_losses
         if step == 1 or step % config.training.log_every_steps == 0:
             elapsed = time.perf_counter() - window_start
@@ -312,8 +291,6 @@ def run_training(
                         **dict(zip(TRAINING_LOSS_NAMES, mean_losses, strict=True)),
                         "learning_rate": scheduler.get_last_lr()[0],
                         "gradient_norm": grad_norm.detach().float().item(),
-                        "loss_scale": float(grad_scaler.get_scale()),
-                        "fp16_overflow_retries": window_overflow_retries,
                         "samples_per_second": global_batch_size
                         * window_steps
                         / elapsed,
@@ -324,7 +301,6 @@ def run_training(
             )
             window_losses.zero_()
             window_steps = 0
-            window_overflow_retries = 0
             window_start = time.perf_counter()
 
         if step % checkpoint_interval == 0:
@@ -334,7 +310,6 @@ def run_training(
                 optimizer,
                 scheduler,
                 ema,
-                grad_scaler,
                 config,
                 step=step,
                 training_contract=training_contract,
@@ -347,7 +322,6 @@ def run_training(
             optimizer,
             scheduler,
             ema,
-            grad_scaler,
             config,
             step=step,
             training_contract=training_contract,
