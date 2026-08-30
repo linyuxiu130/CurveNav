@@ -45,13 +45,14 @@ from curvenav.models.safety import SAFETY_CLEARANCE_M, SAFETY_OBJECTIVE_TYPE
 
 
 CHECKPOINT_TYPE = "curvenav_metric_curve_mean_flow_policy"
+TRAINING_PRECISION = "bf16_condition_fp32_meanflow_jvp"
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
 
 def build_training_contract(
     config: CurveNavConfig,
     world_size: int,
-) -> dict[str, int]:
+) -> dict[str, int | str]:
     """Resolve the exact optimizer-step topology represented by a checkpoint."""
     if world_size not in PRODUCTION_WORLD_SIZES:
         raise ValueError(
@@ -66,6 +67,7 @@ def build_training_contract(
     )
     steps_per_epoch = config.training.samples_per_epoch // global_batch_size
     return {
+        "mixed_precision": TRAINING_PRECISION,
         "world_size": world_size,
         "minimum_per_rank_batch_size": min(layout.rank_batch_sizes),
         "maximum_per_rank_batch_size": max(layout.rank_batch_sizes),
@@ -251,7 +253,7 @@ def build_training_checkpoint(
     config: CurveNavConfig,
     step: int,
     *,
-    training_contract: Mapping[str, int],
+    training_contract: Mapping[str, int | str],
     rng_states: Mapping[str, Tensor],
 ) -> dict[str, Any]:
     """Build the complete state required to resume BF16 optimizer updates."""
@@ -358,10 +360,20 @@ def restore_training_state(
 ) -> int:
     """Restore the complete state needed to continue optimizer updates."""
     validate_policy_contract(checkpoint, config)
-    required = {"step", "model", "optimizer", "scheduler", "ema"}
-    missing = sorted(required.difference(checkpoint))
-    if missing:
-        raise ValueError(f"training checkpoint is missing state: {missing}")
+    expected_keys = {
+        "checkpoint_type",
+        "step",
+        "model",
+        "optimizer",
+        "scheduler",
+        "ema",
+        "config",
+        "policy_contract",
+        "training_contract",
+        "rng_states",
+    }
+    if set(checkpoint) != expected_keys:
+        raise ValueError("training checkpoint does not match the unique BF16 state")
     model.load_state_dict(checkpoint["model"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])

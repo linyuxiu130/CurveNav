@@ -20,7 +20,7 @@ from curvenav.training.ema import ExponentialMovingAverage
 
 def _distributed_state(
     config: CurveNavConfig,
-) -> tuple[dict[str, int], dict[str, torch.Tensor]]:
+) -> tuple[dict[str, int | str], dict[str, torch.Tensor]]:
     training_contract = build_training_contract(config, world_size=2)
     cpu_state = torch.get_rng_state()
     rng_states = {
@@ -51,9 +51,21 @@ def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
         checkpoint["checkpoint_type"]
         == "curvenav_metric_curve_mean_flow_policy"
     )
-    assert {"model", "optimizer", "scheduler", "ema"} <= set(checkpoint)
-    assert "grad_scaler" not in checkpoint
-    assert "extra" not in checkpoint
+    assert set(checkpoint) == {
+        "checkpoint_type",
+        "step",
+        "model",
+        "optimizer",
+        "scheduler",
+        "ema",
+        "config",
+        "policy_contract",
+        "training_contract",
+        "rng_states",
+    }
+    assert checkpoint["training_contract"]["mixed_precision"] == (
+        "bf16_condition_fp32_meanflow_jvp"
+    )
     assert (
         contract["trajectory_decoder_type"]
         == "path_relative_configuration_refined_curve_mean_flow_transformer"
@@ -288,6 +300,7 @@ def test_training_contract_preserves_global_optimization_across_one_to_eight_gpu
             <= contract["maximum_per_rank_batch_size"] * world_size
         )
         assert contract["per_device_batch_size"] == 256
+        assert contract["mixed_precision"] == "bf16_condition_fp32_meanflow_jvp"
         assert contract["global_batch_size"] == 1024
         assert contract["steps_per_epoch"] == 40
         assert contract["total_steps"] == 8000

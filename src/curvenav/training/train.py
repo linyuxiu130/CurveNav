@@ -41,7 +41,7 @@ def _save_checkpoint(
     ema: ExponentialMovingAverage,
     config: CurveNavConfig,
     step: int,
-    training_contract: dict[str, int],
+    training_contract: dict[str, int | str],
 ) -> None:
     accelerator.wait_for_everyone()
     cpu_rng_states = accelerator.gather(
