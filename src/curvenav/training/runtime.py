@@ -9,6 +9,9 @@ def configure_cuda_training_backend() -> None:
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    # CurveNav compiles only internal static functions.  DDPOptimizer is for
+    # compiling an enclosing DDP model and cannot split a torch.func JVP graph.
+    torch._dynamo.config.optimize_ddp = False
     # All training shapes are fixed.  With the NCHW activation route, limiting
     # cuDNN's search to ten plans improves the complete ResNet step without the
     # transient workspace exhaustion seen on the discarded NHWC route.
