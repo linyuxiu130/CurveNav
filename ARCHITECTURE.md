@@ -211,7 +211,7 @@ L=L_MF+L_safe
 
 训练数据只来自 CurveNav 按 benchmark Dingo 配置生成的 HSSD 专家路线，不读取 SanD/NavDP 数据。当前 canonical dataset 为训练 `25,928`、验证 `6,087` 条；深度 bank 在编译时硬链接，不重复复制图像。
 
-训练固定 global batch `1024`、每卡 micro-batch 上限 `256`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。视觉、条件编码、瞬时边界主值和部署区间平均速度统一使用 BF16 Tensor Core 路径；只有已经 stop-gradient、不会参与反向图的精确 forward-mode JVP 使用 FP32 与数学 SDPA，因为十二层 Jacobian 连乘的动态范围不能可靠地放进 16 bit。JVP 的 primal 返回值被丢弃，可训练的平均速度另做一次 BF16 前向；这与 Improved MeanFlow 中 `Vθ=uθ+t·stopgrad(D_tuθ)` 完全等价，同时避免让数学 SDPA 的 JVP 激活驻留在梯度图中。训练和在线推理均使用 BF16，不存在 FP16/FP32 主值分支。EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。完整 MeanFlow/JVP 保持 eager；训练运行时只用 `torch.compile(fullgraph=True, mode="reduce-overhead")` 融合无参数、静态形状的度量几何投影器，因此 checkpoint 和推理数学图不变，也没有第二训练实现。每次反向只接受有限的 loss 和全局梯度范数，否则直接终止；不存在跳过 batch、降低 scale 或重抽 Flow source 的第二更新路径。
+训练固定 global batch `1024`、每卡 micro-batch 上限 `384`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。`384` 不是估算值：24 GiB RTX 4090 上完整 `342` 样本前后向实测峰值约 `18.25 GiB`，因此三卡的 `342/341/341` 和四卡的 `256×4` 都只需一个 micro-batch。视觉、条件编码、瞬时边界主值和部署区间平均速度统一使用 BF16 Tensor Core 路径；只有已经 stop-gradient、不会参与反向图的精确 forward-mode JVP 使用 FP32 与数学 SDPA，因为十二层 Jacobian 连乘的动态范围不能可靠地放进 16 bit。JVP 的 primal 返回值被丢弃，可训练的平均速度另做一次 BF16 前向；这与 Improved MeanFlow 中 `Vθ=uθ+t·stopgrad(D_tuθ)` 完全等价，同时避免让数学 SDPA 的 JVP 激活驻留在梯度图中。训练和在线推理均使用 BF16，不存在 FP16/FP32 主值分支。EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。完整 MeanFlow/JVP 保持 eager；训练运行时只用 `torch.compile(fullgraph=True, mode="reduce-overhead")` 融合无参数、静态形状的度量几何投影器，因此 checkpoint 和推理数学图不变，也没有第二训练实现。每次反向只接受有限的 loss 和全局梯度范数，否则直接终止；不存在跳过 batch、降低 scale 或重抽 Flow source 的第二更新路径。
 
 当前必要验证：
 
@@ -220,7 +220,7 @@ L=L_MF+L_safe
 - 生产 39,804,232 参数图的 BF16 可训练主值、FP32 detached JVP 与反向检查；
 - 离线轨迹精度不按模型输出索引直接对齐，而是把所有模型和专家统一按绝对弧长重采样到前 `min(2 m, 专家局部长度)`；预测不足该距离时保持其终点继续计算误差，同时单列 horizon coverage，避免短轨迹靠少走获得低 ADE。安全评测独立以不大于 `0.025 m` 的间距覆盖前 `3.6 m` 局部轨迹，再查询与模型完全相同的四帧融合配置空间场；报告相对专家新增的 collision/margin violation，不把感知场自身对专家的误报归给模型；
 - 6,087 条验证专家的四帧配置空间审计：当前帧单独识别专家 footprint collision `0` 条、裕度违例 `89` 条、直线裕度违例 `787` 条；四帧静态融合后分别为 `9`、`143`、`1,325` 条。9 条碰撞均可由具体单独历史帧复现，位姿为正常的约 `0.45/0.89/1.33 m` 后向平移，不是跨帧符号或偶然 observed 拼接错误；
-- 被本节精度图替代的全 FP32 MeanFlow 主值在三张 RTX 4090 上按 `342/341/341` 分片、每 rank 两个 micro-batch 时约为 `0.72--0.96k samples/s`；分段剖析显示条件编码约 `26 ms`，而 JVP 约 `475 ms`，证明瓶颈在错误驻留于反向图的 JVP 主值，不在数据或四帧几何。新图必须重新实测 3/4 卡峰值、显存和端到端吞吐后才写入当前成绩。
+- 被本节精度图替代的全 FP32 MeanFlow 主值在三张 RTX 4090 上按 `342/341/341` 分片、每 rank 两个 micro-batch 时约为 `0.72--0.96k samples/s`；分段剖析显示条件编码约 `26 ms`，而 JVP 约 `475 ms`，证明瓶颈在错误驻留于反向图的 JVP 主值，不在数据或四帧几何。新图单卡完整更新实测：batch `256` 峰值约 `13.85 GiB`、稳态约 `328--376 samples/s`；batch `342` 峰值约 `18.25 GiB`、稳态约 `408--442 samples/s`。这是单卡生产图结果；最终 3/4 卡端到端 DDP 吞吐仍以正式训练日志为准。
 - 旧 decoder 的 V100S/4090 训练吞吐和推理延迟不适用于当前精确路径场查询图，已从当前结论删除。当前图的空闲态 4090 batch-1 延迟必须在本轮训练结束后重新实测，不用占卡争用数据代替；
 - 新模型最终 200 epoch 墙钟时间和离线指标必须由本次训练实测，不沿用旧 checkpoint。
 
