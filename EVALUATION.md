@@ -81,7 +81,7 @@ scripts/compare_offline.sh configs/base.yaml COMMON.npz HSSD_SOURCE REPORT.json 
 
 报告除全样本与物理分层外，还逐 held-out scene 输出同一指标，并给 scene-macro 与 worst-scene；样本数更多的场景不能淹没小场景上的完全失败。
 
-CurveNav 用 8 维无界 Flow state 表示标准化 `log` 正弧长和 7 个 cubic B-spline 局部航向增量；单位切向积分保证轨迹正则、初始前向且曲率连续。训练为每个优化器 batch 显式采样一次随机高斯源并做闭区间时间 collocation，同时监督瞬时边界与数据锚定 improved MeanFlow；FP16 overflow 重试复用同一源。部署从固定高斯典型 latent 只做一次平均速度输运。四帧配准的坡度感知配置空间场完整编码为 `8×8` 度量安全 token，并在生成前融合进条件记忆；不再只沿更新前的 Flow 源路径读取不足 1% 的场。历史位姿既用于障碍配准，也以三个因果 SE(2) token 提供近期运动；训练和部署使用同一变换定义，不读取未来专家状态。不存在 ODE solver、随机候选、learned critic、在线碰撞修补或 fallback。
+CurveNav 用 8 维无界 Flow state 表示标准化 `softplus` 弧长预激活和 7 个 cubic B-spline 局部航向增量；单位切向积分保证轨迹正则、初始前向且曲率连续。训练为每个优化器 batch 显式采样一次随机高斯源并做闭区间时间 collocation，同时监督瞬时边界与数据锚定 improved MeanFlow；FP16 overflow 重试复用同一源。部署从固定高斯典型 latent 只做一次平均速度输运。四帧配准的坡度感知配置空间场完整编码为 `8×8` 度量安全 token，并在生成前融合进条件记忆；不再只沿更新前的 Flow 源路径读取不足 1% 的场。历史位姿既用于障碍配准，也以三个因果 SE(2) token 提供近期运动；训练和部署使用同一变换定义，不读取未来专家状态。不存在 ODE solver、随机候选、learned critic、在线碰撞修补或 fallback。
 
 模型内部 64 点路径的第 0 点是当前机器人原点。官方 evaluator 会统一在 policy 返回值前追加当前原点，因此 CurveNav 的部署边界只发送内部路径的 `1:64` 共 63 个未来点；MPC 最终仍接收 64 点路径，且只有一个原点。NavDP/X-NavDP 的累积位移输出本来就不含当前点。若 CurveNav 发送内部第 0 点，evaluator 会制造两个连续原点，使 MPC 的起始离散曲率退化。
 
@@ -94,6 +94,8 @@ general-navigation-benchmark/baselines/x-navdp/eval
 ```
 
 ## 当前终态离线结果（2026-08-30）
+
+本节 checkpoint 是闭环结构重构前的 8,000-step EMA 基线。它用于定位旧生成器的信息瓶颈，不是正在训练的路径相对配置空间模型成绩；新模型只有完成训练、离线门禁和固定 10 回合闭环后才能替换本节结论。
 
 最终 EMA checkpoint 为 step 8,000。完整自然分布验证集含 6,087 条 held-out HSSD 样本：固定 `2 m` ADE mean/P90 为 `0.05776/0.15277 m`，FDE mean/P90 为 `0.16284/0.42437 m`，覆盖率 `97.94%`，footprint collision `1.544%`，`0.10 m` 裕度违例 `4.436%`，负目标进度 `2.399%`。直接前向层的 ADE/collision 为 `0.03539 m/0.282%`；前向绕障层为 `0.12266 m/4.919%`；后向目标层为 `0.16808 m/10.00%`。只保留当前深度帧会把 ADE 从 `0.05776 m` 提高到 `0.06995 m`，碰撞从 `1.544%` 提高到 `2.776%`，说明四帧历史在同一模型上的净增益成立。空闲 4090 上纯模型 batch-1 FP16 延迟 P50/P95 为 `50.21/50.58 ms`，批量 32 的观测吞吐为 `596.59 obs/s`。
 
@@ -114,6 +116,48 @@ full CurveNav:    /DataDisk2/hsb/curvenav-f19ba8a/outputs/offline-evaluation-800
 cross-model:      /DataDisk2/hsb/offline-cross-model/results/full-20260830-metric-12612de/comparison.json
 common dataset:   /DataDisk2/hsb/offline-cross-model/data/offline-common-hssd-64-metric-12612de.npz
 safety source:    /DataDisk2/hsb/offline-cross-model/source-metric-12612de
+```
+
+## 单场景闭环诊断（2026-08-30）
+
+场景固定为 `home/MVUCSQAKTKJ5EAABAAAAABA8_usd`，episode `0--99`、seed `1234`、官方 Dingo、相机、异步 MPC、timeout 和 SPL 公式完全相同。当前这一轮使用 `num_envs=10` 加速收集配对轨迹，因此只称为单场景吞吐诊断，不冒充论文 20/40 场景均值或 `num_envs=1` 固定协议成绩。
+
+| 模型 | 完成回合 | SR | mean SPL | 结果状态 |
+|---|---:|---:|---:|---|
+| CurveNav（结构重构前 checkpoint） | 100 | 32.00% | 0.297861 | 完整 |
+| NavDP | 100 | 59.00% | 0.568184 | 完整 |
+
+同一 episode 配对为：两者都成功 `27`，仅 CurveNav 成功 `5`，仅 NavDP 成功 `32`，两者都失败 `36`。因此至少 32 个 CurveNav 失败回合能由相同仿真、起终点和控制器下的 NavDP 完成，不能归因于场景普遍不可达或评测整体失效。
+
+CurveNav 成功/失败轨迹的核心差异如下。可行驶距离使用本场景官方 `navigable.ply` 点集；每条预测先按机器人世界位姿转换，再查询最近可行驶机器人中心，`>0.15 m` 仅作为诊断阈值，不替代官方 success 或碰撞定义。
+
+| 量 | 成功 32 | 失败 68 |
+|---|---:|---:|
+| 初始目标距离均值 | 6.016 m | 5.855 m |
+| 最终目标距离均值 | 0.283 m | 4.575 m |
+| 目标进展比例 | 94.96% | 21.45% |
+| 目标距离回退 | 0.037 m | 0.874 m |
+| 实际平均速度 | 0.315 m/s | 0.041 m/s |
+| 有效命令期间停止比例 | 3.84% | 90.64% |
+| 实际速度/线速度命令 | 91.97% | 10.29% |
+| 平均局部规划弧长 | 2.105 m | 2.885 m |
+| 路径曲折度 | 1.121 | 1.947 |
+| 规划点离可行驶集合 `>0.15 m` | 2.66% | 49.15% |
+| 含任一上述点的规划比例 | 13.49% | 97.69% |
+| 实际机器人采样点离集合 `>0.15 m` | 0.66% | 16.10% |
+| 局部起始切向与 PointGoal 余弦 | 0.914 | 0.232 |
+| 局部终点与 PointGoal 余弦 | 0.962 | 0.487 |
+
+这些数字支持一条闭环因果链，而不是几个独立补丁需求：旧模型先生成与障碍几何不一致的路径；MPC 仍发出约 `0.41 m/s` 的正向命令，但实体被障碍/不可行驶边界阻滞；机器人没有按计划移动后，PointGoal 转到侧后方，后续局部规划的目标一致性和单调进展继续恶化。失败回合的局部规划更长且曲率更低，排除了“3.6 m 不够长”或“曲率限制太严格”作为主因；成功与失败的初始目标距离也近似相同，排除了单纯任务长度差异。
+
+逐层反证后的结构根因是旧生成器中的**路径位置—配置空间信息失配**。旧条件编码器先让 64 个度量配置空间 cell 被通用 goal/vision/motion token 查询并相加，随后丢弃作为独立 memory 的 cell；decoder 的 path token 又建立在当前 Flow state 解码的曲线上。部署从独立高斯源开始时，这条曲线不是待输出路径，因此生成器没有在“自己真正准备执行的位置”读取 clearance、梯度、可见性和禁行占据。训练期末端安全损失能降低平均风险，但不能恢复推理图中缺失的空间对应关系。
+
+当前唯一重构直接修正该信息流：64 个配置空间 token 保持为一等条件 memory；第一阶段从完整条件估计数据端曲线，后两阶段沿该估计曲线的 16 个锚点连续查询原始配置空间场并细化同一 Flow velocity；三个阶段共用 readout，且都满足相同 Improved MeanFlow 恒等式监督。它不投影、裁剪或拒绝输出，也不增加候选评价头，因此是生成器内部的空间条件化修正，不是在线避碰补丁。其有效性仍须由新 checkpoint 的离线安全门禁与 10 回合闭环证明。
+
+```text
+CurveNav metric: /DataDisk2/hsb/eval-server-audit/runs/four-model-resident-b100-control-r2/pointgoal-v2/resident/20260830_002958/models/curvenav/00-curvenav-98d1e8d4d592/scenes/home/MVUCSQAKTKJ5EAABAAAAABA8_usd/metric.csv
+NavDP metric:    /DataDisk2/hsb/eval-server-audit/runs/four-model-resident-b100-control-r2/pointgoal-v2/resident/20260830_002958/models/navdp/01-navdp-cc0246524765/scenes/home/MVUCSQAKTKJ5EAABAAAAABA8_usd/metric.csv
+paired traces:   /DataDisk2/hsb/eval-server-audit/runs/four-model-resident-b100-control-r2/pointgoal-v2/resident/20260830_002958/trajectory_episodes.csv
 ```
 
 ## 历史基线与当前在线状态

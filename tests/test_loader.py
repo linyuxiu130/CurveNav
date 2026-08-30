@@ -46,15 +46,6 @@ def _write_dataset(root, count: int = 4) -> None:
         "num_curve_values": 8,
         "num_path_points": 64,
         "curve_value_semantics": "metric_arc_length_then_seven_cubic_heading_control_increments_rad",
-        "flow_coordinate_transform": "standardized_log_length_and_heading_increments",
-        "log_length_mean": TrajectoryConfig().log_length_mean,
-        "log_length_std": TrajectoryConfig().log_length_std,
-        "heading_increment_mean_rad": list(
-            TrajectoryConfig().heading_increment_mean_rad
-        ),
-        "heading_increment_std_rad": list(
-            TrajectoryConfig().heading_increment_std_rad
-        ),
         "expert_projection": "equal_arc_heading_field_least_squares",
         "maximum_expert_projection_ade_m": 0.03,
     }

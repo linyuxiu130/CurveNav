@@ -24,7 +24,7 @@ observation_to_current float [B,4,4]   # x,y,sin Δyaw,cos Δyaw
 observation_valid      bool  [B,4]
 
 expert curve values    float [B,8]     # L, Δθ1,...,Δθ7
-mean-flow coordinates  float [B,8]     # standardized log L and Δθ
+mean-flow coordinates  float [B,8]     # standardized softplus pre-activation and Δθ
 prediction path        float [B,64,2]
 ```
 
@@ -84,14 +84,15 @@ p(u)=L∫₀ᵘ[cos θ(v), sin θ(v)]dv
 
 所以任意有限网络输出都满足 `||dp/ds||=1`、起点为原点、初始方向向前；`θ∈C²`，因此 `p∈C³`、曲率连续。64 点之间用四倍过采样和线性航向圆弧弦公式积分。没有最大规划长度、`L≤2d_goal`、最大曲率、`tanh` 或 clip。
 
-Flow 的无界欧氏坐标为：
+令 `a=softplus⁻¹(L)=L+log(-expm1(-L))`。Flow 的无界欧氏坐标为：
 
 ```text
-zL=(log L-μL)/σL
+zL=(a-μL)/σL
 zi=(Δθi-μi)/σi
+L=softplus(μL+σL zL)
 ```
 
-`log L` 保证长度严格为正；差分是从航向控制到局部转向的满秩线性双射，不改变 B-spline 曲线族。专家等弧长重采样后先拟合累计航向，再取控制差分。训练集统计写入唯一配置与数据 manifest。
+`softplus` 是从实数到正数的光滑严格单调双射，保证长度严格为正；它在大正输入处线性增长且导数始终小于 1，因此训练会遇到的大幅有限 Flow 中间状态不会再像指数坐标一样上溢。逆式使用 `expm1` 在短轨迹处保持数值精度。这不是长度裁剪：`L` 仍无上界，且该变换在整个数学定义域可逆。差分是从航向控制到局部转向的满秩线性双射，不改变 B-spline 曲线族。专家等弧长重采样后先拟合累计航向，再取控制差分。训练数据只保存米制弧长与弧度增量；坐标统计属于模型合同，只写入配置和 checkpoint，不污染物理数据合同。
 
 ## 4. 标定视觉与配置空间场
 
@@ -137,7 +138,7 @@ clearance/3.6, gradient_x, gradient_y, observed, forbidden
 
 第八层再用同一个 readout 得到 `u²`，重建 `P_hat²` 并重复一次精确场查询；最后四层输出 `u³`。因此后续层修正的依据始终是当前网络实际准备生成的曲线，而不是独立 Gaussian `z_t` 解码出的随机曲线。三个阶段只是一个可微函数 `uθ` 内部的深度计算，MeanFlow 的 NFE 仍严格为 1；JVP 会穿过曲线解码和连续场查询，不存在训练/推理之外的投影、优化器或评价链。
 
-中间轨迹不能是仅用来选择下一次几何查询位置的自由 latent：否则它经 `exp(log L)` 和场查询进入 JVP 后会形成无监督的高增益反馈。因此 `u¹,u²,u³` 都使用下节同一 Improved MeanFlow 恒等式监督，损失在三个阶段和八个欧氏坐标上直接取均值，没有人工阶段权重。概率路径的 JVP 切向仍唯一使用最终瞬时速度 `u³(z_t,t,t)`；推理只取最终平均速度 `u³(e,0,1)`。这是同一 readout 的深层监督，不是候选轨迹、评价头或第二推理链。
+中间轨迹不能是仅用来选择下一次几何查询位置的自由 latent：否则它会经曲线解码和场查询进入 JVP，形成无监督的高增益反馈。因此 `u¹,u²,u³` 都使用下节同一 Improved MeanFlow 恒等式监督，损失在三个阶段和八个欧氏坐标上直接取均值，没有人工阶段权重。概率路径的 JVP 切向仍唯一使用最终瞬时速度 `u³(z_t,t,t)`；推理只取最终平均速度 `u³(e,0,1)`。这是同一 readout 的深层监督，不是候选轨迹、评价头或第二推理链。
 
 ## 6. Boundary-complete improved MeanFlow
 
@@ -199,7 +200,7 @@ L=L_MF+L_safe
 
 | 来源 | 吸收 | CurveNav 的改进/取舍 |
 |---|---|---|
-| [SanD](https://arxiv.org/abs/2602.00923) | ResNet 视觉、小样本轨迹先验、cubic spline、配置空间净空 | 保留解析平滑曲线，但改用严格正弧长和差分航向；完整配置空间在生成前进入唯一生成器，不复制候选 evaluator。 |
+| [SanD](https://arxiv.org/abs/2602.00923) | ResNet 视觉、小样本轨迹先验、cubic spline、配置空间净空 | 保留解析平滑曲线，但改用 softplus 正弧长和差分航向；完整配置空间在生成前进入唯一生成器，不复制候选 evaluator。 |
 | [NavDP](https://arxiv.org/abs/2505.08712) | 轨迹 token 与视觉 memory 的深层交互、历史条件 | 保留深交互；以标定连续配置空间场替代要求 latent token 隐式恢复的碰撞几何。 |
 | [X-NavDP](https://arxiv.org/abs/2607.28560) | 后训练用于恢复和分布外行为 | 当前先验证单生成器；不以 critic/RL 掩盖生成器的监督与几何错误。 |
 | [Flow Matching](https://arxiv.org/abs/2210.02747) | 合法随机高斯源和条件概率路径 | 禁止零源/固定源训练；确定性只在推理时选择典型 latent。 |

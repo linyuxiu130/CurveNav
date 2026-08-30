@@ -127,7 +127,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             "fixed_future_expert_projected_into_regular_heading_field"
         ),
         "expert_curve_projection": "equal_arc_heading_field_least_squares",
-        "arc_length_policy": "positive_exponential_of_standardized_log_length",
+        "arc_length_policy": "positive_softplus_of_standardized_pre_activation",
         "trajectory_endpoint_policy": "single_evaluation_conditional_average_flow_curve",
         "curve_boundary_conditions": (
             "origin_and_robot_longitudinal_initial_heading"
@@ -233,12 +233,12 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "curve_value_semantics": (
             "metric_arc_length_then_seven_cubic_heading_control_increments_rad"
         ),
-        "log_length_mean": trajectory.log_length_mean,
-        "log_length_std": trajectory.log_length_std,
+        "length_pre_activation_mean": trajectory.length_pre_activation_mean,
+        "length_pre_activation_std": trajectory.length_pre_activation_std,
         "heading_increment_mean_rad": list(trajectory.heading_increment_mean_rad),
         "heading_increment_std_rad": list(trajectory.heading_increment_std_rad),
         "flow_coordinate_transform": (
-            "standardized_log_length_and_heading_increments"
+            "standardized_softplus_length_pre_activation_and_heading_increments"
         ),
     }
 

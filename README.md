@@ -1,6 +1,6 @@
 # CurveNav
 
-CurveNav 是 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal。当前帧经 SanD 风格 ResNet 形成 96 个视觉 token；四帧标定深度统一反投影、坡度分类并配准成连续机器人配置空间场，三个因果 SE(2) token 描述近期运动。生成器在标准化正弧长与七个局部航向增量中学习 boundary-complete improved MeanFlow：随机高斯用于训练，固定典型 latent 用于确定性 1-NFE 推理。一次求值内先估计数据端粗轨迹，再用 16 个路径锚点连续查询 signed clearance、梯度、可见性与禁行占据，经两次内部细化输出唯一轨迹。三个共享-readout 阶段均满足同一 Improved MeanFlow 监督，避免无监督中间曲线在 JVP 中形成高增益反馈；推理仍只读取最终阶段。弧长不与 PointGoal 距离硬绑定，目标距离不截断，航向不经过 clip 或 `tanh`。不存在 ODE solver、候选集、评价头或推理修补。
+CurveNav 是 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal。当前帧经 SanD 风格 ResNet 形成 96 个视觉 token；四帧标定深度统一反投影、坡度分类并配准成连续机器人配置空间场，三个因果 SE(2) token 描述近期运动。生成器在标准化 softplus 弧长预激活与七个局部航向增量中学习 boundary-complete improved MeanFlow：随机高斯用于训练，固定典型 latent 用于确定性 1-NFE 推理。一次求值内先估计数据端粗轨迹，再用 16 个路径锚点连续查询 signed clearance、梯度、可见性与禁行占据，经两次内部细化输出唯一轨迹。三个共享-readout 阶段均满足同一 Improved MeanFlow 监督，避免无监督中间曲线在 JVP 中形成高增益反馈；推理仍只读取最终阶段。弧长严格为正且无上界，不与 PointGoal 距离硬绑定；目标距离不截断，航向不经过 clip 或 `tanh`。不存在 ODE solver、候选集、评价头或推理修补。
 
 当前目标只有一个：先在现有深度合同下验证 PointGoal 局部规划，再在完全相同的 episode、相机、异步 MPC 和指标口径下对比 NavDP 与 X-NavDP。局部基线成立前不专项扩展长距离或脱困能力。
 

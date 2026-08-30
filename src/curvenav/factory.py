@@ -67,8 +67,8 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         num_heading_control_points=trajectory.num_heading_control_points,
         degree=trajectory.spline_degree,
         num_path_points=trajectory.num_path_points,
-        log_length_mean=trajectory.log_length_mean,
-        log_length_std=trajectory.log_length_std,
+        length_pre_activation_mean=trajectory.length_pre_activation_mean,
+        length_pre_activation_std=trajectory.length_pre_activation_std,
         heading_increment_mean_rad=trajectory.heading_increment_mean_rad,
         heading_increment_std_rad=trajectory.heading_increment_std_rad,
     )

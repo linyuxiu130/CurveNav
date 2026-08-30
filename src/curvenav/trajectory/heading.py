@@ -2,12 +2,13 @@
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from .basis import bspline_basis_and_first_derivative
 
 
 HEADING_PARAMETERIZATION_TYPE = (
-    "positive_log_arc_length_and_cubic_heading_increment_coordinates"
+    "positive_softplus_arc_length_and_cubic_heading_increment_coordinates"
 )
 HEADING_CONTROL_POINTS = 8
 HEADING_SPLINE_DEGREE = 3
@@ -30,8 +31,8 @@ class MetricHeadingTrajectory(nn.Module):
         num_heading_control_points: int,
         degree: int,
         num_path_points: int,
-        log_length_mean: float,
-        log_length_std: float,
+        length_pre_activation_mean: float,
+        length_pre_activation_std: float,
         heading_increment_mean_rad: tuple[float, ...],
         heading_increment_std_rad: tuple[float, ...],
     ) -> None:
@@ -42,8 +43,10 @@ class MetricHeadingTrajectory(nn.Module):
             raise ValueError("CurveNav uses one clamped cubic heading spline")
         if num_path_points < num_heading_control_points:
             raise ValueError("num_path_points must cover the heading controls")
-        if log_length_std <= 0:
-            raise ValueError("log-length standard deviation must be positive")
+        if length_pre_activation_std <= 0:
+            raise ValueError(
+                "length pre-activation standard deviation must be positive"
+            )
         if len(heading_increment_mean_rad) != HEADING_CONTROL_POINTS - 1:
             raise ValueError("heading-increment mean must contain seven values")
         if (
@@ -56,8 +59,8 @@ class MetricHeadingTrajectory(nn.Module):
         self.degree = degree
         self.num_path_points = num_path_points
         self.num_curve_tokens = LEARNED_CURVE_VALUES
-        self.log_length_mean = float(log_length_mean)
-        self.log_length_std = float(log_length_std)
+        self.length_pre_activation_mean = float(length_pre_activation_mean)
+        self.length_pre_activation_std = float(length_pre_activation_std)
 
         dense_points = (
             (num_path_points - 1) * CURVE_INTEGRATION_OVERSAMPLE_FACTOR + 1
@@ -93,8 +96,9 @@ class MetricHeadingTrajectory(nn.Module):
         if coordinates.ndim != 2 or coordinates.shape[1] != self.num_curve_tokens:
             raise ValueError("coordinates do not match the heading-curve codec")
         coordinates = coordinates.float()
-        length = torch.exp(
-            self.log_length_mean + self.log_length_std * coordinates[:, :1]
+        length = F.softplus(
+            self.length_pre_activation_mean
+            + self.length_pre_activation_std * coordinates[:, :1]
         )
         heading_increments = (
             self.heading_increment_mean_rad
@@ -109,8 +113,12 @@ class MetricHeadingTrajectory(nn.Module):
         values = values.float()
         return torch.cat(
             (
-                (values[:, :1].log() - self.log_length_mean)
-                / self.log_length_std,
+                (
+                    values[:, :1]
+                    + torch.log(-torch.expm1(-values[:, :1]))
+                    - self.length_pre_activation_mean
+                )
+                / self.length_pre_activation_std,
                 (values[:, 1:] - self.heading_increment_mean_rad)
                 / self.heading_increment_std_rad,
             ),

@@ -168,17 +168,17 @@ def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
     assert contract["num_heading_control_points"] == 8
     assert contract["path_sampling"] == "fixed_uniform_arc_progress"
     assert contract["curve_coordinates"] == (
-        "positive_log_arc_length_and_cubic_heading_increment_coordinates"
+        "positive_softplus_arc_length_and_cubic_heading_increment_coordinates"
     )
     assert contract["visual_planning_scale_m"] == pytest.approx(3.6)
     assert contract["curve_value_semantics"] == (
         "metric_arc_length_then_seven_cubic_heading_control_increments_rad"
     )
     assert contract["flow_coordinate_transform"] == (
-        "standardized_log_length_and_heading_increments"
+        "standardized_softplus_length_pre_activation_and_heading_increments"
     )
-    assert contract["log_length_mean"] == pytest.approx(0.94119977)
-    assert contract["log_length_std"] == pytest.approx(0.65789850)
+    assert contract["length_pre_activation_mean"] == pytest.approx(2.78108525)
+    assert contract["length_pre_activation_std"] == pytest.approx(1.32780565)
     assert len(contract["heading_increment_mean_rad"]) == 7
     assert len(contract["heading_increment_std_rad"]) == 7
     assert contract["inference_source_seed"] == 20_260_828

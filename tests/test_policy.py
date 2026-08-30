@@ -192,6 +192,32 @@ def test_eight_control_point_heading_contract_is_unique() -> None:
         raise AssertionError("an alternate curve token shape must be rejected")
 
 
+def test_softplus_length_coordinates_are_positive_finite_and_invertible() -> None:
+    codec = build_policy(tiny_config()).curve_codec
+    coordinates = torch.zeros(4, codec.num_curve_tokens)
+    coordinates[:, 0] = torch.tensor([-50.0, -1.0, 1.0, 10_000.0])
+
+    values = codec.values_from_coordinates(coordinates)
+    path, _ = codec.decode(coordinates)
+
+    assert torch.all(values[:, 0] > 0)
+    assert torch.isfinite(values).all()
+    assert torch.isfinite(path).all()
+    torch.testing.assert_close(
+        codec.coordinates_from_values(values),
+        coordinates,
+        rtol=2e-5,
+        atol=2e-5,
+    )
+
+    physical_values = torch.zeros(3, codec.num_curve_tokens)
+    physical_values[:, 0] = torch.tensor([0.1315874, 2.938137, 3.599717])
+    round_trip = codec.values_from_coordinates(
+        codec.coordinates_from_values(physical_values)
+    )
+    torch.testing.assert_close(round_trip, physical_values, rtol=1e-6, atol=1e-6)
+
+
 def test_typical_source_and_one_step_mean_flow_are_deterministic() -> None:
     policy = build_policy(tiny_config())
     curve_tokens = policy.curve_codec.num_curve_tokens

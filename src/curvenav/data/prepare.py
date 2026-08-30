@@ -316,8 +316,10 @@ def _compile_split(
         num_heading_control_points=config.trajectory.num_heading_control_points,
         degree=config.trajectory.spline_degree,
         num_path_points=config.trajectory.num_path_points,
-        log_length_mean=config.trajectory.log_length_mean,
-        log_length_std=config.trajectory.log_length_std,
+        length_pre_activation_mean=(
+            config.trajectory.length_pre_activation_mean
+        ),
+        length_pre_activation_std=config.trajectory.length_pre_activation_std,
         heading_increment_mean_rad=config.trajectory.heading_increment_mean_rad,
         heading_increment_std_rad=config.trajectory.heading_increment_std_rad,
     )
@@ -424,8 +426,18 @@ def _compile_split(
         },
         "production_curve_projection_rejected": rejected_projection_count,
         "production_curve_coordinate_statistics": {
-            "log_length_mean": float(np.log(curve_values[:, 0]).mean()),
-            "log_length_std": float(np.log(curve_values[:, 0]).std(ddof=1)),
+            "length_pre_activation_mean": float(
+                (
+                    curve_values[:, 0]
+                    + np.log(-np.expm1(-curve_values[:, 0]))
+                ).mean()
+            ),
+            "length_pre_activation_std": float(
+                (
+                    curve_values[:, 0]
+                    + np.log(-np.expm1(-curve_values[:, 0]))
+                ).std(ddof=1)
+            ),
             "heading_increment_mean_rad": curve_values[:, 1:].mean(0).tolist(),
             "heading_increment_std_rad": curve_values[:, 1:].std(0, ddof=1).tolist(),
             "standardized_coordinate_rms": float(np.sqrt(np.mean(flow_coordinates**2))),

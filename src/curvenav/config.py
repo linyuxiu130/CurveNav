@@ -61,8 +61,8 @@ class TrajectoryConfig:
     num_heading_control_points: int = 8
     spline_degree: int = 3
     num_path_points: int = 64
-    log_length_mean: float = 0.9411997728025253
-    log_length_std: float = 0.6578984994694861
+    length_pre_activation_mean: float = 2.7810852451799377
+    length_pre_activation_std: float = 1.3278056485734497
     heading_increment_mean_rad: tuple[float, ...] = (
         0.0027091927181629527,
         0.005207439937511474,
@@ -89,10 +89,13 @@ class TrajectoryConfig:
             raise ValueError("CurveNav uses one clamped cubic heading spline")
         if self.num_path_points < self.num_heading_control_points:
             raise ValueError("num_path_points must cover the heading controls")
-        if not math.isfinite(self.log_length_mean):
-            raise ValueError("log-length mean must be finite")
-        if not math.isfinite(self.log_length_std) or self.log_length_std <= 0:
-            raise ValueError("log-length standard deviation must be positive")
+        if not math.isfinite(self.length_pre_activation_mean):
+            raise ValueError("length pre-activation mean must be finite")
+        if (
+            not math.isfinite(self.length_pre_activation_std)
+            or self.length_pre_activation_std <= 0
+        ):
+            raise ValueError("length pre-activation standard deviation must be positive")
         if len(self.heading_increment_mean_rad) != 7 or not all(
             math.isfinite(value) for value in self.heading_increment_mean_rad
         ):

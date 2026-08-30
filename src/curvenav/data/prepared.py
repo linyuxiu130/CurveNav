@@ -17,6 +17,8 @@ from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data.depth import depth_camera_contract
 from curvenav.data.depth_bank import PackedDepthBankSpec, PackedDepthRun
 from curvenav.data.trajectory import MAXIMUM_EXPERT_PROJECTION_ADE_RATIO
+
+
 POLICY_ARRAYS = {
     "depth_indices": ("uint32", 2),
     "point_goal": ("float32", 2),
@@ -47,13 +49,6 @@ def policy_dataset_contract(
         "curve_value_semantics": (
             "metric_arc_length_then_seven_cubic_heading_control_increments_rad"
         ),
-        "flow_coordinate_transform": (
-            "standardized_log_length_and_heading_increments"
-        ),
-        "log_length_mean": trajectory.log_length_mean,
-        "log_length_std": trajectory.log_length_std,
-        "heading_increment_mean_rad": list(trajectory.heading_increment_mean_rad),
-        "heading_increment_std_rad": list(trajectory.heading_increment_std_rad),
         "expert_projection": "equal_arc_heading_field_least_squares",
         "maximum_expert_projection_ade_m": (
             data.expert_waypoint_spacing_m * MAXIMUM_EXPERT_PROJECTION_ADE_RATIO
