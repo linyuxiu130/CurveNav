@@ -87,7 +87,7 @@ class CurveNavPolicy(nn.Module):
             condition.observation_to_current,
         )
 
-    def _predict_mean_velocity(
+    def _predict_stage_velocities(
         self,
         state: Tensor,
         start_time: Tensor,
@@ -138,17 +138,18 @@ class CurveNavPolicy(nn.Module):
             start_time: Tensor,
             end_time: Tensor,
         ) -> Tensor:
-            return self._predict_mean_velocity(
+            return self._predict_stage_velocities(
                 flow_state,
                 start_time,
                 end_time,
                 encoded,
             )
 
-        instantaneous_velocity = mean_velocity(state, time, time)
+        instantaneous_velocities = mean_velocity(state, time, time)
+        instantaneous_velocity = instantaneous_velocities[:, -1]
         zero = torch.zeros_like(time)
         with sdpa_kernel([SDPBackend.MATH]):
-            average_velocity, total_time_derivative = torch.func.jvp(
+            average_velocities, total_time_derivatives = torch.func.jvp(
                 mean_velocity,
                 (state, zero, time),
                 (
@@ -157,18 +158,19 @@ class CurveNavPolicy(nn.Module):
                     torch.ones_like(time),
                 ),
             )
-        reparameterized_velocity = average_velocity + time[:, None] * (
-            total_time_derivative.detach()
+        reparameterized_velocities = average_velocities + time[:, None, None] * (
+            total_time_derivatives.detach()
         )
-        instantaneous_error = (
-            instantaneous_velocity.float() - conditional_velocity
-        )
-        average_error = reparameterized_velocity.float() - conditional_velocity
+        stage_target = conditional_velocity[:, None]
+        instantaneous_error = instantaneous_velocities.float() - stage_target
+        average_error = reparameterized_velocities.float() - stage_target
         mean_flow_loss = 0.5 * (
             instantaneous_error.square().mean() + average_error.square().mean()
         )
 
-        predicted_clean = state - time[:, None] * average_velocity.float()
+        predicted_clean = (
+            state - time[:, None] * average_velocities[:, -1].float()
+        )
         predicted_path, _ = self.curve_codec.decode_path(predicted_clean)
         safety_loss = configuration_space_risk_loss(
             predicted_path,
@@ -187,13 +189,13 @@ class CurveNavPolicy(nn.Module):
         state = self.inference_source.expand(condition.point_goal.shape[0], -1).clone()
         start_time = torch.zeros(state.shape[0], device=state.device)
         end_time = torch.ones_like(start_time)
-        average_velocity = self._predict_mean_velocity(
+        average_velocities = self._predict_stage_velocities(
             state,
             start_time,
             end_time,
             encoded,
         ).float()
-        state = state - average_velocity
+        state = state - average_velocities[:, -1]
         path, _ = self.curve_codec.decode(state)
         return TrajectoryPrediction(path=path)
 

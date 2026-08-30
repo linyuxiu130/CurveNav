@@ -189,6 +189,9 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             + CONFIGURATION_TOKEN_COUNT
         ),
         "decoder_refinement_stages": 3,
+        "decoder_stage_supervision": (
+            "shared_readout_improved_mean_flow_on_all_three_stages"
+        ),
         "configuration_encoder_type": CONFIGURATION_ENCODER_TYPE,
         "configuration_token_grid": [
             CONFIGURATION_TOKEN_GRID_SIZE,

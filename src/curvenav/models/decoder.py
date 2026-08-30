@@ -164,15 +164,13 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             + flow_time
         ).float()
         trajectory = controls
+        stage_velocities = []
         for stage in range(DECODER_REFINEMENT_STAGES):
             if stage:
-                proposal = self._read_velocity(
-                    trajectory[:, : self.curve_tokens]
-                )
                 path_tokens = self._path_tokens(
                     state,
                     end_time,
-                    proposal,
+                    stage_velocities[-1],
                     condition,
                     flow_time,
                     curve_codec,
@@ -184,4 +182,7 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             end = begin + self.layers_per_stage
             for block in self.blocks[begin:end]:
                 trajectory = block(trajectory, condition.tokens)
-        return self._read_velocity(trajectory[:, : self.curve_tokens])
+            stage_velocities.append(
+                self._read_velocity(trajectory[:, : self.curve_tokens])
+            )
+        return torch.stack(stage_velocities, dim=1)

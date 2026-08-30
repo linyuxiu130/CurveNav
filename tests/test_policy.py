@@ -205,9 +205,11 @@ def test_typical_source_and_one_step_mean_flow_are_deterministic() -> None:
     constant_average_velocity = torch.linspace(-0.2, 0.2, curve_tokens)
 
     def constant_field(self, state, start_time, end_time, encoded):
-        return constant_average_velocity.expand_as(state)
+        return constant_average_velocity.expand_as(state)[:, None].expand(
+            -1, 3, -1
+        )
 
-    policy._predict_mean_velocity = MethodType(constant_field, policy)
+    policy._predict_stage_velocities = MethodType(constant_field, policy)
     expected_state = policy.inference_source - constant_average_velocity
     expected_path, _ = policy.curve_codec.decode(expected_state)
     prediction = policy.sample(condition(batch=2))
@@ -227,7 +229,8 @@ def test_training_uses_random_source_and_closed_interval_collocation() -> None:
         def forward(
             self, state, start_time, end_time, encoded, curve_codec
         ):
-            return state * 0.0 + (end_time - start_time)[:, None] * 0.0
+            velocity = state * 0.0 + (end_time - start_time)[:, None] * 0.0
+            return velocity[:, None].expand(-1, 3, -1)
 
     policy.trajectory_decoder = ZeroMeanVelocity()
     inputs = condition(batch=2)
@@ -263,7 +266,11 @@ def test_improved_mean_flow_jvp_has_the_exact_sign_and_interval_tangent() -> Non
         def forward(
             self, state, start_time, end_time, encoded, curve_codec
         ):
-            return state + (end_time - start_time)[:, None]
+            velocity = state + (end_time - start_time)[:, None]
+            stage_offset = torch.tensor(
+                [-0.5, 0.0, 0.5], device=state.device, dtype=state.dtype
+            )[None, :, None]
+            return velocity[:, None] + stage_offset
 
     policy.trajectory_decoder = AnalyticMeanVelocity()
     inputs = condition(batch=2)
@@ -276,13 +283,15 @@ def test_improved_mean_flow_jvp_has_the_exact_sign_and_interval_tangent() -> Non
     time = torch.tensor([0.0, 1.0])
     state = (1.0 - time[:, None]) * clean + time[:, None] * source
     conditional_velocity = source - clean
-    instantaneous = state
-    average = state + time[:, None]
-    total_derivative = instantaneous + 1.0
-    reparameterized = average + time[:, None] * total_derivative
+    stage_offset = torch.tensor([-0.5, 0.0, 0.5])[None, :, None]
+    instantaneous = state[:, None] + stage_offset
+    average = state[:, None] + time[:, None, None] + stage_offset
+    final_instantaneous = state + 0.5
+    total_derivative = final_instantaneous[:, None] + 1.0
+    reparameterized = average + time[:, None, None] * total_derivative
     expected = 0.5 * (
-        (instantaneous - conditional_velocity).square().mean()
-        + (reparameterized - conditional_velocity).square().mean()
+        (instantaneous - conditional_velocity[:, None]).square().mean()
+        + (reparameterized - conditional_velocity[:, None]).square().mean()
     )
 
     losses = policy.training_loss(inputs, TrajectoryTarget(target_values), source)
@@ -352,13 +361,14 @@ def test_conditioned_decoder_returns_one_smooth_metric_curve() -> None:
     encoded = policy.encode_condition(inputs)
     noisy = torch.randn(2, policy.curve_codec.num_curve_tokens)
     time = torch.tensor([0.2, 0.7])
-    predicted_velocity = policy._predict_mean_velocity(
+    predicted_velocity = policy._predict_stage_velocities(
         noisy, torch.zeros_like(time), time, encoded
     )
-    repeated = policy._predict_mean_velocity(
+    repeated = policy._predict_stage_velocities(
         noisy, torch.zeros_like(time), time, encoded
     )
     torch.testing.assert_close(predicted_velocity, repeated)
+    assert predicted_velocity.shape == (2, 3, policy.curve_codec.num_curve_tokens)
     prediction = policy.sample(inputs)
     assert prediction.path.shape == (2, 16, 2)
 
@@ -416,8 +426,10 @@ def test_obstacle_far_from_flow_source_changes_one_step_velocity() -> None:
         )
         source = policy.inference_source.clone()
         zero = torch.zeros(1)
-        velocity = policy._predict_mean_velocity(source, zero, zero + 1.0, baseline)
-        changed_velocity = policy._predict_mean_velocity(
+        velocity = policy._predict_stage_velocities(
+            source, zero, zero + 1.0, baseline
+        )
+        changed_velocity = policy._predict_stage_velocities(
             source,
             zero,
             zero + 1.0,
@@ -437,10 +449,10 @@ def test_exact_path_field_changes_velocity_without_changing_context_tokens() -> 
     source = policy.inference_source.clone()
     zero = torch.zeros(1)
     with torch.no_grad():
-        baseline_velocity = policy._predict_mean_velocity(
+        baseline_velocity = policy._predict_stage_velocities(
             source, zero, zero + 1.0, encoded
         )
-        changed_velocity = policy._predict_mean_velocity(
+        changed_velocity = policy._predict_stage_velocities(
             source, zero, zero + 1.0, changed
         )
     torch.testing.assert_close(changed.tokens, encoded.tokens)
@@ -538,9 +550,11 @@ def test_mean_flow_decoder_depends_on_state_and_interval() -> None:
     with torch.no_grad():
         zero = torch.zeros(2)
         one = torch.ones(2)
-        reference = policy._predict_mean_velocity(noisy, zero, zero, encoded)
-        changed_curve = policy._predict_mean_velocity(noisy + 1.0, zero, zero, encoded)
-        changed_time = policy._predict_mean_velocity(noisy, zero, one, encoded)
+        reference = policy._predict_stage_velocities(noisy, zero, zero, encoded)
+        changed_curve = policy._predict_stage_velocities(
+            noisy + 1.0, zero, zero, encoded
+        )
+        changed_time = policy._predict_stage_velocities(noisy, zero, one, encoded)
 
     assert not torch.allclose(changed_curve, reference)
     assert not torch.allclose(changed_time, reference)
@@ -564,7 +578,7 @@ def test_curve_residual_carrier_stays_float32_under_fp16_autocast() -> None:
         lambda _module, inputs: observed_dtype.append(inputs[0].dtype)
     )
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-        output = policy._predict_mean_velocity(
+        output = policy._predict_stage_velocities(
             torch.randn(
                 2, policy.curve_codec.num_curve_tokens, device="cuda"
             ),

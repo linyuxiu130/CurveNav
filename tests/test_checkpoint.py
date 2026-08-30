@@ -134,6 +134,9 @@ def test_checkpoint_records_the_regular_heading_flow_contract() -> None:
     assert "route_query_count" not in contract
     assert contract["condition_token_count"] == 164
     assert contract["decoder_refinement_stages"] == 3
+    assert contract["decoder_stage_supervision"] == (
+        "shared_readout_improved_mean_flow_on_all_three_stages"
+    )
     assert contract["configuration_encoder_type"] == (
         "complete_metric_configuration_space_tokens"
     )

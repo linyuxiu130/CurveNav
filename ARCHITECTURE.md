@@ -120,7 +120,7 @@ forbidden(q)=[c(q)≤0]
 
 完整 `64×64×5` 配置空间先把 clearance 除以 `3.6 m`，再经过三个 `3×3,stride=2` 卷积得到带二维度量位置的 `8×8` token。它们不再被提前折叠并丢弃，而是与 PointGoal、96 个当前视觉 token 和三个历史状态 token 直接拼成 164 个一等 token，共同通过四层 condition Transformer；decoder 每层都能读取原始空间语义仍然存在的 memory。
 
-12 层 decoder 分为三个连续的四层阶段，三个阶段使用同一个归一化和八维速度 readout，不存在中间辅助头。第一阶段只根据 Flow 控制 token 和完整条件 memory 形成粗平均速度 `u¹`。对数据锚定时刻 `t`，其粗数据端估计为：
+12 层 decoder 分为三个连续的四层阶段，三个阶段使用同一个归一化和八维速度 readout，不存在独立中间头。第一阶段只根据 Flow 控制 token 和完整条件 memory 形成粗平均速度 `u¹`。对数据锚定时刻 `t`，其粗数据端估计为：
 
 ```text
 x_hat¹=z_t-t·u¹
@@ -136,6 +136,8 @@ clearance/3.6, gradient_x, gradient_y, observed, forbidden
 ```
 
 第八层再用同一个 readout 得到 `u²`，重建 `P_hat²` 并重复一次精确场查询；最后四层输出 `u³`。因此后续层修正的依据始终是当前网络实际准备生成的曲线，而不是独立 Gaussian `z_t` 解码出的随机曲线。三个阶段只是一个可微函数 `uθ` 内部的深度计算，MeanFlow 的 NFE 仍严格为 1；JVP 会穿过曲线解码和连续场查询，不存在训练/推理之外的投影、优化器或评价链。
+
+中间轨迹不能是仅用来选择下一次几何查询位置的自由 latent：否则它经 `exp(log L)` 和场查询进入 JVP 后会形成无监督的高增益反馈。因此 `u¹,u²,u³` 都使用下节同一 Improved MeanFlow 恒等式监督，损失在三个阶段和八个欧氏坐标上直接取均值，没有人工阶段权重。概率路径的 JVP 切向仍唯一使用最终瞬时速度 `u³(z_t,t,t)`；推理只取最终平均速度 `u³(e,0,1)`。这是同一 readout 的深层监督，不是候选轨迹、评价头或第二推理链。
 
 ## 6. Boundary-complete improved MeanFlow
 
@@ -162,7 +164,7 @@ Vθ = uθ(z_t,0,t,c)+t·stopgrad(D_tuθ)
 由平均流恒等式 `v=u+(t-r)D_tu`，训练损失是：
 
 ```text
-L_MF = 1/2 E[||vθ-v_c||² + ||Vθ-v_c||²]
+L_MF = 1/6 Σ_{k=1}^3 E[||vθᵏ-v_c||² + ||Vθᵏ-v_c||²]
 ```
 
 每个 batch 先显式采样一次 `e~N(0,I)`，并用闭区间等距 collocation 覆盖 `[0,1]`。该源属于当前优化器 batch；若 FP16 overflow，重试复用同一个源，不重新抽样，也不复制/恢复整份 CUDA RNG 状态。不使用固定源训练、时间端点概率、课程开关或有限差分。推理选择训练高斯典型集内范数为 `√8` 的固定 latent：
