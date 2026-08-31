@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from typing import Mapping
 
+import torch
 from torch import Tensor
 
 from curvenav.types import PolicyCondition, TrajectoryTarget

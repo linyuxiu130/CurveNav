@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from curvenav.config import CurveNavConfig, DataConfig, TrajectoryConfig
+from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.depth_bank import gather_depth_observations, load_packed_depth_bank
 from curvenav.data.loader import (
     build_policy_training_loader,
@@ -126,6 +127,24 @@ def test_prepared_dataset_has_one_fixed_tensor_contract(tmp_path) -> None:
     bank = load_packed_depth_bank(dataset.depth_bank, torch.device("cpu"))
     depth = gather_depth_observations(bank, sample["depth_indices"].unsqueeze(0))
     assert depth.shape == (1, 4, 1, 126, 224)
+
+
+def test_unpack_policy_batch_accepts_integer_global_interval_groups() -> None:
+    batch_size = 2
+    prepared = unpack_policy_batch(
+        {
+            "depth": torch.zeros((batch_size, 4, 1, 126, 224)),
+            "point_goal": torch.zeros((batch_size, 2)),
+            "observation_to_current": torch.zeros((batch_size, 4, 4)),
+            "observation_valid": torch.ones((batch_size, 4), dtype=torch.bool),
+            "curve_values": torch.zeros((batch_size, 8)),
+            "flow_interval_group": torch.tensor([0, 3], dtype=torch.uint8),
+        }
+    )
+    torch.testing.assert_close(
+        prepared.flow_interval_group,
+        torch.tensor([0, 3], dtype=torch.uint8),
+    )
 
 
 def test_habitat_xz_routes_are_converted_to_x_forward_y_left() -> None:
