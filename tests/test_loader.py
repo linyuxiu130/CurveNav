@@ -5,7 +5,6 @@ import pytest
 import torch
 
 from curvenav.config import CurveNavConfig, DataConfig, TrajectoryConfig
-from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data.depth_bank import gather_depth_observations, load_packed_depth_bank
 from curvenav.data.loader import (
     build_policy_training_loader,
@@ -13,13 +12,24 @@ from curvenav.data.loader import (
 )
 from curvenav.data.prepare import (
     _cumulative_distance,
+    _flow_coordinate_statistics,
     _frame_indices,
     _fixed_future,
     _observation_to_current,
     _planar_local,
+    _validate_flow_coordinate_statistics,
 )
-from curvenav.data.prepared import PreparedPolicyDataset, RepeatedPolicyDataset
+from curvenav.data.prepared import (
+    PreparedPolicyDataset,
+    RepeatedPolicyDataset,
+    flow_coordinate_statistics,
+    policy_dataset_contract,
+)
+from curvenav.data.privileged import (
+    SourceConfigurationSpaceQuery,
+)
 from curvenav.deployment.runtime import DepthContextBuffer
+from curvenav.factory import build_policy
 from curvenav.training.batching import (
     DistributedStepBatchSampler,
     build_distributed_batch_layout,
@@ -27,34 +37,21 @@ from curvenav.training.batching import (
 
 
 def _write_dataset(root, count: int = 4) -> None:
-    contract = {
-        "expert_navigation_geometry": expert_navigation_geometry_contract(),
-        "observation_frames": 4,
-        "frame_spacing_m": 0.45,
-        "expert_waypoint_spacing_m": 0.15,
-        "future_steps": 24,
-        "planar_axis_convention": "x_forward_y_left",
-        "observation_to_current_semantics": "planar_rigid_transform_from_observation_to_current_frame",
-        "image_height": 126,
-        "image_width": 224,
-        "max_depth_m": 5.0,
-        "canonical_focal_x_px": 166.80851063829786,
-        "canonical_focal_y_px": 166.80851063829786,
-        "camera_forward_offset_m": 0.28618,
-        "camera_height_m": 0.62532,
-        "camera_downward_pitch_degrees": 10.0,
-        "num_curve_values": 8,
-        "num_path_points": 64,
-        "curve_value_semantics": "metric_arc_length_then_seven_cubic_heading_control_increments_rad",
-        "expert_projection": "equal_arc_heading_field_least_squares",
-        "maximum_expert_projection_ade_m": 0.03,
-    }
+    contract = policy_dataset_contract(DataConfig(), TrajectoryConfig())
     root.mkdir()
     (root / "manifest.json").write_text(json.dumps({"contract": contract}))
     for split in ("train", "validation"):
         split_root = root / split
         (split_root / "depth").mkdir(parents=True)
+        (split_root / "source_configuration").mkdir()
         np.save(split_root / "depth/00000.npy", np.ones((8, 126, 224), np.float16))
+        np.savez(
+            split_root / "source_configuration/00000.npz",
+            free=np.ones((9, 9), dtype=np.bool_),
+            clearance_m=np.ones((9, 9), dtype=np.float32),
+            origin_xy=np.asarray([-1.0, -1.0], dtype=np.float64),
+            cell_size_m=np.asarray(0.25),
+        )
         arrays = {
             "depth_indices": np.tile(np.arange(4, dtype=np.uint32), (count, 1)),
             "point_goal": np.ones((count, 2), np.float32),
@@ -66,6 +63,9 @@ def _write_dataset(root, count: int = 4) -> None:
                 np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], np.float32),
                 (count, 1),
             ),
+            "source_grid_index": np.zeros(count, np.int64),
+            "source_origin_xy": np.zeros((count, 2), np.float32),
+            "source_yaw_rad": np.zeros(count, np.float32),
         }
         metadata = {}
         for name, value in arrays.items():
@@ -86,6 +86,18 @@ def _write_dataset(root, count: int = 4) -> None:
                 "total_frames": 8,
                 "runs": [{"file": "depth/00000.npy", "offset": 0, "frames": 8}],
             },
+            "source_configuration_space": {
+                "query": "source_dingo_signed_clearance_cell_lookup",
+                "spacing_m": 0.025,
+                "out_of_bounds": "non_executable_negative_clearance",
+                "grids": [{"file": "source_configuration/00000.npz"}],
+            },
+            "audit": {
+                "source_configuration_space": {
+                    "serialized_requery": True,
+                    "expert_all_margin_safe": True,
+                }
+            },
         }
         (split_root / "manifest.json").write_text(json.dumps(manifest))
 
@@ -104,6 +116,10 @@ def test_prepared_dataset_has_one_fixed_tensor_contract(tmp_path) -> None:
         "observation_to_current",
         "observation_valid",
         "curve_values",
+        "source_grid_index",
+        "source_origin_xy",
+        "source_yaw_rad",
+        "flow_interval_group",
     }
     assert sample["depth_indices"].dtype == torch.uint32
     assert sample["curve_values"].shape == (8,)
@@ -188,6 +204,33 @@ def test_prepared_dataset_rejects_non_positive_arc_length(tmp_path) -> None:
         PreparedPolicyDataset(root, "train", DataConfig(root=str(root)), TrajectoryConfig())
 
 
+def test_prepared_dataset_requires_serialized_source_safety_certificate(tmp_path) -> None:
+    root = tmp_path / "policy"
+    _write_dataset(root)
+    manifest_path = root / "train" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["audit"]["source_configuration_space"][
+        "expert_all_margin_safe"
+    ] = False
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="source configuration audit"):
+        PreparedPolicyDataset(root, "train", DataConfig(root=str(root)), TrajectoryConfig())
+
+
+def test_source_gated_flow_statistics_reject_stale_trajectory_scale() -> None:
+    config = CurveNavConfig()
+    _validate_flow_coordinate_statistics(
+        flow_coordinate_statistics(config.trajectory), config
+    )
+    codec = build_policy(config).curve_codec
+    values = codec.values_from_coordinates(torch.zeros(32, 8)).numpy()
+    observed = _flow_coordinate_statistics(values)
+
+    with pytest.raises(ValueError, match="trajectory normalization"):
+        _validate_flow_coordinate_statistics(observed, config)
+
+
 def test_training_and_validation_preserve_deterministic_batch_order(tmp_path) -> None:
     root = tmp_path / "policy"
     _write_dataset(root)
@@ -222,17 +265,27 @@ def test_training_sampler_covers_each_cycle_once_and_resume_continues() -> None:
             return 7
 
         def __getitem__(self, index):
-            return index
+            return {"index": torch.tensor(index)}
 
     base = IndexedDataset()
     complete = RepeatedPolicyDataset(base, count=14, seed=42)
-    first_cycle = [complete[index] for index in range(7)]
-    second_cycle = [complete[index] for index in range(7, 14)]
+    first_cycle = [int(complete[index]["index"]) for index in range(7)]
+    second_cycle = [int(complete[index]["index"]) for index in range(7, 14)]
     assert sorted(first_cycle) == list(range(7))
     assert sorted(second_cycle) == list(range(7))
     resumed = RepeatedPolicyDataset(base, count=6, seed=42, start_index=8)
-    assert [resumed[index] for index in range(6)] == [
-        complete[index] for index in range(8, 14)
+    assert [int(resumed[index]["index"]) for index in range(6)] == [
+        int(complete[index]["index"]) for index in range(8, 14)
+    ]
+    assert [int(complete[index]["flow_interval_group"]) for index in range(8)] == [
+        0,
+        1,
+        2,
+        3,
+        0,
+        1,
+        2,
+        3,
     ]
 
 
@@ -260,6 +313,23 @@ def test_six_rank_batches_cover_exact_global_step_without_padding() -> None:
     assert ddp_weight / 6 == pytest.approx(1.0)
 
 
+def test_global_flow_interval_groups_are_exactly_quartered_for_all_topologies() -> None:
+    for world_size in range(1, 9):
+        batches = [
+            batch
+            for rank in range(world_size)
+            for batch in DistributedStepBatchSampler(
+                1,
+                1024,
+                342,
+                rank,
+                world_size,
+            )
+        ]
+        groups = torch.tensor([index % 4 for batch in batches for index in batch])
+        torch.testing.assert_close(torch.bincount(groups, minlength=4), torch.full((4,), 256))
+
+
 def test_micro_batches_are_balanced_for_one_static_shape() -> None:
     four_gpu = DistributedStepBatchSampler(1, 1024, 192, rank=0, world_size=4)
     assert list(map(len, four_gpu)) == [128, 128]
@@ -278,6 +348,54 @@ def test_fixed_future_uses_steps_without_rescaling_metric_length() -> None:
     np.testing.assert_allclose(near_prefix[-1], near[-1])
     assert not far_reached
     assert near_reached
+
+
+def test_final_production_curve_is_checked_in_source_configuration_space(
+    tmp_path,
+) -> None:
+    path = torch.tensor([[[-1.0, 0.0], [0.0, 0.0], [1.0, 0.0]]])
+    grid_path = tmp_path / "navigation_grid.npz"
+    clearance = np.ones((9, 9), dtype=np.float32)
+    clearance[4, 4] = 0.05
+    np.savez(
+        grid_path,
+        free=np.ones((9, 9), dtype=np.bool_),
+        clearance_m=clearance,
+        origin_xy=np.asarray([-1.0, -1.0]),
+        cell_size_m=np.asarray(0.25),
+    )
+    query = SourceConfigurationSpaceQuery.from_paths((grid_path,))
+    minimum = query.query(
+        path,
+        torch.zeros(1, dtype=torch.int64),
+        torch.zeros(1, 2),
+        torch.zeros(1),
+        1.0,
+    ).minimum_clearance_m.numpy()
+    np.testing.assert_allclose(minimum, [0.05])
+
+
+def test_source_query_detects_an_obstacle_between_sparse_curve_points(tmp_path) -> None:
+    grid_path = tmp_path / "navigation_grid.npz"
+    free = np.ones((41, 41), dtype=np.bool_)
+    free[29, 20] = False
+    np.savez(
+        grid_path,
+        free=free,
+        clearance_m=np.ones((41, 41), dtype=np.float32),
+        origin_xy=np.asarray([-1.0, -1.0]),
+        cell_size_m=np.asarray(0.05),
+    )
+    query = SourceConfigurationSpaceQuery.from_paths((grid_path,))
+    result = query.query(
+        torch.tensor([[[-1.0, 0.0], [1.0, 0.0]]]),
+        torch.zeros(1, dtype=torch.int64),
+        torch.zeros(1, 2),
+        torch.zeros(1),
+        2.0,
+    )
+
+    assert result.minimum_clearance_m.item() < 0.0
 
 
 def test_fixed_future_preserves_stationary_steps_in_the_prediction_window() -> None:

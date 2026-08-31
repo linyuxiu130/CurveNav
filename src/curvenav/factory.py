@@ -6,7 +6,6 @@ from curvenav.encoders import (
     CONFIGURATION_TOKEN_COUNT,
     ConfigurationSpaceEncoder,
     DepthObservationEncoder,
-    PointGoalEncoder,
 )
 from curvenav.models import ConditionalCurveMeanFlowDecoder, CurveNavPolicy
 from curvenav.trajectory import MetricHeadingTrajectory
@@ -17,7 +16,6 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
     config.validate()
     trajectory = config.trajectory
     depth = config.depth_encoder
-    point_goal = config.point_goal_encoder
     condition = config.condition_encoder
     decoder = config.trajectory_decoder
 
@@ -36,13 +34,6 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
             config.data.future_steps * config.data.expert_waypoint_spacing_m
         ),
     )
-    point_goal_encoder = PointGoalEncoder(
-        model_dim=point_goal.model_dim,
-        hidden_dim=point_goal.hidden_dim,
-        range_scale_m=(
-            config.data.future_steps * config.data.expert_waypoint_spacing_m
-        ),
-    )
     configuration_encoder = ConfigurationSpaceEncoder(
         model_dim=condition.model_dim,
         planning_horizon_m=(
@@ -50,7 +41,6 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         ),
     )
     condition_encoder = PolicyConditionEncoder(
-        point_goal_encoder,
         configuration_encoder,
         observation_frames=config.data.observation_frames,
         spatial_tokens=depth.frame_tokens_height * depth.frame_tokens_width,

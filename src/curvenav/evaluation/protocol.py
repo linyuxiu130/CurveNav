@@ -14,8 +14,8 @@ def evaluation_strata(metrics: dict[str, Tensor]) -> dict[str, Tensor]:
     situations present in that fixed validation set.
     """
     forward = ~metrics["point_goal_is_behind"]
-    reference_safe = ~metrics["reference_observed_safety_margin_violation"]
-    straight_blocked = metrics["straight_observed_safety_margin_violation"]
+    reference_safe = ~metrics["reference_safety_margin_violation"]
+    straight_blocked = metrics["straight_safety_margin_violation"]
     return {
         "all": torch.ones_like(forward),
         "forward": forward,
@@ -31,7 +31,7 @@ def evaluation_strata(metrics: dict[str, Tensor]) -> dict[str, Tensor]:
 
 
 def summarize_strata(metrics: dict[str, Tensor]) -> dict[str, dict[str, float | int]]:
-    """Report fidelity, progress, and observed continuous-path safety per stratum."""
+    """Report fidelity, progress, and complete configuration-space safety."""
     result: dict[str, dict[str, float | int]] = {}
     for name, selected in evaluation_strata(metrics).items():
         count = int(selected.sum().item())
@@ -51,24 +51,60 @@ def summarize_strata(metrics: dict[str, Tensor]) -> dict[str, dict[str, float | 
                 .mean()
                 .item(),
                 footprint_collision_fraction=(
-                    metrics["observed_footprint_collision"][selected]
+                    metrics["footprint_collision"][selected]
                     .float()
                     .mean()
                     .item()
                 ),
                 safety_margin_violation_fraction=(
-                    metrics["observed_safety_margin_violation"][selected]
+                    metrics["safety_margin_violation"][selected]
                     .float()
                     .mean()
                     .item()
                 ),
                 extra_footprint_collision_fraction=(
-                    metrics["observed_footprint_collision"][selected]
-                    & ~metrics["reference_observed_footprint_collision"][selected]
+                    metrics["footprint_collision"][selected]
+                    & ~metrics["reference_footprint_collision"][selected]
                 )
                 .float()
                 .mean()
                 .item(),
+            )
+        result[name] = values
+    return result
+
+
+def summarize_goal_bearing_strata(
+    metrics: dict[str, Tensor],
+) -> dict[str, dict[str, float | int]]:
+    """Measure goal response on fixed angular regions of the real validation set."""
+    absolute_bearing = metrics["point_goal_bearing_rad"].abs()
+    boundaries = (0.0, torch.pi / 6, torch.pi / 3, torch.pi / 2, torch.pi)
+    names = ("0_30_deg", "30_60_deg", "60_90_deg", "90_180_deg")
+    result: dict[str, dict[str, float | int]] = {}
+    for index, name in enumerate(names):
+        lower = boundaries[index]
+        upper = boundaries[index + 1]
+        selected = (absolute_bearing >= lower) & (absolute_bearing < upper)
+        if index == len(names) - 1:
+            selected = (absolute_bearing >= lower) & (absolute_bearing <= upper)
+        count = int(selected.sum().item())
+        values: dict[str, float | int] = {"samples": count}
+        if count:
+            values.update(
+                mean_abs_goal_bearing_rad=absolute_bearing[selected].mean().item(),
+                endpoint_goal_bearing_error_rad=metrics[
+                    "path_endpoint_goal_bearing_error_rad"
+                ][selected].mean().item(),
+                reference_endpoint_goal_bearing_error_rad=metrics[
+                    "reference_path_endpoint_goal_bearing_error_rad"
+                ][selected].mean().item(),
+                endpoint_goal_bearing_regret_rad=metrics[
+                    "endpoint_goal_bearing_regret_rad"
+                ][selected].mean().item(),
+                footprint_collision_fraction=metrics["footprint_collision"][
+                    selected
+                ].float().mean().item(),
             )
         result[name] = values
     return result

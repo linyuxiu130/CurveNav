@@ -1,7 +1,8 @@
-"""Multi-GPU BF16 training for the single CurveNav policy route."""
+"""Multi-GPU mixed-precision training for the single CurveNav policy route."""
 
 import argparse
 import json
+import os
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -15,6 +16,7 @@ from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.loader import build_policy_training_loader
 from curvenav.factory import build_policy
 from curvenav.models import TRAINING_LOSS_NAMES
+from curvenav.precision import cuda_precision
 from curvenav.training.checkpoint import (
     build_training_contract,
     build_training_checkpoint,
@@ -63,6 +65,11 @@ def _save_checkpoint(
         step,
         training_contract=training_contract,
         rng_states={"cpu": cpu_rng_states, "cuda": cuda_rng_states},
+        amp_state=(
+            accelerator.scaler.state_dict()
+            if accelerator.scaler is not None
+            else None
+        ),
     )
     checkpoint_path = output_dir / "checkpoint.pt"
     temporary_path = output_dir / ".checkpoint.tmp.pt"
@@ -73,9 +80,13 @@ def _save_checkpoint(
 def _advance_schedule_and_ema(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     ema: ExponentialMovingAverage,
+    *,
+    optimizer_step_was_skipped: bool,
 ) -> None:
-    scheduler.step()
-    ema.update()
+    """Advance state only when AMP committed an optimizer update."""
+    if not optimizer_step_was_skipped:
+        scheduler.step()
+        ema.update()
 
 
 def run_training(
@@ -87,6 +98,9 @@ def run_training(
     if not torch.cuda.is_available():
         raise RuntimeError("CurveNav production training requires CUDA")
 
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    precision = cuda_precision(torch.device("cuda", local_rank))
     ddp = DistributedDataParallelKwargs(
         broadcast_buffers=False,
         bucket_cap_mb=64,
@@ -95,13 +109,17 @@ def run_training(
         static_graph=True,
     )
     accelerator = Accelerator(
-        mixed_precision="bf16",
+        mixed_precision=precision.accelerate_mode,
         step_scheduler_with_optimizer=False,
         kwargs_handlers=[ddp],
     )
     configure_cuda_training_backend()
     set_seed(config.training.seed, device_specific=True)
-    training_contract = build_training_contract(config, accelerator.num_processes)
+    training_contract = build_training_contract(
+        config,
+        accelerator.num_processes,
+        precision.checkpoint_name,
+    )
     global_batch_size = training_contract["global_batch_size"]
     per_device_batch_size = training_contract["per_device_batch_size"]
     batch_layout = build_distributed_batch_layout(
@@ -118,7 +136,12 @@ def run_training(
     if resume_path is not None:
         checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
         validate_policy_contract(checkpoint, config)
-        validate_training_resume(checkpoint, config, accelerator.num_processes)
+        validate_training_resume(
+            checkpoint,
+            config,
+            accelerator.num_processes,
+            precision.checkpoint_name,
+        )
         start_step = int(checkpoint["step"])
         if not 0 <= start_step < total_steps:
             raise ValueError(
@@ -180,6 +203,7 @@ def run_training(
             scheduler,
             ema,
             config,
+            accelerator.scaler,
         )
         restore_process_rng_state(checkpoint, accelerator.process_index)
 
@@ -242,6 +266,7 @@ def run_training(
                         prepared.condition,
                         prepared.target,
                         flow_source,
+                        prepared.flow_interval_group,
                     )
                 batch_weight = (
                     accelerator.num_processes
@@ -258,15 +283,19 @@ def run_training(
         grad_norm = accelerator.clip_grad_norm_(
             policy.parameters(), config.training.grad_clip_norm
         )
-        finite_update = torch.isfinite(current_losses).all() & torch.isfinite(
-            grad_norm
-        )
+        finite_update = torch.isfinite(current_losses).all()
+        if accelerator.scaler is None:
+            finite_update &= torch.isfinite(grad_norm)
         torch._assert_async(
             finite_update,
-            "CurveNav BF16 update contains a non-finite loss or gradient norm",
+            "CurveNav mixed-precision update contains a non-finite loss or gradient norm",
         )
         optimizer.step()
-        _advance_schedule_and_ema(scheduler, ema)
+        _advance_schedule_and_ema(
+            scheduler,
+            ema,
+            optimizer_step_was_skipped=accelerator.optimizer_step_was_skipped,
+        )
 
         step += 1
         epoch = (step - 1) // steps_per_epoch + 1

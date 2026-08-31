@@ -1,5 +1,5 @@
 data:
-  root: data/policy_dataset
+  root: data/policy_dataset-source-cspace
   observation_frames: 4
   frame_spacing_m: 0.45
   expert_waypoint_spacing_m: 0.15
@@ -18,18 +18,15 @@ model:
     num_heading_control_points: 8
     spline_degree: 3
     num_path_points: 64
-    length_pre_activation_mean: 2.7810852451799377
-    length_pre_activation_std: 1.3278056485734497
-    heading_increment_mean_rad: [0.0027091927181629527, 0.005207439937511474, 0.006545409534199333, 0.005466179133750451, 0.0027312263638442787, 0.0029715759159046357, -0.0006079559277851468]
-    heading_increment_std_rad: [0.1039597669108465, 0.2211581749264293, 0.2887267459379414, 0.2893491499417256, 0.30020639618179806, 0.26251125436301076, 0.14751645522709783]
+    length_pre_activation_mean: 2.7761289656895536
+    length_pre_activation_std: 1.3310157896776207
+    heading_increment_mean_rad: [0.0027291269968929455, 0.005034111766925072, 0.006383425585098021, 0.004844627023100332, 0.002278887391014113, 0.0029080880413952896, -0.0006175329948281985]
+    heading_increment_std_rad: [0.10250223795474468, 0.21724207730012957, 0.2826873156288638, 0.2832551794170072, 0.29620460147965216, 0.25915543561132065, 0.1463571463898459]
   depth_encoder:
     model_dim: 384
     frame_tokens_height: 8
     frame_tokens_width: 12
     dropout: 0.0
-  point_goal_encoder:
-    model_dim: 384
-    hidden_dim: 384
   condition_encoder:
     model_dim: 384
     transformer_layers: 4
@@ -39,7 +36,7 @@ model:
     model_dim: 384
     transformer_layers: 12
     transformer_heads: 8
-    path_tokens: 16
+    path_tokens: 32
     dropout: 0.0
 training:
   seed: 42

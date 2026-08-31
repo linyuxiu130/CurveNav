@@ -82,6 +82,15 @@ def test_hssd_route_cache_and_local_slicing_share_depth_frames(tmp_path) -> None
     assert packed.shape == (5, 126, 224)
     np.testing.assert_allclose(packed, 0.8, atol=3e-4)
 
+    scene_root = tmp_path / "train/dataset_hssd_scene"
+    np.savez_compressed(
+        scene_root / "navigation_grid.npz",
+        free=np.ones((32, 32), dtype=np.bool_),
+        clearance_m=np.ones((32, 32), dtype=np.float32),
+        origin_xy=np.array([-0.5, -0.5], dtype=np.float64),
+        cell_size_m=np.array(0.1, dtype=np.float64),
+    )
+
     examples = _hssd_examples(tmp_path, config)
     assert len(examples["train"]) == 4
     np.testing.assert_array_equal(examples["train"][0].depth_indices, [0, 0, 0, 0])

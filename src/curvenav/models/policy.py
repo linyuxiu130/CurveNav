@@ -1,4 +1,4 @@
-"""PointGoal-conditioned one-step MeanFlow generation of an executable curve."""
+"""PointGoal-conditioned one-step improved MeanFlow trajectory generation."""
 
 import math
 from dataclasses import dataclass
@@ -16,21 +16,30 @@ from curvenav.types import (
 )
 
 from .blocks import ProjectedCondition
-from .safety import configuration_space_risk_loss
-
-
-TRAINING_LOSS_NAMES = ("loss", "mean_flow_loss", "safety_loss")
+from .safety import observed_clearance_loss
+TRAINING_LOSS_NAMES = (
+    "loss",
+    "mean_flow_loss",
+    "visible_clearance_loss",
+)
 INFERENCE_SOURCE_SEED = 20_260_828
-
-
+MEAN_FLOW_TIME_SAMPLING = (
+    "half_diagonal_quarter_logit_normal_interval_quarter_deployment_boundary"
+)
+MEAN_FLOW_LOGIT_NORMAL_MEAN = -0.4
+MEAN_FLOW_LOGIT_NORMAL_STD = 1.0
 @dataclass
 class CurveNavLoss:
     loss: Tensor
     mean_flow_loss: Tensor
-    safety_loss: Tensor
+    visible_clearance_loss: Tensor
 
     def logging_values(self) -> tuple[Tensor, ...]:
-        return self.loss, self.mean_flow_loss, self.safety_loss
+        return (
+            self.loss,
+            self.mean_flow_loss,
+            self.visible_clearance_loss,
+        )
 
 
 class CurveNavPolicy(nn.Module):
@@ -95,7 +104,7 @@ class CurveNavPolicy(nn.Module):
         end_time: Tensor,
         condition: ConditionFeatures,
         projected_condition: tuple[ProjectedCondition, ...],
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         return self.trajectory_decoder(
             state,
             start_time,
@@ -108,17 +117,17 @@ class CurveNavPolicy(nn.Module):
     def _mean_flow_total_time_derivative(
         self,
         state: Tensor,
-        time: Tensor,
+        start_time: Tensor,
+        end_time: Tensor,
         instantaneous_velocity: Tensor,
         condition: ConditionFeatures,
     ) -> Tensor:
         """Evaluate the stopped MeanFlow material derivative in float32."""
-        zero = torch.zeros_like(time)
         projected_condition = self.trajectory_decoder.project_condition_memory(
             condition.tokens
         )
 
-        def mean_velocity(
+        def average_velocity(
             flow_state: Tensor,
             start_time: Tensor,
             end_time: Tensor,
@@ -129,36 +138,51 @@ class CurveNavPolicy(nn.Module):
                 end_time,
                 condition,
                 projected_condition,
-            )
+            )[0]
 
         return torch.func.jvp(
-            mean_velocity,
-            (state, zero, time),
+            average_velocity,
+            (state, start_time, end_time),
             (
                 instantaneous_velocity,
-                zero,
-                torch.ones_like(time),
+                torch.zeros_like(start_time),
+                torch.ones_like(end_time),
             ),
         )[1]
 
     @staticmethod
-    def _closed_interval_times(batch_size: int, reference: Tensor) -> Tensor:
-        """Deterministically collocate the complete data-to-noise interval."""
-        if batch_size == 1:
-            return torch.ones(1, device=reference.device, dtype=reference.dtype)
-        return torch.linspace(
-            0.0,
-            1.0,
-            batch_size,
-            device=reference.device,
-            dtype=reference.dtype,
+    def _training_intervals(
+        flow_interval_group: Tensor,
+        reference: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Sample the iMF diagonal/interior law plus the exact deployed boundary."""
+        if (
+            flow_interval_group.shape != reference.shape[:1]
+            or flow_interval_group.device != reference.device
+        ):
+            raise ValueError("flow_interval_group must have shape [B] on the flow device")
+        batch_size = reference.shape[0]
+        group = flow_interval_group.long()
+        deployment = group == 0
+        diagonal = group >= 2
+        sampled = torch.sigmoid(
+            torch.randn(batch_size, 2, device=reference.device, dtype=reference.dtype)
+            * MEAN_FLOW_LOGIT_NORMAL_STD
+            + MEAN_FLOW_LOGIT_NORMAL_MEAN
         )
+        start_time = sampled.min(dim=1).values
+        end_time = sampled.max(dim=1).values
+        start_time = torch.where(diagonal, end_time, start_time)
+        start_time = torch.where(deployment, torch.zeros_like(start_time), start_time)
+        end_time = torch.where(deployment, torch.ones_like(end_time), end_time)
+        return start_time, end_time, deployment
 
     def training_loss(
         self,
         condition: PolicyCondition,
         target: TrajectoryTarget,
         source: Tensor,
+        flow_interval_group: Tensor,
     ) -> CurveNavLoss:
         target.validate()
         clean = self.curve_codec.coordinates_from_values(target.curve_values.float())
@@ -169,19 +193,23 @@ class CurveNavPolicy(nn.Module):
                 "flow source must match the standardized curve coordinates"
             )
         source = source.float()
-        time = self._closed_interval_times(clean.shape[0], clean)
-        state = (1.0 - time[:, None]) * clean + time[:, None] * source
-        conditional_velocity = source - clean
+        start_time, end_time, deployment = self._training_intervals(
+            flow_interval_group, clean
+        )
+        flow_source = source.clone()
+        flow_source[deployment] = self.inference_source.to(flow_source)
+        state = (1.0 - end_time[:, None]) * clean + end_time[:, None] * flow_source
+        conditional_velocity = flow_source - clean
         encoded = self.encode_condition(condition)
         projected_condition = self.trajectory_decoder.project_condition_memory(
             encoded.tokens
         )
 
-        def mean_velocity(
+        def stage_velocities(
             flow_state: Tensor,
             start_time: Tensor,
             end_time: Tensor,
-        ) -> Tensor:
+        ) -> tuple[Tensor, Tensor]:
             return self._predict_stage_velocities(
                 flow_state,
                 start_time,
@@ -193,9 +221,11 @@ class CurveNavPolicy(nn.Module):
         # Only the forward-mode tangent needs the full float32/MATH route.
         # It is a stopped regression target, so retaining its reverse-mode
         # graph wastes memory and prevents the trainable primal evaluations
-        # from using the surrounding BF16 autocast route.
-        instantaneous_velocities = mean_velocity(state, time, time)
-        instantaneous_velocity = instantaneous_velocities[:, -1]
+        # from using the surrounding mixed-precision autocast route.
+        _, diagonal_instantaneous_velocities = stage_velocities(
+            state, end_time, end_time
+        )
+        jvp_tangent = diagonal_instantaneous_velocities[:, -1]
         with (
             torch.no_grad(),
             torch.autocast(
@@ -206,33 +236,41 @@ class CurveNavPolicy(nn.Module):
             with sdpa_kernel([SDPBackend.MATH]):
                 total_time_derivatives = self._mean_flow_total_time_derivative(
                     state,
-                    time,
-                    instantaneous_velocity.detach(),
+                    start_time,
+                    end_time,
+                    jvp_tangent.detach(),
                     encoded,
                 )
-        zero = torch.zeros_like(time)
-        average_velocities = mean_velocity(state, zero, time)
-        reparameterized_velocities = average_velocities + time[:, None, None] * (
+        average_velocities, instantaneous_velocities = stage_velocities(
+            state, start_time, end_time
+        )
+        interval = end_time - start_time
+        reparameterized_velocities = average_velocities + interval[:, None, None] * (
             total_time_derivatives.detach()
         )
         stage_target = conditional_velocity[:, None]
         instantaneous_error = instantaneous_velocities.float() - stage_target
         average_error = reparameterized_velocities.float() - stage_target
+        instantaneous_squared_error = instantaneous_error.square()
+        average_squared_error = average_error.square()
         mean_flow_loss = 0.5 * (
-            instantaneous_error.square().mean() + average_error.square().mean()
+            instantaneous_squared_error.mean() + average_squared_error.mean()
         )
-
-        predicted_clean = state - time[:, None] * average_velocities[:, -1].float()
-        predicted_path, _ = self.curve_codec.decode_path(predicted_clean)
-        safety_loss = configuration_space_risk_loss(
-            predicted_path,
-            encoded.configuration_field,
+        predicted_deployment_coordinates = (
+            flow_source - average_velocities[:, -1].float()
+        )
+        predicted_deployment_path, _ = self.curve_codec.decode(
+            predicted_deployment_coordinates[deployment]
+        )
+        visible_clearance_loss = observed_clearance_loss(
+            predicted_deployment_path,
+            encoded.path_configuration_field[deployment],
             self.planning_horizon_m,
-        )
+        ).sum().mul(4.0 / clean.shape[0])
         return CurveNavLoss(
-            loss=mean_flow_loss + safety_loss,
+            loss=mean_flow_loss + visible_clearance_loss,
             mean_flow_loss=mean_flow_loss,
-            safety_loss=safety_loss,
+            visible_clearance_loss=visible_clearance_loss,
         )
 
     @torch.no_grad()
@@ -241,14 +279,14 @@ class CurveNavPolicy(nn.Module):
         state = self.inference_source.expand(condition.point_goal.shape[0], -1).clone()
         start_time = torch.zeros(state.shape[0], device=state.device)
         end_time = torch.ones_like(start_time)
-        average_velocities = self._predict_stage_velocities(
+        average_velocities, _ = self._predict_stage_velocities(
             state,
             start_time,
             end_time,
             encoded,
             self.trajectory_decoder.project_condition_memory(encoded.tokens),
-        ).float()
-        state = state - average_velocities[:, -1]
+        )
+        state = state - average_velocities[:, -1].float()
         path, _ = self.curve_codec.decode(state)
         return TrajectoryPrediction(path=path)
 
@@ -257,5 +295,11 @@ class CurveNavPolicy(nn.Module):
         condition: PolicyCondition,
         target: TrajectoryTarget,
         source: Tensor,
+        flow_interval_group: Tensor,
     ) -> CurveNavLoss:
-        return self.training_loss(condition, target, source)
+        return self.training_loss(
+            condition,
+            target,
+            source,
+            flow_interval_group,
+        )

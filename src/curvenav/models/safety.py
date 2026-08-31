@@ -1,16 +1,14 @@
-"""Continuous configuration-space queries and pathwise collision risk."""
-
-import math
+"""Continuous observed-C-space queries for generated metric curves."""
 
 import torch
 from torch import Tensor
 
-from curvenav.physical import EXTRA_CLEARANCE_M
+from curvenav.encoders.configuration import PATH_CONFIGURATION_FIELD_CHANNELS
+from curvenav.physical import EXTRA_CLEARANCE_M, PATH_CONFIGURATION_QUERY_SPACING_M
+from curvenav.trajectory import resample_path_to_horizon
 
 
 SAFETY_CLEARANCE_M = EXTRA_CLEARANCE_M
-SAFETY_OBJECTIVE_TYPE = "smooth_maximum_observed_configuration_space_margin_violation"
-SAFETY_SMOOTH_MAX_TEMPERATURE = 0.10
 
 
 def sample_configuration_field(
@@ -18,9 +16,15 @@ def sample_configuration_field(
     path: Tensor,
     planning_horizon_m: float,
 ) -> Tensor:
-    """Bilinearly query clearance, gradient, visibility, and occupancy."""
-    if configuration_field.ndim != 4 or configuration_field.shape[1] != 5:
-        raise ValueError("configuration field must have shape [B,5,H,W]")
+    """Bilinearly query one explicit configuration-space field contract."""
+    if (
+        configuration_field.ndim != 4
+        or configuration_field.shape[1] != PATH_CONFIGURATION_FIELD_CHANNELS
+    ):
+        raise ValueError(
+            "configuration field must have "
+            f"{PATH_CONFIGURATION_FIELD_CHANNELS} channels"
+        )
     if path.ndim != 3 or path.shape[-1] != 2:
         raise ValueError("path must have shape [B,P,2]")
     if path.shape[0] != configuration_field.shape[0] or planning_horizon_m <= 0:
@@ -53,32 +57,41 @@ def sample_configuration_field(
     ) * weight_x[..., None]
     sampled = top * (1.0 - weight_y[..., None]) + bottom * weight_y[..., None]
     inside = (normalized.abs() <= 1.0).all(dim=-1)
-    observed = sampled[..., 3:4] * inside[..., None].to(sampled.dtype)
-    forbidden = sampled[..., 4:5] * inside[..., None].to(sampled.dtype)
-    return torch.cat((sampled[..., :3], observed, forbidden), dim=-1)
+    inside_value = inside[..., None].to(sampled.dtype)
+    return torch.cat(
+        (sampled[..., :3], sampled[..., 3:] * inside_value), dim=-1
+    )
 
 
-def configuration_space_risk_loss(
-    path: Tensor,
+def observed_clearance_loss(
+    predicted_path: Tensor,
     configuration_field: Tensor,
     planning_horizon_m: float,
 ) -> Tensor:
-    """Penalize a smooth maximum of observed footprint-margin violations."""
-    field = sample_configuration_field(
+    """Return one observed signed-clearance residual for every trajectory.
+
+    This is a training-only differentiable coupling to the generator's own
+    depth input, not a deployment-time barrier, candidate score, or completed
+    map.  Each curve is sampled over its executed arc (never by repeating a
+    short endpoint); only cells observed by raw depth contribute.  Thus the
+    gradient through bilinear signed clearance directly moves a generated
+    curve away from a visible footprint-inflated obstacle.
+    """
+    if predicted_path.ndim != 3 or predicted_path.shape[-1] != 2:
+        raise ValueError("predicted_path must have shape [B,P,2]")
+    if planning_horizon_m <= 0:
+        raise ValueError("planning_horizon_m must be positive")
+    path, active = resample_path_to_horizon(
+        predicted_path,
+        planning_horizon_m,
+        PATH_CONFIGURATION_QUERY_SPACING_M,
+    )
+    predicted = sample_configuration_field(
         configuration_field,
         path,
         planning_horizon_m,
     )
-    clearance = field[..., 0]
-    observed = field[..., 3] > 0.5
-    violation = (
-        torch.relu(SAFETY_CLEARANCE_M - clearance) / SAFETY_CLEARANCE_M
-    ).square()
-    scaled = (
-        violation.masked_fill(~observed, 0.0)
-        / SAFETY_SMOOTH_MAX_TEMPERATURE
-    )
-    path_risk = SAFETY_SMOOTH_MAX_TEMPERATURE * (
-        torch.logsumexp(scaled, dim=-1) - math.log(path.shape[1])
-    )
-    return path_risk.mean()
+    observed = active & (predicted[..., 3] > 0.5)
+    deficit = torch.relu(EXTRA_CLEARANCE_M - predicted[..., 0])
+    residual = (deficit / EXTRA_CLEARANCE_M).square()
+    return (residual * observed.to(residual.dtype)).mean(dim=-1)

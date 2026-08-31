@@ -20,12 +20,12 @@ def configure_cuda_training_backend() -> None:
 
 
 def compile_static_training_functions(policy: nn.Module) -> None:
-    """Fuse the fixed-shape geometry and stopped MeanFlow derivative."""
+    """Fuse fixed-shape geometry projection and the stopped JVP."""
     projector = policy.depth_encoder.metric_projector
     projector.forward = torch.compile(
         projector.forward,
         fullgraph=True,
-        mode="reduce-overhead",
+        dynamic=False,
     )
     policy._mean_flow_total_time_derivative = torch.compile(
         policy._mean_flow_total_time_derivative,

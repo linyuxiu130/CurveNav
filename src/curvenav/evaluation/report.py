@@ -21,7 +21,7 @@ def _representative_index(mask: Tensor, score: Tensor, quantile: float) -> int |
 
 
 def select_cases(metrics: dict[str, Tensor]) -> list[tuple[str, int]]:
-    """Choose deterministic median cases plus the hardest visible detour."""
+    """Choose deterministic behavior and collision-diagnosis cases."""
     strata = evaluation_strata(metrics)
     requested = (
         ("forward_direct_median", "forward_direct", 0.5),
@@ -37,6 +37,13 @@ def select_cases(metrics: dict[str, Tensor]) -> list[tuple[str, int]]:
         )
         if index is not None and index not in {item[1] for item in selected}:
             selected.append((label, index))
+    index = _representative_index(
+        metrics["footprint_collision"].bool(),
+        metrics["min_clearance_m"],
+        0.0,
+    )
+    if index is not None:
+        selected.append(("source_collision_worst", index))
     return selected
 
 
@@ -69,10 +76,13 @@ def write_case_report(
                     np.degrees(np.arctan2(float(goal[1]), float(goal[0])))
                 ),
                 "predicted_min_clearance_m": float(
-                    metrics["observed_min_clearance_m"][index]
+                    metrics["min_clearance_m"][index]
                 ),
                 "reference_min_clearance_m": float(
-                    metrics["reference_observed_min_clearance_m"][index]
+                    metrics["reference_min_clearance_m"][index]
+                ),
+                "depth_min_clearance_m": float(
+                    metrics["depth_min_clearance_m"][index]
                 ),
                 "configuration_extent_m": float(
                     sample_data["configuration_extent_m"][index]
@@ -81,7 +91,7 @@ def write_case_report(
                 "predicted_path": sample_data["predicted_path"][index].tolist(),
                 "reference_path": sample_data["reference_path"][index].tolist(),
                 "configuration_clearance_m": field[0].tolist(),
-                "configuration_observed": (field[1] > 0.5).tolist(),
+                "configuration_ray_coverage": (field[1] > 0.5).tolist(),
                 "configuration_forbidden": (field[2] > 0.5).tolist(),
             }
         )

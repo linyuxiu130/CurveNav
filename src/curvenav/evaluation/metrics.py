@@ -8,11 +8,17 @@ import torch
 from torch import Tensor
 
 from curvenav.models.safety import SAFETY_CLEARANCE_M, sample_configuration_field
-from curvenav.trajectory import path_arc_length
+from curvenav.trajectory import (
+    path_arc_length,
+    resample_path_at_distance,
+    resample_path_to_horizon,
+)
+from curvenav.data.privileged import SourcePathQuery
+from curvenav.physical import PATH_CONFIGURATION_QUERY_SPACING_M
 
 
 COMPARISON_HORIZON_M = 2.0
-EVALUATION_SPACING_M = 0.025
+EVALUATION_SPACING_M = PATH_CONFIGURATION_QUERY_SPACING_M
 COMPARISON_PATH_SAMPLES = round(COMPARISON_HORIZON_M / EVALUATION_SPACING_M) + 1
 
 
@@ -21,38 +27,6 @@ def _validate_path(path: Tensor, name: str) -> None:
         raise ValueError(f"{name} must have shape [B,P,2] with P >= 3")
     if not torch.isfinite(path).all():
         raise ValueError(f"{name} must contain only finite coordinates")
-
-
-def resample_path_at_distance(path: Tensor, distance_m: Tensor) -> Tensor:
-    """Linearly sample a polyline at per-example physical arc distances.
-
-    Requests beyond the path endpoint hold the endpoint.  This is deliberate:
-    a short prediction must incur displacement error on the missing horizon
-    instead of receiving an artificially favorable overlap-only score.
-    """
-    _validate_path(path, "path")
-    if distance_m.ndim != 2 or distance_m.shape[0] != path.shape[0]:
-        raise ValueError("distance_m must have shape [B,Q]")
-    if (distance_m < 0).any() or not torch.isfinite(distance_m).all():
-        raise ValueError("distance_m must contain finite non-negative values")
-
-    segment = torch.linalg.vector_norm(path[:, 1:] - path[:, :-1], dim=-1)
-    cumulative = torch.cat(
-        (torch.zeros_like(segment[:, :1]), segment.cumsum(dim=-1)), dim=-1
-    )
-    query = torch.minimum(distance_m, cumulative[:, -1:]).contiguous()
-    lower = torch.searchsorted(cumulative.contiguous(), query, right=True) - 1
-    lower = lower.clamp(0, path.shape[1] - 2)
-    upper = lower + 1
-    lower_distance = cumulative.gather(1, lower)
-    upper_distance = cumulative.gather(1, upper)
-    weight = (query - lower_distance) / (
-        upper_distance - lower_distance
-    ).clamp_min(1e-8)
-    gather_index = lower[..., None].expand(-1, -1, 2)
-    start = path.gather(1, gather_index)
-    end = path.gather(1, (upper[..., None].expand_as(gather_index)))
-    return start + weight[..., None] * (end - start)
 
 
 def _uniform_distance(length_m: Tensor, samples: int) -> Tensor:
@@ -130,6 +104,19 @@ def trajectory_metrics(
     reference_progress = goal_distance - torch.linalg.vector_norm(
         point_goal - reference[:, -1], dim=-1
     )
+    goal_bearing = torch.atan2(point_goal[:, 1], point_goal[:, 0])
+    endpoint_bearing = torch.atan2(path[:, -1, 1], path[:, -1, 0])
+    reference_endpoint_bearing = torch.atan2(
+        reference_path[:, -1, 1], reference_path[:, -1, 0]
+    )
+    endpoint_goal_error = torch.atan2(
+        (endpoint_bearing - goal_bearing).sin(),
+        (endpoint_bearing - goal_bearing).cos(),
+    ).abs()
+    reference_endpoint_goal_error = torch.atan2(
+        (reference_endpoint_bearing - goal_bearing).sin(),
+        (reference_endpoint_bearing - goal_bearing).cos(),
+    ).abs()
     predicted_shape = _path_shape_metrics(path, comparison_horizon_m)
     reference_shape = _path_shape_metrics(reference_path, comparison_horizon_m)
     result = {
@@ -146,8 +133,17 @@ def trajectory_metrics(
         "reference_goal_progress_m": reference_progress,
         "goal_progress_regret_m": reference_progress - predicted_progress,
         "point_goal_distance_m": goal_distance,
-        "point_goal_bearing_rad": torch.atan2(point_goal[:, 1], point_goal[:, 0]),
+        "point_goal_bearing_rad": goal_bearing,
         "point_goal_is_behind": point_goal[:, 0] < 0,
+        "path_endpoint_bearing_rad": endpoint_bearing,
+        "reference_path_endpoint_bearing_rad": reference_endpoint_bearing,
+        "path_endpoint_goal_bearing_error_rad": endpoint_goal_error,
+        "reference_path_endpoint_goal_bearing_error_rad": (
+            reference_endpoint_goal_error
+        ),
+        "endpoint_goal_bearing_regret_rad": (
+            endpoint_goal_error - reference_endpoint_goal_error
+        ),
     }
     result.update(predicted_shape)
     result.update(
@@ -156,47 +152,95 @@ def trajectory_metrics(
     return result
 
 
-def observed_safety_metrics(
+def configuration_space_safety_metrics(
     path: Tensor,
     configuration_field: Tensor,
     planning_horizon_m: float,
 ) -> dict[str, Tensor]:
-    """Evaluate perceived safety at <=2.5 cm spacing over the local horizon."""
+    """Evaluate path safety in a signed robot configuration-space field."""
     _validate_path(path, "path")
     if planning_horizon_m <= 0:
         raise ValueError("planning_horizon_m must be positive")
+    if configuration_field.ndim != 4 or configuration_field.shape[1] != 5:
+        raise ValueError(
+            "evaluation configuration field must contain clearance, gradient, "
+            "coverage, and occupancy channels"
+        )
     length = path_arc_length(path)
-    evaluated_length = length.clamp_max(planning_horizon_m)
-    samples = math.ceil(planning_horizon_m / EVALUATION_SPACING_M) + 1
-    dense_path = resample_path_at_distance(
+    dense_path, active = resample_path_to_horizon(
         path,
-        _uniform_distance(evaluated_length, samples),
+        planning_horizon_m,
+        EVALUATION_SPACING_M,
     )
     sampled = sample_configuration_field(
         configuration_field,
         dense_path,
         planning_horizon_m,
     )
-    observed = sampled[..., 3] > 0.5
+    covered = active & (sampled[..., 3] > 0.5)
     clearance = sampled[..., 0]
-    observed_clearance = clearance.masked_fill(~observed, torch.inf)
-    minimum = observed_clearance.amin(dim=-1)
-    collision = observed & (clearance < 0.0)
-    margin_violation = observed & (clearance < SAFETY_CLEARANCE_M)
+    covered_clearance = clearance.masked_fill(~covered, torch.inf)
+    minimum = covered_clearance.amin(dim=-1)
+    collision = covered & (clearance < 0.0)
+    margin_violation = covered & (clearance < SAFETY_CLEARANCE_M)
     maximum_margin_violation = torch.where(
-        observed,
+        covered,
         torch.relu(SAFETY_CLEARANCE_M - clearance),
         torch.zeros_like(clearance),
     ).amax(dim=-1)
     return {
-        "observed_path_fraction": observed.float().mean(dim=-1),
-        "observed_min_clearance_m": minimum,
-        "observed_footprint_collision": collision.any(dim=-1),
-        "observed_safety_margin_violation": margin_violation.any(dim=-1),
-        "observed_max_margin_violation_m": maximum_margin_violation,
+        "path_field_coverage_fraction": covered.sum(dim=-1) / active.sum(
+            dim=-1
+        ).clamp_min(1),
+        "min_clearance_m": minimum,
+        "footprint_collision": collision.any(dim=-1),
+        "safety_margin_violation": margin_violation.any(dim=-1),
+        "max_margin_violation_m": maximum_margin_violation,
         "arc_length_beyond_local_horizon_m": torch.relu(
             length - planning_horizon_m
         ),
+    }
+
+
+def configuration_space_collision_attribution(
+    source_query: SourcePathQuery,
+    raw_depth_field: Tensor,
+    planning_horizon_m: float,
+) -> dict[str, Tensor]:
+    """Attribute source-truth collisions at identical dense local points."""
+    dense_path = source_query.local_path
+    raw = sample_configuration_field(
+        raw_depth_field, dense_path, planning_horizon_m
+    )
+    truth_collision = source_query.active & (source_query.clearance_m < 0.0)
+    truth_free = source_query.active & ~truth_collision
+    raw_ray_coverage = source_query.active & (raw[..., 3] > 0.5)
+    raw_collision = raw_ray_coverage & (raw[..., 0] < 0.0)
+
+    def point_count(mask: Tensor) -> Tensor:
+        return mask.sum(dim=-1)
+
+    return {
+        "truth_collision_point_count": point_count(truth_collision),
+        "truth_collision_point_raw_depth_count": point_count(
+            truth_collision & raw_collision
+        ),
+        "truth_collision_point_raw_ray_coverage_count": point_count(
+            truth_collision & raw_ray_coverage
+        ),
+        "truth_collision_point_raw_ray_coverage_missed_count": point_count(
+            truth_collision & raw_ray_coverage & ~raw_collision
+        ),
+        "truth_collision_point_outside_raw_ray_coverage_count": point_count(
+            truth_collision & ~raw_ray_coverage
+        ),
+        "raw_depth_false_collision_point_count": point_count(
+            truth_free & raw_collision
+        ),
+        "truth_collision_trajectory": truth_collision.any(dim=-1),
+        "truth_collision_trajectory_recognized_by_raw_depth": (
+            truth_collision & raw_collision
+        ).any(dim=-1),
     }
 
 
@@ -226,6 +270,15 @@ def summarize_metrics(metrics: dict[str, Tensor]) -> dict[str, float | int]:
         ].mean().item(),
         "goal_progress_regret_m_mean": metrics[
             "goal_progress_regret_m"
+        ].mean().item(),
+        "path_endpoint_goal_bearing_error_rad_mean": metrics[
+            "path_endpoint_goal_bearing_error_rad"
+        ].mean().item(),
+        "reference_path_endpoint_goal_bearing_error_rad_mean": metrics[
+            "reference_path_endpoint_goal_bearing_error_rad"
+        ].mean().item(),
+        "endpoint_goal_bearing_regret_rad_mean": metrics[
+            "endpoint_goal_bearing_regret_rad"
         ].mean().item(),
         "negative_progress_fraction": (
             metrics["goal_progress_m"] < 0
@@ -283,51 +336,51 @@ def summarize_metrics(metrics: dict[str, Tensor]) -> dict[str, float | int]:
     return result
 
 
-def summarize_paired_safety(metrics: dict[str, Tensor]) -> dict[str, float]:
-    """Summarize perceived risk relative to the same-field expert baseline."""
-    predicted_finite = torch.isfinite(metrics["observed_min_clearance_m"])
+def summarize_configuration_safety(metrics: dict[str, Tensor]) -> dict[str, float]:
+    """Summarize complete configuration-space risk against the expert baseline."""
+    predicted_finite = torch.isfinite(metrics["min_clearance_m"])
     reference_finite = torch.isfinite(
-        metrics["reference_observed_min_clearance_m"]
+        metrics["reference_min_clearance_m"]
     )
     if not predicted_finite.any() or not reference_finite.any():
         raise RuntimeError("evaluated trajectories do not intersect observed geometry")
     return {
-        "observed_path_fraction_mean": metrics[
-            "observed_path_fraction"
+        "path_field_coverage_fraction_mean": metrics[
+            "path_field_coverage_fraction"
         ].mean().item(),
-        "observed_min_clearance_m_mean": metrics["observed_min_clearance_m"][
+        "min_clearance_m_mean": metrics["min_clearance_m"][
             predicted_finite
         ].mean().item(),
-        "observed_footprint_collision_fraction": metrics[
-            "observed_footprint_collision"
+        "footprint_collision_fraction": metrics[
+            "footprint_collision"
         ].float().mean().item(),
-        "observed_safety_margin_violation_fraction": metrics[
-            "observed_safety_margin_violation"
+        "safety_margin_violation_fraction": metrics[
+            "safety_margin_violation"
         ].float().mean().item(),
-        "observed_max_margin_violation_m_mean": metrics[
-            "observed_max_margin_violation_m"
+        "max_margin_violation_m_mean": metrics[
+            "max_margin_violation_m"
         ].mean().item(),
         "arc_length_beyond_local_horizon_m_mean": metrics[
             "arc_length_beyond_local_horizon_m"
         ].mean().item(),
         "extra_footprint_collision_fraction_over_reference": (
-            metrics["observed_footprint_collision"]
-            & ~metrics["reference_observed_footprint_collision"]
+            metrics["footprint_collision"]
+            & ~metrics["reference_footprint_collision"]
         ).float().mean().item(),
         "extra_safety_margin_violation_fraction_over_reference": (
-            metrics["observed_safety_margin_violation"]
-            & ~metrics["reference_observed_safety_margin_violation"]
+            metrics["safety_margin_violation"]
+            & ~metrics["reference_safety_margin_violation"]
         ).float().mean().item(),
-        "reference_observed_path_fraction_mean": metrics[
-            "reference_observed_path_fraction"
+        "reference_path_field_coverage_fraction_mean": metrics[
+            "reference_path_field_coverage_fraction"
         ].mean().item(),
-        "reference_observed_min_clearance_m_mean": metrics[
-            "reference_observed_min_clearance_m"
+        "reference_min_clearance_m_mean": metrics[
+            "reference_min_clearance_m"
         ][reference_finite].mean().item(),
-        "reference_observed_footprint_collision_fraction": metrics[
-            "reference_observed_footprint_collision"
+        "reference_footprint_collision_fraction": metrics[
+            "reference_footprint_collision"
         ].float().mean().item(),
-        "reference_observed_safety_margin_violation_fraction": metrics[
-            "reference_observed_safety_margin_violation"
+        "reference_safety_margin_violation_fraction": metrics[
+            "reference_safety_margin_violation"
         ].float().mean().item(),
     }

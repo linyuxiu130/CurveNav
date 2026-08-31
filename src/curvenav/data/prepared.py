@@ -17,6 +17,11 @@ from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data.depth import depth_camera_contract
 from curvenav.data.depth_bank import PackedDepthBankSpec, PackedDepthRun
 from curvenav.data.trajectory import MAXIMUM_EXPERT_PROJECTION_ADE_RATIO
+from curvenav.data.privileged import (
+    SOURCE_CONFIGURATION_QUERY_SPACING_M,
+    SOURCE_CONFIGURATION_QUERY_TYPE,
+)
+from curvenav.physical import EXTRA_CLEARANCE_M
 
 
 POLICY_ARRAYS = {
@@ -25,7 +30,20 @@ POLICY_ARRAYS = {
     "observation_to_current": ("float32", 3),
     "observation_valid": ("bool", 2),
     "curve_values": ("float32", 2),
+    "source_grid_index": ("int64", 1),
+    "source_origin_xy": ("float32", 2),
+    "source_yaw_rad": ("float32", 1),
 }
+
+
+def flow_coordinate_statistics(trajectory: TrajectoryConfig) -> dict[str, object]:
+    """Return the train-split Euclidean coordinate normalization contract."""
+    return {
+        "length_pre_activation_mean": trajectory.length_pre_activation_mean,
+        "length_pre_activation_std": trajectory.length_pre_activation_std,
+        "heading_increment_mean_rad": list(trajectory.heading_increment_mean_rad),
+        "heading_increment_std_rad": list(trajectory.heading_increment_std_rad),
+    }
 
 
 def policy_dataset_contract(
@@ -49,9 +67,17 @@ def policy_dataset_contract(
         "curve_value_semantics": (
             "metric_arc_length_then_seven_cubic_heading_control_increments_rad"
         ),
+        "flow_coordinate_statistics": flow_coordinate_statistics(trajectory),
         "expert_projection": "equal_arc_heading_field_least_squares",
         "maximum_expert_projection_ade_m": (
             data.expert_waypoint_spacing_m * MAXIMUM_EXPERT_PROJECTION_ADE_RATIO
+        ),
+        "production_curve_minimum_source_clearance_m": EXTRA_CLEARANCE_M,
+        "trajectory_geometry_coupling": (
+            "expert_curve_only_raw_depth_observed_cspace_runtime_coupling"
+        ),
+        "source_configuration_space_truth": (
+            "native_navigation_grid_dense_0.025m_oob_non_executable"
         ),
     }
 
@@ -118,6 +144,9 @@ class PreparedPolicyDataset(Dataset):
                 self.count,
                 trajectory.num_heading_control_points,
             ),
+            "source_grid_index": (self.count,),
+            "source_origin_xy": (self.count, 2),
+            "source_yaw_rad": (self.count,),
         }
         invalid_shapes = {
             name: (tuple(self.arrays[name].shape), shape)
@@ -130,6 +159,8 @@ class PreparedPolicyDataset(Dataset):
             "point_goal",
             "observation_to_current",
             "curve_values",
+            "source_origin_xy",
+            "source_yaw_rad",
         )
         if any(not np.isfinite(self.arrays[name]).all() for name in finite_arrays):
             raise ValueError(
@@ -148,6 +179,36 @@ class PreparedPolicyDataset(Dataset):
         if np.any(observation_valid[:, :-1] & ~observation_valid[:, 1:]):
             raise ValueError(
                 f"prepared policy split history is not a valid suffix: {split}"
+            )
+
+        source = split_manifest.get("source_configuration_space", {})
+        grids = source.get("grids", ())
+        if (
+            source.get("query") != SOURCE_CONFIGURATION_QUERY_TYPE
+            or source.get("spacing_m") != SOURCE_CONFIGURATION_QUERY_SPACING_M
+            or source.get("out_of_bounds") != "non_executable_negative_clearance"
+            or not grids
+        ):
+            raise ValueError(f"prepared source configuration contract mismatch: {split}")
+        if not all(
+            (split_root / str(item.get("file", ""))).is_file()
+            for item in grids
+        ):
+            raise ValueError(f"prepared source configuration grid is missing: {split}")
+        grid_index = self.arrays["source_grid_index"]
+        if np.any(grid_index < 0) or np.any(grid_index >= len(grids)):
+            raise ValueError(f"prepared source grid index is invalid: {split}")
+
+        source_audit = split_manifest.get("audit", {}).get(
+            "source_configuration_space", {}
+        )
+        required_source_audit = (
+            "serialized_requery",
+            "expert_all_margin_safe",
+        )
+        if not all(source_audit.get(name) is True for name in required_source_audit):
+            raise ValueError(
+                f"prepared source configuration audit is missing or invalid: {split}"
             )
 
         depth = split_manifest.get("depth", {})
@@ -191,10 +252,15 @@ class PreparedPolicyDataset(Dataset):
         return self.count
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
-        return {
+        sample = {
             name: torch.from_numpy(np.array(array[index], copy=True))
             for name, array in self.arrays.items()
         }
+        # This runtime-only group is assigned before any distributed shuffling.
+        # It defines an exact global quarter of deployed MeanFlow boundaries;
+        # it is neither a stored expert label nor a policy condition.
+        sample["flow_interval_group"] = torch.tensor(index % 4, dtype=torch.uint8)
+        return sample
 
 
 class RepeatedPolicyDataset(Dataset):
@@ -228,4 +294,9 @@ class RepeatedPolicyDataset(Dataset):
         stride = 2 * ((self.seed ^ (cycle * 0x85EBCA77)) % max(size // 2, 1)) + 1
         while math.gcd(stride, size) != 1:
             stride += 2
-        return self.dataset[(offset + stride * position) % size]
+        sample = self.dataset[(offset + stride * position) % size]
+        sample["flow_interval_group"] = torch.tensor(
+            absolute_index % 4,
+            dtype=torch.uint8,
+        )
+        return sample

@@ -11,9 +11,7 @@ workspace_root=$(cd "$project_root/.." && pwd)
 export PYTHONPATH="$project_root/src"
 cd "$project_root"
 
-scripts/download_hssd_assets.sh
-scripts/generate_hssd_dataset.sh
-"$workspace_root/.venvs/curvenav/bin/python" scripts/prepare_hssd_depth_cache.py \
-  configs/base.yaml outputs/hssd_policy_dataset
-scripts/prepare_policy_dataset.sh \
-  configs/base.yaml outputs/hssd_policy_dataset data/policy_dataset
+exec "$workspace_root/.venvs/curvenav/bin/python" -m curvenav.data.prepare \
+  --config configs/base.yaml \
+  --hssd-root outputs/hssd_policy_dataset \
+  --output data/policy_dataset-source-cspace

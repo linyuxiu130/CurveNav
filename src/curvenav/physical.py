@@ -30,3 +30,7 @@ BODY_OBSTACLE_MIN_Z_M = (
     ROBOT_COLLISION_BOTTOM_Z_M + MAXIMUM_TRAVERSABLE_HEIGHT_M
 )
 EXTRA_CLEARANCE_M = 0.10
+
+# One common physical query spacing for source-truth certification, offline
+# safety measurement, and the training-only observed-geometry coupling.
+PATH_CONFIGURATION_QUERY_SPACING_M = 0.025

@@ -11,7 +11,6 @@ from curvenav.config import (
     DepthEncoderConfig,
     TrajectoryDecoderConfig,
     ConditionEncoderConfig,
-    PointGoalEncoderConfig,
     TrainingConfig,
     TrajectoryConfig,
 )
@@ -30,7 +29,6 @@ def config_from_mapping(raw: Mapping[str, Any]) -> CurveNavConfig:
     allowed_model = {
         "trajectory",
         "depth_encoder",
-        "point_goal_encoder",
         "condition_encoder",
         "trajectory_decoder",
     }
@@ -46,9 +44,6 @@ def config_from_mapping(raw: Mapping[str, Any]) -> CurveNavConfig:
         data=DataConfig(**raw.get("data", {})),
         trajectory=TrajectoryConfig(**trajectory),
         depth_encoder=DepthEncoderConfig(**model.get("depth_encoder", {})),
-        point_goal_encoder=PointGoalEncoderConfig(
-            **model.get("point_goal_encoder", {})
-        ),
         condition_encoder=ConditionEncoderConfig(**model.get("condition_encoder", {})),
         trajectory_decoder=TrajectoryDecoderConfig(
             **model.get("trajectory_decoder", {})

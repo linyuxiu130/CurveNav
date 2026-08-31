@@ -1,10 +1,15 @@
 # CurveNav
 
-CurveNav 是 PointGoal 条件二维局部规划器。模型读取三帧过去深度与一帧当前深度、对应逐帧相对变换和当前 PointGoal。当前帧经 SanD 风格 ResNet 形成 96 个视觉 token；四帧标定深度统一反投影、坡度分类并配准成连续机器人配置空间场，三个因果 SE(2) token 描述近期运动。生成器在标准化 softplus 弧长预激活与七个局部航向增量中学习 boundary-complete improved MeanFlow：随机高斯用于训练，固定典型 latent 用于确定性 1-NFE 推理。一次求值内先估计数据端粗轨迹，再用 16 个路径锚点连续查询 signed clearance、梯度、可见性与禁行占据，经两次内部细化输出唯一轨迹。三个共享-readout 阶段均满足同一 Improved MeanFlow 监督，避免无监督中间曲线在 JVP 中形成高增益反馈；推理仍只读取最终阶段。弧长严格为正且无上界，不与 PointGoal 距离硬绑定；目标距离不截断，航向不经过 clip 或 `tanh`。不存在 ODE solver、候选集、评价头或推理修补。
+CurveNav 是 PointGoal 条件二维局部轨迹生成器。它读取三帧历史深度、一帧当前深度、
+逐帧相对 SE(2) 变换和当前 PointGoal，以一次 improved MeanFlow 生成唯一平滑 B-spline。
+模型内部使用四帧深度构成局部配置空间条件；原始 Dingo `navigation_grid.npz` 只用于
+数据编译和物理安全评测，绝不进入部署网络。安全 query 固定为 `0.025m` 弧长采样、原生
+cell lookup，OOB 一律不可执行。`64×64` 局部 raw C-space 是部署输入；它不补全
+不可见区域，也不替代 source collision 真值。
 
-当前目标只有一个：先在现有深度合同下验证 PointGoal 局部规划，再在完全相同的 episode、相机、异步 MPC 和指标口径下对比 NavDP 与 X-NavDP。局部基线成立前不专项扩展长距离或脱困能力。
-
-架构与训练合同见 `ARCHITECTURE.md`，评测合同见 `EVALUATION.md`。
+架构、数学和安全合同见 [`ARCHITECTURE.md`](ARCHITECTURE.md)；离线和在线评测合同见
+[`EVALUATION.md`](EVALUATION.md)。项目不存在候选评价、推理碰撞投影、ODE solver、旧模型
+兼容、fallback 或第二条训练/推理链路。
 
 ## 唯一工作流
 
@@ -14,50 +19,52 @@ CurveNav 是 PointGoal 条件二维局部规划器。模型读取三帧过去深
 ../.venvs/curvenav
 ```
 
-从固定上游 commit 下载 HSSD、用官方 Dingo 相机生成观测并编译唯一训练集：
+从已审计、冻结的 HSSD 路线与深度缓存编译唯一训练集：
 
 ```bash
 scripts/build_dataset.sh
 ```
 
-该入口面向空的数据目录执行一次；内部阶段不提供历史版本、恢复模式或已有输出分支。训练只读取最终的 `data/policy_dataset`。
+当前训练唯一读取路径是 `data/policy_dataset-source-cspace`。该 prepared dataset 保存
+Dingo 深度索引、专家曲线、复制的 source grids 和逐样本 anchor provenance；写盘后必须通过
+source re-query certificate，且 source-gated train 曲线的
+FP64 Flow 坐标统计必须与模型配置一致，loader 才接受它。它不混入 SanD/NavDP 数据。
 
-当前唯一相机合同与 X-NavDP Dingo 测评相机一致：参考深度内参为
-`640×360, fx=fy=326.39856, cx=320, cy=180`；benchmark 可在保持光圈与 FoV
-不变时等比例采样为 `320×180`，此时内参随宽高解析缩放。两者都严格重投影到
-`224×126, fx=fy=166.80851`；相机在机器人系前向
-`0.28618 m`、高度 `0.62532 m`、下俯 `10°`。HSSD 直接按该外参渲染；数据、
-模型反投影与 checkpoint 共用该合同。旧 SanD `0/0.40/0°`
-深度不再进入训练，因为单张深度无法无损改造成不同视点。
+唯一相机合同与 X-NavDP Dingo 测评相机一致：参考深度内参为
+`640×360, fx=fy=326.39856, cx=320, cy=180`；所有输入重投影到
+`224×126, fx=fy=166.80851`。相机相对机器人前向 `0.28618m`、高度 `0.62532m`、
+下俯 `10°`。HSSD 数据、模型反投影与 checkpoint 共用该合同。
 
 测试、训练与离线评估：
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
   ../.venvs/curvenav/bin/python -m pytest -q -p no:cacheprovider
-GPU_IDS=0,1
-CUDA_VISIBLE_DEVICES="${GPU_IDS}" scripts/train_policy.sh configs/base.yaml
-CUDA_VISIBLE_DEVICES=0 scripts/evaluate_policy.sh configs/base.yaml outputs/train_policy/checkpoint.pt
+CUDA_VISIBLE_DEVICES=0,1,2,3 scripts/run_training_runtime.sh \
+  scripts/train_policy.sh configs/base.yaml
+CUDA_VISIBLE_DEVICES=0 scripts/evaluate_policy.sh \
+  configs/base.yaml outputs/train_policy/checkpoint.pt
 ```
 
-训练固定全局 batch 为 1024、每卡 micro-batch 上限为 256；1–8 张 GPU 都保持每次更新严格覆盖 1024 个不重复样本以及相同的 8000 个优化器更新。不能整除时只允许相邻 rank 相差一个样本，并按样本数缩放 loss 后再做 DDP 平均。每个 rank 的份额均衡拆成相同数量的 micro-batch；当前三卡训练为 `342/341/341`，每 rank 均衡拆为两次前后向；四卡时每 rank 使用 B256 且只需一次前后向。当前 prepared dataset 只包含我们在固定 HSSD 资产上生成的 Dingo 深度与专家轨迹，不混入 SanD/NavDP 数据。
+训练固定全局 batch 1024、200 epoch/8000 optimizer step；所有 GPU 数都按真实样本数缩放
+DDP loss，保持全局均值。四卡为 `256×4`，单卡微批上限为 342。支持 BF16 的 GPU 使用
+BF16；V100 使用同一代码路径下的 FP16 + GradScaler，stopped JVP 始终使用 FP32。运行时
+包装在独立 PID namespace 中执行唯一训练入口；强制
+结束其 tmux 会话不会留下 DDP rank。
 
 ## 目录
 
 ```text
-configs/base.yaml          唯一模型与训练配置
-configs/hssd_dataset.json  唯一 HSSD 生成配置
+configs/base.yaml          唯一模型、数据根和训练配置
 scripts/build_dataset.sh   唯一数据构建入口
-src/curvenav/data/         标定深度、统一数据编译与 loader
-src/curvenav/data_generation/ HSSD 资产、几何、生成与正式审计
-src/curvenav/encoders/     深度与 PointGoal 编码
-src/curvenav/conditioning/ 目标、当前视觉与因果运动状态融合
-src/curvenav/models/       有序曲线 Transformer 与 policy
-src/curvenav/trajectory/   专家/推理共用的正弧长度量航向场几何
+src/curvenav/data/         深度、source C-space query、编译与 loader
+src/curvenav/data_generation/ HSSD 资产、几何、生成与审计
+src/curvenav/encoders/     标定深度与观测配置空间编码
+src/curvenav/conditioning/目标无关场景编码、PointGoal 与因果状态
+src/curvenav/models/       MeanFlow trajectory Transformer
+src/curvenav/trajectory/   专家/推理共用的 B-spline 坐标与重采样
 src/curvenav/training/     DDP、AMP、EMA 与 checkpoint
-src/curvenav/evaluation/   固定离线评测
-src/curvenav/deployment/   多帧观测状态与严格推理接口
+src/curvenav/evaluation/   source-consistent 离线与跨模型评测
+src/curvenav/deployment/   严格单步推理接口
 tests/                     数学、数据、模型和部署合同
 ```
-
-仓库不保存生成结果、权重或日志，也不提供旧协议分支。

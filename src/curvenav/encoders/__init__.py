@@ -1,4 +1,4 @@
-"""Depth, configuration-space, and PointGoal encoders."""
+"""Calibrated depth and observed configuration-space encoders."""
 
 from .configuration import (
     CONFIGURATION_ENCODER_TYPE,
@@ -7,7 +7,6 @@ from .configuration import (
 )
 from .depth import DepthObservationEncoder
 from .geometry import MetricDepthProjector
-from .goal import POINT_GOAL_ENCODER_TYPE, PointGoalEncoder
 
 __all__ = [
     "CONFIGURATION_ENCODER_TYPE",
@@ -15,6 +14,4 @@ __all__ = [
     "ConfigurationSpaceEncoder",
     "DepthObservationEncoder",
     "MetricDepthProjector",
-    "POINT_GOAL_ENCODER_TYPE",
-    "PointGoalEncoder",
 ]

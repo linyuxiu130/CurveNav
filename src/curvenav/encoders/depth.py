@@ -11,7 +11,7 @@ from .geometry import MetricDepthProjector
 
 
 DEPTH_ENCODER_TYPE = (
-    "current_resnet18_plus_aligned_four_frame_configuration_space_field"
+    "shared_resnet18_all_four_frames_plus_aligned_metric_configuration_space_field"
 )
 
 
@@ -180,19 +180,28 @@ class DepthObservationEncoder(nn.Module):
         ):
             raise ValueError("observation_valid must be boolean with shape [B, T]")
         batch, frames = depth.shape[:2]
-        features = self.backbone(depth[:, -1])
+        # One shared visual encoder processes every valid temporal observation
+        # in one batched call.  The current frame remains the global visual
+        # context; all four aligned feature grids are lifted into metric BEV.
+        features = self.backbone(depth.flatten(0, 1))
         features = self.adaptive_pool(self.spatial_projection(features))
-        features = features.flatten(2).transpose(1, 2)
+        features = features.flatten(2).transpose(1, 2).reshape(
+            batch,
+            frames,
+            self.tokens_height * self.tokens_width,
+            self.model_dim,
+        )
         position = self.position_2d.to(device=features.device, dtype=features.dtype)
         projection = self.metric_projector(
             depth,
             observation_to_current,
             observation_valid,
         )
-        metric_points = projection.points[:, -1]
-        pooled_depth = projection.depth[:, -1]
-        body_obstacle = projection.obstacle_valid[:, -1] & observation_valid[:, -1, None]
+        metric_points = projection.points
+        pooled_depth = projection.depth
+        body_obstacle = projection.obstacle_valid & observation_valid[..., None]
         surface_valid = pooled_depth < self.metric_projector.max_depth_m
+        visual_valid = surface_valid & observation_valid[..., None]
         geometry = torch.cat(
             (
                 metric_points / self.metric_projector.max_depth_m,
@@ -206,11 +215,11 @@ class DepthObservationEncoder(nn.Module):
         )
         geometry_tokens = self.geometry_projection(geometry.to(features.dtype))
         features = self.output_norm(features + position + geometry_tokens)
-        tokens = self.dropout(features)
+        features = self.dropout(features)
         return DepthFeatures(
-            tokens=tokens,
-            points=metric_points,
-            depth=pooled_depth,
-            obstacle_valid=body_obstacle,
+            tokens=features[:, -1],
+            configuration_tokens=features.flatten(1, 2),
+            configuration_points=metric_points.flatten(1, 2),
+            configuration_visual_valid=visual_valid.flatten(1, 2),
             configuration_field=projection.configuration_field,
         )

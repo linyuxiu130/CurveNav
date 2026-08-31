@@ -95,7 +95,7 @@ def test_rejects_invalid_trajectory_contract() -> None:
         config_from_mapping({"model": {"trajectory": {"target_spline_degree": 2}}})
     with pytest.raises(ValueError, match="clamped cubic"):
         config_from_mapping({"model": {"trajectory": {"spline_degree": 2}}})
-    with pytest.raises(ValueError, match="cover"):
+    with pytest.raises(ValueError, match="sixty-four"):
         config_from_mapping({"model": {"trajectory": {"num_path_points": 4}}})
     with pytest.raises(ValueError, match="exactly eight"):
         replace(

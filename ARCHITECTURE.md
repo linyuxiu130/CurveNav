@@ -1,235 +1,123 @@
-# CurveNav 模型架构
+# CurveNav architecture
 
-本文是当前代码的唯一模型合同。CurveNav 读取四帧标定深度、对应的历史观测到当前帧 SE(2) 变换和机器人系 PointGoal，以一次 improved MeanFlow 输运生成一条二维短程轨迹。模型没有候选集、评价头、ODE solver、硬长度/曲率裁剪、推理碰撞投影、旧模型兼容或 fallback。
+CurveNav 是一个单输出、PointGoal 条件的二维局部轨迹生成器。它只接收四帧标定深度、历史相对状态和当前机器人系 PointGoal；一次 MeanFlow 传输直接输出一条短程 B-spline 轨迹。它不包含候选采样、轨迹 critic、ESDF/地图补全、轨迹投影、推理期安全能量或后处理分支。
 
-## 1. 问题判断与唯一设计
+## 1. 坐标和物理合同
 
-旧模型的主要问题不是 Transformer 不够大，而是几何变量和场景交互不适合一步 Flow：
+所有局部量采用 `x-forward, y-left`，PointGoal 为当前机器人系中任务终点的二维坐标。Dingo 碰撞体用半径 `0.167584539 m` 的圆形 C-space 膨胀；额外净空为
 
-1. 七个累计航向控制量高度相关，训练集协方差条件数约为 `315`；各局部航向增量的条件数约为 `2.86`。同一条曲线流形用差分坐标表示后，Flow 不再重复运输累计误差。
-2. 旧历史压缩器先把三帧度量几何压成 32 个潜变量，再要求路径 token 从潜变量中重新发现障碍位置。它丢失了避障最需要的连续空间对应关系。
-3. 稀疏 cell 最近点和全局最近障碍 penalty 不能表示机器人 footprint、可见自由空间或整条路径的最坏风险。
-4. PointGoal 距离曾被硬截断，远目标失去距离顺序；视觉 backbone 重复计算四帧，而短时历史真正需要的是已经配准的几何与运动状态。
-5. 深度可见性曾把归一化深度同米制阈值比较，令无回波区域错误变成已观测空间。该单位错误已从投影根源消除。
-6. 把完整配置空间先压成 `8×8` token，再以它们更新视觉/目标 query，随后丢弃配置 token，仍然没有建立“输出路径点—障碍场位置”的直接对应。100 回合闭环中 CurveNav 只有 `32%` SR；失败回合仍给出约 `0.41 m/s` 前进命令，但实际速度约 `0.041 m/s` 且 87% 时间近乎静止。离线分支消融中，完整模型碰撞率为 `1.54%`，只保留当前帧视觉为 `4.70%`，只保留显式四帧配置空间却为 `15.67%`，与全空输入的 `16.31%` 几乎相同。这证明配置空间计算本身存在，但它在间接融合中没有成为可独立使用的规划变量。
+\[
+m=0.10\;\mathrm m.
+\]
 
-唯一方案是：差分航向曲线坐标、当前帧 SanD 风格视觉特征、四帧配准的机器人配置空间场、保留到解码端的完整配置 token、显式历史 SE(2) token，以及在一次 improved MeanFlow 函数调用内部进行粗到细路径相对几何查询。当前不增加 critic、多候选、RL 后训练或长期地图。
+规划视野和最大局部评测长度均为 `H=3.6 m`。源 C-space、离线评测和训练期路径查询共用 `0.025 m` 的物理采样间隔；它们的坐标变换、OOB 语义和机器人 footprint 均由 [`src/curvenav/physical.py`](src/curvenav/physical.py) 定义。
 
-## 2. 张量与模块合同
+## 2. 数据合同
 
-```text
-depth                  float [B,4,1,126,224]
-point_goal             float [B,2]
-observation_to_current float [B,4,4]   # x,y,sin Δyaw,cos Δyaw
-observation_valid      bool  [B,4]
-
-expert curve values    float [B,8]     # L, Δθ1,...,Δθ7
-mean-flow coordinates  float [B,8]     # standardized softplus pre-activation and Δθ
-prediction path        float [B,64,2]
-```
-
-生产模型维度固定为 `D=384`、39,804,232 个可训练参数：
+训练数据只保存模型真正需要的条件和专家曲线：
 
 ```text
-current depth
-  └─ GroupNorm ResNet-18 stage3 + 8×12 pooling
-  └─ calibrated current metric geometry
-       └─ 96 current visual tokens
-
-four aligned depths
-  └─ slope-aware body-obstacle extraction
-  └─ exact 64×64 Euclidean distance transform
-       └─ [clearance,gx,gy,observed,forbidden]
-       └─ 3-stage strided metric CNN
-            └─ 64 complete configuration-space tokens
-
-PointGoal + 96 visual + 3 historical SE(2) + 64 configuration tokens
-  └─ 4 joint condition Transformer blocks
-       └─ heterogeneous condition memory [B,164,384]
-
-8 curve tokens
-  └─ decoder blocks 1--4 ── shared readout ── coarse data-end curve
-       └─ 16 path anchors query exact 64×64×5 field
-  └─ decoder blocks 5--8 ── shared readout ── refined data-end curve
-       └─ 16 path anchors query exact 64×64×5 field
-  └─ decoder blocks 9--12 ── shared readout ── 8-D average velocity
-
-fixed typical Gaussian latent
-  └─ one average-velocity evaluation
-       └─ one 64-point path
+depth_indices              uint32 [B,4]
+point_goal                 float32[B,2]
+observation_to_current     float32[B,4,4]  # dx, dy, sin(dyaw), cos(dyaw)
+observation_valid          bool   [B,4]
+curve_values               float32[B,8]
+source_grid_index          int64  [B]
+source_origin_xy           float32[B,2]
+source_yaw_rad             float32[B]
 ```
 
-模块职责：
+最后三项只保留在数据集，用于 source C-space 专家证书和离线物理评测；它们绝不进入策略条件。准备阶段把每条专家 B-spline 以 `0.025 m` 在原始 `navigation_grid.npz` 上重新查询，要求全程在 world bounds 内且 signed clearance 不小于 `m`。因此 source C-space 是数据门控和独立裁判，不是策略输入或训练标签。
 
-- `encoders/depth.py`：只对当前图运行视觉 backbone，并融合当前帧标定几何。
-- `encoders/geometry.py`：四帧反投影、坡度分类、刚体配准和配置空间场。
-- `encoders/configuration.py`：把完整配置空间场编码为带二维度量位置的全局安全 token。
-- `conditioning/transformer.py`、`conditioning/motion.py`：目标、当前视觉、配置空间和因果历史状态的联合 token memory。
-- `trajectory/heading.py`：训练与推理共用的八维正则曲线双射。
-- `models/decoder.py`、`models/blocks.py`：一次函数调用内的共享-readout平均速度细化与路径相对配置空间查询。
-- `models/policy.py`：唯一 MeanFlow 恒等式、损失和一步采样。
-- `models/safety.py`：配置空间场查询与路径最坏风险；不修改推理轨迹。
+不再写入 `local_clearance_m`、碰撞反事实曲线或其有效位。它们对应的特权 map completion、BCE 和相对负轨迹损失已删除。
 
-## 3. 正弧长差分航向曲线
+## 3. 可观测局部几何
 
-令 `L>0`，八个 clamped cubic B-spline 航向控制为 `θ0,...,θ7`，其中 `θ0=0`。网络的七个物理转向值是局部增量：
+`MetricDepthProjector` 对四帧深度逐帧反投影，并用 `observation_to_current` 的 SE(2) 变换对齐到当前机器人系。它构造固定 `64×64` 的局部 C-space field：
 
-```text
-θ0=0
-θi=Σ_{k=1}^i Δθk
-θ(u)=Σ_i B_i(u)θi
-p(u)=L∫₀ᵘ[cos θ(v), sin θ(v)]dv
-κ(u)=(1/L)dθ/du
-```
+\[
+F(q)=[d(q),\hat\nabla_xd(q),\hat\nabla_yd(q),o(q),b(q)].
+\]
 
-所以任意有限网络输出都满足 `||dp/ds||=1`、起点为原点、初始方向向前；`θ∈C²`，因此 `p∈C³`、曲率连续。64 点之间用四倍过采样和线性航向圆弧弦公式积分。没有最大规划长度、`L≤2d_goal`、最大曲率、`tanh` 或 clip。
+其中 `d` 是由已观测 body-height 障碍得到的 footprint-inflated signed clearance，`o` 是射线可观测性，`b=1[d\le0]`。`F` 是输入深度的确定函数；未知格不会被学习模块补成可通行或不可通行。距离变换为了在可见障碍附近连续查询而在整张有限栅格上有数值，但它在 `o=0` 时不是自由空间观测：进入卷积编码器和路径 token 的实际特征严格为
 
-令 `a=softplus⁻¹(L)=L+log(-expm1(-L))`。Flow 的无界欧氏坐标为：
+\[
+[o d,\;o\hat\nabla_xd,\;o\hat\nabla_yd,\;o,\;o b].
+\]
 
-```text
-zL=(a-μL)/σL
-zi=(Δθi-μi)/σi
-L=softplus(μL+σL zL)
-```
+因此未知格不能借由正的外推 clearance 伪装成可通行空间；raw `d` 只在 `o` 掩码下用于连续训练期净空梯度和可观测性诊断。
 
-`softplus` 是从实数到正数的光滑严格单调双射，保证长度严格为正；它在大正输入处线性增长且导数始终小于 1，因此训练会遇到的大幅有限 Flow 中间状态不会再像指数坐标一样上溢。逆式使用 `expm1` 在短轨迹处保持数值精度。这不是长度裁剪：`L` 仍无上界，且该变换在整个数学定义域可逆。差分是从航向控制到局部转向的满秩线性双射，不改变 B-spline 曲线族。专家等弧长重采样后先拟合累计航向，再取控制差分。训练数据只保存米制弧长与弧度增量；坐标统计属于模型合同，只写入配置和 checkpoint，不污染物理数据合同。
+这一区分是关键：`64×64` raw field 是部署端的局部观测，不是物理真值。物理真值仍是 native `0.05 m` source grid。
 
-## 4. 标定视觉与配置空间场
+## 4. 视觉、时序与目标融合
 
-四帧深度使用同一 Dingo 相机标定反投影到机器人系。每个像素参与相邻四个图像三角面；重力方向法向坡度不超过 `45°` 的表面视为可通行地形。其余落在机器人碰撞高度带内的点是 body obstacle。所有有效历史点使用同一个刚体合同
+共享的 ResNet-18 对所有四帧一次批量编码，得到每帧 `8×12` 个视觉 token。当前帧的 96 个 token 进入全局 scene memory；四帧共 384 个 token 连同其标定三维点和有效位，双线性 splat 到当前机器人系 `8×8` metric BEV memory。raw C-space 同时经 `64→32→16→8` 卷积编码并与该 BEV memory 相加。
 
-```text
-p_current = t_observation_to_current
-          + R(yaw_observation-yaw_current) p_observation
-```
+因此历史帧既以确定的障碍 union 进入 raw field，也以可学习视觉特征进入同一度量 BEV；历史视觉不再被丢弃。三个过去时刻的 SE(2) 状态 token 提供因果运动信息。
 
-对齐到当前机器人系。训练的 Habitat XZ 角度是右转为正，因此在写入该合同时先转换成左转为正；部署的 Isaac XY yaw 已是左转为正。两端最终张量语义完全相同。
+当前视觉 token、状态 token 和 `8×8=64` C-space token 先经过四层**与目标无关**的 self-attention。随后才追加独立的、按 `H` 归一化的 PointGoal token。PointGoal 可以引导绕行方向，但不能改写测得的障碍证据。
 
-局部场覆盖 `[-3.6,3.6]²` 的 `64×64` 网格。对栅格化障碍集合 `O` 使用可分离的精确欧氏距离变换：
+## 5. 正则轨迹坐标
 
-```text
-d(q)=min_{o∈O} ||q-o||₂
-c(q)=d(q)-r_robot
-forbidden(q)=[c(q)≤0]
-```
+网络生成八维 Euclidean Flow 坐标：一维长度预激活和七维局部航向增量。解码为
 
-其中 `r_robot=0.167584539 m`。场的五个通道是：footprint signed clearance、其单位梯度 `gx,gy`、由相机到有效深度表面的射线覆盖 `observed`、以及 `forbidden`。每条最大平面长度小于 `6.3 m` 的标定射线使用 `64` 个点栅格化，相邻点间距小于 `64×64` 场的 `7.2/63 m` 单元宽度。障碍一旦被观测，其 `c(q)≤0.10 m` 的机器人包络与安全裕度影响域也直接属于已观测已知区域；不能只把障碍点中心标成 observed。前四帧对障碍和可见区域取静态并集，因而过去看见但当前遮挡的近程障碍仍存在；无长期地图。
+\[
+L=\operatorname{softplus}(\mu_L+\sigma_Lz_0),\qquad
+\Delta\theta_k=\mu_k+\sigma_kz_k,
+\]
 
-视觉 ResNet 只处理当前帧，避免四倍重复卷积。当前 `8×12` 特征同每个 cell 的 metric XYZ、深度、表面有效位和障碍位融合。三个过去位姿另以 `(x/h,y/h,sin Δyaw,cos Δyaw)` 编码；无效历史使用一个学习 null token。PointGoal 使用方向和无截断 `log1p(distance/3.6)`，因此任意有限距离保持顺序。
+随后累积成八个 clamped cubic B-spline heading control points，并按弧长积分得到 64 个路径点。该参数化保证正弧长、原点和初始前向切线，以及连续 heading/curvature；它不把长度硬绑定到目标距离，也不使用 `tanh` 曲率边界。
 
-## 5. 路径相对配置空间 MeanFlow
+解码器有三次自细化。在后两次细化中，它沿当前估计曲线查询 raw C-space。`32` 个路径 anchor 覆盖 64 个输出点，间距约 `3.6/31=0.116 m`，与 `64×64` field 的 `7.2/63=0.114 m` 单元分辨率对齐；旧的 16-anchor 欠采样已删除。
 
-完整 `64×64×5` 配置空间先把 clearance 除以 `3.6 m`，再经过三个 `3×3,stride=2` 卷积得到带二维度量位置的 `8×8` token。它们不再被提前折叠并丢弃，而是与 PointGoal、96 个当前视觉 token 和三个历史状态 token 直接拼成 164 个一等 token，共同通过四层 condition Transformer；decoder 每层都能读取原始空间语义仍然存在的 memory。
+## 6. 单步 MeanFlow 与训练期可见净空耦合
 
-同一个 MeanFlow 训练样本需要计算瞬时主值 `uθ(z_t,t,t,c)` 和区间主值 `uθ(z_t,0,t,c)`，两者的 condition memory 完全相同。第 `l` 层因此只计算一次 `M_l=Norm_l(c)` 和 `(K_l,V_l)=P_l^{KV}(M_l)`，两个主值各自只投影自己的 query，并共同读取 `(K_l,V_l)`。这不是近似缓存：对两项损失 `L₁,L₂`，共享图的梯度 `J_Pᵀ(g₁+g₂)` 与重复图的 `J_Pᵀg₁+J_Pᵀg₂` 严格相同。stop-gradient JVP 仍在禁用 autocast 的 FP32 图内独立投影 condition，避免把 BF16 K/V 混入十二层 Jacobian 连乘；推理只计算一个主值，也只投影一次。cross-attention 参数名、初始化、scaled dot-product attention 和 checkpoint 张量与 `MultiheadAttention` 完全一致，不存在旧 attention 分支。
+令专家标准化坐标为 `z`，训练源为 `e`，插值状态为
 
-12 层 decoder 分为三个连续的四层阶段，三个阶段使用同一个归一化和八维速度 readout，不存在独立中间头。第一阶段只根据 Flow 控制 token 和完整条件 memory 形成粗平均速度 `u¹`。对数据锚定时刻 `t`，其粗数据端估计为：
+\[
+x_t=(1-t)z+t e,qquad v^\star=e-z.
+\]
 
-```text
-x_hat¹=z_t-t·u¹
-P_hat¹=Decode(x_hat¹)
-```
+网络同时预测瞬时速度和区间平均速度。训练使用 iMF 的 diagonal/interior 区间，以及固定部署边界 `(r,t)=(0,1)`；部署子集固定使用同一典型高斯源 `e*`。停止梯度的 JVP 形成平均速度的总时间导数，优化目标为瞬时和重参数平均速度对 `v*` 的等权平方误差。推理严格使用
 
-从 `P_hat¹` 取 16 个固定弧进度锚点，直接在原始 `64×64×5` 场上做连续双线性查询。送入第二阶段的每个路径 token 为：
+\[
+\hat z=e_\star-u_\theta(e_\star,0,1,c),\qquad
+\hat\tau=D(\hat z),
+\]
 
-```text
-position/3.6, sin heading, cos heading, arc progress,
-(PointGoal-position)/3.6,
-clearance/3.6, gradient_x, gradient_y, observed, forbidden
-```
+即一次平均速度传输，无 ODE 多步积分。
 
-第八层再用同一个 readout 得到 `u²`，重建 `P_hat²` 并重复一次精确场查询；最后四层输出 `u³`。因此后续层修正的依据始终是当前网络实际准备生成的曲线，而不是独立 Gaussian `z_t` 解码出的随机曲线。三个阶段只是一个可微函数 `uθ` 内部的深度计算，MeanFlow 的 NFE 仍严格为 1；JVP 会穿过曲线解码和连续场查询，不存在训练/推理之外的投影、优化器或评价链。
+每个训练 global batch 的连续样本流按 `index mod 4` 分配 interval group，而不是在每张卡或每个 micro-batch 重新计数：group `0` 是部署边界、`1` 是 interior、`2/3` 是 diagonal。因此无论 1–8 张卡怎样切分，每个 global batch 都有精确 `1/4` 的部署样本，DDP 的路径净空项与全局目标一致。
 
-中间轨迹不能是仅用来选择下一次几何查询位置的自由 latent：否则它会经曲线解码和场查询进入 JVP，形成无监督的高增益反馈。因此 `u¹,u²,u³` 都使用下节同一 Improved MeanFlow 恒等式监督，损失在三个阶段和八个欧氏坐标上直接取均值，没有人工阶段权重。概率路径的 JVP 切向仍唯一使用最终瞬时速度 `u³(z_t,t,t)`；推理只取最终平均速度 `u³(e,0,1)`。这是同一 readout 的深层监督，不是候选轨迹、评价头或第二推理链。
+仅在该精确部署子集上，对 `\hat\tau` 加入训练期 observed-clearance 项。令 `q_j` 是从起点开始、间隔不大于 `0.025 m` 且不重复短路径终点的 active 路径采样点，`d_j,o_j` 是从**同一个输入 raw field** 双线性查询的 clearance 和可观测性，`Q=145`：
 
-## 6. Boundary-complete improved MeanFlow
+\[
+L_{\rm vis}=
+\frac{1}{|\mathcal D|}\sum_{i\in\mathcal D}
+\frac1Q\sum_j a_{ij}o_{ij}
+\left[\max\left(0,\frac{m-d_{ij}}m\right)\right]^2,
+\qquad
+L=L_{\rm MF}+L_{\rm vis}.
+\]
 
-采用数据端 `t=0`、高斯端 `t=1`。专家标准坐标为 `x`，源为 `e~N(0,I)`：
+`a` 是执行弧长掩码，未知格的 `o=0`，所以 source map 不会泄漏为可微监督。对 `d<m`，位置梯度与 `+\nabla d` 同向，经过 B-spline 和 MeanFlow 直接推动生成轨迹远离已观测、已膨胀 C-obstacle。该项只在训练中建立“生成轨迹—自身输入几何”的因果联系；推理图完全不变。
 
-```text
-z_t=(1-t)x+t e
-v_c=e-x
-```
+## 7. 为什么删除 completion 和反事实负轨迹
 
-网络 `uθ(z,r,t,c)` 表示区间 `[r,t]` 的平均速度，瞬时速度由退化区间定义：
+旧链路用 source grid 栅格化得到全局 `local_clearance_m`，让一个 head 补全不可见区域，再用 source-unsafe `p−` 做相对轨迹边界。这两条监督都不能保证由输入深度判定。
 
-```text
-vθ(z,t,c)=uθ(z,t,t,c)
-```
+在 source-cspace validation 上，2,247 条有效 `p−` 中有 35.43% 在真实碰撞段没有任何 raw observed-margin (`d<0.10m`) 证据；把它们全部称为“深度避障梯度”在数学上不成立。相反，1,024 条 source-safe 专家的 raw field 覆盖率为 89.31%，只有 0.364% 路径点（2.832% 轨迹）出现 observed `d<0.10m` 冲突。因此现在的软 observed-only 项保留局部传感器证据，避免把少量投影/分辨率差异变成硬约束。
 
-部署使用的数据锚定区间为 `[0,t]`。沿概率路径的总导数通过精确 forward-mode JVP 计算：
+## 8. 与 SanD、NavDP、X-NavDP 的关系
 
-```text
-D_tuθ = JVP(uθ; vθ,0,1)
-Vθ = uθ(z_t,0,t,c)+t·stopgrad(D_tuθ)
-```
+- SanD 的短深度序列、ResNet token 和 B-spline 轨迹参数化被保留；但 SanD 的实际安全性还依赖候选轨迹和 ESDF 选择，不能等同于单输出生成器本身已学会避障。
+- NavDP 的 ESDF 负轨迹与 critic 属于特权评价/选择链路。CurveNav 不复制该分支：源 C-space 只做数据证书和评测，生成器只学习部署时可见的 raw C-space。
+- X-NavDP 的 RL post-training 不在当前范围；本链路先保证模仿学习生成器、训练边界和物理评测一致。
 
-由平均流恒等式 `v=u+(t-r)D_tu`，训练损失是：
+相对这些方案，CurveNav 的改进不是增加第二个决策器，而是让唯一 MeanFlow 轨迹在与部署相同的输入 C-space 上获得连续、可微且不泄漏特权地图的避障梯度。
 
-```text
-L_MF = 1/6 Σ_{k=1}^3 E[||vθᵏ-v_c||² + ||Vθᵏ-v_c||²]
-```
+## 9. 效率和唯一链路
 
-每个 batch 先显式采样一次 `e~N(0,I)`，并用闭区间等距 collocation 覆盖 `[0,1]`。该源只属于当前优化器 batch；BF16 更新只执行一次，不重抽 source、不跳过 batch，也不复制/恢复整份 CUDA RNG 状态。不使用固定源训练、时间端点概率、课程开关或有限差分。推理选择训练高斯典型集内范数为 `√8` 的固定 latent：
+没有 completion decoder、BCE、`p−` 搜索、candidate batch 或 critic，因此主损失和数据准备都更短。四帧 ResNet 以 `[B·4]` 单次卷积执行；BEV splat 固定为 `8×8`；visible loss 只作用于四分之一部署样本的 `145×5` field gather，不额外执行 JVP 或推理。
 
-```text
-x_hat=e* - uθ(e*,0,1,c)
-P_hat=Decode(x_hat)
-```
-
-这是严格 1-NFE，不存在 Euler、Heun、midpoint 或 `flow_steps`。
-
-## 7. 生成路径安全目标
-
-训练时同样从当前平均流估计数据端：
-
-```text
-x_hat_t=z_t-t·uθ(z_t,0,t,c)
-P_hat_t=Decode(x_hat_t)
-```
-
-对 64 个等弧长路径点查询配置空间场，只在已观测位置计算 footprint 外的 `0.10 m` 软裕度。硬 `max` 只把梯度传给一个最坏采样点，不足以训练整段扫掠路径；当前使用温度 `τ=0.10` 的稳定 smooth maximum：
-
-```text
-vj=observed(pj)·[relu((0.10-c(pj))/0.10)]²
-L_safe=mean_batch τ[logsumexp_j(vj/τ)-log 64]
-L=L_MF+L_safe
-```
-
-该式在全安全时严格为零，逼近最坏风险，同时让所有近危险点获得梯度；配置空间距离已经减去机器人半径，因此阈值只剩额外净空。该项不裁剪、不重规划、不拒绝模型输出，也不对不可见空间声称安全保证。
-
-## 8. 相对公开工作的依据
-
-| 来源 | 吸收 | CurveNav 的改进/取舍 |
-|---|---|---|
-| [SanD](https://arxiv.org/abs/2602.00923) | ResNet 视觉、小样本轨迹先验、cubic spline、配置空间净空 | 保留解析平滑曲线，但改用 softplus 正弧长和差分航向；完整配置空间在生成前进入唯一生成器，不复制候选 evaluator。 |
-| [NavDP](https://arxiv.org/abs/2505.08712) | 轨迹 token 与视觉 memory 的深层交互、历史条件 | 保留深交互；以标定连续配置空间场替代要求 latent token 隐式恢复的碰撞几何。 |
-| [X-NavDP](https://arxiv.org/abs/2607.28560) | 后训练用于恢复和分布外行为 | 当前先验证单生成器；不以 critic/RL 掩盖生成器的监督与几何错误。 |
-| [Flow Matching](https://arxiv.org/abs/2210.02747) | 合法随机高斯源和条件概率路径 | 禁止零源/固定源训练；确定性只在推理时选择典型 latent。 |
-| [Improved MeanFlow](https://arxiv.org/abs/2512.02012) | 平均速度和 JVP 重参数化 | 同时监督瞬时边界与部署区间；只把 stop-gradient JVP 置于 FP32，普通主值与部署统一为 BF16。 |
-| [Riemannian Flow Matching Policy](https://arxiv.org/abs/2412.10855) | 动作空间几何应进入 Flow | 先解析删除零切向奇点，再在标准化、良态的欧氏差分坐标中训练。 |
-
-## 9. 数据、效率与验证合同
-
-训练数据只来自 CurveNav 按 benchmark Dingo 配置生成的 HSSD 专家路线，不读取 SanD/NavDP 数据。当前 canonical dataset 为训练 `25,928`、验证 `6,087` 条；深度 bank 在编译时硬链接，不重复复制图像。
-
-训练固定 global batch `1024`、每卡 micro-batch 上限 `342`、最大学习率 `2e-4`、`40` step/epoch、`200` epoch，共 `8,000` 次优化器更新。1--8 卡使用同一 DDP batch 分配；各 rank 份额最多差一个样本，并均衡拆成 micro-batch。`342` 是三卡 rank0 的实际最大值：24 GiB RTX 4090 上完整 `342` 样本前后向实测峰值约 `18.25 GiB`，因此三卡的 `342/341/341` 和四卡的 `256×4` 都只需一个 micro-batch。视觉、条件编码、瞬时边界主值和部署区间平均速度统一使用 BF16 Tensor Core 路径；只有已经 stop-gradient、不会参与反向图的精确 forward-mode JVP 使用 FP32 与数学 SDPA，因为十二层 Jacobian 连乘的动态范围不能可靠地放进 16 bit。JVP 的 primal 返回值被丢弃，可训练的平均速度另做一次 BF16 前向；这与 Improved MeanFlow 中 `Vθ=uθ+t·stopgrad(D_tuθ)` 完全等价，同时避免让数学 SDPA 的 JVP 激活驻留在梯度图中。训练和在线推理均使用 BF16，不存在 FP16/FP32 主值分支。EMA 与 optimizer/scheduler/RNG 都进入唯一 checkpoint。训练运行时以 `torch.compile(fullgraph=True)` 融合完整、静态形状的 FP32 JVP 函数，并以 `mode="reduce-overhead"` 融合无参数的度量几何投影器；编译只改变同一数学函数的执行计划，不改 checkpoint、推理图、精度或损失，也不保留 eager 训练分支。PyTorch 的 DDPOptimizer 只用于编译包住整个 DDP module 的图，会错误切开内部 `torch.func.jvp` 的 TensorWrapper 图；CurveNav 没有编译外层 DDP，因此统一关闭该无关切图器，保留正常 DDP gradient bucket 与通信重叠。每次反向仍在设备上检查 loss 和全局梯度范数是否有限，但用 CUDA 异步断言终止非法更新，不再为了读取布尔标量而强制每个 step 同步 CPU；不存在跳过 batch、降低 scale 或重抽 Flow source 的第二更新路径。
-
-当前必要验证：
-
-- `compileall`、`git diff --check`；
-- 94 个数学、数据、前向、梯度和合同测试；
-- V100S batch `128` 的完整前后向交叉顺序 A/B：eager JVP 为 `94.97/91.40 samples/s`，完整 JVP 融合为 `100.31/100.68 samples/s`，即提升 `5.63%/10.15%`，峰值显存均约 `8.70 GiB`；单独 JVP 从 `181.70 ms` 降至 `70.15 ms`，输出最大绝对误差 `4.84e-6`。完整 loss 精确相同，318 个参数张量的梯度逐项通过 `rtol=2e-3, atol=2e-4` 检查，最大绝对梯度误差 `1.22e-4`；`reduce-overhead` 的 CUDA Graph 输出别名方案已拒绝，生产只使用无输出生命周期隐患的默认编译模式；
-- condition K/V 重用的 V100S batch `128` 交叉顺序 A/B：GPU0 完整前后向从 `1366.92 ms` 降至 `1308.45 ms`（`+4.46%` samples/s），GPU3 从 `1445.66 ms` 降至 `1358.71 ms`（`+6.40%`），峰值显存从 `8.69 GiB` 降至 `8.47 GiB`，loss 完全相同。单独 12 层、两个主值的 cross-attention 子系统从 `202--203 ms` 降至 `127--128 ms`；生产 BF16 单步训练、完整 checkpoint 和旧 attention state-dict 严格加载合同均通过；
-- 生产 39,804,232 参数图的 BF16 可训练主值、FP32 detached JVP 与反向检查；同一 RTX 4090、batch `256` 的交叉顺序 A/B 中，同步有限性检查为 `303.2/320.8 samples/s`，设备端异步断言为 `338.6/334.3 samples/s`，峰值显存均为 `13.89 GiB`，证明该修改只删除 host synchronization；
-- 离线轨迹精度不按模型输出索引直接对齐，而是把所有模型和专家统一按绝对弧长重采样到前 `min(2 m, 专家局部长度)`；预测不足该距离时保持其终点继续计算误差，同时单列 horizon coverage，避免短轨迹靠少走获得低 ADE。安全评测独立以不大于 `0.025 m` 的间距覆盖前 `3.6 m` 局部轨迹，再查询与模型完全相同的四帧融合配置空间场；报告相对专家新增的 collision/margin violation，不把感知场自身对专家的误报归给模型；
-- 6,087 条验证专家的四帧配置空间审计：当前帧单独识别专家 footprint collision `0` 条、裕度违例 `89` 条、直线裕度违例 `787` 条；四帧静态融合后分别为 `9`、`143`、`1,325` 条。9 条碰撞均可由具体单独历史帧复现，位姿为正常的约 `0.45/0.89/1.33 m` 后向平移，不是跨帧符号或偶然 observed 拼接错误；
-- 被本节精度图替代的全 FP32 MeanFlow 主值在三张 RTX 4090 上按 `342/341/341` 分片、每 rank 两个 micro-batch 时约为 `0.72--0.96k samples/s`；分段剖析显示条件编码约 `26 ms`，而 JVP 约 `475 ms`，证明瓶颈在错误驻留于反向图的 JVP 主值，不在数据或四帧几何。新图单卡完整更新实测：batch `256` 峰值约 `13.85 GiB`、稳态约 `328--376 samples/s`；batch `342` 峰值约 `18.25 GiB`、稳态约 `408--442 samples/s`。这是单卡生产图结果；最终 3/4 卡端到端 DDP 吞吐仍以正式训练日志为准。
-- 旧 decoder 的 V100S/4090 训练吞吐和推理延迟不适用于当前精确路径场查询图，已从当前结论删除。当前图的空闲态 4090 batch-1 延迟必须在本轮训练结束后重新实测，不用占卡争用数据代替；
-- 新模型最终 200 epoch 墙钟时间和离线指标必须由本次训练实测，不沿用旧 checkpoint。
-
-## 10. 正确性边界
-
-代码保证：标定与坐标一致；历史变换同时用于障碍配准和因果状态；`L>0`；起点为原点；初始切向前向；路径正则且曲率连续；Flow 训练源合法；时间端点属于训练域；MeanFlow JVP 符号与一步推理一致；安全损失作用于实际生成曲线。
-
-代码不保证：有限数据必然复现专家；深度可见空间等价完整地图；无长期记忆时一定走出迷宫或死胡同；软损失等价控制屏障函数；离线 ADE 必然转化为闭环成功率。这些必须由严格离线分层和固定协议闭环测评验证。
+训练、离线评测和部署共享同一 `CurveNavPolicy`、codec、raw C-space 和 CUDA precision contract。支持 BF16 的设备使用 BF16；V100 等设备使用同一代码路径下的 FP16 + GradScaler，checkpoint 保存对应 scaler state。不存在模型版本、fallback launcher 或旧 checkpoint 兼容分支。

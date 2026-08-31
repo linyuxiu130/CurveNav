@@ -14,19 +14,27 @@ from typing import Callable
 
 import numpy as np
 import torch
+from torch import Tensor
 
 from curvenav.config import CurveNavConfig, DataConfig
 from curvenav.config_io import load_config
 from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data.depth import depth_camera_contract
 from curvenav.data.prepared import (
+    flow_coordinate_statistics,
     policy_dataset_contract,
+)
+from curvenav.data.privileged import (
+    SOURCE_CONFIGURATION_QUERY_SPACING_M,
+    SOURCE_CONFIGURATION_QUERY_TYPE,
+    SourceConfigurationSpaceQuery,
 )
 from curvenav.data.trajectory import (
     MAXIMUM_EXPERT_PROJECTION_ADE_RATIO,
     collate_metric_paths,
 )
 from curvenav.trajectory import MetricHeadingTrajectory
+from curvenav.physical import EXTRA_CLEARANCE_M
 
 
 @dataclass(frozen=True)
@@ -43,6 +51,9 @@ class _Example:
     point_goal: np.ndarray
     observation_to_current: np.ndarray
     observation_valid: np.ndarray
+    source_grid_path: Path
+    source_origin_xy: np.ndarray
+    source_yaw_rad: float
     metric_path: np.ndarray
     scene: str
     reached_goal: bool
@@ -204,6 +215,7 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
         route_id = str(record["route_id"])
         cached = manifest.get("runs", {}).get(route_id)
         route_root = root / str(record["route_directory"])
+        source_grid_path = (route_root.parent / "navigation_grid.npz").resolve()
         xy = np.load(route_root / "traj_xy.npy").astype(np.float32)
         yaw = np.load(route_root / "traj_yaw.npy").astype(np.float32)
         if (
@@ -250,6 +262,9 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
                     observation_valid=_observation_valid(
                         frame_indices, data.observation_frames
                     ),
+                    source_grid_path=source_grid_path,
+                    source_origin_xy=xy[anchor].copy(),
+                    source_yaw_rad=float(yaw[anchor]),
                     metric_path=local_path,
                     scene=f"hssd/{record['scene_id']}",
                     reached_goal=reached_goal,
@@ -264,11 +279,200 @@ def _save_array(split_root: Path, name: str, value: np.ndarray) -> dict[str, obj
     return {"file": path.name, "shape": list(value.shape), "dtype": str(value.dtype)}
 
 
+@dataclass(frozen=True)
+class _SourceMetadata:
+    grid_paths: tuple[Path, ...]
+    grid_index: np.ndarray
+    origin_xy: np.ndarray
+    yaw_rad: np.ndarray
+    query: SourceConfigurationSpaceQuery
+
+
+def _source_metadata(examples: list[_Example]) -> _SourceMetadata:
+    """Keep source C-space provenance out of the policy condition tensors."""
+    grid_paths = tuple(sorted(
+        {example.source_grid_path.resolve() for example in examples},
+        key=lambda path: path.as_posix(),
+    ))
+    index = {path: value for value, path in enumerate(grid_paths)}
+    return _SourceMetadata(
+        grid_paths=grid_paths,
+        grid_index=np.asarray(
+            [index[example.source_grid_path.resolve()] for example in examples],
+            dtype=np.int64,
+        ),
+        origin_xy=np.stack(
+            [example.source_origin_xy for example in examples]
+        ).astype(np.float32),
+        yaw_rad=np.asarray(
+            [example.source_yaw_rad for example in examples], dtype=np.float32
+        ),
+        query=SourceConfigurationSpaceQuery.from_paths(grid_paths),
+    )
+
+
+def _source_minimum_clearance(
+    path: Tensor,
+    source: _SourceMetadata,
+    planning_horizon_m: float,
+) -> np.ndarray:
+    """Evaluate prepared curves in bounded chunks against the source oracle."""
+    values = []
+    for start in range(0, len(path), 2048):
+        end = min(start + 2048, len(path))
+        values.append(
+            source.query.query(
+                path[start:end],
+                torch.from_numpy(source.grid_index[start:end]),
+                torch.from_numpy(source.origin_xy[start:end]),
+                torch.from_numpy(source.yaw_rad[start:end]),
+                planning_horizon_m,
+            ).minimum_clearance_m.numpy()
+        )
+    return np.concatenate(values)
+
+
+def _flow_coordinate_statistics(curve_values: np.ndarray) -> dict[str, object]:
+    """Measure the one train-split normalization used by Flow coordinates."""
+    values = np.asarray(curve_values, dtype=np.float64)
+    length = values[:, 0]
+    length_pre_activation = length + np.log(-np.expm1(-length))
+    return {
+        "length_pre_activation_mean": float(length_pre_activation.mean()),
+        "length_pre_activation_std": float(length_pre_activation.std(ddof=1)),
+        "heading_increment_mean_rad": values[:, 1:].mean(axis=0).tolist(),
+        "heading_increment_std_rad": values[:, 1:].std(axis=0, ddof=1).tolist(),
+    }
+
+
+def _validate_flow_coordinate_statistics(
+    observed: dict[str, object],
+    config: CurveNavConfig,
+) -> None:
+    """Reject a stale trajectory scale before it defines Flow coordinates."""
+    expected = flow_coordinate_statistics(config.trajectory)
+    observed_values = np.concatenate(
+        (
+            np.asarray(
+                [observed["length_pre_activation_mean"]], dtype=np.float64
+            ),
+            np.asarray(
+                [observed["length_pre_activation_std"]], dtype=np.float64
+            ),
+            np.asarray(observed["heading_increment_mean_rad"], dtype=np.float64),
+            np.asarray(observed["heading_increment_std_rad"], dtype=np.float64),
+        )
+    )
+    expected_values = np.concatenate(
+        (
+            np.asarray(
+                [expected["length_pre_activation_mean"]], dtype=np.float64
+            ),
+            np.asarray(
+                [expected["length_pre_activation_std"]], dtype=np.float64
+            ),
+            np.asarray(expected["heading_increment_mean_rad"], dtype=np.float64),
+            np.asarray(expected["heading_increment_std_rad"], dtype=np.float64),
+        )
+    )
+    if not np.allclose(observed_values, expected_values, rtol=0.0, atol=1e-9):
+        raise ValueError(
+            "trajectory normalization does not match the source-gated train split; "
+            f"configured={expected}, observed={observed}"
+        )
+
+
+def _copy_source_configuration_grids(
+    split_root: Path,
+    source: _SourceMetadata,
+) -> list[dict[str, str]]:
+    """Make the prepared dataset self-contained for the same source oracle."""
+    geometry_root = split_root / "source_configuration"
+    geometry_root.mkdir()
+    entries = []
+    for index, path in enumerate(source.grid_paths):
+        destination = geometry_root / f"{index:05d}.npz"
+        shutil.copyfile(path, destination)
+        entries.append({"file": destination.relative_to(split_root).as_posix()})
+    return entries
+
+
+def _audit_serialized_source_contract(
+    split_root: Path,
+    source_grids: list[dict[str, str]],
+    codec: MetricHeadingTrajectory,
+    planning_horizon_m: float,
+) -> dict[str, object]:
+    """Certify serialized controls against the copied source C-space grids.
+
+    The compiler gates curves before writing, but this second pass proves that
+    the exact expert arrays and copied geometry used by a future evaluator
+    preserve the same safety relation.  It is a data-contract check, not a
+    training-time or inference-time safety mechanism.
+    """
+    query = SourceConfigurationSpaceQuery.from_paths(
+        tuple(split_root / entry["file"] for entry in source_grids)
+    )
+    expert_values = np.load(split_root / "curve_values.npy", mmap_mode="r")
+    grid_index = np.load(split_root / "source_grid_index.npy", mmap_mode="r")
+    origin_xy = np.load(split_root / "source_origin_xy.npy", mmap_mode="r")
+    yaw_rad = np.load(split_root / "source_yaw_rad.npy", mmap_mode="r")
+
+    expert_minimum: list[np.ndarray] = []
+    expert_oob_count = 0
+    for start in range(0, len(expert_values), 2048):
+        end = min(start + 2048, len(expert_values))
+        indices = torch.from_numpy(
+            np.array(grid_index[start:end], dtype=np.int64, copy=True)
+        )
+        origins = torch.from_numpy(
+            np.array(origin_xy[start:end], dtype=np.float32, copy=True)
+        )
+        yaws = torch.from_numpy(
+            np.array(yaw_rad[start:end], dtype=np.float32, copy=True)
+        )
+        expert_path, _ = codec.decode_values(
+            torch.from_numpy(
+                np.array(expert_values[start:end], dtype=np.float32, copy=True)
+            )
+        )
+        expert_query = query.query(
+            expert_path, indices, origins, yaws, planning_horizon_m
+        )
+        expert_minimum.append(expert_query.minimum_clearance_m.numpy())
+        expert_oob_count += int(
+            (~expert_query.in_world_bounds).any(dim=-1).sum().item()
+        )
+
+    expert_minimum_values = np.concatenate(expert_minimum)
+    expert_all_margin_safe = bool(
+        expert_oob_count == 0
+        and np.all(expert_minimum_values + 1e-6 >= EXTRA_CLEARANCE_M)
+    )
+    if not expert_all_margin_safe:
+        raise RuntimeError(
+            "serialized expert curves violate the source C-space contract: "
+            f"oob={expert_oob_count}, min={expert_minimum_values.min():.6f}"
+        )
+    return {
+        "query": SOURCE_CONFIGURATION_QUERY_TYPE,
+        "spacing_m": SOURCE_CONFIGURATION_QUERY_SPACING_M,
+        "out_of_bounds": "non_executable_negative_clearance",
+        "serialized_requery": True,
+        "expert_count": int(len(expert_values)),
+        "expert_all_margin_safe": expert_all_margin_safe,
+        "expert_oob_count": expert_oob_count,
+        "expert_minimum_clearance_m": float(expert_minimum_values.min()),
+    }
+
+
 def _compile_split(
     split_root: Path,
     examples: list[_Example],
     seed: int,
     config: CurveNavConfig,
+    *,
+    verify_flow_coordinate_statistics: bool,
 ) -> dict[str, object]:
     split_root.mkdir(parents=True)
     depth_root = split_root / "depth"
@@ -372,6 +576,30 @@ def _compile_split(
         maximum_curvature = (
             wrapped_turn[:, 1:].abs() / support.clamp_min(1e-6)
         ).amax(1).numpy()
+        extent_m = config.data.future_steps * config.data.expert_waypoint_spacing_m
+        source = _source_metadata(examples)
+        minimum_clearance = _source_minimum_clearance(decoded, source, extent_m)
+
+    safe = minimum_clearance + 1e-6 >= EXTRA_CLEARANCE_M
+    rejected_clearance_count = int((~safe).sum())
+    examples = [example for example, selected in zip(examples, safe, strict=True) if selected]
+    depth_indices = depth_indices[safe]
+    point_goal = point_goal[safe]
+    observation_to_current = observation_to_current[safe]
+    observation_valid = observation_valid[safe]
+    curve_values = curve_values[safe]
+    reference_path = reference_path[safe]
+    projection_error = projection_error[safe]
+    decoded = decoded[safe]
+    heading = heading[safe]
+    total_turn = total_turn[safe]
+    maximum_curvature = maximum_curvature[safe]
+    minimum_clearance = minimum_clearance[safe]
+
+    source = _source_metadata(examples)
+    observed_flow_statistics = _flow_coordinate_statistics(curve_values)
+    if verify_flow_coordinate_statistics:
+        _validate_flow_coordinate_statistics(observed_flow_statistics, config)
 
     arrays = {
         "depth_indices": _save_array(split_root, "depth_indices", depth_indices),
@@ -383,7 +611,29 @@ def _compile_split(
             split_root, "observation_valid", observation_valid
         ),
         "curve_values": _save_array(split_root, "curve_values", curve_values),
+        "source_grid_index": _save_array(
+            split_root,
+            "source_grid_index",
+            source.grid_index,
+        ),
+        "source_origin_xy": _save_array(
+            split_root,
+            "source_origin_xy",
+            source.origin_xy,
+        ),
+        "source_yaw_rad": _save_array(
+            split_root,
+            "source_yaw_rad",
+            source.yaw_rad,
+        ),
     }
+    source_grids = _copy_source_configuration_grids(split_root, source)
+    serialized_source_audit = _audit_serialized_source_contract(
+        split_root,
+        source_grids,
+        codec,
+        extent_m,
+    )
     local_arc = np.asarray([_arc_length(example.metric_path) for example in examples])
     flow_coordinates = codec.coordinates_from_values(
         torch.from_numpy(curve_values)
@@ -425,21 +675,17 @@ def _compile_split(
             "max": float(projection_error.max()),
         },
         "production_curve_projection_rejected": rejected_projection_count,
+        "production_curve_clearance_rejected": rejected_clearance_count,
+        "source_configuration_space": {
+            **serialized_source_audit,
+            "grid_count": len(source_grids),
+        },
+        "production_curve_minimum_clearance_m": {
+            "min": float(minimum_clearance.min()),
+            "p05": float(np.quantile(minimum_clearance, 0.05)),
+        },
         "production_curve_coordinate_statistics": {
-            "length_pre_activation_mean": float(
-                (
-                    curve_values[:, 0]
-                    + np.log(-np.expm1(-curve_values[:, 0]))
-                ).mean()
-            ),
-            "length_pre_activation_std": float(
-                (
-                    curve_values[:, 0]
-                    + np.log(-np.expm1(-curve_values[:, 0]))
-                ).std(ddof=1)
-            ),
-            "heading_increment_mean_rad": curve_values[:, 1:].mean(0).tolist(),
-            "heading_increment_std_rad": curve_values[:, 1:].std(0, ddof=1).tolist(),
+            **observed_flow_statistics,
             "standardized_coordinate_rms": float(np.sqrt(np.mean(flow_coordinates**2))),
         },
         "production_curve_max_curvature_inv_m": {
@@ -469,6 +715,12 @@ def _compile_split(
             "max_depth_m": config.data.max_depth_m,
             "total_frames": total_frames,
             "runs": depth_manifest,
+        },
+        "source_configuration_space": {
+            "query": SOURCE_CONFIGURATION_QUERY_TYPE,
+            "spacing_m": SOURCE_CONFIGURATION_QUERY_SPACING_M,
+            "out_of_bounds": "non_executable_negative_clearance",
+            "grids": source_grids,
         },
         "audit": audit,
     }
@@ -501,6 +753,7 @@ def compile_policy_dataset(
                 examples,
                 config.training.seed + index,
                 config,
+                verify_flow_coordinate_statistics=split == "train",
             )
         manifest = {
             "contract": {

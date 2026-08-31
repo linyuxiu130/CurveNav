@@ -3,6 +3,10 @@
 import torch
 from torch import Tensor, nn
 
+from curvenav.encoders.configuration import (
+    PATH_CONFIGURATION_FIELD_CHANNELS,
+    observed_configuration_features,
+)
 from curvenav.layers import RMSNorm
 from curvenav.models.blocks import ConditionalTrajectoryBlock, ProjectedCondition
 from curvenav.models.safety import sample_configuration_field
@@ -10,7 +14,7 @@ from curvenav.types import ConditionFeatures
 
 
 TRAJECTORY_DECODER_TYPE = (
-    "path_relative_configuration_refined_curve_mean_flow_transformer"
+    "pointgoal_and_configuration_field_conditioned_curve_mean_flow_transformer"
 )
 DECODER_REFINEMENT_STAGES = 3
 
@@ -68,7 +72,7 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         self.state_embedding = nn.Linear(1, model_dim)
         self.position_embedding = nn.Parameter(torch.empty(1, curve_tokens, model_dim))
         self.path_geometry_embedding = nn.Sequential(
-            nn.Linear(12, model_dim),
+            nn.Linear(5 + PATH_CONFIGURATION_FIELD_CHANNELS, model_dim),
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
@@ -80,7 +84,10 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             ConditionalTrajectoryBlock(model_dim, heads, dropout) for _ in range(layers)
         )
         self.output_norm = RMSNorm(model_dim)
-        self.velocity_readout = StructuredCurveReadout(curve_tokens, model_dim)
+        self.average_velocity_readout = StructuredCurveReadout(curve_tokens, model_dim)
+        self.instantaneous_velocity_readout = StructuredCurveReadout(
+            curve_tokens, model_dim
+        )
         nn.init.normal_(self.position_embedding, std=0.02)
         nn.init.normal_(self.path_position_embedding, std=0.02)
         path_indices = (
@@ -92,9 +99,20 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             (path_indices.float() / (num_path_points - 1)).reshape(1, path_tokens, 1),
             persistent=True,
         )
+        field_scale = torch.ones(PATH_CONFIGURATION_FIELD_CHANNELS)
+        field_scale[0] = 1.0 / self.planning_horizon_m
+        self.register_buffer(
+            "path_configuration_field_scale",
+            field_scale.reshape(1, 1, -1),
+            persistent=True,
+        )
 
-    def _read_velocity(self, controls: Tensor) -> Tensor:
-        return self.velocity_readout(self.output_norm(controls))
+    def _read_velocities(self, controls: Tensor) -> tuple[Tensor, Tensor]:
+        normalized = self.output_norm(controls)
+        return (
+            self.average_velocity_readout(normalized),
+            self.instantaneous_velocity_readout(normalized),
+        )
 
     def project_condition_memory(
         self,
@@ -106,39 +124,34 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         self,
         state: Tensor,
         end_time: Tensor,
-        velocity: Tensor,
-        condition: ConditionFeatures,
+        instantaneous_velocity: Tensor,
+        path_configuration_field: Tensor,
         flow_time: Tensor,
         curve_codec: nn.Module,
     ) -> Tensor:
-        # For the production data-anchored field, z_t - t*u estimates the
-        # actual data endpoint.  Geometry is therefore queried on the curve
-        # being generated, never on the independent Gaussian flow state.
-        estimated_clean = state - end_time[:, None] * velocity
+        # On the linear interpolant, x = z_t - t*(e-x).  Replacing the
+        # conditional velocity by its learned marginal estimate therefore
+        # gives the data endpoint independently of the MeanFlow start r.
+        estimated_clean = state - end_time[:, None] * instantaneous_velocity
         path, heading = curve_codec.decode_path(estimated_clean)
         indices = self.path_indices
         anchor_points = path[:, indices]
         anchor_heading = heading[:, indices]
-        goal_delta = condition.point_goal[:, None] - anchor_points
-        field = sample_configuration_field(
-            condition.configuration_field,
-            anchor_points,
-            self.planning_horizon_m,
-        )
-        normalized_field = torch.cat(
-            (
-                field[..., :1] / self.planning_horizon_m,
-                field[..., 1:],
+        field = observed_configuration_features(
+            sample_configuration_field(
+                path_configuration_field,
+                anchor_points,
+                self.planning_horizon_m,
             ),
-            dim=-1,
+            channel_dim=-1,
         )
+        normalized_field = field * self.path_configuration_field_scale
         geometry = torch.cat(
             (
                 anchor_points / self.planning_horizon_m,
                 anchor_heading.sin()[..., None],
                 anchor_heading.cos()[..., None],
                 self.path_progress.to(path.dtype).expand(path.shape[0], -1, -1),
-                goal_delta / self.planning_horizon_m,
                 normalized_field,
             ),
             dim=-1,
@@ -158,7 +171,7 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         condition: ConditionFeatures,
         projected_condition: tuple[ProjectedCondition, ...],
         curve_codec: nn.Module,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         if state.ndim != 2 or state.shape[1] != self.curve_tokens:
             raise ValueError("flow state does not match decoder tokens")
         if start_time.shape != state.shape[:1] or end_time.shape != state.shape[:1]:
@@ -173,14 +186,16 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             + flow_time.to(dtype=controls.dtype)
         )
         trajectory = controls
-        stage_velocities = []
+        average_velocities = []
+        instantaneous_velocities = []
+        path_configuration_field = condition.path_configuration_field
         for stage in range(DECODER_REFINEMENT_STAGES):
             if stage:
                 path_tokens = self._path_tokens(
                     state,
                     end_time,
-                    stage_velocities[-1],
-                    condition,
+                    instantaneous_velocities[-1],
+                    path_configuration_field,
                     flow_time,
                     curve_codec,
                 )
@@ -194,7 +209,12 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
                     trajectory,
                     projected_condition[index],
                 )
-            stage_velocities.append(
-                self._read_velocity(trajectory[:, : self.curve_tokens])
+            average, instantaneous = self._read_velocities(
+                trajectory[:, : self.curve_tokens]
             )
-        return torch.stack(stage_velocities, dim=1)
+            average_velocities.append(average)
+            instantaneous_velocities.append(instantaneous)
+        return (
+            torch.stack(average_velocities, dim=1),
+            torch.stack(instantaneous_velocities, dim=1),
+        )

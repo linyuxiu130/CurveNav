@@ -68,12 +68,12 @@ class MetricDepthProjector(nn.Module):
         self.configuration_resolution_m = (
             2.0 * self.planning_horizon_m / (CONFIGURATION_GRID_SIZE - 1)
         )
-        pitch = math.radians(camera_downward_pitch_degrees)
-        self.pitch_sine = math.sin(pitch)
-        self.pitch_cosine = math.cos(pitch)
         self.minimum_traversable_normal_z = math.cos(
             math.radians(MAXIMUM_TRAVERSABLE_SLOPE_DEGREES)
         )
+        pitch = math.radians(camera_downward_pitch_degrees)
+        self.pitch_sine = math.sin(pitch)
+        self.pitch_cosine = math.cos(pitch)
         axis = torch.linspace(
             -self.planning_horizon_m,
             self.planning_horizon_m,
@@ -85,36 +85,6 @@ class MetricDepthProjector(nn.Module):
             "axis_squared_distance",
             (axis_index[:, None] - axis_index[None]).square(),
             persistent=False,
-        )
-
-    def _body_points(
-        self,
-        selected_depth_m: Tensor,
-        selected_index: Tensor,
-        image_height: int,
-        image_width: int,
-    ) -> Tensor:
-        """Backproject selected pinhole-depth pixels into the robot body frame."""
-        column = selected_index.remainder(image_width).float()
-        row = torch.div(
-            selected_index,
-            image_width,
-            rounding_mode="floor",
-        ).float()
-        ray_x = (column - image_width / 2.0) / self.focal_x_px
-        ray_y = (row - image_height / 2.0) / self.focal_y_px
-        optical_y = selected_depth_m * ray_y
-        return torch.stack(
-            (
-                self.camera_forward_offset_m
-                + self.pitch_cosine * selected_depth_m
-                - self.pitch_sine * optical_y,
-                -selected_depth_m * ray_x,
-                self.camera_height_m
-                - self.pitch_cosine * optical_y
-                - self.pitch_sine * selected_depth_m,
-            ),
-            dim=-1,
         )
 
     def _traversable_surface(self, body_points: Tensor, valid: Tensor) -> Tensor:
@@ -166,6 +136,36 @@ class MetricDepthProjector(nn.Module):
                 normal_z >= self.minimum_traversable_normal_z
             )
         return traversable
+
+    def _body_points(
+        self,
+        selected_depth_m: Tensor,
+        selected_index: Tensor,
+        image_height: int,
+        image_width: int,
+    ) -> Tensor:
+        """Backproject selected pinhole-depth pixels into the robot body frame."""
+        column = selected_index.remainder(image_width).float()
+        row = torch.div(
+            selected_index,
+            image_width,
+            rounding_mode="floor",
+        ).float()
+        ray_x = (column - image_width / 2.0) / self.focal_x_px
+        ray_y = (row - image_height / 2.0) / self.focal_y_px
+        optical_y = selected_depth_m * ray_y
+        return torch.stack(
+            (
+                self.camera_forward_offset_m
+                + self.pitch_cosine * selected_depth_m
+                - self.pitch_sine * optical_y,
+                -selected_depth_m * ray_x,
+                self.camera_height_m
+                - self.pitch_cosine * optical_y
+                - self.pitch_sine * selected_depth_m,
+            ),
+            dim=-1,
+        )
 
     def _backproject(
         self,

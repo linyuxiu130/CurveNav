@@ -5,7 +5,12 @@ from .heading import (
     HEADING_SPLINE_DEGREE,
     MetricHeadingTrajectory,
 )
-from .resampling import path_arc_length, resample_path_by_arc_length
+from .resampling import (
+    path_arc_length,
+    resample_path_at_distance,
+    resample_path_by_arc_length,
+    resample_path_to_horizon,
+)
 
 __all__ = [
     "MetricHeadingTrajectory",
@@ -13,5 +18,7 @@ __all__ = [
     "HEADING_SPLINE_DEGREE",
     "HEADING_PARAMETERIZATION_TYPE",
     "path_arc_length",
+    "resample_path_at_distance",
     "resample_path_by_arc_length",
+    "resample_path_to_horizon",
 ]

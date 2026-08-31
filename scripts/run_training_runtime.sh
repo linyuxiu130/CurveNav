@@ -35,6 +35,8 @@ done
 
 exec bwrap \
     --die-with-parent \
+    --unshare-pid \
+    --as-pid-1 \
     --ro-bind "${RUNTIME_ROOT}" / \
     --dev-bind /dev /dev \
     --proc /proc \

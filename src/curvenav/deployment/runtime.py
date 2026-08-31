@@ -13,6 +13,7 @@ from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
 from curvenav.data.depth import BENCHMARK_INTRINSICS, preprocess_metric_depth
 from curvenav.factory import build_policy
+from curvenav.precision import cuda_precision
 from curvenav.training.checkpoint import validate_policy_contract
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.types import PolicyCondition
@@ -157,6 +158,9 @@ class CurveNavRuntime:
         self.config = config
         self.policy = policy
         self.device = torch.device(device)
+        self.precision = (
+            cuda_precision(self.device) if self.device.type == "cuda" else None
+        )
         self.context_buffer = DepthContextBuffer(config)
         self.batch_size = 0
         self.requests = 0
@@ -193,8 +197,12 @@ class CurveNavRuntime:
             torch.inference_mode(),
             torch.autocast(
                 device_type=self.device.type,
-                dtype=torch.bfloat16,
-                enabled=self.device.type == "cuda",
+                dtype=(
+                    self.precision.autocast_dtype
+                    if self.precision is not None
+                    else torch.bfloat16
+                ),
+                enabled=self.precision is not None,
             ),
         ):
             self.policy.sample(condition)
@@ -249,11 +257,17 @@ class CurveNavRuntime:
             ),
         )
         started = time.perf_counter()
-        amp = self.device.type == "cuda"
+        amp = self.precision is not None
         with (
             torch.inference_mode(),
             torch.autocast(
-                device_type=self.device.type, dtype=torch.bfloat16, enabled=amp
+                device_type=self.device.type,
+                dtype=(
+                    self.precision.autocast_dtype
+                    if self.precision is not None
+                    else torch.bfloat16
+                ),
+                enabled=amp,
             ),
         ):
             prediction = self.policy.sample(condition)

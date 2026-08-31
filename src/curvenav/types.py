@@ -36,22 +36,29 @@ class PolicyCondition:
 
 @dataclass
 class DepthFeatures:
-    """Current visual tokens plus the aligned short-horizon metric field."""
+    """Current scene tokens and aligned four-frame metric visual evidence."""
 
     tokens: Tensor
-    points: Tensor
-    depth: Tensor
-    obstacle_valid: Tensor
+    configuration_tokens: Tensor
+    configuration_points: Tensor
+    configuration_visual_valid: Tensor
     configuration_field: Tensor
 
 
 @dataclass
-class ConditionFeatures:
-    """Heterogeneous context tokens and the exact aligned safety field."""
+class ConfigurationFeatures:
+    """Metric spatial memory derived only from measured depth geometry."""
 
     tokens: Tensor
-    configuration_field: Tensor
-    point_goal: Tensor
+    measured_field: Tensor
+
+
+@dataclass
+class ConditionFeatures:
+    """PointGoal scene context and its measured configuration-space field."""
+
+    tokens: Tensor
+    path_configuration_field: Tensor
 
 
 @dataclass

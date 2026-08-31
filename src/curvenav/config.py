@@ -12,7 +12,7 @@ from curvenav.physical import (
 
 @dataclass(frozen=True)
 class DataConfig:
-    root: str = "data/policy_dataset"
+    root: str = "data/policy_dataset-source-cspace"
     observation_frames: int = 4
     frame_spacing_m: float = 0.45
     expert_waypoint_spacing_m: float = 0.15
@@ -61,25 +61,25 @@ class TrajectoryConfig:
     num_heading_control_points: int = 8
     spline_degree: int = 3
     num_path_points: int = 64
-    length_pre_activation_mean: float = 2.7810852451799377
-    length_pre_activation_std: float = 1.3278056485734497
+    length_pre_activation_mean: float = 2.7761289656895536
+    length_pre_activation_std: float = 1.3310157896776207
     heading_increment_mean_rad: tuple[float, ...] = (
-        0.0027091927181629527,
-        0.005207439937511474,
-        0.006545409534199333,
-        0.005466179133750451,
-        0.0027312263638442787,
-        0.0029715759159046357,
-        -0.0006079559277851468,
+        0.0027291269968929455,
+        0.005034111766925072,
+        0.006383425585098021,
+        0.004844627023100332,
+        0.002278887391014113,
+        0.0029080880413952896,
+        -0.0006175329948281985,
     )
     heading_increment_std_rad: tuple[float, ...] = (
-        0.1039597669108465,
-        0.2211581749264293,
-        0.2887267459379414,
-        0.2893491499417256,
-        0.30020639618179806,
-        0.26251125436301076,
-        0.14751645522709783,
+        0.10250223795474468,
+        0.21724207730012957,
+        0.2826873156288638,
+        0.2832551794170072,
+        0.29620460147965216,
+        0.25915543561132065,
+        0.1463571463898459,
     )
 
     def validate(self) -> None:
@@ -87,8 +87,10 @@ class TrajectoryConfig:
             raise ValueError("CurveNav uses exactly eight heading control points")
         if self.spline_degree != 3:
             raise ValueError("CurveNav uses one clamped cubic heading spline")
-        if self.num_path_points < self.num_heading_control_points:
-            raise ValueError("num_path_points must cover the heading controls")
+        if self.num_path_points != 64:
+            raise ValueError(
+                "CurveNav uses exactly sixty-four metric path samples"
+            )
         if not math.isfinite(self.length_pre_activation_mean):
             raise ValueError("length pre-activation mean must be finite")
         if (
@@ -118,12 +120,6 @@ class DepthEncoderConfig:
 
 
 @dataclass(frozen=True)
-class PointGoalEncoderConfig:
-    model_dim: int = 384
-    hidden_dim: int = 384
-
-
-@dataclass(frozen=True)
 class ConditionEncoderConfig:
     model_dim: int = 384
     transformer_layers: int = 4
@@ -136,12 +132,14 @@ class TrajectoryDecoderConfig:
     model_dim: int = 384
     transformer_layers: int = 12
     transformer_heads: int = 8
-    path_tokens: int = 16
+    path_tokens: int = 32
     dropout: float = 0.0
 
     def validate(self) -> None:
-        if self.path_tokens != 16:
-            raise ValueError("CurveNav uses exactly sixteen path tokens")
+        if self.path_tokens != 32:
+            raise ValueError(
+                "CurveNav uses thirty-two metric path anchors for local-field queries"
+            )
         if self.transformer_layers < 3 or self.transformer_layers % 3:
             raise ValueError(
                 "trajectory decoder layers must form three equal refinement stages"
@@ -175,9 +173,6 @@ class CurveNavConfig:
     depth_encoder: DepthEncoderConfig = dataclass_field(
         default_factory=DepthEncoderConfig
     )
-    point_goal_encoder: PointGoalEncoderConfig = dataclass_field(
-        default_factory=PointGoalEncoderConfig
-    )
     condition_encoder: ConditionEncoderConfig = dataclass_field(
         default_factory=ConditionEncoderConfig
     )
@@ -202,11 +197,8 @@ class CurveNavConfig:
             < 1
         ):
             raise ValueError("depth encoder token grid dimensions must be positive")
-        if self.point_goal_encoder.hidden_dim < 1:
-            raise ValueError("point_goal_encoder.hidden_dim must be positive")
         dims = {
             self.depth_encoder.model_dim,
-            self.point_goal_encoder.model_dim,
             self.condition_encoder.model_dim,
             self.trajectory_decoder.model_dim,
         }
