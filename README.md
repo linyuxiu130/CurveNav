@@ -40,7 +40,8 @@ FP64 Flow 坐标统计必须与模型配置一致，loader 才接受它。它不
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src \
   ../.venvs/curvenav/bin/python -m pytest -q -p no:cacheprovider
-CUDA_VISIBLE_DEVICES=0,1,2,3 scripts/run_training_runtime.sh \
+# 本机 9999 的 V100 peer-DMA 实测不可靠；NCCL 必须走单机 SHM 路径。
+NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,3 scripts/run_training_runtime.sh \
   scripts/train_policy.sh configs/base.yaml
 CUDA_VISIBLE_DEVICES=0 scripts/evaluate_policy.sh \
   configs/base.yaml outputs/train_policy/checkpoint.pt
@@ -51,6 +52,9 @@ DDP loss，保持全局均值。四卡为 `256×4`，单卡微批上限为 342�
 BF16；V100 使用同一代码路径下的 FP16 + GradScaler，stopped JVP 始终使用 FP32。运行时
 包装在独立 PID namespace 中执行唯一训练入口；强制
 结束其 tmux 会话不会留下 DDP rank。
+
+9999 的 GPU 0↔3 已通过 `NCCL_P2P_DISABLE=1` 的双 rank all-reduce；该变量仅选择其
+已验证的 SHM 通信传输，不改变模型、优化器或训练入口。
 
 ## 目录
 
