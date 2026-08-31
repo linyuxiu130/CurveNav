@@ -7,6 +7,10 @@ RUNTIME_ROOT="${CURVENAV_RUNTIME_ROOT:-${WORKSPACE_ROOT}/curvenav-runtime/rootfs
 HOST_DRIVER_ROOT="/usr/lib/x86_64-linux-gnu"
 HOST_PYTHON="/usr/bin/python3"
 HOST_PYTHON_STDLIB="/usr/lib/python3.10"
+HOST_GCC="$(readlink -f /usr/bin/gcc)"
+HOST_AS="$(readlink -f /usr/bin/as)"
+HOST_LD="$(readlink -f /usr/bin/ld)"
+HOST_GCC_LIB="/usr/lib/gcc"
 
 if [[ ! -x "${RUNTIME_ROOT}/bin/bash" ]]; then
     echo "CurveNav training runtime is missing: ${RUNTIME_ROOT}" >&2
@@ -18,6 +22,11 @@ if (( $# == 0 )); then
 fi
 if [[ ! -x "${HOST_PYTHON}" || ! -d "${HOST_PYTHON_STDLIB}" ]]; then
     echo "CurveNav training Python runtime is missing" >&2
+    exit 1
+fi
+if [[ ! -x "${HOST_GCC}" || ! -x "${HOST_AS}" || ! -x "${HOST_LD}" \
+    || ! -d "${HOST_GCC_LIB}" ]]; then
+    echo "CurveNav training C toolchain is missing" >&2
     exit 1
 fi
 
@@ -82,8 +91,13 @@ exec bwrap \
     --dir /opt/nvidia \
     --ro-bind "${HOST_PYTHON}" "${HOST_PYTHON}" \
     --ro-bind "${HOST_PYTHON_STDLIB}" "${HOST_PYTHON_STDLIB}" \
+    --ro-bind /usr/include /usr/include \
     --ro-bind /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu \
     --ro-bind /usr/lib64 /usr/lib64 \
+    --ro-bind "${HOST_GCC}" /usr/bin/gcc \
+    --ro-bind "${HOST_AS}" /usr/bin/as \
+    --ro-bind "${HOST_LD}" /usr/bin/ld \
+    --ro-bind "${HOST_GCC_LIB}" "${HOST_GCC_LIB}" \
     "${driver_mounts[@]}" \
     --setenv HOME "${WORKSPACE_ROOT}" \
     --setenv LD_LIBRARY_PATH /opt/nvidia \
