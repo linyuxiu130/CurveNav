@@ -872,3 +872,25 @@ details belong in `ARCHITECTURE.md`.
   must not be compared numerically with E008/E009/E010's B1 acceptance scores;
   nevertheless it rejects any claim that the improved offline prefix metric by
   itself predicts robust closed-loop navigation.
+- Frozen-map replay closes the controller ambiguity. Across `11,043` E011 B10
+  replans, `99.62%` of complete plans and `97.64%` of first-metre prefixes enter
+  the benchmark robot-centre non-navigable raster; even among plans whose
+  origin is free, `82.02%` of first-metre prefixes collide. Actual positions
+  are free for only `19.65%` of sampled steps and the episode-mean stalled-step
+  fraction is `73.77%`, while desired MPC speed remains `0.421 m/s`. Adjacent
+  first-metre replans differ by only `3.59 mm`. E008 under the same frozen-map
+  renderer had `69.56%` actual-position free fraction and `35.43%` stalled
+  steps. E011 therefore generates stable unsafe intent; MPC is not the primary
+  cause. The separately captured E011 B1 episode 0 also has `100%` full-plan
+  collision and only `3.27%` actual-position free samples, so vector batching
+  is not the source of the failure.
+- Causal correction to the experiment history: E008 to E009 was not a
+  single-variable geometry-query experiment. Commit `9f57201` changed 60 files,
+  including the perception/BEV contract, decoder tokenization, three internal
+  refinement segments, readout structure, Flow coordinates and the training
+  and evaluation implementations. The later E010/E011 tests move the first
+  query only inside this already-regressed skeleton; their shared `3/10` B1
+  outcome cannot identify the original `6/10 -> 3/10` cause. Do not add another
+  query heuristic to E011. The next architecture must retain the current
+  verified data/precision/MeanFlow contracts while isolating the decoder
+  structural change against the evidence-backed E008 behavior.
