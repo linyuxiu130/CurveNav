@@ -910,6 +910,15 @@ details belong in `ARCHITECTURE.md`.
   sustain `976--988 samples/s`; the device holds about `22.5 GiB` and reaches
   full compute utilization. The exact log is
   `/DataDisk2/hsb/curvenav-training-e011/train-e012.log`.
+- Early paired evidence: archived E008 logs and E012 use the same RTX 4090,
+  BF16, seed, data order, batch, schedule and update count. At steps
+  `240/400/480/560`, E008 total loss is
+  `0.6801/0.4811/0.4298/0.4061`, whereas E012 is
+  `0.7534/0.5139/0.4876/0.4886`. The gap is principally MeanFlow imitation,
+  not a missing clearance penalty. Repeating robot-origin geometry for all
+  seven control tokens removes their distinct metric retrieval anchors and is
+  the only remaining causal graph difference. This is preliminary convergence
+  evidence; the run still completes before the architecture decision.
 - Decision gate: compare the final EMA checkpoint with E011 using the same
   source-truth offline strata, then run the fixed ten episodes with
   `num-envs=1`. If E012 remains below E008, reject robot-origin retrieval and
