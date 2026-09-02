@@ -1011,3 +1011,14 @@ details belong in `ARCHITECTURE.md`.
   the same BF16, global-1024, 8000-update contract. It must preserve E008's
   fixed `6/10` result and reduce source-truth forward-detour collision; average
   ADE alone cannot accept the model.
+- Production training: the real RTX 4090 compiled forward, MeanFlow JVP,
+  backward and deployment-sampling gate passes. The remote virtual environment
+  had lost its declared `accelerate` dependency after E012; restoring the
+  pinned `1.14.0` package repaired the sole import failure without changing
+  code or adding a launcher path. E013 now runs on GPU2 with BF16, global batch
+  `1024`, about `22.5 GiB` allocated and `975--996 samples/s` after compilation.
+  At the matched step `800`, E013 total/MeanFlow/visible-clearance losses are
+  `0.33864/0.32538/0.01326`, versus E012's
+  `0.41474/0.39513/0.01961`. This is evidence of improved optimization only;
+  the retained checkpoint still requires the same source-truth and online
+  acceptance tests.
