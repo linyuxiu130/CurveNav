@@ -919,6 +919,12 @@ details belong in `ARCHITECTURE.md`.
   seven control tokens removes their distinct metric retrieval anchors and is
   the only remaining causal graph difference. This is preliminary convergence
   evidence; the run still completes before the architecture decision.
+- The exact E012 checkpoints at steps `800/1600/2400` are retained. Their total
+  losses are `0.41474/0.29187/0.17221`; the step-2400 split is MeanFlow
+  `0.16962` plus visible-clearance `0.00259`. The active RTX 4090 run sustains
+  about `986--1004 samples/s`. These snapshots will be evaluated with the same
+  source-truth evaluator after the final checkpoint, so a lower training loss
+  alone cannot accept robot-origin retrieval.
 - Decision gate: compare the final EMA checkpoint with E011 using the same
   source-truth offline strata, then run the fixed ten episodes with
   `num-envs=1`. If E012 remains below E008, reject robot-origin retrieval and
