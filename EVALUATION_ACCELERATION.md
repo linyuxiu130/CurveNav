@@ -81,6 +81,13 @@ batch-1 统计，不把两种数字混在一起。
 固定协议成绩；新的硬件报告必须同时给出 batch、worker 数、GPU 型号、稳定
 区间和完整 artifact 路径。
 
+2026-09-02 本机 9999 的四张 V100S 在 `NCCL_P2P_DISABLE=1` 下使用
+`global_batch=1792 (448×4)` 实测稳定 `2766–2785 samples/s`，每卡显存约
+`27.6 GiB/32 GiB`、利用率 `94–100%`。此前 `1368 (342×4)` 为约
+`2690 samples/s`；第一次启用 P2P 的启动因 NCCL `ALLGATHER` 超时失败，
+之后使用已验证的 SHM 传输成功。首轮静态 CUDA/Inductor 编译耗时单独计入
+启动记录，不计入上述稳定吞吐。
+
 本次整理完成后应至少验证：
 
 - `bash -n scripts/*.sh`；
