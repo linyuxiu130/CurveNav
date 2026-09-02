@@ -462,6 +462,13 @@ def test_goal_geometry_uses_one_terminal_goal_not_a_straight_template() -> None:
     )
     assert torch.count_nonzero(geometry[:, :-1, 4]) > 0
     torch.testing.assert_close(geometry[:, -1, 4], torch.zeros(1))
+    changed_reference = encoded.goal_reference.clone()
+    changed_reference[:, :-1] += torch.randn_like(changed_reference[:, :-1])
+    changed = replace(encoded, goal_reference=changed_reference)
+    torch.testing.assert_close(
+        policy.trajectory_decoder._goal_geometry(candidate, changed),
+        geometry,
+    )
 
 
 def test_reusable_cross_attention_matches_projected_call() -> None:

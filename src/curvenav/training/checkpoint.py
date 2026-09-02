@@ -107,7 +107,9 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         },
         "trajectory_dimensions": 2,
         "planar_axis_convention": "x_forward_y_left",
-        "point_goal_semantics": "mission_destination_in_current_robot_xy",
+        "point_goal_semantics": (
+            "mission_destination_in_current_robot_xy_clamped_to_local_terminal"
+        ),
         "point_goal_conditioning": (
             "metric_goal_reference_retrieval_plus_candidate_to_terminal_local_goal"
         ),
