@@ -249,53 +249,57 @@ def run_training(
             torch.randn_like(prepared.target.curve_values)
             for prepared in prepared_batches
         )
-        optimizer.zero_grad(set_to_none=True)
-        current_losses = torch.zeros_like(window_losses)
-        for micro_step, (prepared, flow_source) in enumerate(
-            zip(prepared_batches, flow_sources, strict=True)
-        ):
-            synchronize = micro_step + 1 == micro_batches_per_step
-            synchronization_context = (
-                nullcontext()
-                if synchronize
-                else accelerator.no_sync(policy)
-            )
-            with synchronization_context:
-                with accelerator.autocast():
-                    losses = policy(
-                        prepared.condition,
-                        prepared.target,
-                        flow_source,
-                        prepared.flow_interval_group,
-                    )
-                batch_weight = (
-                    accelerator.num_processes
-                    * prepared.condition.depth.shape[0]
-                    / global_batch_size
+        while True:
+            optimizer.zero_grad(set_to_none=True)
+            current_losses = torch.zeros_like(window_losses)
+            for micro_step, (prepared, flow_source) in enumerate(
+                zip(prepared_batches, flow_sources, strict=True)
+            ):
+                synchronize = micro_step + 1 == micro_batches_per_step
+                synchronization_context = (
+                    nullcontext()
+                    if synchronize
+                    else accelerator.no_sync(policy)
                 )
-                accelerator.backward(losses.loss * batch_weight)
-            current_losses += (
-                torch.stack(losses.logging_values())
-                .detach()
-                .float()
-                * batch_weight
+                with synchronization_context:
+                    with accelerator.autocast():
+                        losses = policy(
+                            prepared.condition,
+                            prepared.target,
+                            flow_source,
+                            prepared.flow_interval_group,
+                        )
+                    batch_weight = (
+                        accelerator.num_processes
+                        * prepared.condition.depth.shape[0]
+                        / global_batch_size
+                    )
+                    accelerator.backward(losses.loss * batch_weight)
+                current_losses += (
+                    torch.stack(losses.logging_values())
+                    .detach()
+                    .float()
+                    * batch_weight
+                )
+            grad_norm = accelerator.clip_grad_norm_(
+                policy.parameters(), config.training.grad_clip_norm
             )
-        grad_norm = accelerator.clip_grad_norm_(
-            policy.parameters(), config.training.grad_clip_norm
-        )
-        finite_update = torch.isfinite(current_losses).all()
-        if accelerator.scaler is None:
-            finite_update &= torch.isfinite(grad_norm)
-        torch._assert_async(
-            finite_update,
-            "CurveNav mixed-precision update contains a non-finite loss or gradient norm",
-        )
-        optimizer.step()
-        _advance_schedule_and_ema(
-            scheduler,
-            ema,
-            optimizer_step_was_skipped=accelerator.optimizer_step_was_skipped,
-        )
+            finite_update = torch.isfinite(current_losses).all()
+            if accelerator.scaler is None:
+                finite_update &= torch.isfinite(grad_norm)
+            torch._assert_async(
+                finite_update,
+                "CurveNav mixed-precision update contains a non-finite loss or gradient norm",
+            )
+            optimizer.step()
+            optimizer_step_was_skipped = accelerator.optimizer_step_was_skipped
+            _advance_schedule_and_ema(
+                scheduler,
+                ema,
+                optimizer_step_was_skipped=optimizer_step_was_skipped,
+            )
+            if not optimizer_step_was_skipped:
+                break
 
         step += 1
         epoch = (step - 1) // steps_per_epoch + 1

@@ -60,7 +60,8 @@ DDP loss，保持全局均值。四卡各处理 256 个样本；单卡按 `342/3
 同一个全局 batch，不改变优化目标。
 神经算子在支持 BF16
 的 GPU 使用 BF16；V100 在同一代码路径使用 FP16 + GradScaler。标定几何、Flow 状态、
-MeanFlow/JVP、B-spline 解码和损失始终使用 FP32。运行时
+MeanFlow/JVP、B-spline 解码和损失始终使用 FP32。FP16 溢出时同一批样本与 Flow source
+会在降低 loss scale 后重新计算，只有实际参数更新才计入 step、LR 和 EMA。运行时
 包装在独立 PID namespace 中执行唯一训练入口；强制
 结束其 tmux 会话不会留下 DDP rank。
 

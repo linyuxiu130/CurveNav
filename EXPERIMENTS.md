@@ -976,6 +976,11 @@ details belong in `ARCHITECTURE.md`.
   the shared decoder so the resulting clean proposal locates the second
   half's geometry query. It does not use expert `e-x` as the JVP direction or
   perform a second inference call.
+- Mixed-precision audit: Accelerate skips the underlying optimizer call when
+  FP16 GradScaler detects overflow. The old loop correctly held LR and EMA but
+  still advanced the reported step. The unique loop now recomputes the same
+  sample batch and Flow source after the scaler is reduced, and counts the
+  step only when parameters actually update. BF16 execution is unchanged.
 - Acceptance: first finish and evaluate E012. E013 then trains from zero with
   the same BF16, global-1024, 8000-update contract. It must preserve E008's
   fixed `6/10` result and reduce source-truth forward-detour collision; average

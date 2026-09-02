@@ -326,7 +326,9 @@ measurements, never from the raw `64x64` depth proxy alone.
 - twelve decoder blocks: six reference-geometry-to-proposal plus six
   proposal-to-average blocks in one call;
 - DDP preserves the exact global batch and exact deployment quarter;
-- scheduler and EMA advance only after a successful optimizer update;
+- an FP16 overflow recomputes the same global sample batch and Flow source at
+  the reduced loss scale; step, scheduler and EMA advance only after the
+  optimizer commits the update;
 - step-800 source-truth gate before a full run;
 - RTX-4090 steady-state architecture gate at least 3000 samples/s.
 
