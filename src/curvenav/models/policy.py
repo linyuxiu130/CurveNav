@@ -266,9 +266,9 @@ class CurveNavPolicy(nn.Module):
             tuple(value[positive_width] for value in projected)
             for projected in projected_condition
         )
-        # The decoder makes v(z_t,t) structurally independent of r, so the
-        # trainable primal already provides the exact JVP tangent; no second
-        # diagonal decoder evaluation is needed.
+        # The auxiliary marginal-velocity readout is structurally independent
+        # of r. The same primal therefore supplies iMF's stopped predicted-v
+        # JVP tangent without a second decoder evaluation.
         jvp_tangent = instantaneous_velocities[positive_width, -1].float()
         with (
             torch.no_grad(),

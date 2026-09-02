@@ -969,6 +969,13 @@ details belong in `ARCHITECTURE.md`.
   C-space must enter its single generator. LoGoPlanner and DiffusionAnything
   independently support metric/trajectory-aligned geometry queries; none
   justify treating a straight goal ray as the desired intermediate path.
+- MeanFlow audit: the official iMF implementation returns average `u` and an
+  auxiliary marginal velocity `v` from one network call, directly supervises
+  both, and uses predicted `v` as the stopped JVP direction. E013 follows that
+  contract; its only specialization is exposing `v` after the first half of
+  the shared decoder so the resulting clean proposal locates the second
+  half's geometry query. It does not use expert `e-x` as the JVP direction or
+  perform a second inference call.
 - Acceptance: first finish and evaluate E012. E013 then trains from zero with
   the same BF16, global-1024, 8000-update contract. It must preserve E008's
   fixed `6/10` result and reduce source-truth forward-detour collision; average

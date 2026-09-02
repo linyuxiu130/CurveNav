@@ -55,8 +55,9 @@ CUDA_VISIBLE_DEVICES=0 scripts/evaluate_policy.sh \
   configs/base.yaml outputs/train_policy-e013/checkpoint.pt
 ```
 
-训练固定全局 batch 1792、200 epoch/4600 optimizer step；所有 GPU 数都按真实样本数缩放
-DDP loss，保持全局均值。四卡为 `448×4`，单卡微批上限为 448，避免无意义的梯度累积。
+训练固定全局 batch 1024、200 epoch/8000 optimizer step；所有 GPU 数都按真实样本数缩放
+DDP loss，保持全局均值。四卡各处理 256 个样本；单卡按 `342/341/341` 三个微批完成
+同一个全局 batch，不改变优化目标。
 神经算子在支持 BF16
 的 GPU 使用 BF16；V100 在同一代码路径使用 FP16 + GradScaler。标定几何、Flow 状态、
 MeanFlow/JVP、B-spline 解码和损失始终使用 FP32。运行时

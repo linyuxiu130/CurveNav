@@ -254,6 +254,13 @@ derivative, improved MeanFlow trains
 and `L_MF` is the equal mean of those two standardized Euclidean squared
 errors.
 
+Here `D_t u_theta` is the JVP in direction `(v_theta,0,1)`. This is iMF's
+learned marginal-velocity direction, emitted by the auxiliary instantaneous
+readout in the same decoder call and supervised by `v*`; it is not the
+sample-specific expert velocity injected into the prediction function. The
+first half of the shared decoder exposes that readout early only so its clean
+estimate can locate the second half's trajectory-aligned geometry query.
+
 For the exact deployment quarter only, let
 `x_hat=e*-u_theta(e*,0,1,c)` and densely sample its decoded path at 2.5 cm. At
 query `q_j`, `d_j` is raw signed clearance and `s_j` is true only when every
