@@ -790,5 +790,13 @@ details belong in `ARCHITECTURE.md`.
   Source-truth offline ADE/FDE are `0.03758/0.10204 m`, full collision is
   `12.187%`, and first `0.5/1.0 m` collision is `0.000/0.495%`. Relative to
   E009, only the immediate execution prefix improves slightly; full collision
-  and imitation error do not. The fixed resident ten-episode online run is in
-  progress and remains the acceptance test.
+  and imitation error do not. The fixed resident ten-episode online run below
+  remains the acceptance test.
+- Fixed online rejection: on the same resident Home scene, episodes `0--9`,
+  seed `1234` and `num-envs=1`, E010 reaches `3/10` SR and `0.298922` mean SPL.
+  Successful episodes are `4,5,6`; E009 also reaches `3/10` and `0.296271`,
+  while E008 reaches `6/10` and `0.582788`. E010 improves median final goal
+  distance (`3.64 -> 2.54 m`), progress fraction (`0.412 -> 0.512`) and online
+  plan peak-curvature p95 (`80.66 -> 36.63 m^-1`) relative to E009, but does
+  not recover any additional success. The retrieval-order correction is
+  therefore insufficient and must not replace E008 as the accepted baseline.
