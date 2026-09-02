@@ -3,12 +3,12 @@
 from curvenav.config import CurveNavConfig
 from curvenav.conditioning import PolicyConditionEncoder
 from curvenav.encoders import (
-    CONFIGURATION_TOKEN_COUNT,
     ConfigurationSpaceEncoder,
     DepthObservationEncoder,
+    MetricDepthProjector,
 )
 from curvenav.models import ConditionalCurveMeanFlowDecoder, CurveNavPolicy
-from curvenav.trajectory import MetricHeadingTrajectory
+from curvenav.trajectory import IncrementalBSplineTrajectory
 
 
 def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
@@ -18,8 +18,12 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
     depth = config.depth_encoder
     condition = config.condition_encoder
     decoder = config.trajectory_decoder
+    planning_horizon_m = (
+        config.data.future_steps * config.data.expert_waypoint_spacing_m
+    )
 
     depth_encoder = DepthObservationEncoder(
+        observation_frames=config.data.observation_frames,
         model_dim=depth.model_dim,
         frame_tokens_height=depth.frame_tokens_height,
         frame_tokens_width=depth.frame_tokens_width,
@@ -30,53 +34,60 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         camera_forward_offset_m=config.data.camera_forward_offset_m,
         camera_height_m=config.data.camera_height_m,
         camera_downward_pitch_degrees=(config.data.camera_downward_pitch_degrees),
-        planning_horizon_m=(
-            config.data.future_steps * config.data.expert_waypoint_spacing_m
-        ),
+        planning_horizon_m=planning_horizon_m,
     )
     configuration_encoder = ConfigurationSpaceEncoder(
         model_dim=condition.model_dim,
-        planning_horizon_m=(
-            config.data.future_steps * config.data.expert_waypoint_spacing_m
-        ),
+        planning_horizon_m=planning_horizon_m,
+        grid_size=condition.bev_grid_size,
     )
     condition_encoder = PolicyConditionEncoder(
         configuration_encoder,
         observation_frames=config.data.observation_frames,
-        spatial_tokens=depth.frame_tokens_height * depth.frame_tokens_width,
-        configuration_tokens=CONFIGURATION_TOKEN_COUNT,
         history_horizon_m=(
             (config.data.observation_frames - 1) * config.data.frame_spacing_m
         ),
+        planning_horizon_m=planning_horizon_m,
+        control_tokens=trajectory.num_control_points - 1,
         model_dim=condition.model_dim,
-        transformer_layers=condition.transformer_layers,
-        transformer_heads=condition.transformer_heads,
-        dropout=condition.dropout,
     )
-    curve_codec = MetricHeadingTrajectory(
-        num_heading_control_points=trajectory.num_heading_control_points,
+    curve_codec = IncrementalBSplineTrajectory(
+        num_control_points=trajectory.num_control_points,
         degree=trajectory.spline_degree,
         num_path_points=trajectory.num_path_points,
-        length_pre_activation_mean=trajectory.length_pre_activation_mean,
-        length_pre_activation_std=trajectory.length_pre_activation_std,
-        heading_increment_mean_rad=trajectory.heading_increment_mean_rad,
-        heading_increment_std_rad=trajectory.heading_increment_std_rad,
+        control_increment_mean_xy_m=trajectory.control_increment_mean_xy_m,
+        control_increment_std_xy_m=trajectory.control_increment_std_xy_m,
     )
     trajectory_decoder = ConditionalCurveMeanFlowDecoder(
-        curve_tokens=curve_codec.num_curve_tokens,
-        path_tokens=decoder.path_tokens,
-        num_path_points=trajectory.num_path_points,
-        planning_horizon_m=(
-            config.data.future_steps * config.data.expert_waypoint_spacing_m
-        ),
+        control_tokens=curve_codec.num_control_tokens,
+        coordinate_dim=curve_codec.coordinate_dim,
         model_dim=decoder.model_dim,
         layers=decoder.transformer_layers,
         heads=decoder.transformer_heads,
         dropout=decoder.dropout,
+        planning_horizon_m=planning_horizon_m,
+        path_to_control_weight=curve_codec.basis[:, 1:].transpose(0, 1),
     )
     return CurveNavPolicy(
         depth_encoder=depth_encoder,
         condition_encoder=condition_encoder,
         trajectory_decoder=trajectory_decoder,
         curve_codec=curve_codec,
+        planning_horizon_m=planning_horizon_m,
+    )
+
+
+def build_evaluation_projector(config: CurveNavConfig) -> MetricDepthProjector:
+    """Build the raw-depth diagnostic geometry outside the policy graph."""
+    data = config.data
+    return MetricDepthProjector(
+        token_height=config.depth_encoder.frame_tokens_height,
+        token_width=config.depth_encoder.frame_tokens_width,
+        max_depth_m=data.max_depth_m,
+        focal_x_px=data.canonical_focal_x_px,
+        focal_y_px=data.canonical_focal_y_px,
+        camera_forward_offset_m=data.camera_forward_offset_m,
+        camera_height_m=data.camera_height_m,
+        camera_downward_pitch_degrees=data.camera_downward_pitch_degrees,
+        planning_horizon_m=data.future_steps * data.expert_waypoint_spacing_m,
     )

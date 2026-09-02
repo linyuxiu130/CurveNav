@@ -11,7 +11,7 @@ import torch
 
 from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
-from curvenav.data.depth import BENCHMARK_INTRINSICS, preprocess_metric_depth
+from curvenav.data.depth import PinholeIntrinsics, preprocess_metric_depth
 from curvenav.factory import build_policy
 from curvenav.precision import cuda_precision
 from curvenav.training.checkpoint import validate_policy_contract
@@ -53,8 +53,13 @@ class DepthContextBuffer:
         self.samples: list[deque[tuple[float, np.ndarray, np.ndarray, float]]] = []
         self.distances = np.empty(0, dtype=np.float64)
         self.previous_positions = np.empty((0, 2), dtype=np.float32)
+        self.source_intrinsic_matrix = np.empty((0, 0), dtype=np.float64)
 
-    def reset(self, batch_size: int) -> None:
+    def reset(self, batch_size: int, camera_intrinsics: np.ndarray) -> None:
+        intrinsic = np.asarray(camera_intrinsics, dtype=np.float64)
+        if intrinsic.shape != (3, 3) or not np.isfinite(intrinsic).all():
+            raise ValueError("camera_intrinsics must be finite [3,3]")
+        self.source_intrinsic_matrix = intrinsic.copy()
         self.samples = [deque() for _ in range(batch_size)]
         self.distances = np.zeros(batch_size, dtype=np.float64)
         self.previous_positions = np.full((batch_size, 2), np.nan, dtype=np.float32)
@@ -82,7 +87,11 @@ class DepthContextBuffer:
             self.previous_positions[env_id] = position
             frame = preprocess_metric_depth(
                 raw_frame[..., 0],
-                source_intrinsics=BENCHMARK_INTRINSICS,
+                source_intrinsics=PinholeIntrinsics.from_matrix(
+                    self.source_intrinsic_matrix,
+                    width=raw_frame.shape[1],
+                    height=raw_frame.shape[0],
+                ),
                 maximum_m=self.maximum_m,
             )
             samples = self.samples[env_id]
@@ -209,9 +218,9 @@ class CurveNavRuntime:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
-    def reset(self, batch_size: int) -> None:
+    def reset(self, batch_size: int, camera_intrinsics: np.ndarray) -> None:
         self.batch_size = batch_size
-        self.context_buffer.reset(batch_size)
+        self.context_buffer.reset(batch_size, camera_intrinsics)
         self._warmup_policy(batch_size)
 
     def reset_env(self, env_id: int) -> None:

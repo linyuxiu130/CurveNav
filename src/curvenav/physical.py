@@ -31,6 +31,6 @@ BODY_OBSTACLE_MIN_Z_M = (
 )
 EXTRA_CLEARANCE_M = 0.10
 
-# One common physical query spacing for source-truth certification, offline
-# safety measurement, and the training-only observed-geometry coupling.
+# One common physical query spacing for source-truth certification and offline
+# safety measurement.
 PATH_CONFIGURATION_QUERY_SPACING_M = 0.025

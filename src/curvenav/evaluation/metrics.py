@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as functional
 from torch import Tensor
 
-from curvenav.models.safety import SAFETY_CLEARANCE_M, sample_configuration_field
+from curvenav.evaluation.configuration import (
+    SAFETY_CLEARANCE_M,
+    query_configuration_field,
+)
 from curvenav.trajectory import (
     path_arc_length,
     resample_path_at_distance,
@@ -20,6 +25,24 @@ from curvenav.physical import PATH_CONFIGURATION_QUERY_SPACING_M
 COMPARISON_HORIZON_M = 2.0
 EVALUATION_SPACING_M = PATH_CONFIGURATION_QUERY_SPACING_M
 COMPARISON_PATH_SAMPLES = round(COMPARISON_HORIZON_M / EVALUATION_SPACING_M) + 1
+EXECUTION_PREFIX_HORIZONS_M = (0.5, 1.0)
+MPC_REFERENCE_LENGTH_M = 2.0
+MPC_REFERENCE_SPEED_MPS = 0.5
+MPC_MAX_LINEAR_SPEED_MPS = 0.5
+MPC_MAX_ANGULAR_SPEED_RADPS = 0.5
+MPC_MIN_DESIRED_SPEED_MPS = 0.05
+MPC_CURVATURE_LOOKAHEAD_POINTS = 12
+TERMINAL_COLLISION_WINDOW_M = 0.25
+
+
+@dataclass(frozen=True)
+class CollisionVisibilityAttribution:
+    """Source collisions partitioned by deployed raw-depth evidence."""
+
+    metrics: dict[str, Tensor]
+    current_visible_points: Tensor
+    history_only_visible_points: Tensor
+    unrecognized_points: Tensor
 
 
 def _validate_path(path: Tensor, name: str) -> None:
@@ -152,6 +175,25 @@ def trajectory_metrics(
     return result
 
 
+def paired_path_change_m(
+    path: Tensor,
+    baseline_path: Tensor,
+    comparison_horizon_m: float = COMPARISON_HORIZON_M,
+) -> Tensor:
+    """Measure one intervention against its own unmodified policy output."""
+    _validate_path(path, "path")
+    _validate_path(baseline_path, "baseline_path")
+    if path.shape[0] != baseline_path.shape[0] or comparison_horizon_m <= 0:
+        raise ValueError("paired paths must share a batch and positive horizon")
+    evaluated_length = path_arc_length(baseline_path).clamp_max(
+        comparison_horizon_m
+    )
+    query = _uniform_distance(evaluated_length, COMPARISON_PATH_SAMPLES)
+    intervened = resample_path_at_distance(path, query)
+    baseline = resample_path_at_distance(baseline_path, query)
+    return torch.linalg.vector_norm(intervened - baseline, dim=-1).mean(dim=-1)
+
+
 def configuration_space_safety_metrics(
     path: Tensor,
     configuration_field: Tensor,
@@ -172,13 +214,13 @@ def configuration_space_safety_metrics(
         planning_horizon_m,
         EVALUATION_SPACING_M,
     )
-    sampled = sample_configuration_field(
+    sampled = query_configuration_field(
         configuration_field,
         dense_path,
         planning_horizon_m,
     )
-    covered = active & (sampled[..., 3] > 0.5)
-    clearance = sampled[..., 0]
+    covered = active & sampled.support_observed
+    clearance = sampled.signed_clearance_m
     covered_clearance = clearance.masked_fill(~covered, torch.inf)
     minimum = covered_clearance.amin(dim=-1)
     collision = covered & (clearance < 0.0)
@@ -202,45 +244,206 @@ def configuration_space_safety_metrics(
     }
 
 
-def configuration_space_collision_attribution(
+def collision_visibility_attribution(
     source_query: SourcePathQuery,
-    raw_depth_field: Tensor,
+    full_history_field: Tensor,
+    current_frame_field: Tensor,
     planning_horizon_m: float,
-) -> dict[str, Tensor]:
-    """Attribute source-truth collisions at identical dense local points."""
+) -> CollisionVisibilityAttribution:
+    """Partition identical source-collision points by current/history evidence."""
     dense_path = source_query.local_path
-    raw = sample_configuration_field(
-        raw_depth_field, dense_path, planning_horizon_m
+    full = query_configuration_field(
+        full_history_field, dense_path, planning_horizon_m
+    )
+    current = query_configuration_field(
+        current_frame_field, dense_path, planning_horizon_m
     )
     truth_collision = source_query.active & (source_query.clearance_m < 0.0)
     truth_free = source_query.active & ~truth_collision
-    raw_ray_coverage = source_query.active & (raw[..., 3] > 0.5)
-    raw_collision = raw_ray_coverage & (raw[..., 0] < 0.0)
+    full_coverage = source_query.active & full.support_observed
+    current_coverage = source_query.active & current.support_observed
+    full_recognized = full_coverage & (full.signed_clearance_m < 0.0)
+    current_recognized = current_coverage & (current.signed_clearance_m < 0.0)
+    current_visible = truth_collision & current_recognized
+    history_only_visible = truth_collision & full_recognized & ~current_recognized
+    unrecognized = truth_collision & ~full_recognized
 
     def point_count(mask: Tensor) -> Tensor:
         return mask.sum(dim=-1)
 
-    return {
+    full_visible_trajectory = (truth_collision & full_recognized).any(dim=-1)
+    current_visible_trajectory = current_visible.any(dim=-1)
+    history_only_trajectory = full_visible_trajectory & ~current_visible_trajectory
+    collision_trajectory = truth_collision.any(dim=-1)
+    first_collision_index = truth_collision.to(torch.int64).argmax(dim=-1)
+
+    def first_collision(mask: Tensor) -> Tensor:
+        return collision_trajectory & mask.gather(
+            1, first_collision_index[:, None]
+        ).squeeze(1)
+
+    last_active = source_query.active.sum(dim=-1).clamp_min(1) - 1
+
+    def endpoint(mask: Tensor) -> Tensor:
+        return mask.gather(1, last_active[:, None]).squeeze(1)
+
+    metrics = {
         "truth_collision_point_count": point_count(truth_collision),
         "truth_collision_point_raw_depth_count": point_count(
-            truth_collision & raw_collision
+            truth_collision & full_recognized
         ),
         "truth_collision_point_raw_ray_coverage_count": point_count(
-            truth_collision & raw_ray_coverage
+            truth_collision & full_coverage
         ),
         "truth_collision_point_raw_ray_coverage_missed_count": point_count(
-            truth_collision & raw_ray_coverage & ~raw_collision
+            truth_collision & full_coverage & ~full_recognized
         ),
         "truth_collision_point_outside_raw_ray_coverage_count": point_count(
-            truth_collision & ~raw_ray_coverage
+            truth_collision & ~full_coverage
         ),
         "raw_depth_false_collision_point_count": point_count(
-            truth_free & raw_collision
+            truth_free & full_recognized
         ),
-        "truth_collision_trajectory": truth_collision.any(dim=-1),
+        "truth_collision_point_current_depth_count": point_count(current_visible),
+        "truth_collision_point_history_only_depth_count": point_count(
+            history_only_visible
+        ),
+        "truth_collision_point_unrecognized_by_full_depth_count": point_count(
+            unrecognized
+        ),
+        "truth_collision_trajectory": collision_trajectory,
         "truth_collision_trajectory_recognized_by_raw_depth": (
-            truth_collision & raw_collision
-        ).any(dim=-1),
+            full_visible_trajectory
+        ),
+        "truth_collision_trajectory_recognized_by_current_depth": (
+            current_visible_trajectory
+        ),
+        "truth_collision_trajectory_has_additional_history_evidence": (
+            history_only_visible.any(dim=-1)
+        ),
+        "truth_collision_trajectory_recognized_only_with_history": (
+            history_only_trajectory
+        ),
+        "truth_collision_trajectory_unrecognized_by_full_depth": (
+            collision_trajectory & ~full_visible_trajectory
+        ),
+        "first_collision_current_depth_visible": first_collision(current_visible),
+        "first_collision_history_only_depth_visible": first_collision(
+            history_only_visible
+        ),
+        "first_collision_unrecognized_by_full_depth": first_collision(unrecognized),
+        "path_endpoint_collision_current_depth_visible": endpoint(
+            current_visible
+        ),
+        "path_endpoint_collision_history_only_depth_visible": endpoint(
+            history_only_visible
+        ),
+        "path_endpoint_collision_unrecognized_by_full_depth": endpoint(
+            unrecognized
+        ),
+    }
+    return CollisionVisibilityAttribution(
+        metrics=metrics,
+        current_visible_points=current_visible,
+        history_only_visible_points=history_only_visible,
+        unrecognized_points=unrecognized,
+    )
+
+
+def source_execution_prefix_metrics(
+    query: SourcePathQuery,
+) -> dict[str, Tensor]:
+    """Measure the source-truth portion that a receding-horizon policy executes.
+
+    The source query is already endpoint-inclusive at 2.5 cm spacing, so these
+    metrics add no map queries and use exactly the same physical truth as the
+    full-path collision report.
+    """
+    local = query.local_path
+    segment = torch.linalg.vector_norm(local[:, 1:] - local[:, :-1], dim=-1)
+    distance = torch.cat(
+        (torch.zeros_like(segment[:, :1]), segment.cumsum(dim=-1)), dim=-1
+    )
+    evaluated_length = distance.masked_fill(~query.active, 0.0).amax(dim=-1)
+    collision = query.active & (query.clearance_m < 0.0)
+    margin = query.active & (query.clearance_m < SAFETY_CLEARANCE_M)
+    terminal_window = query.active & (
+        distance >= (evaluated_length - TERMINAL_COLLISION_WINDOW_M)[:, None] - 1e-6
+    )
+    last_active = query.active.sum(dim=-1).clamp_min(1) - 1
+    endpoint_collision = collision.gather(1, last_active[:, None]).squeeze(1)
+    terminal_collision = (collision & terminal_window).any(dim=-1)
+    preterminal_collision = (collision & ~terminal_window).any(dim=-1)
+
+    def first_violation(mask: Tensor) -> Tensor:
+        first = distance.masked_fill(~mask, torch.inf).amin(dim=-1)
+        return torch.where(torch.isfinite(first), first, evaluated_length)
+
+    result = {
+        "distance_to_first_collision_m": first_violation(collision),
+        "distance_to_first_margin_violation_m": first_violation(margin),
+        "path_endpoint_collision": endpoint_collision,
+        "terminal_0p25m_collision": terminal_collision,
+        "collision_confined_to_terminal_0p25m": (
+            terminal_collision & ~preterminal_collision
+        ),
+    }
+    for horizon_m in EXECUTION_PREFIX_HORIZONS_M:
+        key = str(horizon_m).replace(".", "p")
+        inside_prefix = query.active & (distance <= horizon_m + 1e-6)
+        result[f"execution_prefix_{key}m_collision"] = (
+            collision & inside_prefix
+        ).any(dim=-1)
+        result[f"execution_prefix_{key}m_margin_violation"] = (
+            margin & inside_prefix
+        ).any(dim=-1)
+    return result
+
+
+def _point_gradient(value: Tensor) -> Tensor:
+    """Vectorized equivalent of numpy.gradient(..., edge_order=1)."""
+    gradient = torch.empty_like(value)
+    gradient[:, 0] = value[:, 1] - value[:, 0]
+    gradient[:, -1] = value[:, -1] - value[:, -2]
+    gradient[:, 1:-1] = 0.5 * (value[:, 2:] - value[:, :-2])
+    return gradient
+
+
+def controller_tracking_metrics(path: Tensor) -> dict[str, Tensor]:
+    """Reproduce the benchmark MPC's path-dependent speed calculation exactly."""
+    _validate_path(path, "path")
+    dx = _point_gradient(path[..., 0])
+    dy = _point_gradient(path[..., 1])
+    dy[:, 0] = 0.0
+    ddx = _point_gradient(dx)
+    ddy = _point_gradient(dy)
+    denominator = (dx.square() + dy.square()).pow(1.5).clamp_min(1e-6)
+    curvature = (dx * ddy - dy * ddx).abs() / denominator
+    curvature = functional.avg_pool1d(
+        curvature[:, None], kernel_size=3, stride=1, padding=1,
+        count_include_pad=True,
+    )[:, 0]
+    lookahead = min(MPC_CURVATURE_LOOKAHEAD_POINTS, path.shape[1])
+    maximum = curvature[:, :lookahead].amax(dim=-1)
+    length = path_arc_length(path)
+    length_speed = (
+        MPC_REFERENCE_SPEED_MPS
+        * (length / MPC_REFERENCE_LENGTH_M).clamp(max=1.0)
+    ).clamp(MPC_MIN_DESIRED_SPEED_MPS, MPC_MAX_LINEAR_SPEED_MPS)
+    curvature_speed = (
+        MPC_MAX_ANGULAR_SPEED_RADPS / maximum.clamp_min(1e-6)
+    ).clamp(MPC_MIN_DESIRED_SPEED_MPS, MPC_MAX_LINEAR_SPEED_MPS)
+    desired_speed = torch.minimum(length_speed, curvature_speed)
+    initial = path[:, 1] - path[:, 0]
+    return {
+        "mpc_max_curvature_first12_inv_m": maximum,
+        "mpc_length_limited_speed_mps": length_speed,
+        "mpc_curvature_limited_speed_mps": curvature_speed,
+        "mpc_desired_speed_mps": desired_speed,
+        "mpc_curvature_is_active": curvature_speed < length_speed,
+        "initial_tangent_heading_error_rad": torch.atan2(
+            initial[:, 1], initial[:, 0]
+        ).abs(),
     }
 
 
@@ -344,7 +547,7 @@ def summarize_configuration_safety(metrics: dict[str, Tensor]) -> dict[str, floa
     )
     if not predicted_finite.any() or not reference_finite.any():
         raise RuntimeError("evaluated trajectories do not intersect observed geometry")
-    return {
+    result = {
         "path_field_coverage_fraction_mean": metrics[
             "path_field_coverage_fraction"
         ].mean().item(),
@@ -384,3 +587,47 @@ def summarize_configuration_safety(metrics: dict[str, Tensor]) -> dict[str, floa
             "reference_safety_margin_violation"
         ].float().mean().item(),
     }
+    for horizon_m in EXECUTION_PREFIX_HORIZONS_M:
+        key = str(horizon_m).replace(".", "p")
+        for suffix in ("collision", "margin_violation"):
+            name = f"execution_prefix_{key}m_{suffix}"
+            result[f"{name}_fraction"] = metrics[name].float().mean().item()
+    result.update(
+        path_endpoint_collision_fraction=metrics["path_endpoint_collision"]
+        .float()
+        .mean()
+        .item(),
+        terminal_0p25m_collision_fraction=metrics["terminal_0p25m_collision"]
+        .float()
+        .mean()
+        .item(),
+        collision_confined_to_terminal_0p25m_fraction=metrics[
+            "collision_confined_to_terminal_0p25m"
+        ]
+        .float()
+        .mean()
+        .item(),
+    )
+    result.update(
+        distance_to_first_collision_m_mean=metrics[
+            "distance_to_first_collision_m"
+        ].mean().item(),
+        distance_to_first_margin_violation_m_mean=metrics[
+            "distance_to_first_margin_violation_m"
+        ].mean().item(),
+        mpc_desired_speed_mps_mean=metrics["mpc_desired_speed_mps"].mean().item(),
+        mpc_desired_speed_mps_p05=torch.quantile(
+            metrics["mpc_desired_speed_mps"], 0.05
+        ).item(),
+        mpc_curvature_limited_fraction=metrics["mpc_curvature_is_active"]
+        .float()
+        .mean()
+        .item(),
+        mpc_max_curvature_first12_inv_m_p95=torch.quantile(
+            metrics["mpc_max_curvature_first12_inv_m"], 0.95
+        ).item(),
+        initial_tangent_heading_error_rad_p95=torch.quantile(
+            metrics["initial_tangent_heading_error_rad"], 0.95
+        ).item(),
+    )
+    return result

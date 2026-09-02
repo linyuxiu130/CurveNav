@@ -1,58 +1,53 @@
-"""Goal-independent scene encoding followed by explicit PointGoal conditioning."""
-
-import math
+"""Target-independent fused metric memory and a PointGoal reference."""
 
 import torch
 from torch import Tensor, nn
 
-from curvenav.layers import EncoderBlock, RMSNorm
+from curvenav.layers import RMSNorm
+from curvenav.trajectory import metric_goal_reference
 from curvenav.types import ConditionFeatures, DepthFeatures
 
 from .motion import HistoricalMotionEncoder
+
+
 CONDITION_ENCODER_TYPE = (
-    "goal_independent_scene_plus_explicit_pointgoal_token"
+    "observed_cspace_visual_bev_and_motion_plus_metric_goal_reference"
 )
 
 
 class PolicyConditionEncoder(nn.Module):
-    """Preserve scene geometry and expose PointGoal as one separate token."""
+    """Build target-independent scene memory and metric PointGoal queries."""
 
     def __init__(
         self,
         configuration_encoder: nn.Module,
         *,
         observation_frames: int,
-        spatial_tokens: int,
-        configuration_tokens: int,
         history_horizon_m: float,
-        model_dim: int = 384,
-        transformer_layers: int = 4,
-        transformer_heads: int = 8,
-        dropout: float = 0.0,
+        planning_horizon_m: float,
+        control_tokens: int,
+        model_dim: int,
     ) -> None:
         super().__init__()
         self.configuration_encoder = configuration_encoder
-        self.observation_frames = observation_frames
-        self.spatial_tokens = spatial_tokens
-        self.configuration_tokens = configuration_tokens
-        self.configuration_grid_size = math.isqrt(configuration_tokens)
-        if self.configuration_grid_size**2 != configuration_tokens:
-            raise ValueError("configuration tokens must form one square metric grid")
+        self.planning_horizon_m = float(planning_horizon_m)
+        if control_tokens != 7:
+            raise ValueError("goal reference must match seven B-spline controls")
         self.motion_encoder = HistoricalMotionEncoder(
             observation_frames=observation_frames,
             history_horizon_m=history_horizon_m,
             model_dim=model_dim,
         )
-        self.goal_projection = nn.Sequential(
-            nn.Linear(2, model_dim),
-            nn.SiLU(),
-            nn.Linear(model_dim, model_dim),
-        )
-        self.context_blocks = nn.ModuleList(
-            EncoderBlock(model_dim, transformer_heads, dropout)
-            for _ in range(transformer_layers)
-        )
         self.memory_norm = RMSNorm(model_dim)
+
+    def _goal_reference(self, point_goal: Tensor) -> Tensor:
+        """Return the exact straight B-spline controls on the observable goal ray.
+
+        The local-horizon clamp locates an attention query; it does not constrain
+        the generated B-spline, whose controls remain unconstrained Euclidean
+        variables.
+        """
+        return metric_goal_reference(point_goal, self.planning_horizon_m)
 
     def forward(
         self,
@@ -62,36 +57,74 @@ class PolicyConditionEncoder(nn.Module):
         observation_to_current: Tensor,
     ) -> ConditionFeatures:
         batch = point_goal.shape[0]
-        if observation.tokens.shape[:2] != (batch, self.spatial_tokens):
-            raise ValueError("current visual tokens do not match the condition contract")
-        if observation.configuration_field.ndim != 4:
-            raise ValueError("configuration field must have shape [B,C,H,W]")
+        if observation.tokens.ndim != 3 or observation.tokens.shape[0] != batch:
+            raise ValueError("depth tokens must have shape [B,N,D]")
+        if observation.token_valid.shape != observation.tokens.shape[:2]:
+            raise ValueError("depth token validity must have shape [B,N]")
         configuration = self.configuration_encoder(
             observation.configuration_field,
-            observation.configuration_tokens,
-            observation.configuration_points,
-            observation.configuration_visual_valid,
+            observation.tokens,
+            observation.metric_position,
+            observation.token_valid,
         )
-        if configuration.tokens.shape[:2] != (batch, self.configuration_tokens):
-            raise ValueError(
-                "configuration tokens do not match the condition contract"
-            )
         motion = self.motion_encoder(observation_to_current, observation_valid)
-        # Scene reasoning is deliberately goal independent.  PointGoal cannot
-        # rewrite the measured obstacle field.
-        tokens = torch.cat(
-            (observation.tokens, motion, configuration.tokens), dim=1
-        ).float()
-        for block in self.context_blocks:
-            tokens = block(tokens)
-        tokens = self.memory_norm(tokens)
-        # The goal is appended after scene self-attention, so it can condition
-        # the trajectory decoder without rewriting measured obstacle tokens.
-        goal_token = self.goal_projection(
-            point_goal.float() / self.configuration_encoder.planning_horizon_m
-        )[:, None]
-        tokens = torch.cat((tokens, goal_token), dim=1)
+        tokens = torch.cat((configuration.tokens, motion), dim=1)
+        configuration_valid = torch.ones(
+            batch,
+            configuration.tokens.shape[1],
+            device=point_goal.device,
+            dtype=torch.bool,
+        )
+        token_valid = torch.cat((configuration_valid, observation_valid[:, :-1]), dim=1)
+        past_position = torch.cat(
+            (
+                observation_to_current[:, :-1, :2].float(),
+                torch.zeros(
+                    batch,
+                    observation_to_current.shape[1] - 1,
+                    1,
+                    device=point_goal.device,
+                ),
+            ),
+            dim=-1,
+        )
+        metric_position = torch.cat((configuration.metric_position, past_position), dim=1)
+        surface_hit = torch.cat(
+            (
+                configuration.observed_fraction > 0.0,
+                torch.zeros_like(observation_valid[:, :-1]),
+            ),
+            dim=1,
+        )
+        frame_age = torch.cat(
+            (
+                torch.zeros_like(configuration.observed_fraction),
+                torch.arange(
+                    observation_to_current.shape[1] - 1,
+                    0,
+                    -1,
+                    device=point_goal.device,
+                    dtype=torch.float32,
+                )[None].expand(batch, -1)
+                / (observation_to_current.shape[1] - 1),
+            ),
+            dim=1,
+        )
+        motion_token = torch.cat(
+            (
+                torch.zeros_like(configuration_valid),
+                torch.ones_like(observation_valid[:, :-1]),
+            ),
+            dim=1,
+        )
+        goal_reference = self._goal_reference(point_goal)
         return ConditionFeatures(
-            tokens=tokens,
-            path_configuration_field=configuration.measured_field,
+            tokens=self.memory_norm(tokens),
+            token_valid=token_valid,
+            metric_position=metric_position,
+            surface_hit=surface_hit,
+            frame_age=frame_age,
+            motion_token=motion_token,
+            goal_reference=goal_reference,
+            configuration_field=observation.configuration_field,
         )

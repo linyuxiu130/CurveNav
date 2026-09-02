@@ -20,10 +20,19 @@ def configure_cuda_training_backend() -> None:
 
 
 def compile_static_training_functions(policy: nn.Module) -> None:
-    """Fuse fixed-shape geometry projection and the stopped JVP."""
-    projector = policy.depth_encoder.metric_projector
-    projector.forward = torch.compile(
-        projector.forward,
+    """Fuse fixed-shape perception, conditioning, primal, and stopped JVP."""
+    policy.depth_encoder.forward = torch.compile(
+        policy.depth_encoder.forward,
+        fullgraph=True,
+        dynamic=False,
+    )
+    policy.condition_encoder.forward = torch.compile(
+        policy.condition_encoder.forward,
+        fullgraph=True,
+        dynamic=False,
+    )
+    policy._trainable_velocity_primal = torch.compile(
+        policy._trainable_velocity_primal,
         fullgraph=True,
         dynamic=False,
     )

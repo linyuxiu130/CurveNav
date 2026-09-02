@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from functools import lru_cache
 
-import cv2
 import numpy as np
 
 from curvenav.config import DataConfig
@@ -17,6 +16,39 @@ class PinholeIntrinsics:
     fy: float
     cx: float
     cy: float
+
+    @classmethod
+    def from_matrix(
+        cls,
+        matrix: np.ndarray,
+        *,
+        width: int,
+        height: int,
+    ) -> "PinholeIntrinsics":
+        value = np.asarray(matrix, dtype=np.float64)
+        if value.shape != (3, 3) or not np.isfinite(value).all():
+            raise ValueError("camera intrinsic matrix must be finite [3,3]")
+        expected_last_row = np.array([0.0, 0.0, 1.0])
+        if not np.allclose(value[2], expected_last_row, atol=1e-8, rtol=0.0):
+            raise ValueError("camera intrinsic matrix must be pinhole-normalized")
+        if value[0, 1] != 0.0 or value[1, 0] != 0.0:
+            raise ValueError("CurveNav requires a zero-skew pinhole camera")
+        if value[0, 0] <= 0.0 or value[1, 1] <= 0.0:
+            raise ValueError("camera focal lengths must be positive")
+        return cls(
+            width=int(width),
+            height=int(height),
+            fx=float(value[0, 0]),
+            fy=float(value[1, 1]),
+            cx=float(value[0, 2]),
+            cy=float(value[1, 2]),
+        )
+
+    def matrix(self) -> np.ndarray:
+        return np.array(
+            ((self.fx, 0.0, self.cx), (0.0, self.fy, self.cy), (0.0, 0.0, 1.0)),
+            dtype=np.float64,
+        )
 
     def at_resolution(self, width: int, height: int) -> "PinholeIntrinsics":
         """Resample the same horizontal and vertical field of view."""
@@ -101,14 +133,16 @@ def preprocess_metric_depth(
     frame = frame.copy()
     frame[invalid] = maximum_m
     map_x, map_y = _pinhole_remap(sampled_intrinsics, CANONICAL_INTRINSICS)
-    canonical = cv2.remap(
-        frame,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=maximum_m,
+    source_x = np.floor(map_x + 0.5).astype(np.int64)
+    source_y = np.floor(map_y + 0.5).astype(np.int64)
+    inside = (
+        (source_x >= 0)
+        & (source_x < frame.shape[1])
+        & (source_y >= 0)
+        & (source_y < frame.shape[0])
     )
+    canonical = np.full(map_x.shape, maximum_m, dtype=np.float32)
+    canonical[inside] = frame[source_y[inside], source_x[inside]]
     return np.ascontiguousarray(
         np.clip(canonical, 0.0, maximum_m) / maximum_m,
         dtype=np.float32,

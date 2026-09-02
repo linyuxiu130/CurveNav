@@ -14,29 +14,12 @@ from curvenav.conditioning import (
     CONDITION_ENCODER_TYPE,
     HISTORICAL_STATE_FEATURES,
 )
-from curvenav.encoders.configuration import (
-    CONFIGURATION_ENCODER_TYPE,
-    CONFIGURATION_TOKEN_COUNT,
-    CONFIGURATION_TOKEN_GRID_SIZE,
-)
-from curvenav.encoders.geometry import CONFIGURATION_GRID_SIZE
 from curvenav.encoders.depth import DEPTH_ENCODER_TYPE
+from curvenav.encoders.configuration import CONFIGURATION_ENCODER_TYPE
 from curvenav.models import TRAJECTORY_DECODER_TYPE
-from curvenav.physical import (
-    BODY_OBSTACLE_MIN_Z_M,
-    EXTRA_CLEARANCE_M,
-    MAXIMUM_TRAVERSABLE_HEIGHT_M,
-    MAXIMUM_TRAVERSABLE_SLOPE_DEGREES,
-    ROBOT_COLLISION_BOTTOM_Z_M,
-    ROBOT_COLLISION_HEIGHT_M,
-    ROBOT_COLLISION_TOP_Z_M,
-    ROBOT_FOOTPRINT_RADIUS_M,
-)
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.batching import build_distributed_batch_layout
-from curvenav.trajectory import (
-    HEADING_PARAMETERIZATION_TYPE,
-)
+from curvenav.trajectory import INCREMENTAL_CONTROL_PARAMETERIZATION_TYPE
 from curvenav.models.policy import (
     INFERENCE_SOURCE_SEED,
     MEAN_FLOW_TIME_SAMPLING,
@@ -46,8 +29,8 @@ from curvenav.models.policy import (
 CHECKPOINT_TYPE = "curvenav_metric_curve_mean_flow_policy"
 SUPPORTED_TRAINING_PRECISIONS = frozenset(
     {
-        "bf16_primal_fp32_detached_meanflow_jvp",
-        "fp16_primal_fp32_detached_meanflow_jvp",
+        "bf16_neural_fp32_geometry_flow_jvp",
+        "fp16_neural_fp32_geometry_flow_jvp",
     }
 )
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
@@ -91,8 +74,8 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
     data = config.data
     trajectory = config.trajectory
     depth = config.depth_encoder
-    condition = config.condition_encoder
     decoder = config.trajectory_decoder
+    condition = config.condition_encoder
     return {
         "observation_frames": data.observation_frames,
         "frame_spacing_m": data.frame_spacing_m,
@@ -113,34 +96,27 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
                 depth.frame_tokens_height,
                 depth.frame_tokens_width,
             ],
-            "configuration_token_grid": [
-                CONFIGURATION_TOKEN_GRID_SIZE,
-                CONFIGURATION_TOKEN_GRID_SIZE,
+            "configuration_bev_grid": [
+                condition.bev_grid_size,
+                condition.bev_grid_size,
             ],
             "depth_dropout": depth.dropout,
-            "condition_heads": condition.transformer_heads,
-            "condition_layers": condition.transformer_layers,
-            "condition_dropout": condition.dropout,
             "trajectory_decoder_layers": decoder.transformer_layers,
             "trajectory_decoder_heads": decoder.transformer_heads,
-            "trajectory_path_tokens": decoder.path_tokens,
             "trajectory_decoder_dropout": decoder.dropout,
         },
         "trajectory_dimensions": 2,
         "planar_axis_convention": "x_forward_y_left",
         "point_goal_semantics": "mission_destination_in_current_robot_xy",
         "point_goal_conditioning": (
-            "separate_normalized_metric_pointgoal_token_after_goal_independent_scene_encoding"
+            "candidate_control_to_metric_local_goal_reference"
         ),
         "trajectory_supervision": (
-            "source_cspace_gated_fixed_future_expert_projected_into_regular_heading_field"
+            "source_cspace_gated_fixed_future_expert_planar_bspline_imitation"
         ),
-        "expert_curve_projection": "equal_arc_heading_field_least_squares",
-        "arc_length_policy": "positive_softplus_of_standardized_pre_activation",
-        "trajectory_endpoint_policy": "single_evaluation_conditional_average_flow_curve",
-        "curve_boundary_conditions": (
-            "origin_and_robot_longitudinal_initial_heading"
-        ),
+        "expert_curve_projection": "equal_arc_planar_bspline_least_squares",
+        "trajectory_endpoint_policy": "one_step_improved_mean_flow_curve",
+        "curve_boundary_conditions": "fixed_robot_origin",
         "trajectory_decoder_type": TRAJECTORY_DECODER_TYPE,
         "flow_source": (
             "standard_gaussian_flow_training_plus_exact_fixed_typical_"
@@ -148,45 +124,37 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         ),
         "inference_source_seed": INFERENCE_SOURCE_SEED,
         "flow_path": "data_anchored_linear_stochastic_interpolant",
-        "flow_solver": "none_direct_average_velocity_transport",
+        "flow_solver": "none_direct_average_velocity",
         "flow_time_embedding": "end_time_and_interval_width_mlp",
         "flow_time_sampling": MEAN_FLOW_TIME_SAMPLING,
-        "mean_flow_identity": (
-            "auxiliary_instantaneous_velocity_jvp_reparameterized_average_v_loss"
-        ),
+        "mean_flow_identity": "instantaneous_proposal_plus_average_velocity_jvp_target",
         "training_objective": (
-            "standardized_euclidean_improved_mean_flow_plus_deployment_raw_"
-            "observed_signed_clearance_soft_margin"
+            "standardized_euclidean_mean_flow_plus_deployed_"
+            "strict_observed_clearance_risk"
         ),
-        "trajectory_prediction": (
-            "single_mean_flow_generated_regular_metric_heading_curve"
-        ),
+        "trajectory_prediction": ("one_step_improved_mean_flow_planar_cubic_bspline"),
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
         "visual_context": (
-            "goal_independent_current_metric_tokens_plus_all_frame_metric_"
-            "splat_configuration_tokens_plus_causal_motion_state"
+            "goal_independent_four_frame_visual_observed_configuration_bev"
         ),
-        "depth_token_pooling": (
-            "nearest_nontraversable_body_height_surface_else_nearest_surface_metric_xyz"
-        ),
-        "body_obstacle_selection": (
-            "robot_collision_height_band_excluding_local_traversable_surface_triangles"
-        ),
+        "depth_token_pooling": "nearest_metric_surface_per_image_token",
         "observation_to_current": (
             "planar_rigid_transform_used_for_metric_xyz_alignment_and_motion_state"
         ),
-        "visual_compression": "shared_resnet_all_frames_metric_splat_to_8x8",
-        "condition_context": (
-            "four_layer_goal_independent_visual_motion_and_configuration_transformer"
-        ),
+        "configuration_encoder_type": CONFIGURATION_ENCODER_TYPE,
+        "visual_compression": "metric_splat_and_observed_cspace_16x16_bev",
+        "condition_context": "target_independent_metric_bev_plus_motion_tokens",
         "trajectory_condition_interaction": (
-            "pointgoal_cross_attention_then_two_path_configuration_refinements"
+            "flow_state_then_clean_estimate_query_observed_cspace_and_bev"
+        ),
+        "path_relative_geometry": (
+            "flow_state_then_learned_clean_control_to_bev_metric_attention_bias"
         ),
         "goal_conditioning": (
-            "separate_metric_pointgoal_token_appended_after_scene_encoding"
+            "candidate_control_to_metric_goal_reference_embedding"
         ),
         "temporal_modeling": (
-            "aligned_four_frame_learned_depth_evidence_plus_causal_se2_motion_tokens"
+            "shared_learned_four_frame_depth_tokens_with_metric_se2_alignment"
         ),
         "state_token_features": HISTORICAL_STATE_FEATURES,
         "state_translation_scale_m": (
@@ -194,70 +162,38 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         ),
         "state_token_count": data.observation_frames - 1,
         "condition_token_count": (
-            depth.frame_tokens_height * depth.frame_tokens_width
-            + data.observation_frames
-            - 1
-            + CONFIGURATION_TOKEN_COUNT
-            + 1
+            condition.bev_grid_size**2 + data.observation_frames - 1
         ),
-        "decoder_refinement_stages": 3,
+        "decoder_flow_fields": 2,
         "decoder_stage_supervision": (
-            "separate_average_and_instantaneous_velocity_readouts_on_all_three_stages"
+            "instantaneous_clean_proposal_and_interval_average_velocity"
         ),
-        "configuration_encoder_type": CONFIGURATION_ENCODER_TYPE,
-        "configuration_token_grid": [
-            CONFIGURATION_TOKEN_GRID_SIZE,
-            CONFIGURATION_TOKEN_GRID_SIZE,
-        ],
-        "configuration_space_field": {
-            "grid_size": CONFIGURATION_GRID_SIZE,
-            "extent_m": data.future_steps * data.expert_waypoint_spacing_m,
-            "base_channels": [
-                "measured_signed_clearance_m",
-                "measured_gradient_x",
-                "measured_gradient_y",
-                "measured_ray_coverage_probability",
-                "measured_forbidden_probability",
-            ],
-            "footprint_inflated": True,
-            "training_supervision": (
-                "deployment_generated_path_raw_observed_signed_clearance_soft_margin"
-            ),
-            "inference_input": "aligned_depth_evidence_only",
-        },
         "source_configuration_space_truth": (
-            "native_navigation_grid_dense_0.025m_oob_non_executable"
+            "native_navigation_grid_endpoint_inclusive_dense_0.025m_"
+            "oob_non_executable"
         ),
-        "body_obstacle_geometry": {
-            "footprint_radius_m": ROBOT_FOOTPRINT_RADIUS_M,
-            "extra_clearance_m": EXTRA_CLEARANCE_M,
-            "collision_bottom_z_m": ROBOT_COLLISION_BOTTOM_Z_M,
-            "collision_top_z_m": ROBOT_COLLISION_TOP_Z_M,
-            "collision_height_m": ROBOT_COLLISION_HEIGHT_M,
-            "body_obstacle_min_z_m": BODY_OBSTACLE_MIN_Z_M,
-            "maximum_traversable_height_m": MAXIMUM_TRAVERSABLE_HEIGHT_M,
-            "maximum_traversable_slope_degrees": (
-                MAXIMUM_TRAVERSABLE_SLOPE_DEGREES
-            ),
-        },
-        "num_curve_tokens": trajectory.num_heading_control_points,
-        "num_heading_control_points": trajectory.num_heading_control_points,
+        "source_configuration_space_role": "dataset_certificate_and_evaluation_only",
+        "depth_configuration_space_role": (
+            "target_independent_observed_bev_plus_flow_candidate_curve_query_"
+            "plus_deployed_curve_training_risk"
+        ),
+        "num_curve_tokens": trajectory.num_control_points - 1,
+        "curve_coordinate_dim": 2 * (trajectory.num_control_points - 1),
+        "num_control_points": trajectory.num_control_points,
         "spline_degree": trajectory.spline_degree,
         "num_path_points": trajectory.num_path_points,
         "path_sampling": "fixed_uniform_arc_progress",
-        "curve_coordinates": HEADING_PARAMETERIZATION_TYPE,
-        "visual_planning_scale_m": (
-            data.future_steps * data.expert_waypoint_spacing_m
+        "curve_coordinates": INCREMENTAL_CONTROL_PARAMETERIZATION_TYPE,
+        "visual_planning_scale_m": (data.future_steps * data.expert_waypoint_spacing_m),
+        "curve_value_semantics": ("seven_planar_cubic_bspline_control_points_xy_m"),
+        "control_increment_mean_xy_m": list(
+            trajectory.control_increment_mean_xy_m
         ),
-        "curve_value_semantics": (
-            "metric_arc_length_then_seven_cubic_heading_control_increments_rad"
+        "control_increment_std_xy_m": list(
+            trajectory.control_increment_std_xy_m
         ),
-        "length_pre_activation_mean": trajectory.length_pre_activation_mean,
-        "length_pre_activation_std": trajectory.length_pre_activation_std,
-        "heading_increment_mean_rad": list(trajectory.heading_increment_mean_rad),
-        "heading_increment_std_rad": list(trajectory.heading_increment_std_rad),
         "flow_coordinate_transform": (
-            "standardized_softplus_length_pre_activation_and_heading_increments"
+            "per_dimension_standardized_physical_control_increments"
         ),
     }
 
@@ -407,7 +343,9 @@ def restore_training_state(
         "rng_states",
     }
     if set(checkpoint) != expected_keys:
-        raise ValueError("training checkpoint does not match the unique mixed-precision state")
+        raise ValueError(
+            "training checkpoint does not match the unique mixed-precision state"
+        )
     model.load_state_dict(checkpoint["model"], strict=True)
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])

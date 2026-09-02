@@ -3,14 +3,8 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKSPACE_ROOT="$(cd "${PROJECT_ROOT}/.." && pwd)"
-RUNTIME_ROOT="${CURVENAV_RUNTIME_ROOT:-${WORKSPACE_ROOT}/curvenav-runtime/rootfs}"
+RUNTIME_ROOT="${CURVENAV_RUNTIME_ROOT:-${WORKSPACE_ROOT}/curvenav-runtime-self-contained/rootfs}"
 HOST_DRIVER_ROOT="/usr/lib/x86_64-linux-gnu"
-HOST_PYTHON="/usr/bin/python3"
-HOST_PYTHON_STDLIB="/usr/lib/python3.10"
-HOST_GCC="$(readlink -f /usr/bin/gcc)"
-HOST_AS="$(readlink -f /usr/bin/as)"
-HOST_LD="$(readlink -f /usr/bin/ld)"
-HOST_GCC_LIB="/usr/lib/gcc"
 
 if [[ ! -x "${RUNTIME_ROOT}/bin/bash" ]]; then
     echo "CurveNav training runtime is missing: ${RUNTIME_ROOT}" >&2
@@ -20,16 +14,12 @@ if (( $# == 0 )); then
     echo "usage: $0 COMMAND [ARG ...]" >&2
     exit 2
 fi
-if [[ ! -x "${HOST_PYTHON}" || ! -d "${HOST_PYTHON_STDLIB}" ]]; then
-    echo "CurveNav training Python runtime is missing" >&2
+if [[ ! -x "${RUNTIME_ROOT}/usr/bin/python3" \
+    || ! -f "${RUNTIME_ROOT}/usr/include/python3.10/Python.h" \
+    || ! -x "${RUNTIME_ROOT}/usr/bin/gcc" ]]; then
+    echo "CurveNav self-contained Python/C toolchain is missing" >&2
     exit 1
 fi
-if [[ ! -x "${HOST_GCC}" || ! -x "${HOST_AS}" || ! -x "${HOST_LD}" \
-    || ! -d "${HOST_GCC_LIB}" ]]; then
-    echo "CurveNav training C toolchain is missing" >&2
-    exit 1
-fi
-
 # bwrap creates the bind mount target itself, but its parents must already
 # exist in a writable mount.  Overlay the deepest existing workspace ancestor
 # in the immutable rootfs, then materialize only the missing descendants.
@@ -68,6 +58,18 @@ do
         exit 1
     fi
     driver_mounts+=(--ro-bind "${driver_path}" "/opt/nvidia/${soname}")
+    runtime_driver_link="${RUNTIME_ROOT}/usr/lib/x86_64-linux-gnu/${soname}"
+    if [[ -e "${runtime_driver_link}" || -L "${runtime_driver_link}" ]]; then
+        runtime_driver_path="$(readlink -f "${runtime_driver_link}")"
+        if [[ ! -f "${runtime_driver_path}" \
+            || "${runtime_driver_path}" != "${RUNTIME_ROOT}"/* ]]; then
+            echo "Invalid CurveNav runtime NVIDIA ABI target: ${soname}" >&2
+            exit 1
+        fi
+        driver_mounts+=(
+            --ro-bind "${driver_path}" "${runtime_driver_path#${RUNTIME_ROOT}}"
+        )
+    fi
     if [[ "${soname}" == "libcuda.so.1" ]]; then
         driver_mounts+=(--ro-bind "${driver_path}" /opt/nvidia/libcuda.so)
     fi
@@ -89,17 +91,10 @@ exec bwrap \
     --tmpfs /tmp \
     --tmpfs /opt \
     --dir /opt/nvidia \
-    --ro-bind "${HOST_PYTHON}" "${HOST_PYTHON}" \
-    --ro-bind "${HOST_PYTHON_STDLIB}" "${HOST_PYTHON_STDLIB}" \
-    --ro-bind /usr/include /usr/include \
-    --ro-bind /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu \
-    --ro-bind /usr/lib64 /usr/lib64 \
-    --ro-bind "${HOST_GCC}" /usr/bin/gcc \
-    --ro-bind "${HOST_AS}" /usr/bin/as \
-    --ro-bind "${HOST_LD}" /usr/bin/ld \
-    --ro-bind "${HOST_GCC_LIB}" "${HOST_GCC_LIB}" \
     "${driver_mounts[@]}" \
     --setenv HOME "${WORKSPACE_ROOT}" \
     --setenv LD_LIBRARY_PATH /opt/nvidia \
+    --setenv LIBRARY_PATH /opt/nvidia \
+    --setenv PYTHONPATH "${PROJECT_ROOT}/src" \
     --chdir "${PROJECT_ROOT}" \
     "$@"

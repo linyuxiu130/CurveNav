@@ -6,7 +6,6 @@ import shutil
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 from curvenav.config import DataConfig
@@ -25,7 +24,6 @@ def _prepare_hssd_run(
     task: tuple[str, str, str, int, int, float],
 ) -> tuple[str, dict[str, object]]:
     route_id, source_string, destination_string, height, width, max_depth_m = task
-    cv2.setNumThreads(0)
     source = Path(source_string)
     destination = Path(destination_string)
     destination.parent.mkdir(parents=True, exist_ok=True)

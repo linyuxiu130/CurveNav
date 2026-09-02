@@ -8,6 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import torch
+
+from curvenav.evaluation.metrics import controller_tracking_metrics
+from curvenav.physical import PATH_CONFIGURATION_QUERY_SPACING_M
 
 
 MAX_RENDERED_PLANS = 160
@@ -21,17 +25,26 @@ class NavigationMap:
 
 
 def _rasterize_navigation_map(navigation_xy: np.ndarray) -> NavigationMap:
-    """Rasterize the frozen PLY once; every episode reuses the same exact base."""
-    minimum = np.floor(navigation_xy.min(axis=0) / GLOBAL_MAP_RESOLUTION_M)
-    maximum = np.ceil(navigation_xy.max(axis=0) / GLOBAL_MAP_RESOLUTION_M)
-    x_edges = np.arange(minimum[0], maximum[0] + 1.0) * GLOBAL_MAP_RESOLUTION_M
-    y_edges = np.arange(minimum[1], maximum[1] + 1.0) * GLOBAL_MAP_RESOLUTION_M
-    counts, _, _ = np.histogram2d(
-        navigation_xy[:, 1], navigation_xy[:, 0], bins=(y_edges, x_edges)
+    """Rasterize PLY samples as cell centres on their native 5 cm lattice."""
+    lattice = np.rint(
+        np.asarray(navigation_xy, dtype=np.float64) / GLOBAL_MAP_RESOLUTION_M
+    ).astype(np.int64)
+    minimum = lattice.min(axis=0)
+    maximum = lattice.max(axis=0)
+    free = np.zeros(
+        (maximum[1] - minimum[1] + 1, maximum[0] - minimum[0] + 1),
+        dtype=np.bool_,
     )
+    free[lattice[:, 1] - minimum[1], lattice[:, 0] - minimum[0]] = True
+    half_cell = 0.5 * GLOBAL_MAP_RESOLUTION_M
     return NavigationMap(
-        free=counts > 0,
-        extent=(x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]),
+        free=free,
+        extent=(
+            minimum[0] * GLOBAL_MAP_RESOLUTION_M - half_cell,
+            maximum[0] * GLOBAL_MAP_RESOLUTION_M + half_cell,
+            minimum[1] * GLOBAL_MAP_RESOLUTION_M - half_cell,
+            maximum[1] * GLOBAL_MAP_RESOLUTION_M + half_cell,
+        ),
     )
 
 
@@ -46,16 +59,41 @@ def _draw_navigation_map(axis: object, navigation_map: NavigationMap) -> list[ob
         origin="lower",
         extent=navigation_map.extent,
         interpolation="nearest",
-        cmap=ListedColormap(["#4a1717", "#e5e7eb"]),
+        cmap=ListedColormap(["#d7dce2", "#fbfcfe"]),
         zorder=1,
     )
     axis.set_xlim(navigation_map.extent[:2])
     axis.set_ylim(navigation_map.extent[2:])
     axis.set_aspect("equal", adjustable="box")
     return [
-        Patch(facecolor="#e5e7eb", label="navigable robot-center space"),
-        Patch(facecolor="#4a1717", label="obstacle / non-navigable space"),
+        Patch(facecolor="#fbfcfe", edgecolor="#94a3b8", label="navigable robot-center space"),
+        Patch(facecolor="#d7dce2", edgecolor="#94a3b8", label="obstacle / non-navigable space"),
     ]
+
+
+def _focus_map_view(
+    axis: object,
+    navigation_map: NavigationMap,
+    points: np.ndarray,
+    *,
+    padding_m: float = 1.0,
+    minimum_span_m: float = 4.0,
+) -> None:
+    """Crop a diagnostic map to the task while retaining physical scale."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if points.size == 0 or not np.isfinite(points).all():
+        raise ValueError("map focus points must be finite and non-empty")
+    lower = points.min(axis=0) - padding_m
+    upper = points.max(axis=0) + padding_m
+    span = upper - lower
+    expansion = np.maximum(minimum_span_m - span, 0.0) * 0.5
+    lower -= expansion
+    upper += expansion
+    x_min, x_max, y_min, y_max = navigation_map.extent
+    lower = np.maximum(lower, (x_min, y_min))
+    upper = np.minimum(upper, (x_max, y_max))
+    axis.set_xlim(float(lower[0]), float(upper[0]))
+    axis.set_ylim(float(lower[1]), float(upper[1]))
 
 
 def _read_open3d_navigation_ply(path: Path) -> np.ndarray:
@@ -130,6 +168,163 @@ def _plan_indices(count: int) -> np.ndarray:
     return np.linspace(0, count - 1, MAX_RENDERED_PLANS).round().astype(np.int64)
 
 
+def _query_navigation_map(
+    navigation_map: NavigationMap,
+    world_xy: np.ndarray,
+) -> np.ndarray:
+    """Query the same frozen robot-center raster that is rendered."""
+    points = np.asarray(world_xy, dtype=np.float64)
+    x_min, x_max, y_min, y_max = navigation_map.extent
+    inside = (
+        (points[..., 0] >= x_min)
+        & (points[..., 0] < x_max)
+        & (points[..., 1] >= y_min)
+        & (points[..., 1] < y_max)
+    )
+    columns = np.floor(
+        (points[..., 0] - x_min) / GLOBAL_MAP_RESOLUTION_M
+    ).astype(np.int64)
+    rows = np.floor(
+        (points[..., 1] - y_min) / GLOBAL_MAP_RESOLUTION_M
+    ).astype(np.int64)
+    columns = np.clip(columns, 0, navigation_map.free.shape[1] - 1)
+    rows = np.clip(rows, 0, navigation_map.free.shape[0] - 1)
+    return inside & navigation_map.free[rows, columns]
+
+
+def _resample_world_plan(
+    path: np.ndarray,
+    horizon_m: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Endpoint-inclusive physical arc sampling shared by online diagnostics."""
+    path = np.asarray(path, dtype=np.float64)
+    segment = np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(segment)))
+    evaluated_length = cumulative[-1]
+    if horizon_m is not None:
+        evaluated_length = min(evaluated_length, horizon_m)
+    distance = np.arange(
+        0.0,
+        evaluated_length + 0.5 * PATH_CONFIGURATION_QUERY_SPACING_M,
+        PATH_CONFIGURATION_QUERY_SPACING_M,
+    )
+    distance = distance[distance <= evaluated_length + 1e-12]
+    if distance.size == 0 or evaluated_length - distance[-1] > 1e-12:
+        distance = np.append(distance, evaluated_length)
+    indices = np.searchsorted(cumulative, distance, side="right") - 1
+    indices = np.clip(indices, 0, len(path) - 2)
+    width = segment[indices]
+    ratio = np.divide(
+        distance - cumulative[indices],
+        width,
+        out=np.zeros_like(distance),
+        where=width > 1e-12,
+    )
+    sampled = path[indices, :2] + ratio[:, None] * (
+        path[indices + 1, :2] - path[indices, :2]
+    )
+    return sampled, distance
+
+
+def _closed_loop_plan_diagnostics(
+    world_plans: list[np.ndarray],
+    local_plans: list[np.ndarray],
+    navigation_map: NavigationMap,
+) -> dict[str, object]:
+    """Summarize safety, controller response, and actual replanning stability."""
+    if not world_plans or len(world_plans) != len(local_plans):
+        raise ValueError("closed-loop diagnostics require aligned non-empty plans")
+    future_collision = []
+    prefix_collision = {0.5: [], 1.0: []}
+    origin_free = []
+    free_points = 0
+    total_points = 0
+    dense_world = []
+    controller_values: dict[str, list[float]] = {}
+    for world in world_plans:
+        dense, distance = _resample_world_plan(world)
+        free = _query_navigation_map(navigation_map, dense)
+        dense_world.append(dense)
+        future = distance > 1e-12
+        free_points += int(free[future].sum())
+        total_points += int(future.sum())
+        origin_free.append(bool(free[0]))
+        future_collision.append(bool((~free[future]).any()))
+        for horizon_m in prefix_collision:
+            selected = future & (distance <= horizon_m + 1e-12)
+            prefix_collision[horizon_m].append(bool((~free[selected]).any()))
+    for point_count in sorted({len(plan) for plan in local_plans}):
+        batch = np.stack([
+            plan[:, :2] for plan in local_plans if len(plan) == point_count
+        ])
+        measured = controller_tracking_metrics(
+            torch.from_numpy(batch).to(dtype=torch.float32)
+        )
+        for name, value in measured.items():
+            controller_values.setdefault(name, []).extend(
+                value.to(dtype=torch.float64).tolist()
+            )
+
+    disagreement = []
+    for previous, current in zip(dense_world[:-1], dense_world[1:]):
+        if len(current) < 2:
+            current_prefix = current
+        else:
+            current_prefix, _ = _resample_world_plan(current, horizon_m=1.0)
+        distance = np.linalg.norm(
+            current_prefix[:, None, :] - previous[None, :, :], axis=-1
+        )
+        disagreement.append(float(distance.min(axis=1).mean()))
+
+    def fraction(values: list[bool]) -> float:
+        return float(np.mean(values)) if values else 0.0
+
+    free_origin_indices = [index for index, value in enumerate(origin_free) if value]
+
+    def conditional_fraction(values: list[bool]) -> float:
+        selected = [values[index] for index in free_origin_indices]
+        return fraction(selected)
+
+    return {
+        "plan_origin_free_fraction": fraction(origin_free),
+        "free_origin_plan_count": len(free_origin_indices),
+        "future_planned_point_free_fraction": free_points / max(total_points, 1),
+        "future_plan_collision_fraction": fraction(future_collision),
+        "future_execution_prefix_0p5m_collision_fraction": fraction(
+            prefix_collision[0.5]
+        ),
+        "future_execution_prefix_1p0m_collision_fraction": fraction(
+            prefix_collision[1.0]
+        ),
+        "future_execution_prefix_0p5m_collision_given_free_origin_fraction": (
+            conditional_fraction(prefix_collision[0.5])
+        ),
+        "future_execution_prefix_1p0m_collision_given_free_origin_fraction": (
+            conditional_fraction(prefix_collision[1.0])
+        ),
+        "first_plan_execution_prefix_0p5m_collision": (
+            prefix_collision[0.5][0] if prefix_collision[0.5] else False
+        ),
+        "first_plan_execution_prefix_1p0m_collision": (
+            prefix_collision[1.0][0] if prefix_collision[1.0] else False
+        ),
+        "mpc_desired_speed_mps_mean": float(
+            np.mean(controller_values.get("mpc_desired_speed_mps", [0.0]))
+        ),
+        "mpc_curvature_limited_fraction": fraction([
+            bool(value)
+            for value in controller_values.get("mpc_curvature_is_active", [])
+        ]),
+        "mpc_max_curvature_first12_inv_m_p95": float(np.quantile(
+            controller_values.get("mpc_max_curvature_first12_inv_m", [0.0]), 0.95
+        )),
+        "adjacent_plan_first1m_world_disagreement_m_mean": (
+            float(np.mean(disagreement)) if disagreement else 0.0
+        ),
+        "adjacent_plan_pairs": len(disagreement),
+    }
+
+
 def _render_episode(
     trace_path: Path,
     navigation_map: NavigationMap,
@@ -168,6 +363,22 @@ def _render_episode(
     goal_world = _robot_to_world(point_goals[0, :2], positions[0], quaternions[0])
     stalled = (speeds < 0.02) & (commands[:, 0] > 0.2)
 
+    world_plans = []
+    local_plans = []
+    for index in range(plan_local.shape[0]):
+        length = int(plan_lengths[index])
+        if length < 3:
+            continue
+        local = plan_local[index, :length, :2]
+        local_plans.append(local)
+        world_plans.append(_robot_to_world(
+            local, plan_positions[index], plan_quaternions[index]
+        ))
+    plan_diagnostics = _closed_loop_plan_diagnostics(
+        world_plans, local_plans, navigation_map
+    )
+    executed_free = _query_navigation_map(navigation_map, executed)
+
     figure, axis = plt.subplots(figsize=(10, 10), constrained_layout=True)
     map_handles = _draw_navigation_map(axis, navigation_map)
     selected = _plan_indices(plan_local.shape[0])
@@ -180,7 +391,18 @@ def _render_episode(
             plan_positions[index],
             plan_quaternions[index],
         )
-        axis.plot(world_plan[:, 0], world_plan[:, 1], color="#46c7e8", alpha=0.08, lw=0.7)
+        axis.plot(
+            world_plan[:, 0], world_plan[:, 1],
+            color="#0891b2", alpha=0.10, lw=0.75, zorder=2,
+        )
+        dense_plan, dense_distance = _resample_world_plan(world_plan)
+        future = dense_distance > 1e-12
+        unsafe = future & ~_query_navigation_map(navigation_map, dense_plan)
+        if np.any(unsafe):
+            axis.scatter(
+                dense_plan[unsafe, 0], dense_plan[unsafe, 1],
+                s=3.0, c="#dc2626", linewidths=0, alpha=0.16, zorder=3,
+            )
     axis.plot(
         executed[:, 0], executed[:, 1], color="#2457ff", lw=2.5,
         label="executed trajectory", zorder=4,
@@ -189,6 +411,13 @@ def _render_episode(
         axis.scatter(
             positions[stalled, 0], positions[stalled, 1], s=9, c="#ef4444",
             linewidths=0, alpha=0.65, label="stalled while commanded", zorder=5,
+        )
+    executed_unsafe = ~executed_free
+    if np.any(executed_unsafe):
+        axis.scatter(
+            executed[executed_unsafe, 0], executed[executed_unsafe, 1],
+            s=13, c="#b91c1c", linewidths=0, alpha=0.85,
+            label="executed outside proxy free space", zorder=5,
         )
     axis.scatter(
         executed[0, 0], executed[0, 1], marker="o", s=90, c="#22c55e",
@@ -208,6 +437,11 @@ def _render_episode(
         f"episode {episode_idx:03d} | {'success' if success else 'timeout'} | "
         f"final goal {final_goal_distance:.2f} m | executed {executed_length:.2f} m"
     )
+    _focus_map_view(
+        axis,
+        navigation_map,
+        np.concatenate((executed, goal_world.reshape(1, 2)), axis=0),
+    )
     handles, labels = axis.get_legend_handles_labels()
     axis.legend(
         map_handles + handles,
@@ -216,7 +450,7 @@ def _render_episode(
         fontsize=8,
         framealpha=0.9,
     )
-    axis.grid(color="white", alpha=0.12, linewidth=0.5)
+    axis.grid(color="#64748b", alpha=0.22, linewidth=0.5)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=180)
     plt.close(figure)
@@ -228,7 +462,9 @@ def _render_episode(
         "rendered_plan_count": int(selected.size),
         "total_plan_count": int(plan_local.shape[0]),
         "stalled_step_fraction": float(stalled.mean()),
+        "actual_position_free_fraction": float(executed_free.mean()),
         "final_goal_distance_m": final_goal_distance,
+        **plan_diagnostics,
     }
 
 
@@ -247,6 +483,7 @@ def _render_scene_overview(
     figure, axis = plt.subplots(figsize=(10, 10), constrained_layout=True)
     map_handles = _draw_navigation_map(axis, navigation_map)
     successes = 0
+    focus_points = []
     for trace_path in trace_paths:
         with np.load(trace_path, allow_pickle=False) as trace:
             episode_idx = int(trace["episode_idx"].item())
@@ -265,6 +502,7 @@ def _render_scene_overview(
                 trace["step_robot_quaternion_xyzw"][0], dtype=np.float64
             )
         goal_world = _robot_to_world(point_goal[:2], positions[0], quaternion)
+        focus_points.extend((executed, goal_world.reshape(1, 2)))
         color = "#16a34a" if success else "#2563eb"
         successes += int(success)
         axis.plot(executed[:, 0], executed[:, 1], color=color, lw=1.8, alpha=0.82, zorder=3)
@@ -280,7 +518,7 @@ def _render_scene_overview(
             executed[-1, 0],
             executed[-1, 1],
             str(episode_idx),
-            color="#fef2f2",
+            color="#111827",
             fontsize=6,
             ha="center",
             va="center",
@@ -311,13 +549,20 @@ def _render_scene_overview(
     axis.set_title(
         f"closed-loop scene overview | {successes}/{len(trace_paths)} successful"
     )
+    _focus_map_view(
+        axis,
+        navigation_map,
+        np.concatenate(focus_points, axis=0),
+        padding_m=1.5,
+        minimum_span_m=6.0,
+    )
     axis.legend(
         handles=map_handles + trajectory_handles,
         loc="best",
         fontsize=8,
         framealpha=0.9,
     )
-    axis.grid(color="white", alpha=0.12, linewidth=0.5)
+    axis.grid(color="#64748b", alpha=0.22, linewidth=0.5)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=180)
     plt.close(figure)
@@ -325,6 +570,83 @@ def _render_scene_overview(
         "image": str(output_path.resolve()),
         "episode_count": len(trace_paths),
         "success_count": successes,
+    }
+
+
+def _summarize_closed_loop(records: list[dict[str, object]]) -> dict[str, object]:
+    """Aggregate diagnostics with plans, not episodes, as the planning unit."""
+    plans = sum(int(record["total_plan_count"]) for record in records)
+    free_origin_plans = sum(
+        int(record["free_origin_plan_count"]) for record in records
+    )
+    pairs = sum(int(record["adjacent_plan_pairs"]) for record in records)
+
+    def episode_mean(name: str) -> float:
+        return float(np.mean([float(record[name]) for record in records]))
+
+    def plan_mean(name: str) -> float:
+        return sum(
+            float(record[name]) * int(record["total_plan_count"])
+            for record in records
+        ) / max(plans, 1)
+
+    def free_origin_plan_mean(name: str) -> float:
+        return sum(
+            float(record[name]) * int(record["free_origin_plan_count"])
+            for record in records
+        ) / max(free_origin_plans, 1)
+
+    return {
+        "episodes": len(records),
+        "successes": sum(bool(record["success"]) for record in records),
+        "plans": plans,
+        "free_origin_plans": free_origin_plans,
+        "plan_origin_free_fraction": plan_mean("plan_origin_free_fraction"),
+        "future_plan_collision_fraction": plan_mean(
+            "future_plan_collision_fraction"
+        ),
+        "future_execution_prefix_0p5m_collision_fraction": plan_mean(
+            "future_execution_prefix_0p5m_collision_fraction"
+        ),
+        "future_execution_prefix_1p0m_collision_fraction": plan_mean(
+            "future_execution_prefix_1p0m_collision_fraction"
+        ),
+        "future_execution_prefix_0p5m_collision_given_free_origin_fraction": (
+            free_origin_plan_mean(
+                "future_execution_prefix_0p5m_collision_given_free_origin_fraction"
+            )
+        ),
+        "future_execution_prefix_1p0m_collision_given_free_origin_fraction": (
+            free_origin_plan_mean(
+                "future_execution_prefix_1p0m_collision_given_free_origin_fraction"
+            )
+        ),
+        "first_plan_execution_prefix_0p5m_collision_fraction": episode_mean(
+            "first_plan_execution_prefix_0p5m_collision"
+        ),
+        "first_plan_execution_prefix_1p0m_collision_fraction": episode_mean(
+            "first_plan_execution_prefix_1p0m_collision"
+        ),
+        "future_planned_point_free_fraction_episode_mean": episode_mean(
+            "future_planned_point_free_fraction"
+        ),
+        "actual_position_free_fraction_episode_mean": episode_mean(
+            "actual_position_free_fraction"
+        ),
+        "mpc_desired_speed_mps_plan_mean": plan_mean(
+            "mpc_desired_speed_mps_mean"
+        ),
+        "mpc_curvature_limited_fraction": plan_mean(
+            "mpc_curvature_limited_fraction"
+        ),
+        "adjacent_plan_first1m_world_disagreement_m_mean": sum(
+            float(record["adjacent_plan_first1m_world_disagreement_m_mean"])
+            * int(record["adjacent_plan_pairs"])
+            for record in records
+        ) / max(pairs, 1),
+        "stalled_step_fraction_episode_mean": episode_mean(
+            "stalled_step_fraction"
+        ),
     }
 
 
@@ -369,7 +691,11 @@ def render_run(checkpoint_root: Path) -> Path:
     temporary = manifest_path.with_name(manifest_path.name + ".incoming")
     temporary.write_text(
         json.dumps(
-            {"episodes": records, "scene_overviews": scene_overviews},
+            {
+                "summary": _summarize_closed_loop(records),
+                "episodes": records,
+                "scene_overviews": scene_overviews,
+            },
             ensure_ascii=False,
             indent=2,
         ) + "\n",

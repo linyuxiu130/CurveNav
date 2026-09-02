@@ -36,34 +36,40 @@ class PolicyCondition:
 
 @dataclass
 class DepthFeatures:
-    """Current scene tokens and aligned four-frame metric visual evidence."""
+    """Learned image evidence plus the aligned observed configuration field."""
 
     tokens: Tensor
-    configuration_tokens: Tensor
-    configuration_points: Tensor
-    configuration_visual_valid: Tensor
+    token_valid: Tensor
+    metric_position: Tensor
     configuration_field: Tensor
 
 
 @dataclass
 class ConfigurationFeatures:
-    """Metric spatial memory derived only from measured depth geometry."""
+    """One target-independent metric BEV memory."""
 
     tokens: Tensor
-    measured_field: Tensor
+    metric_position: Tensor
+    observed_fraction: Tensor
 
 
 @dataclass
 class ConditionFeatures:
-    """PointGoal scene context and its measured configuration-space field."""
+    """Target-independent local scene memory and a metric goal reference."""
 
     tokens: Tensor
-    path_configuration_field: Tensor
+    token_valid: Tensor
+    metric_position: Tensor
+    surface_hit: Tensor
+    frame_age: Tensor
+    motion_token: Tensor
+    goal_reference: Tensor
+    configuration_field: Tensor
 
 
 @dataclass
 class TrajectoryTarget:
-    """Expert metric length and heading-field values used by the codec."""
+    """Expert physical B-spline controls used by the production codec."""
 
     curve_values: Tensor
 
@@ -75,3 +81,4 @@ class TrajectoryTarget:
 @dataclass
 class TrajectoryPrediction:
     path: Tensor
+    proposal_coordinates: Tensor

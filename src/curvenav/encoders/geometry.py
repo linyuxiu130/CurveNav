@@ -459,7 +459,11 @@ class MetricDepthProjector(nn.Module):
             observation_to_current,
         )
         flat_obstacle_valid = obstacle_valid.flatten(2)
-        surface_valid = surface_depth < 1.0
+        # A maximum-range return is still a calibrated negative observation:
+        # the complete camera ray is free up to max depth even though it has
+        # no surface hit.  Keep it in visibility while excluding it from the
+        # obstacle and surface-normal calculations above.
+        surface_valid = torch.ones_like(surface_depth, dtype=torch.bool)
         configuration_field = self._configuration_field(
             aligned_dense_body_points,
             body_pixel,

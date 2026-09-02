@@ -6,6 +6,7 @@ import torch
 
 from curvenav.config import CurveNavConfig, DataConfig, TrajectoryConfig
 from curvenav.data.batch import unpack_policy_batch
+from curvenav.data.depth import BENCHMARK_INTRINSICS
 from curvenav.data.depth_bank import gather_depth_observations, load_packed_depth_bank
 from curvenav.data.loader import (
     build_policy_training_loader,
@@ -61,7 +62,7 @@ def _write_dataset(root, count: int = 4) -> None:
             ),
             "observation_valid": np.ones((count, 4), np.bool_),
             "curve_values": np.tile(
-                np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], np.float32),
+                np.linspace(0.1, 1.4, 14, dtype=np.float32),
                 (count, 1),
             ),
             "source_grid_index": np.zeros(count, np.int64),
@@ -90,6 +91,7 @@ def _write_dataset(root, count: int = 4) -> None:
             "source_configuration_space": {
                 "query": "source_dingo_signed_clearance_cell_lookup",
                 "spacing_m": 0.025,
+                "path_sampling": "endpoint_inclusive_max_spacing",
                 "out_of_bounds": "non_executable_negative_clearance",
                 "grids": [{"file": "source_configuration/00000.npz"}],
             },
@@ -123,7 +125,7 @@ def test_prepared_dataset_has_one_fixed_tensor_contract(tmp_path) -> None:
         "flow_interval_group",
     }
     assert sample["depth_indices"].dtype == torch.uint32
-    assert sample["curve_values"].shape == (8,)
+    assert sample["curve_values"].shape == (14,)
     bank = load_packed_depth_bank(dataset.depth_bank, torch.device("cpu"))
     depth = gather_depth_observations(bank, sample["depth_indices"].unsqueeze(0))
     assert depth.shape == (1, 4, 1, 126, 224)
@@ -137,7 +139,7 @@ def test_unpack_policy_batch_accepts_integer_global_interval_groups() -> None:
             "point_goal": torch.zeros((batch_size, 2)),
             "observation_to_current": torch.zeros((batch_size, 4, 4)),
             "observation_valid": torch.ones((batch_size, 4), dtype=torch.bool),
-            "curve_values": torch.zeros((batch_size, 8)),
+            "curve_values": torch.zeros((batch_size, 14)),
             "flow_interval_group": torch.tensor([0, 3], dtype=torch.uint8),
         }
     )
@@ -179,7 +181,7 @@ def test_training_and_deployment_history_transforms_are_identical() -> None:
     )
 
     context = DepthContextBuffer(CurveNavConfig())
-    context.reset(1)
+    context.reset(1, BENCHMARK_INTRINSICS.matrix())
     depth = np.ones((1, 360, 640, 1), dtype=np.float32)
     selected = None
     for position_xz, yaw in zip(route_xz, route_yaw, strict=True):
@@ -211,15 +213,15 @@ def test_prepared_dataset_rejects_geometry_contract_mismatch(tmp_path) -> None:
         )
 
 
-def test_prepared_dataset_rejects_non_positive_arc_length(tmp_path) -> None:
+def test_prepared_dataset_rejects_non_finite_control(tmp_path) -> None:
     root = tmp_path / "policy"
     _write_dataset(root)
     curve_values_path = root / "train" / "curve_values.npy"
     curve_values = np.load(curve_values_path)
-    curve_values[0, 0] = 0.0
+    curve_values[0, 0] = np.nan
     np.save(curve_values_path, curve_values)
 
-    with pytest.raises(ValueError, match="non-positive arc length"):
+    with pytest.raises(ValueError, match="non-finite values"):
         PreparedPolicyDataset(root, "train", DataConfig(root=str(root)), TrajectoryConfig())
 
 
@@ -243,7 +245,7 @@ def test_source_gated_flow_statistics_reject_stale_trajectory_scale() -> None:
         flow_coordinate_statistics(config.trajectory), config
     )
     codec = build_policy(config).curve_codec
-    values = codec.values_from_coordinates(torch.zeros(32, 8)).numpy()
+    values = codec.values_from_coordinates(torch.zeros(32, 14)).numpy()
     observed = _flow_coordinate_statistics(values)
 
     with pytest.raises(ValueError, match="trajectory normalization"):

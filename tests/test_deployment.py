@@ -54,6 +54,28 @@ def test_benchmark_depth_resolution_rescales_the_same_camera_rays():
     np.testing.assert_array_equal(downsampled, full)
 
 
+def test_runtime_uses_the_intrinsic_matrix_supplied_by_the_evaluator() -> None:
+    context = DepthContextBuffer(CurveNavConfig())
+    shifted = BENCHMARK_INTRINSICS.matrix()
+    shifted[0, 2] += 20.0
+    context.reset(1, shifted)
+    depth = np.tile(
+        np.linspace(0.5, 4.5, 640, dtype=np.float32)[None, :, None],
+        (360, 1, 1),
+    )[None]
+    selected = context.update(
+        depth,
+        np.zeros((1, 2), dtype=np.float32),
+        np.zeros(1, dtype=np.float32),
+    )
+    baseline = preprocess_metric_depth(
+        depth[0, ..., 0],
+        source_intrinsics=BENCHMARK_INTRINSICS,
+        maximum_m=5.0,
+    )
+    assert not np.array_equal(selected.depth[0, -1, 0], baseline)
+
+
 def test_depth_preprocessing_rejects_non_image_input():
     with pytest.raises(ValueError, match="two-dimensional"):
         preprocess_metric_depth(
@@ -67,7 +89,7 @@ def test_runtime_reset_warms_the_actual_batch_execution() -> None:
     policy = _RecordingPolicy()
     runtime = CurveNavRuntime(CurveNavConfig(), policy, device="cpu")
 
-    runtime.reset(3)
+    runtime.reset(3, BENCHMARK_INTRINSICS.matrix())
 
     assert runtime.batch_size == 3
     assert len(policy.conditions) == 1
@@ -82,7 +104,7 @@ def test_runtime_reset_warms_the_actual_batch_execution() -> None:
 def test_environment_reset_only_clears_that_observation_history() -> None:
     policy = _RecordingPolicy()
     runtime = CurveNavRuntime(CurveNavConfig(), policy, device="cpu")
-    runtime.reset(3)
+    runtime.reset(3, BENCHMARK_INTRINSICS.matrix())
     depth = np.ones((3, 360, 640, 1), dtype=np.float32)
     positions = np.zeros((3, 2), dtype=np.float32)
     runtime.context_buffer.update(depth, positions, np.zeros(3, dtype=np.float32))
@@ -96,7 +118,7 @@ def test_environment_reset_only_clears_that_observation_history() -> None:
 
 def test_runtime_sends_only_future_points_to_the_benchmark() -> None:
     runtime = CurveNavRuntime(CurveNavConfig(), _RecordingPolicy(), device="cpu")
-    runtime.reset(1)
+    runtime.reset(1, BENCHMARK_INTRINSICS.matrix())
 
     prediction = runtime.step(
         np.array([[3.0, 0.0]], dtype=np.float32),
@@ -111,7 +133,7 @@ def test_runtime_sends_only_future_points_to_the_benchmark() -> None:
 
 def test_depth_context_uses_expert_spatial_offsets():
     context_buffer = DepthContextBuffer(CurveNavConfig())
-    context_buffer.reset(1)
+    context_buffer.reset(1, BENCHMARK_INTRINSICS.matrix())
     selected = None
     for index in range(15):
         depth = np.full((1, 360, 640, 1), 1.0 + index * 0.2, dtype=np.float32)
@@ -132,7 +154,7 @@ def test_depth_context_uses_expert_spatial_offsets():
 
 def test_stationary_context_uses_the_current_observation():
     context_buffer = DepthContextBuffer(CurveNavConfig())
-    context_buffer.reset(1)
+    context_buffer.reset(1, BENCHMARK_INTRINSICS.matrix())
     context_buffer.update(
         np.full((1, 360, 640, 1), 1.0, dtype=np.float32),
         np.zeros((1, 2), dtype=np.float32),
@@ -149,7 +171,7 @@ def test_stationary_context_uses_the_current_observation():
 
 def test_depth_context_reports_observation_transforms_in_current_coordinates():
     context_buffer = DepthContextBuffer(CurveNavConfig())
-    context_buffer.reset(1)
+    context_buffer.reset(1, BENCHMARK_INTRINSICS.matrix())
     depth = np.ones((1, 360, 640, 1), dtype=np.float32)
     context_buffer.update(
         depth,

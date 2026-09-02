@@ -15,8 +15,11 @@ from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.loader import build_policy_validation_loader
 from curvenav.data.privileged import SourceConfigurationSpaceQuery
 from curvenav.evaluation.metrics import (
-    configuration_space_collision_attribution,
+    collision_visibility_attribution,
     configuration_space_safety_metrics,
+    controller_tracking_metrics,
+    paired_path_change_m,
+    source_execution_prefix_metrics,
     summarize_configuration_safety,
     summarize_metrics,
     trajectory_metrics,
@@ -26,7 +29,7 @@ from curvenav.evaluation.protocol import (
     summarize_strata,
 )
 from curvenav.evaluation.report import write_case_report
-from curvenav.factory import build_policy
+from curvenav.factory import build_evaluation_projector, build_policy
 from curvenav.models import CurveNavPolicy
 from curvenav.precision import CudaPrecision, cuda_precision
 from curvenav.training.checkpoint import validate_policy_contract
@@ -42,8 +45,11 @@ MODEL_LATENCY_REPEATS = 50
 class PolicyMeasurements:
     metrics: dict[str, Tensor]
     current_frame_metrics: dict[str, Tensor]
+    depth_swap_metrics: dict[str, Tensor]
+    point_goal_swap_metrics: dict[str, Tensor]
     batch_latency_ms: Tensor
     model_latency_ms: Tensor
+    wall_seconds: float
     samples: int
     sample_data: dict[str, Tensor]
 
@@ -59,8 +65,48 @@ def _sample(
     return prepared, prediction
 
 
+def _condition_intervention(
+    batch: dict[str, Tensor],
+    fields: tuple[str, ...],
+) -> dict[str, Tensor]:
+    """Cyclically pair real held-out conditions within one deterministic batch."""
+    permutation = torch.arange(
+        len(batch["point_goal"]), device=batch["point_goal"].device
+    ).roll(len(batch["point_goal"]) // 2)
+    intervened = dict(batch)
+    for name in fields:
+        intervened[name] = batch[name][permutation]
+    return intervened
+
+
+def _intervention_metrics(
+    path: Tensor,
+    baseline_path: Tensor,
+    source_query: SourceConfigurationSpaceQuery,
+    source_grid_index: Tensor,
+    source_origin_xy: Tensor,
+    source_yaw_rad: Tensor,
+    planning_horizon_m: float,
+) -> dict[str, Tensor]:
+    metrics = {
+        "path_change_from_policy_m": paired_path_change_m(path, baseline_path)
+    }
+    source = source_query.query(
+        path,
+        source_grid_index,
+        source_origin_xy,
+        source_yaw_rad,
+        planning_horizon_m,
+    )
+    metrics.update(
+        source_query.safety_metrics_from_query(path, source, planning_horizon_m)
+    )
+    metrics.update(source_execution_prefix_metrics(source))
+    return metrics
+
+
 def _collision_detection_summary(metrics: dict[str, Tensor]) -> dict[str, int | float]:
-    """Report raw-depth observability of source-truth collision points."""
+    """Report where source collisions occur and which frames reveal them."""
     truth_points = metrics["truth_collision_point_count"].sum()
     truth_trajectories = metrics["truth_collision_trajectory"].sum()
 
@@ -77,6 +123,49 @@ def _collision_detection_summary(metrics: dict[str, Tensor]) -> dict[str, int | 
     raw_trajectories = aggregate(
         "truth_collision_trajectory_recognized_by_raw_depth"
     )
+    current_points = aggregate("truth_collision_point_current_depth_count")
+    history_only_points = aggregate(
+        "truth_collision_point_history_only_depth_count"
+    )
+    unrecognized_points = aggregate(
+        "truth_collision_point_unrecognized_by_full_depth_count"
+    )
+    current_trajectories = aggregate(
+        "truth_collision_trajectory_recognized_by_current_depth"
+    )
+    history_only_trajectories = aggregate(
+        "truth_collision_trajectory_recognized_only_with_history"
+    )
+    additional_history_trajectories = aggregate(
+        "truth_collision_trajectory_has_additional_history_evidence"
+    )
+    unrecognized_trajectories = aggregate(
+        "truth_collision_trajectory_unrecognized_by_full_depth"
+    )
+    first_current = aggregate("first_collision_current_depth_visible")
+    first_history = aggregate("first_collision_history_only_depth_visible")
+    first_unrecognized = aggregate("first_collision_unrecognized_by_full_depth")
+    prefix_1m = metrics["execution_prefix_1p0m_collision"]
+    prefix_1m_count = int(prefix_1m.sum().item())
+    prefix_1m_first_current = int(
+        (prefix_1m & metrics["first_collision_current_depth_visible"])
+        .sum()
+        .item()
+    )
+    prefix_1m_first_history = int(
+        (prefix_1m & metrics["first_collision_history_only_depth_visible"])
+        .sum()
+        .item()
+    )
+    prefix_1m_first_unrecognized = int(
+        (prefix_1m & metrics["first_collision_unrecognized_by_full_depth"])
+        .sum()
+        .item()
+    )
+
+    def prefix_fraction(count: int) -> float:
+        return float(count / max(prefix_1m_count, 1))
+
     return {
         "ground_truth_collision_trajectory_count": int(truth_trajectories.item()),
         "ground_truth_collision_point_count": int(truth_points.item()),
@@ -101,6 +190,86 @@ def _collision_detection_summary(metrics: dict[str, Tensor]) -> dict[str, int | 
         ),
         "ground_truth_collision_trajectories_recognized_by_raw_depth_fraction": (
             fraction(raw_trajectories, truth_trajectories)
+        ),
+        "collision_points_visible_in_current_frame_count": current_points,
+        "collision_points_visible_in_current_frame_fraction": fraction(
+            current_points, truth_points
+        ),
+        "collision_points_visible_only_through_history_count": history_only_points,
+        "collision_points_visible_only_through_history_fraction": fraction(
+            history_only_points, truth_points
+        ),
+        "collision_points_unrecognized_by_all_four_frames_count": (
+            unrecognized_points
+        ),
+        "collision_points_unrecognized_by_all_four_frames_fraction": fraction(
+            unrecognized_points, truth_points
+        ),
+        "collision_trajectories_recognized_in_current_frame_count": (
+            current_trajectories
+        ),
+        "collision_trajectories_recognized_in_current_frame_fraction": fraction(
+            current_trajectories, truth_trajectories
+        ),
+        "collision_trajectories_recognized_only_through_history_count": (
+            history_only_trajectories
+        ),
+        "collision_trajectories_recognized_only_through_history_fraction": fraction(
+            history_only_trajectories, truth_trajectories
+        ),
+        "collision_trajectories_with_additional_history_evidence_count": (
+            additional_history_trajectories
+        ),
+        "collision_trajectories_unrecognized_by_all_four_frames_count": (
+            unrecognized_trajectories
+        ),
+        "collision_trajectories_unrecognized_by_all_four_frames_fraction": fraction(
+            unrecognized_trajectories, truth_trajectories
+        ),
+        "first_collision_visible_in_current_frame_count": first_current,
+        "first_collision_visible_in_current_frame_fraction": fraction(
+            first_current, truth_trajectories
+        ),
+        "first_collision_visible_only_through_history_count": first_history,
+        "first_collision_visible_only_through_history_fraction": fraction(
+            first_history, truth_trajectories
+        ),
+        "first_collision_unrecognized_by_all_four_frames_count": first_unrecognized,
+        "first_collision_unrecognized_by_all_four_frames_fraction": fraction(
+            first_unrecognized, truth_trajectories
+        ),
+        "execution_prefix_1p0m_collision_count": prefix_1m_count,
+        "first_collision_within_1p0m_visible_in_current_frame_count": (
+            prefix_1m_first_current
+        ),
+        "first_collision_within_1p0m_visible_in_current_frame_fraction": (
+            prefix_fraction(prefix_1m_first_current)
+        ),
+        "first_collision_within_1p0m_visible_only_through_history_count": (
+            prefix_1m_first_history
+        ),
+        "first_collision_within_1p0m_visible_only_through_history_fraction": (
+            prefix_fraction(prefix_1m_first_history)
+        ),
+        "first_collision_within_1p0m_unrecognized_by_all_four_frames_count": (
+            prefix_1m_first_unrecognized
+        ),
+        "first_collision_within_1p0m_unrecognized_by_all_four_frames_fraction": (
+            prefix_fraction(prefix_1m_first_unrecognized)
+        ),
+        "path_endpoint_collision_count": aggregate("path_endpoint_collision"),
+        "endpoint_collision_point_visible_in_current_frame_count": aggregate(
+            "path_endpoint_collision_current_depth_visible"
+        ),
+        "endpoint_collision_point_visible_only_through_history_count": aggregate(
+            "path_endpoint_collision_history_only_depth_visible"
+        ),
+        "endpoint_collision_point_unrecognized_by_all_four_frames_count": aggregate(
+            "path_endpoint_collision_unrecognized_by_full_depth"
+        ),
+        "terminal_0p25m_collision_count": aggregate("terminal_0p25m_collision"),
+        "collision_confined_to_terminal_0p25m_count": aggregate(
+            "collision_confined_to_terminal_0p25m"
         ),
         "raw_depth_false_collision_point_count": aggregate(
             "raw_depth_false_collision_point_count"
@@ -145,10 +314,12 @@ def measure_policy(
     loader,
     device: torch.device,
     source_query: SourceConfigurationSpaceQuery,
+    depth_projector,
     model_latency_repeats: int = MODEL_LATENCY_REPEATS,
 ) -> PolicyMeasurements:
     """Collect one deterministic path and one history ablation per observation."""
     policy.to(device).eval()
+    depth_projector.to(device).eval()
     precision = cuda_precision(device)
     warmup = next(iter(loader))
     _sample(policy, warmup, precision)
@@ -156,14 +327,20 @@ def measure_policy(
 
     values: dict[str, list[Tensor]] = {}
     current_frame_values: dict[str, list[Tensor]] = {}
+    depth_swap_values: dict[str, list[Tensor]] = {}
+    point_goal_swap_values: dict[str, list[Tensor]] = {}
     sample_data: dict[str, list[Tensor]] = {}
     batch_latency = []
     samples = 0
+    evaluation_started = time.perf_counter()
     for batch in loader:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         prepared, prediction = _sample(policy, batch, precision)
+        proposal_path, _ = policy.curve_codec.decode(
+            prediction.proposal_coordinates.float()
+        )
         end.record()
         end.synchronize()
         batch_latency.append(start.elapsed_time(end))
@@ -174,6 +351,19 @@ def measure_policy(
         current_frame_batch["observation_valid"] = current_frame_valid
         current_prepared, current_prediction = _sample(
             policy, current_frame_batch, precision
+        )
+        _, depth_swap_prediction = _sample(
+            policy,
+            _condition_intervention(
+                batch,
+                ("depth", "observation_to_current", "observation_valid"),
+            ),
+            precision,
+        )
+        _, point_goal_swap_prediction = _sample(
+            policy,
+            _condition_intervention(batch, ("point_goal",)),
+            precision,
         )
 
         reference_path, _ = policy.curve_codec.decode_values(
@@ -189,6 +379,13 @@ def measure_policy(
             source_yaw_rad,
             policy.planning_horizon_m,
         )
+        source_proposal = source_query.query(
+            proposal_path.float(),
+            source_grid_index,
+            source_origin_xy,
+            source_yaw_rad,
+            policy.planning_horizon_m,
+        )
         metrics = trajectory_metrics(
             prediction.path.float(),
             reference_path,
@@ -197,10 +394,15 @@ def measure_policy(
         metrics["valid_observation_frames"] = (
             prepared.condition.observation_valid.sum(dim=-1)
         )
-        projection = policy.depth_encoder.metric_projector(
+        projection = depth_projector(
             prepared.condition.depth,
             prepared.condition.observation_to_current.float(),
             prepared.condition.observation_valid,
+        )
+        current_projection = depth_projector(
+            current_prepared.condition.depth,
+            current_prepared.condition.observation_to_current.float(),
+            current_prepared.condition.observation_valid,
         )
         depth_safety = configuration_space_safety_metrics(
             prediction.path.float(),
@@ -208,6 +410,17 @@ def measure_policy(
             policy.planning_horizon_m,
         )
         metrics.update({f"depth_{name}": value for name, value in depth_safety.items()})
+        reference_depth_safety = configuration_space_safety_metrics(
+            reference_path,
+            projection.configuration_field,
+            policy.planning_horizon_m,
+        )
+        metrics.update(
+            {
+                f"reference_depth_{name}": value
+                for name, value in reference_depth_safety.items()
+            }
+        )
         metrics.update(
             source_query.safety_metrics_from_query(
                 prediction.path.float(),
@@ -215,21 +428,43 @@ def measure_policy(
                 policy.planning_horizon_m,
             )
         )
-        metrics.update(
-            configuration_space_collision_attribution(
-                source_prediction,
-                projection.configuration_field,
-                policy.planning_horizon_m,
-            )
+        metrics.update(source_execution_prefix_metrics(source_prediction))
+        proposal_safety = source_query.safety_metrics_from_query(
+            proposal_path.float(), source_proposal, policy.planning_horizon_m
         )
-        reference_obstacle_metrics = source_query.safety_metrics(
+        proposal_collision = proposal_safety["footprint_collision"].bool()
+        final_collision = metrics["footprint_collision"].bool()
+        metrics.update(
+            proposal_to_final_path_change_m=paired_path_change_m(
+                proposal_path.float(), prediction.path.float()
+            ),
+            proposal_footprint_collision=proposal_collision,
+            proposal_safe_final_collision=(~proposal_collision & final_collision),
+            proposal_collision_final_safe=(proposal_collision & ~final_collision),
+        )
+        metrics.update(controller_tracking_metrics(prediction.path.float()))
+        visibility = collision_visibility_attribution(
+            source_prediction,
+            projection.configuration_field,
+            current_projection.configuration_field,
+            policy.planning_horizon_m,
+        )
+        metrics.update(visibility.metrics)
+        reference_source = source_query.query(
             reference_path,
             source_grid_index,
             source_origin_xy,
             source_yaw_rad,
             policy.planning_horizon_m,
         )
+        reference_obstacle_metrics = source_query.safety_metrics_from_query(
+            reference_path,
+            reference_source,
+            policy.planning_horizon_m,
+        )
         for name, value in reference_obstacle_metrics.items():
+            metrics[f"reference_{name}"] = value
+        for name, value in controller_tracking_metrics(reference_path).items():
             metrics[f"reference_{name}"] = value
         straight_progress = torch.linspace(
             0.0,
@@ -259,21 +494,61 @@ def measure_policy(
         current_metrics["valid_observation_frames"] = (
             current_prepared.condition.observation_valid.sum(dim=-1)
         )
+        current_source_prediction = source_query.query(
+            current_prediction.path.float(),
+            source_grid_index,
+            source_origin_xy,
+            source_yaw_rad,
+            policy.planning_horizon_m,
+        )
         current_metrics.update(
-            source_query.safety_metrics(
+            source_query.safety_metrics_from_query(
                 current_prediction.path.float(),
-                source_grid_index,
-                source_origin_xy,
-                source_yaw_rad,
+                current_source_prediction,
                 policy.planning_horizon_m,
             )
+        )
+        current_metrics.update(source_execution_prefix_metrics(current_source_prediction))
+        current_visibility = collision_visibility_attribution(
+            current_source_prediction,
+            projection.configuration_field,
+            current_projection.configuration_field,
+            policy.planning_horizon_m,
+        )
+        current_metrics.update(current_visibility.metrics)
+        current_metrics["path_change_from_full_history_m"] = paired_path_change_m(
+            current_prediction.path.float(), prediction.path.float()
+        )
+        depth_swap_metrics = _intervention_metrics(
+            depth_swap_prediction.path.float(),
+            prediction.path.float(),
+            source_query,
+            source_grid_index,
+            source_origin_xy,
+            source_yaw_rad,
+            policy.planning_horizon_m,
+        )
+        point_goal_swap_metrics = _intervention_metrics(
+            point_goal_swap_prediction.path.float(),
+            prediction.path.float(),
+            source_query,
+            source_grid_index,
+            source_origin_xy,
+            source_yaw_rad,
+            policy.planning_horizon_m,
         )
         for name, value in metrics.items():
             values.setdefault(name, []).append(value.cpu())
         for name, value in current_metrics.items():
             current_frame_values.setdefault(name, []).append(value.cpu())
+        for name, value in depth_swap_metrics.items():
+            depth_swap_values.setdefault(name, []).append(value.cpu())
+        for name, value in point_goal_swap_metrics.items():
+            point_goal_swap_values.setdefault(name, []).append(value.cpu())
         for name, value in {
             "predicted_path": prediction.path.float(),
+            "proposal_path": proposal_path.float(),
+            "current_frame_predicted_path": current_prediction.path.float(),
             "reference_path": reference_path,
             "point_goal": prepared.condition.point_goal.float(),
             "configuration_field": projection.configuration_field[:, (0, 3, 4)].to(
@@ -284,14 +559,36 @@ def measure_policy(
                 policy.planning_horizon_m,
                 device=prediction.path.device,
             ),
+            "current_configuration_ray_coverage": (
+                current_projection.configuration_field[:, 3] > 0.5
+            ),
+            "current_configuration_forbidden": (
+                current_projection.configuration_field[:, 4] > 0.5
+            ),
+            "source_grid_index": source_grid_index,
+            "source_origin_xy": source_origin_xy,
+            "source_yaw_rad": source_yaw_rad,
+            "source_collision_path_points": source_prediction.local_path,
+            "source_collision_current_visible": visibility.current_visible_points,
+            "source_collision_history_only_visible": (
+                visibility.history_only_visible_points
+            ),
+            "source_collision_unrecognized": visibility.unrecognized_points,
         }.items():
             sample_data.setdefault(name, []).append(value.cpu())
         samples += len(prediction.path)
 
+    wall_seconds = time.perf_counter() - evaluation_started
     return PolicyMeasurements(
         metrics={name: torch.cat(parts) for name, parts in values.items()},
         current_frame_metrics={
             name: torch.cat(parts) for name, parts in current_frame_values.items()
+        },
+        depth_swap_metrics={
+            name: torch.cat(parts) for name, parts in depth_swap_values.items()
+        },
+        point_goal_swap_metrics={
+            name: torch.cat(parts) for name, parts in point_goal_swap_values.items()
         },
         batch_latency_ms=torch.tensor(batch_latency, dtype=torch.float64),
         model_latency_ms=(
@@ -299,6 +596,7 @@ def measure_policy(
             if model_latency_repeats
             else torch.empty(0, dtype=torch.float64)
         ),
+        wall_seconds=wall_seconds,
         samples=samples,
         sample_data={name: torch.cat(parts) for name, parts in sample_data.items()},
     )
@@ -311,6 +609,19 @@ def evaluate_measurements(measurements: PolicyMeasurements) -> dict[str, object]
     metrics = measurements.metrics
     policy_summary = summarize_metrics(metrics)
     current_metrics = measurements.current_frame_metrics
+    depth_swap = measurements.depth_swap_metrics
+    point_goal_swap = measurements.point_goal_swap_metrics
+    current_history_only_risk = current_metrics[
+        "truth_collision_trajectory_recognized_only_with_history"
+    ].bool()
+    history_only_risk_count = int(current_history_only_risk.sum().item())
+    full_safe_on_history_only_risk = (
+        current_history_only_risk & ~metrics["footprint_collision"].bool()
+    )
+    current_collision = current_metrics["footprint_collision"].bool()
+    full_collision = metrics["footprint_collision"].bool()
+    full_avoids_current_collision = current_collision & ~full_collision
+    full_introduces_collision = full_collision & ~current_collision
     return {
         "protocol": "curvenav_metric_local_validation_source_cspace",
         "samples": measurements.samples,
@@ -336,10 +647,99 @@ def evaluate_measurements(measurements: PolicyMeasurements) -> dict[str, object]
             "safety_margin_violation_fraction": current_metrics[
                 "safety_margin_violation"
             ].float().mean().item(),
+            "path_change_from_full_history_m_mean": current_metrics[
+                "path_change_from_full_history_m"
+            ].mean().item(),
+            "current_only_collision_with_history_only_evidence_count": (
+                history_only_risk_count
+            ),
+            "full_history_avoids_current_only_history_visible_collision_count": int(
+                full_safe_on_history_only_risk.sum().item()
+            ),
+            "full_history_avoidance_fraction_on_history_only_risk": float(
+                full_safe_on_history_only_risk.sum().item()
+                / max(history_only_risk_count, 1)
+            ),
+            "full_history_avoids_current_only_collision_count": int(
+                full_avoids_current_collision.sum().item()
+            ),
+            "full_history_avoids_current_only_collision_fraction": float(
+                full_avoids_current_collision.sum().item()
+                / max(int(current_collision.sum().item()), 1)
+            ),
+            "full_history_introduces_collision_vs_current_only_count": int(
+                full_introduces_collision.sum().item()
+            ),
+        },
+        "condition_causality_audit": {
+            "interpretation": "paired intervention only; not a navigation score",
+            "depth_swap_path_change_m": depth_swap[
+                "path_change_from_policy_m"
+            ].mean().item(),
+            "depth_swap_footprint_collision_fraction": depth_swap[
+                "footprint_collision"
+            ].float().mean().item(),
+            "depth_swap_execution_prefix_1p0m_collision_fraction": depth_swap[
+                "execution_prefix_1p0m_collision"
+            ].float().mean().item(),
+            "point_goal_swap_path_change_m": point_goal_swap[
+                "path_change_from_policy_m"
+            ].mean().item(),
+            "point_goal_swap_footprint_collision_fraction": point_goal_swap[
+                "footprint_collision"
+            ].float().mean().item(),
+            "point_goal_swap_execution_prefix_1p0m_collision_fraction": (
+                point_goal_swap["execution_prefix_1p0m_collision"]
+                .float()
+                .mean()
+                .item()
+            ),
+        },
+        "proposal_final_alignment": {
+            "interpretation": (
+                "internal one-call clean proposal versus deployed final path"
+            ),
+            "path_change_m_mean": metrics[
+                "proposal_to_final_path_change_m"
+            ].mean().item(),
+            "proposal_footprint_collision_fraction": metrics[
+                "proposal_footprint_collision"
+            ].float().mean().item(),
+            "proposal_safe_final_collision_fraction": metrics[
+                "proposal_safe_final_collision"
+            ].float().mean().item(),
+            "proposal_collision_final_safe_fraction": metrics[
+                "proposal_collision_final_safe"
+            ].float().mean().item(),
+        },
+        "raw_depth_path_support": {
+            "interpretation": (
+                "strict four-corner observed support on the same 0.025m path grid"
+            ),
+            "predicted_fraction_mean": metrics[
+                "depth_path_field_coverage_fraction"
+            ].mean().item(),
+            "reference_fraction_mean": metrics[
+                "reference_depth_path_field_coverage_fraction"
+            ].mean().item(),
+            "predicted_minus_reference_mean": (
+                metrics["depth_path_field_coverage_fraction"]
+                - metrics["reference_depth_path_field_coverage_fraction"]
+            ).mean().item(),
+            "predicted_below_reference_fraction": (
+                metrics["depth_path_field_coverage_fraction"]
+                < metrics["reference_depth_path_field_coverage_fraction"] - 1e-6
+            ).float().mean().item(),
         },
         "raw_depth_collision_attribution": _collision_detection_summary(metrics),
         "batch32_latency_ms_mean": measurements.batch_latency_ms.mean().item(),
-        "throughput_observations_per_second": measurements.samples / seconds,
+        "base_policy_forward_observations_per_second": (
+            measurements.samples / seconds
+        ),
+        "full_evaluation_observations_per_second": (
+            measurements.samples / measurements.wall_seconds
+        ),
+        "full_evaluation_wall_seconds": measurements.wall_seconds,
         "model_latency_batch1_ms_p50": torch.quantile(
             measurements.model_latency_ms, 0.50
         ).item(),
@@ -357,8 +757,11 @@ def evaluate_policy(
     device: torch.device,
     expected_samples: int,
     source_query: SourceConfigurationSpaceQuery,
+    depth_projector,
 ) -> dict[str, object]:
-    measurements = measure_policy(policy, loader, device, source_query)
+    measurements = measure_policy(
+        policy, loader, device, source_query, depth_projector
+    )
     if measurements.samples != expected_samples:
         raise RuntimeError(
             f"evaluated {measurements.samples} samples, expected {expected_samples}"
@@ -392,11 +795,13 @@ def run_evaluation(
         config.data.root,
         "validation",
     )
+    depth_projector = build_evaluation_projector(config)
     measurements = measure_policy(
         policy,
         loader,
         torch.device("cuda"),
         source_query,
+        depth_projector,
     )
     if measurements.samples != bundle.samples:
         raise RuntimeError(
@@ -416,14 +821,16 @@ def run_evaluation(
             artifact_dir,
             measurements.metrics,
             measurements.sample_data,
+            source_query,
         )
         metrics_path = artifact_dir / "offline-metrics.json"
+        result["case_report"] = str(case_path)
+        result["case_visualization"] = str(case_path.with_suffix(".svg"))
+        result["metrics_report"] = str(metrics_path)
         metrics_path.write_text(
             json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        result["case_report"] = str(case_path)
-        result["metrics_report"] = str(metrics_path)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
     return result
 

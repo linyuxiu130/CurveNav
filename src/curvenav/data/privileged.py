@@ -16,6 +16,7 @@ from curvenav.trajectory import path_arc_length, resample_path_to_horizon
 
 SOURCE_CONFIGURATION_QUERY_SPACING_M = PATH_CONFIGURATION_QUERY_SPACING_M
 SOURCE_CONFIGURATION_QUERY_TYPE = "source_dingo_signed_clearance_cell_lookup"
+SOURCE_CONFIGURATION_PATH_SAMPLING = "endpoint_inclusive_max_spacing"
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,7 @@ class SourceConfigurationSpaceQuery:
         if (
             source.get("query") != SOURCE_CONFIGURATION_QUERY_TYPE
             or source.get("spacing_m") != SOURCE_CONFIGURATION_QUERY_SPACING_M
+            or source.get("path_sampling") != SOURCE_CONFIGURATION_PATH_SAMPLING
             or source.get("out_of_bounds") != "non_executable_negative_clearance"
         ):
             raise ValueError("prepared source configuration-space contract mismatch")

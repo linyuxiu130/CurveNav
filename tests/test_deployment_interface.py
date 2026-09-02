@@ -13,8 +13,9 @@ class _FakeRuntime:
     def __init__(self) -> None:
         self.reset_ids = []
 
-    def reset(self, batch_size: int) -> None:
+    def reset(self, batch_size: int, camera_intrinsics) -> None:
         self.batch_size = batch_size
+        self.camera_intrinsics = np.asarray(camera_intrinsics)
 
     def reset_env(self, env_id: int) -> None:
         self.reset_ids.append(env_id)
@@ -33,6 +34,10 @@ def _payload(**updates) -> bytes:
         "depth_m": np.ones((2, 360, 640, 1), np.float32),
         "robot_position": np.zeros((2, 3), np.float32),
         "robot_quaternion": np.tile(np.array([0.0, 0.0, 0.0, 1.0], np.float32), (2, 1)),
+        "camera_intrinsics": np.array(
+            [[326.4, 0.0, 320.0], [0.0, 326.4, 180.0], [0.0, 0.0, 1.0]],
+            np.float32,
+        ),
         "reset": np.array([True, False]),
     }
     values.update(updates)
@@ -46,6 +51,13 @@ def test_npz_interface_has_one_strict_request_and_response_contract() -> None:
     response = CurveNavNpzInterface(runtime).predict(_payload())
 
     assert runtime.batch_size == 2
+    np.testing.assert_array_equal(
+        runtime.camera_intrinsics,
+        np.array(
+            [[326.4, 0.0, 320.0], [0.0, 326.4, 180.0], [0.0, 0.0, 1.0]],
+            np.float32,
+        ),
+    )
     assert runtime.reset_ids == [0]
     with np.load(BytesIO(response), allow_pickle=False) as archive:
         assert frozenset(archive.files) == RESPONSE_FIELDS

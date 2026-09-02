@@ -23,8 +23,10 @@ def resample_path_at_distance(path: Tensor, distance_m: Tensor) -> Tensor:
     _validate_path(path)
     if distance_m.ndim != 2 or distance_m.shape[0] != path.shape[0]:
         raise ValueError("distance_m must have shape [B,Q]")
-    if (distance_m < 0).any() or not torch.isfinite(distance_m).all():
-        raise ValueError("distance_m must contain finite non-negative values")
+    torch._assert_async(
+        torch.isfinite(distance_m).all() & (distance_m >= 0).all(),
+        "distance_m must contain finite non-negative values",
+    )
     segment_length = torch.linalg.vector_norm(path[:, 1:] - path[:, :-1], dim=-1)
     cumulative = torch.cat(
         (torch.zeros_like(segment_length[:, :1]), segment_length.cumsum(dim=1)),
@@ -71,6 +73,8 @@ def resample_path_to_horizon(
     distances = distances.expand(path.shape[0], -1)
     length = path_arc_length(path).clamp_max(horizon_m)
     active = distances <= length[:, None]
+    endpoint_index = torch.ceil(length / spacing_m).long().clamp_max(samples - 1)
+    active.scatter_(1, endpoint_index[:, None], True)
     points = resample_path_at_distance(
         path,
         torch.minimum(distances, length[:, None]),

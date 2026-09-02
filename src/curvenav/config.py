@@ -58,56 +58,61 @@ class DataConfig:
 
 @dataclass(frozen=True)
 class TrajectoryConfig:
-    num_heading_control_points: int = 8
+    num_control_points: int = 8
     spline_degree: int = 3
     num_path_points: int = 64
-    length_pre_activation_mean: float = 2.7761289656895536
-    length_pre_activation_std: float = 1.3310157896776207
-    heading_increment_mean_rad: tuple[float, ...] = (
-        0.0027291269968929455,
-        0.005034111766925072,
-        0.006383425585098021,
-        0.004844627023100332,
-        0.002278887391014113,
-        0.0029080880413952896,
-        -0.0006175329948281985,
+    control_increment_mean_xy_m: tuple[float, ...] = (
+        0.19575905874489494,
+        0.000013560529621743297,
+        0.3902212095715023,
+        0.002008237219028404,
+        0.558451868792498,
+        0.007029782353195491,
+        0.5213567234781906,
+        0.009539148157356049,
+        0.4803115149944964,
+        0.009542148952045124,
+        0.29207692008915925,
+        0.005783167418347843,
+        0.13902845983512357,
+        0.003241675585678419,
     )
-    heading_increment_std_rad: tuple[float, ...] = (
-        0.10250223795474468,
-        0.21724207730012957,
-        0.2826873156288638,
-        0.2832551794170072,
-        0.29620460147965216,
-        0.25915543561132065,
-        0.1463571463898459,
+    control_increment_std_xy_m: tuple[float, ...] = (
+        0.06963118493486234,
+        0.009753948216963312,
+        0.1396785939096103,
+        0.06463728684735078,
+        0.20765432388349703,
+        0.1990670224631178,
+        0.22015131716511072,
+        0.27216707621942426,
+        0.24343845568601458,
+        0.32393372700831924,
+        0.18216146996698057,
+        0.24085929622333027,
+        0.09459704496084137,
+        0.12324686272239309,
     )
 
     def validate(self) -> None:
-        if self.num_heading_control_points != 8:
-            raise ValueError("CurveNav uses exactly eight heading control points")
+        if self.num_control_points != 8:
+            raise ValueError("CurveNav uses exactly eight B-spline controls")
         if self.spline_degree != 3:
-            raise ValueError("CurveNav uses one clamped cubic heading spline")
+            raise ValueError("CurveNav uses one clamped cubic B-spline")
         if self.num_path_points != 64:
+            raise ValueError("CurveNav uses exactly sixty-four metric path samples")
+        if len(self.control_increment_mean_xy_m) != 14 or not all(
+            math.isfinite(value) for value in self.control_increment_mean_xy_m
+        ):
             raise ValueError(
-                "CurveNav uses exactly sixty-four metric path samples"
+                "control increment mean must contain fourteen finite values"
             )
-        if not math.isfinite(self.length_pre_activation_mean):
-            raise ValueError("length pre-activation mean must be finite")
-        if (
-            not math.isfinite(self.length_pre_activation_std)
-            or self.length_pre_activation_std <= 0
-        ):
-            raise ValueError("length pre-activation standard deviation must be positive")
-        if len(self.heading_increment_mean_rad) != 7 or not all(
-            math.isfinite(value) for value in self.heading_increment_mean_rad
-        ):
-            raise ValueError("heading-increment mean must contain seven finite values")
-        if len(self.heading_increment_std_rad) != 7 or not all(
+        if len(self.control_increment_std_xy_m) != 14 or not all(
             math.isfinite(value) and value > 0
-            for value in self.heading_increment_std_rad
+            for value in self.control_increment_std_xy_m
         ):
             raise ValueError(
-                "heading-increment standard deviation must contain seven positive values"
+                "control increment standard deviation must contain fourteen positives"
             )
 
 
@@ -122,9 +127,7 @@ class DepthEncoderConfig:
 @dataclass(frozen=True)
 class ConditionEncoderConfig:
     model_dim: int = 384
-    transformer_layers: int = 4
-    transformer_heads: int = 8
-    dropout: float = 0.0
+    bev_grid_size: int = 16
 
 
 @dataclass(frozen=True)
@@ -132,17 +135,12 @@ class TrajectoryDecoderConfig:
     model_dim: int = 384
     transformer_layers: int = 12
     transformer_heads: int = 8
-    path_tokens: int = 32
     dropout: float = 0.0
 
     def validate(self) -> None:
-        if self.path_tokens != 32:
+        if self.transformer_layers < 2 or self.transformer_layers % 2:
             raise ValueError(
-                "CurveNav uses thirty-two metric path anchors for local-field queries"
-            )
-        if self.transformer_layers < 3 or self.transformer_layers % 3:
-            raise ValueError(
-                "trajectory decoder layers must form three equal refinement stages"
+                "trajectory decoder layers must split evenly into proposal and average phases"
             )
 
 
@@ -197,6 +195,8 @@ class CurveNavConfig:
             < 1
         ):
             raise ValueError("depth encoder token grid dimensions must be positive")
+        if self.condition_encoder.bev_grid_size != 16:
+            raise ValueError("CurveNav uses one 16x16 metric BEV memory")
         dims = {
             self.depth_encoder.model_dim,
             self.condition_encoder.model_dim,
@@ -207,29 +207,28 @@ class CurveNavConfig:
         model_dim = next(iter(dims))
         if model_dim < 4 or model_dim % 4:
             raise ValueError("model_dim must be positive and divisible by four")
-        for name, heads in (
-            ("condition_encoder", self.condition_encoder.transformer_heads),
-            ("trajectory_decoder", self.trajectory_decoder.transformer_heads),
+        heads = self.trajectory_decoder.transformer_heads
+        if heads < 1:
+            raise ValueError("trajectory_decoder.transformer_heads must be positive")
+        if model_dim % heads != 0:
+            raise ValueError(
+                "model_dim must be divisible by trajectory_decoder.transformer_heads"
+            )
+        if (
+            self.trajectory_decoder.transformer_layers < 2
+            or self.trajectory_decoder.transformer_layers % 2
         ):
-            if heads < 1:
-                raise ValueError(f"{name}.transformer_heads must be positive")
-            if model_dim % heads != 0:
-                raise ValueError(
-                    f"model_dim must be divisible by {name}.transformer_heads"
-                )
-        for name, layers in (
-            ("condition_encoder", self.condition_encoder.transformer_layers),
-            ("trajectory_decoder", self.trajectory_decoder.transformer_layers),
-        ):
-            if layers < 1:
-                raise ValueError(f"{name}.transformer_layers must be positive")
+            raise ValueError(
+                "trajectory_decoder.transformer_layers must be positive and even"
+            )
         for name, dropout in (
             ("depth_encoder", self.depth_encoder.dropout),
-            ("condition_encoder", self.condition_encoder.dropout),
             ("trajectory_decoder", self.trajectory_decoder.dropout),
         ):
-            if not 0 <= dropout < 1:
-                raise ValueError(f"{name}.dropout must be in [0, 1)")
+            if dropout != 0:
+                raise ValueError(
+                    f"{name}.dropout must be zero for deterministic MeanFlow"
+                )
         if not 0 <= self.training.seed < 2**32:
             raise ValueError("training.seed must be in [0, 2**32)")
         positive_integers = {
@@ -247,6 +246,10 @@ class CurveNavConfig:
             raise ValueError(f"training values must be positive: {invalid}")
         if self.training.per_device_batch_size > self.training.global_batch_size:
             raise ValueError("per_device_batch_size cannot exceed global_batch_size")
+        if self.training.global_batch_size % 4:
+            raise ValueError(
+                "global_batch_size must contain an exact quarter of deployment intervals"
+            )
         if self.training.samples_per_epoch % self.training.global_batch_size:
             raise ValueError("samples_per_epoch must be divisible by global_batch_size")
         if not 0 <= self.training.warmup_epochs < self.training.epochs:

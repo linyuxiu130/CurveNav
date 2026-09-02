@@ -1,8 +1,17 @@
-"""One CUDA mixed-precision contract shared by training and inference."""
+"""One numerical contract shared by CurveNav training and inference.
+
+Tensor-Core neural operators use the capability-selected autocast dtype.  All
+metric geometry, standardized Flow state, MeanFlow calculus, curve decoding,
+and losses remain float32.  This is one mixed-precision path, not separate
+model implementations.
+"""
 
 from dataclasses import dataclass
 
 import torch
+
+
+GEOMETRY_DTYPE = torch.float32
 
 
 @dataclass(frozen=True)
@@ -20,12 +29,12 @@ def precision_from_bf16_support(supports_bf16: bool) -> CudaPrecision:
         return CudaPrecision(
             accelerate_mode="bf16",
             autocast_dtype=torch.bfloat16,
-            checkpoint_name="bf16_primal_fp32_detached_meanflow_jvp",
+            checkpoint_name="bf16_neural_fp32_geometry_flow_jvp",
         )
     return CudaPrecision(
         accelerate_mode="fp16",
         autocast_dtype=torch.float16,
-        checkpoint_name="fp16_primal_fp32_detached_meanflow_jvp",
+        checkpoint_name="fp16_neural_fp32_geometry_flow_jvp",
     )
 
 

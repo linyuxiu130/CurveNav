@@ -4,7 +4,10 @@ import torch
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence
 
-from curvenav.trajectory import MetricHeadingTrajectory, resample_path_by_arc_length
+from curvenav.trajectory import (
+    IncrementalBSplineTrajectory,
+    resample_path_by_arc_length,
+)
 
 
 MAXIMUM_EXPERT_PROJECTION_ADE_RATIO = 0.2
@@ -12,7 +15,7 @@ MAXIMUM_EXPERT_PROJECTION_ADE_RATIO = 0.2
 
 def collate_metric_paths(
     metric_paths: list[Tensor],
-    codec: MetricHeadingTrajectory,
+    codec: IncrementalBSplineTrajectory,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Return metric controls, decoded targets, and source projection error."""
     if not metric_paths or any(

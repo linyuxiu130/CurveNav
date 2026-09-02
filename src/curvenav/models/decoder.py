@@ -1,27 +1,20 @@
-"""Conditional MeanFlow Transformer over executable curve values."""
+"""Single-call proposal-grounded improved MeanFlow Transformer."""
 
 import torch
 from torch import Tensor, nn
 
-from curvenav.encoders.configuration import (
-    PATH_CONFIGURATION_FIELD_CHANNELS,
-    observed_configuration_features,
-)
+from curvenav.configuration_space import query_configuration_field
 from curvenav.layers import RMSNorm
 from curvenav.models.blocks import ConditionalTrajectoryBlock, ProjectedCondition
-from curvenav.models.safety import sample_configuration_field
 from curvenav.types import ConditionFeatures
 
 
 TRAJECTORY_DECODER_TYPE = (
-    "pointgoal_and_configuration_field_conditioned_curve_mean_flow_transformer"
+    "single_call_flow_state_then_clean_proposal_cspace_improved_mean_flow"
 )
-DECODER_REFINEMENT_STAGES = 3
 
 
 class MeanFlowIntervalEmbedding(nn.Module):
-    """Embed interval endpoint and width for the average velocity field."""
-
     def __init__(self, model_dim: int) -> None:
         super().__init__()
         self.projection = nn.Sequential(
@@ -31,136 +24,153 @@ class MeanFlowIntervalEmbedding(nn.Module):
         )
 
     def forward(self, start_time: Tensor, end_time: Tensor) -> Tensor:
-        interval = torch.stack((end_time, end_time - start_time), dim=-1)
-        return self.projection(interval.float())
+        return self.projection(
+            torch.stack((end_time, end_time - start_time), dim=-1).float()
+        )
 
 
-class StructuredCurveReadout(nn.Module):
-    """Read one heterogeneous velocity scalar from each ordered curve token."""
+class PlanarControlReadout(nn.Module):
+    """Apply one shared two-dimensional head to every control-point token."""
 
-    def __init__(self, curve_tokens: int, model_dim: int) -> None:
+    def __init__(self, model_dim: int) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(1, curve_tokens, model_dim))
-        self.bias = nn.Parameter(torch.zeros(1, curve_tokens))
-        nn.init.normal_(self.weight, std=0.02)
+        self.projection = nn.Linear(model_dim, 2)
 
     def forward(self, tokens: Tensor) -> Tensor:
-        return (tokens * self.weight).sum(dim=-1) + self.bias
+        return self.projection(tokens).flatten(1)
 
 
 class ConditionalCurveMeanFlowDecoder(nn.Module):
-    """Predict average velocity while refining its own data-end trajectory."""
+    """Predict a clean proposal, query its geometry, then predict average flow."""
 
     def __init__(
         self,
-        curve_tokens: int,
-        path_tokens: int,
-        num_path_points: int,
-        planning_horizon_m: float,
+        *,
+        control_tokens: int,
+        coordinate_dim: int,
         model_dim: int,
         layers: int,
         heads: int,
         dropout: float,
+        planning_horizon_m: float,
+        path_to_control_weight: Tensor,
     ) -> None:
         super().__init__()
-        if layers % DECODER_REFINEMENT_STAGES:
-            raise ValueError("decoder layers must divide into three refinement stages")
-        self.curve_tokens = curve_tokens
-        self.path_tokens = path_tokens
+        if layers < 2 or layers % 2:
+            raise ValueError("decoder layers must split proposal and average phases")
+        if coordinate_dim != 2 * control_tokens:
+            raise ValueError("each trajectory token must be one planar control")
+        self.control_tokens = control_tokens
+        self.coordinate_dim = coordinate_dim
+        self.layers_per_phase = layers // 2
         self.planning_horizon_m = float(planning_horizon_m)
-        self.layers_per_stage = layers // DECODER_REFINEMENT_STAGES
-        self.state_embedding = nn.Linear(1, model_dim)
-        self.position_embedding = nn.Parameter(torch.empty(1, curve_tokens, model_dim))
+        if path_to_control_weight.shape != (control_tokens, 64):
+            raise ValueError("path-to-control weights must have shape [C,64]")
+        self.register_buffer(
+            "path_to_control_weight",
+            path_to_control_weight.float()
+            / path_to_control_weight.float().sum(dim=-1, keepdim=True).clamp_min(1e-6),
+            persistent=True,
+        )
+        self.state_embedding = nn.Linear(2, model_dim)
+        self.position_embedding = nn.Parameter(
+            torch.empty(1, control_tokens, model_dim)
+        )
+        self.time_embedding = MeanFlowIntervalEmbedding(model_dim)
         self.path_geometry_embedding = nn.Sequential(
-            nn.Linear(5 + PATH_CONFIGURATION_FIELD_CHANNELS, model_dim),
+            nn.Linear(7, model_dim),
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
-        self.path_position_embedding = nn.Parameter(
-            torch.empty(1, path_tokens, model_dim)
+        self.goal_geometry_embedding = nn.Sequential(
+            nn.Linear(5, model_dim),
+            nn.SiLU(),
+            nn.Linear(model_dim, model_dim),
         )
-        self.time_embedding = MeanFlowIntervalEmbedding(model_dim)
         self.blocks = nn.ModuleList(
-            ConditionalTrajectoryBlock(model_dim, heads, dropout) for _ in range(layers)
+            ConditionalTrajectoryBlock(
+                model_dim,
+                heads,
+                dropout,
+            )
+            for _ in range(layers)
         )
         self.output_norm = RMSNorm(model_dim)
-        self.average_velocity_readout = StructuredCurveReadout(curve_tokens, model_dim)
-        self.instantaneous_velocity_readout = StructuredCurveReadout(
-            curve_tokens, model_dim
-        )
+        self.instantaneous_velocity_readout = PlanarControlReadout(model_dim)
+        self.average_velocity_readout = PlanarControlReadout(model_dim)
         nn.init.normal_(self.position_embedding, std=0.02)
-        nn.init.normal_(self.path_position_embedding, std=0.02)
-        path_indices = (
-            torch.linspace(0, num_path_points - 1, path_tokens).round().long()
-        )
-        self.register_buffer("path_indices", path_indices, persistent=True)
-        self.register_buffer(
-            "path_progress",
-            (path_indices.float() / (num_path_points - 1)).reshape(1, path_tokens, 1),
-            persistent=True,
-        )
-        field_scale = torch.ones(PATH_CONFIGURATION_FIELD_CHANNELS)
-        field_scale[0] = 1.0 / self.planning_horizon_m
-        self.register_buffer(
-            "path_configuration_field_scale",
-            field_scale.reshape(1, 1, -1),
-            persistent=True,
-        )
 
-    def _read_velocities(self, controls: Tensor) -> tuple[Tensor, Tensor]:
-        normalized = self.output_norm(controls)
-        return (
-            self.average_velocity_readout(normalized),
-            self.instantaneous_velocity_readout(normalized),
-        )
-
-    def project_condition_memory(
+    def _trajectory_geometry(
         self,
-        condition_tokens: Tensor,
-    ) -> tuple[ProjectedCondition, ...]:
-        return tuple(block.project_condition(condition_tokens) for block in self.blocks)
-
-    def _path_tokens(
-        self,
-        state: Tensor,
-        end_time: Tensor,
-        instantaneous_velocity: Tensor,
-        path_configuration_field: Tensor,
-        flow_time: Tensor,
-        curve_codec: nn.Module,
-    ) -> Tensor:
-        # On the linear interpolant, x = z_t - t*(e-x).  Replacing the
-        # conditional velocity by its learned marginal estimate therefore
-        # gives the data endpoint independently of the MeanFlow start r.
-        estimated_clean = state - end_time[:, None] * instantaneous_velocity
-        path, heading = curve_codec.decode_path(estimated_clean)
-        indices = self.path_indices
-        anchor_points = path[:, indices]
-        anchor_heading = heading[:, indices]
-        field = observed_configuration_features(
-            sample_configuration_field(
-                path_configuration_field,
-                anchor_points,
-                self.planning_horizon_m,
-            ),
-            channel_dim=-1,
+        candidate_path: Tensor,
+        candidate_controls: Tensor,
+        condition: ConditionFeatures,
+    ) -> tuple[Tensor, Tensor]:
+        query = query_configuration_field(
+            condition.configuration_field,
+            candidate_path,
+            self.planning_horizon_m,
         )
-        normalized_field = field * self.path_configuration_field_scale
-        geometry = torch.cat(
+        observed = query.observed_features
+        path_features = torch.cat(
             (
-                anchor_points / self.planning_horizon_m,
-                anchor_heading.sin()[..., None],
-                anchor_heading.cos()[..., None],
-                self.path_progress.to(path.dtype).expand(path.shape[0], -1, -1),
-                normalized_field,
+                candidate_path.float() / self.planning_horizon_m,
+                observed[..., :1] / self.planning_horizon_m,
+                observed[..., 1:],
             ),
             dim=-1,
         )
-        embedded = self.path_geometry_embedding(geometry)
-        return (
-            embedded
-            + self.path_position_embedding.to(dtype=embedded.dtype)
-            + flow_time.to(dtype=embedded.dtype)
+        control_path_features = torch.einsum(
+            "cp,bpf->bcf",
+            self.path_to_control_weight.to(path_features),
+            path_features,
+        )
+        goal_delta = condition.goal_reference - candidate_controls.float()
+        goal_features = torch.cat(
+            (
+                candidate_controls.float() / self.planning_horizon_m,
+                goal_delta / self.planning_horizon_m,
+                torch.linalg.vector_norm(goal_delta, dim=-1, keepdim=True)
+                / self.planning_horizon_m,
+            ),
+            dim=-1,
+        )
+        return control_path_features, goal_features
+
+    def project_condition_memory(
+        self, condition: ConditionFeatures
+    ) -> tuple[ProjectedCondition, ...]:
+        return tuple(block.project_condition(condition) for block in self.blocks)
+
+    def _path_relative_geometry(
+        self,
+        query_position: Tensor,
+        condition: ConditionFeatures,
+    ) -> Tensor:
+        relative = (
+            condition.metric_position[:, None, :, :2]
+            - query_position[:, :, None, :].float()
+        ) / self.planning_horizon_m
+        vertical = (
+            condition.metric_position[:, None, :, 2:3] / self.planning_horizon_m
+        ).expand(-1, query_position.shape[1], -1, -1)
+        distance = torch.linalg.vector_norm(relative, dim=-1, keepdim=True)
+        return torch.cat(
+            (
+                relative,
+                vertical,
+                distance,
+                condition.surface_hit[:, None, :, None]
+                .expand(-1, query_position.shape[1], -1, -1)
+                .to(relative.dtype),
+                condition.frame_age[:, None, :, None]
+                .expand(-1, query_position.shape[1], -1, -1)
+                .to(relative.dtype),
+                condition.motion_token[:, None, :, None]
+                .expand(-1, query_position.shape[1], -1, -1)
+                .to(relative.dtype),
+            ),
+            dim=-1,
         )
 
     def forward(
@@ -172,49 +182,78 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         projected_condition: tuple[ProjectedCondition, ...],
         curve_codec: nn.Module,
     ) -> tuple[Tensor, Tensor]:
-        if state.ndim != 2 or state.shape[1] != self.curve_tokens:
-            raise ValueError("flow state does not match decoder tokens")
+        if state.ndim != 2 or state.shape[1] != self.coordinate_dim:
+            raise ValueError("flow state does not match planar control coordinates")
         if start_time.shape != state.shape[:1] or end_time.shape != state.shape[:1]:
-            raise ValueError("mean-flow interval times must have shape [B]")
+            raise ValueError("MeanFlow interval times must have shape [B]")
         if len(projected_condition) != len(self.blocks):
             raise ValueError("projected condition must cover every decoder block")
-        flow_time = self.time_embedding(start_time, end_time)[:, None]
-        controls = self.state_embedding(state[..., None])
-        controls = (
-            controls
-            + self.position_embedding.to(dtype=controls.dtype)
-            + flow_time.to(dtype=controls.dtype)
+        instantaneous_time = self.time_embedding(end_time, end_time)[:, None]
+        interval_time = self.time_embedding(start_time, end_time)[:, None]
+        base_tokens = self.state_embedding(
+            state.reshape(state.shape[0], self.control_tokens, 2)
         )
-        trajectory = controls
-        average_velocities = []
-        instantaneous_velocities = []
-        path_configuration_field = condition.path_configuration_field
-        for stage in range(DECODER_REFINEMENT_STAGES):
-            if stage:
-                path_tokens = self._path_tokens(
-                    state,
-                    end_time,
-                    instantaneous_velocities[-1],
-                    path_configuration_field,
-                    flow_time,
-                    curve_codec,
-                )
-                trajectory = torch.cat(
-                    (trajectory[:, : self.curve_tokens], path_tokens), dim=1
-                )
-            begin = stage * self.layers_per_stage
-            end = begin + self.layers_per_stage
-            for index in range(begin, end):
-                trajectory = self.blocks[index](
-                    trajectory,
-                    projected_condition[index],
-                )
-            average, instantaneous = self._read_velocities(
-                trajectory[:, : self.curve_tokens]
+        if condition.goal_reference.shape != (
+            state.shape[0],
+            self.control_tokens,
+            2,
+        ):
+            raise ValueError("goal reference must have shape [B,C,2]")
+        # Standardized incremental controls are an affine Euclidean chart, so
+        # every linear-interpolant Flow state decodes to one physical curve.
+        # Query geometry at that state before estimating its clean endpoint;
+        # PointGoal supplies relative intent but never relocates the query.
+        flow_controls = curve_codec.control_positions_from_coordinates(state)
+        flow_path, _ = curve_codec.decode(state)
+        flow_path_geometry, flow_goal_geometry = self._trajectory_geometry(
+            flow_path,
+            flow_controls,
+            condition,
+        )
+        flow_pair_geometry = self._path_relative_geometry(flow_controls, condition)
+        proposal_tokens = (
+            base_tokens
+            + self.position_embedding.to(dtype=base_tokens.dtype)
+            + instantaneous_time.to(dtype=base_tokens.dtype)
+            + self.path_geometry_embedding(
+                flow_path_geometry.to(base_tokens.dtype)
             )
-            average_velocities.append(average)
-            instantaneous_velocities.append(instantaneous)
-        return (
-            torch.stack(average_velocities, dim=1),
-            torch.stack(instantaneous_velocities, dim=1),
+            + self.goal_geometry_embedding(
+                flow_goal_geometry.to(base_tokens.dtype)
+            )
         )
+        for index in range(self.layers_per_phase):
+            proposal_tokens = self.blocks[index](
+                proposal_tokens,
+                projected_condition[index],
+                flow_pair_geometry,
+            )
+        instantaneous = self.instantaneous_velocity_readout(
+            self.output_norm(proposal_tokens)
+        )
+
+        estimated_clean = state - end_time[:, None] * instantaneous.float()
+        estimated_path, _ = curve_codec.decode(estimated_clean)
+        estimated_controls = curve_codec.control_positions_from_coordinates(
+            estimated_clean
+        )
+        path_geometry, goal_geometry = self._trajectory_geometry(
+            estimated_path,
+            estimated_controls,
+            condition,
+        )
+        pair_geometry = self._path_relative_geometry(estimated_controls, condition)
+        average_tokens = (
+            proposal_tokens
+            + (interval_time - instantaneous_time).to(proposal_tokens.dtype)
+            + self.path_geometry_embedding(path_geometry.to(proposal_tokens.dtype))
+            + self.goal_geometry_embedding(goal_geometry.to(proposal_tokens.dtype))
+        )
+        for index in range(self.layers_per_phase, len(self.blocks)):
+            average_tokens = self.blocks[index](
+                average_tokens,
+                projected_condition[index],
+                pair_geometry,
+            )
+        average = self.average_velocity_readout(self.output_norm(average_tokens))
+        return average[:, None], instantaneous[:, None]

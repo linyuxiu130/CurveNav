@@ -56,8 +56,89 @@ def summarize_strata(metrics: dict[str, Tensor]) -> dict[str, dict[str, float | 
                     .mean()
                     .item()
                 ),
+                proposal_footprint_collision_fraction=(
+                    metrics["proposal_footprint_collision"][selected]
+                    .float()
+                    .mean()
+                    .item()
+                ),
+                first_collision_current_visible_fraction=(
+                    metrics["first_collision_current_depth_visible"][selected]
+                    .float()
+                    .mean()
+                    .item()
+                ),
+                first_collision_history_only_visible_fraction=(
+                    metrics["first_collision_history_only_depth_visible"][selected]
+                    .float()
+                    .mean()
+                    .item()
+                ),
+                first_collision_unrecognized_fraction=(
+                    metrics["first_collision_unrecognized_by_full_depth"][selected]
+                    .float()
+                    .mean()
+                    .item()
+                ),
                 safety_margin_violation_fraction=(
                     metrics["safety_margin_violation"][selected]
+                    .float()
+                    .mean()
+                    .item()
+                ),
+                execution_prefix_0p5m_collision_fraction=(
+                    metrics["execution_prefix_0p5m_collision"][selected]
+                    .float()
+                    .mean()
+                    .item()
+                ),
+                execution_prefix_1p0m_collision_fraction=(
+                    metrics["execution_prefix_1p0m_collision"][selected]
+                    .float()
+                    .mean()
+                    .item()
+                ),
+                execution_prefix_1p0m_first_collision_current_visible_fraction=(
+                    (
+                        metrics["execution_prefix_1p0m_collision"][selected]
+                        & metrics["first_collision_current_depth_visible"][selected]
+                    )
+                    .float()
+                    .mean()
+                    .item()
+                ),
+                execution_prefix_1p0m_first_collision_history_only_visible_fraction=(
+                    (
+                        metrics["execution_prefix_1p0m_collision"][selected]
+                        & metrics[
+                            "first_collision_history_only_depth_visible"
+                        ][selected]
+                    )
+                    .float()
+                    .mean()
+                    .item()
+                ),
+                execution_prefix_1p0m_first_collision_unrecognized_fraction=(
+                    (
+                        metrics["execution_prefix_1p0m_collision"][selected]
+                        & metrics[
+                            "first_collision_unrecognized_by_full_depth"
+                        ][selected]
+                    )
+                    .float()
+                    .mean()
+                    .item()
+                ),
+                distance_to_first_collision_m=(
+                    metrics["distance_to_first_collision_m"][selected]
+                    .mean()
+                    .item()
+                ),
+                mpc_desired_speed_mps=(
+                    metrics["mpc_desired_speed_mps"][selected].mean().item()
+                ),
+                mpc_curvature_limited_fraction=(
+                    metrics["mpc_curvature_is_active"][selected]
                     .float()
                     .mean()
                     .item()

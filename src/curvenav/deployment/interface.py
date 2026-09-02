@@ -10,7 +10,14 @@ from curvenav.deployment.runtime import CurveNavRuntime, RuntimePrediction, load
 
 
 REQUEST_FIELDS = frozenset(
-    {"point_goal", "depth_m", "robot_position", "robot_quaternion", "reset"}
+    {
+        "point_goal",
+        "depth_m",
+        "robot_position",
+        "robot_quaternion",
+        "camera_intrinsics",
+        "reset",
+    }
 )
 RESPONSE_FIELDS = frozenset({"path"})
 
@@ -56,7 +63,7 @@ class CurveNavNpzInterface:
         if reset.shape != (batch_size,):
             raise ValueError(f"reset must have shape [{batch_size}]")
         if self.runtime.batch_size != batch_size:
-            self.runtime.reset(batch_size)
+            self.runtime.reset(batch_size, request["camera_intrinsics"])
         for env_id in np.flatnonzero(reset):
             self.runtime.reset_env(int(env_id))
         prediction = self.runtime.step(

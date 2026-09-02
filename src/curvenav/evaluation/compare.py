@@ -14,6 +14,8 @@ from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
 from curvenav.data.privileged import SourceConfigurationSpaceQuery
 from curvenav.evaluation.metrics import (
+    controller_tracking_metrics,
+    source_execution_prefix_metrics,
     summarize_configuration_safety,
     summarize_metrics,
     trajectory_metrics,
@@ -68,7 +70,11 @@ class CommonSourceConfiguration:
         )
 
     def measure(self, paths: Tensor, horizon_m: float) -> dict[str, Tensor]:
-        return self.query.safety_metrics(
+        query = self.measure_path(paths, horizon_m)
+        return self.query.safety_metrics_from_query(paths, query, horizon_m)
+
+    def measure_path(self, paths: Tensor, horizon_m: float):
+        return self.query.query(
             paths,
             self.grid_index.to(paths.device),
             self.origin_xy.to(paths.device),
@@ -102,11 +108,22 @@ def _measure(
     planning_horizon_m: float,
 ) -> dict[str, Tensor]:
     metrics = trajectory_metrics(path, reference, point_goal)
-    metrics.update(safety.measure(path, planning_horizon_m))
+    source_path = safety.measure_path(path, planning_horizon_m)
+    metrics.update(
+        safety.query.safety_metrics_from_query(
+            path, source_path, planning_horizon_m
+        )
+    )
+    metrics.update(source_execution_prefix_metrics(source_path))
+    metrics.update(controller_tracking_metrics(path))
     reference_safety = safety.measure(reference, planning_horizon_m)
     metrics.update(
         {f"reference_{name}": value for name, value in reference_safety.items()}
     )
+    metrics.update({
+        f"reference_{name}": value
+        for name, value in controller_tracking_metrics(reference).items()
+    })
     progress = torch.linspace(0.0, 1.0, reference.shape[1])[None, :, None]
     straight = reference[:, :1] + progress * (
         reference[:, -1:] - reference[:, :1]

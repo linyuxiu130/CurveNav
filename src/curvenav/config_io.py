@@ -37,7 +37,10 @@ def config_from_mapping(raw: Mapping[str, Any]) -> CurveNavConfig:
         raise ValueError(f"unknown model config keys: {sorted(unknown_model)}")
 
     trajectory = dict(model.get("trajectory", {}))
-    for name in ("heading_increment_mean_rad", "heading_increment_std_rad"):
+    for name in (
+        "control_increment_mean_xy_m",
+        "control_increment_std_xy_m",
+    ):
         if name in trajectory:
             trajectory[name] = tuple(trajectory[name])
     config = CurveNavConfig(

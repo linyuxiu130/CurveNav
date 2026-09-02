@@ -25,6 +25,7 @@ from curvenav.data.prepared import (
     policy_dataset_contract,
 )
 from curvenav.data.privileged import (
+    SOURCE_CONFIGURATION_PATH_SAMPLING,
     SOURCE_CONFIGURATION_QUERY_SPACING_M,
     SOURCE_CONFIGURATION_QUERY_TYPE,
     SourceConfigurationSpaceQuery,
@@ -33,7 +34,7 @@ from curvenav.data.trajectory import (
     MAXIMUM_EXPERT_PROJECTION_ADE_RATIO,
     collate_metric_paths,
 )
-from curvenav.trajectory import MetricHeadingTrajectory
+from curvenav.trajectory import IncrementalBSplineTrajectory
 from curvenav.physical import EXTRA_CLEARANCE_M
 
 
@@ -161,9 +162,10 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
     source_manifest = json.loads(
         (root / "dataset_manifest.json").read_text(encoding="utf-8")
     )
-    if source_manifest.get("route_contract", {}).get(
-        "navigation_geometry"
-    ) != expert_navigation_geometry_contract():
+    if (
+        source_manifest.get("route_contract", {}).get("navigation_geometry")
+        != expert_navigation_geometry_contract()
+    ):
         raise ValueError(
             "HSSD experts must be planned against the stage and static objects"
         )
@@ -290,10 +292,12 @@ class _SourceMetadata:
 
 def _source_metadata(examples: list[_Example]) -> _SourceMetadata:
     """Keep source C-space provenance out of the policy condition tensors."""
-    grid_paths = tuple(sorted(
-        {example.source_grid_path.resolve() for example in examples},
-        key=lambda path: path.as_posix(),
-    ))
+    grid_paths = tuple(
+        sorted(
+            {example.source_grid_path.resolve() for example in examples},
+            key=lambda path: path.as_posix(),
+        )
+    )
     index = {path: value for value, path in enumerate(grid_paths)}
     return _SourceMetadata(
         grid_paths=grid_paths,
@@ -301,9 +305,9 @@ def _source_metadata(examples: list[_Example]) -> _SourceMetadata:
             [index[example.source_grid_path.resolve()] for example in examples],
             dtype=np.int64,
         ),
-        origin_xy=np.stack(
-            [example.source_origin_xy for example in examples]
-        ).astype(np.float32),
+        origin_xy=np.stack([example.source_origin_xy for example in examples]).astype(
+            np.float32
+        ),
         yaw_rad=np.asarray(
             [example.source_yaw_rad for example in examples], dtype=np.float32
         ),
@@ -332,16 +336,19 @@ def _source_minimum_clearance(
     return np.concatenate(values)
 
 
-def _flow_coordinate_statistics(curve_values: np.ndarray) -> dict[str, object]:
-    """Measure the one train-split normalization used by Flow coordinates."""
-    values = np.asarray(curve_values, dtype=np.float64)
-    length = values[:, 0]
-    length_pre_activation = length + np.log(-np.expm1(-length))
+def _flow_coordinate_statistics(
+    curve_values: np.ndarray,
+) -> dict[str, object]:
+    """Measure train-split physical control-increment normalization."""
+    controls = np.asarray(curve_values, dtype=np.float64).reshape(-1, 7, 2)
+    increments = np.diff(
+        np.concatenate((np.zeros((len(controls), 1, 2)), controls), axis=1),
+        axis=1,
+    )
+    increments = increments.reshape(len(controls), -1)
     return {
-        "length_pre_activation_mean": float(length_pre_activation.mean()),
-        "length_pre_activation_std": float(length_pre_activation.std(ddof=1)),
-        "heading_increment_mean_rad": values[:, 1:].mean(axis=0).tolist(),
-        "heading_increment_std_rad": values[:, 1:].std(axis=0, ddof=1).tolist(),
+        "control_increment_mean_xy_m": increments.mean(axis=0).tolist(),
+        "control_increment_std_xy_m": increments.std(axis=0, ddof=1).tolist(),
     }
 
 
@@ -354,25 +361,21 @@ def _validate_flow_coordinate_statistics(
     observed_values = np.concatenate(
         (
             np.asarray(
-                [observed["length_pre_activation_mean"]], dtype=np.float64
+                observed["control_increment_mean_xy_m"], dtype=np.float64
             ),
             np.asarray(
-                [observed["length_pre_activation_std"]], dtype=np.float64
+                observed["control_increment_std_xy_m"], dtype=np.float64
             ),
-            np.asarray(observed["heading_increment_mean_rad"], dtype=np.float64),
-            np.asarray(observed["heading_increment_std_rad"], dtype=np.float64),
         )
     )
     expected_values = np.concatenate(
         (
             np.asarray(
-                [expected["length_pre_activation_mean"]], dtype=np.float64
+                expected["control_increment_mean_xy_m"], dtype=np.float64
             ),
             np.asarray(
-                [expected["length_pre_activation_std"]], dtype=np.float64
+                expected["control_increment_std_xy_m"], dtype=np.float64
             ),
-            np.asarray(expected["heading_increment_mean_rad"], dtype=np.float64),
-            np.asarray(expected["heading_increment_std_rad"], dtype=np.float64),
         )
     )
     if not np.allclose(observed_values, expected_values, rtol=0.0, atol=1e-9):
@@ -400,7 +403,7 @@ def _copy_source_configuration_grids(
 def _audit_serialized_source_contract(
     split_root: Path,
     source_grids: list[dict[str, str]],
-    codec: MetricHeadingTrajectory,
+    codec: IncrementalBSplineTrajectory,
     planning_horizon_m: float,
 ) -> dict[str, object]:
     """Certify serialized controls against the copied source C-space grids.
@@ -457,6 +460,7 @@ def _audit_serialized_source_contract(
     return {
         "query": SOURCE_CONFIGURATION_QUERY_TYPE,
         "spacing_m": SOURCE_CONFIGURATION_QUERY_SPACING_M,
+        "path_sampling": SOURCE_CONFIGURATION_PATH_SAMPLING,
         "out_of_bounds": "non_executable_negative_clearance",
         "serialized_requery": True,
         "expert_count": int(len(expert_values)),
@@ -516,16 +520,16 @@ def _compile_split(
         [example.observation_valid for example in examples]
     ).astype(np.bool_)
 
-    codec = MetricHeadingTrajectory(
-        num_heading_control_points=config.trajectory.num_heading_control_points,
+    codec = IncrementalBSplineTrajectory(
+        num_control_points=config.trajectory.num_control_points,
         degree=config.trajectory.spline_degree,
         num_path_points=config.trajectory.num_path_points,
-        length_pre_activation_mean=(
-            config.trajectory.length_pre_activation_mean
+        control_increment_mean_xy_m=(
+            config.trajectory.control_increment_mean_xy_m
         ),
-        length_pre_activation_std=config.trajectory.length_pre_activation_std,
-        heading_increment_mean_rad=config.trajectory.heading_increment_mean_rad,
-        heading_increment_std_rad=config.trajectory.heading_increment_std_rad,
+        control_increment_std_xy_m=(
+            config.trajectory.control_increment_std_xy_m
+        ),
     )
     curve_batches = []
     reference_batches = []
@@ -550,7 +554,9 @@ def _compile_split(
     )
     keep = projection_error <= maximum_projection_error
     rejected_projection_count = int((~keep).sum())
-    examples = [example for example, selected in zip(examples, keep, strict=True) if selected]
+    examples = [
+        example for example, selected in zip(examples, keep, strict=True) if selected
+    ]
     depth_indices = depth_indices[keep]
     point_goal = point_goal[keep]
     observation_to_current = observation_to_current[keep]
@@ -565,24 +571,22 @@ def _compile_split(
         if not torch.equal(decoded, torch.from_numpy(reference_path)):
             raise RuntimeError("stored expert controls do not reproduce their path")
         heading_delta = heading[:, 1:] - heading[:, :-1]
-        wrapped_turn = torch.atan2(
-            heading_delta.sin(), heading_delta.cos()
-        )
+        wrapped_turn = torch.atan2(heading_delta.sin(), heading_delta.cos())
         total_turn = wrapped_turn.abs().sum(1).numpy()
-        segment = torch.linalg.vector_norm(
-            decoded[:, 1:] - decoded[:, :-1], dim=-1
-        )
+        segment = torch.linalg.vector_norm(decoded[:, 1:] - decoded[:, :-1], dim=-1)
         support = 0.5 * (segment[:, 1:] + segment[:, :-1])
         maximum_curvature = (
-            wrapped_turn[:, 1:].abs() / support.clamp_min(1e-6)
-        ).amax(1).numpy()
+            (wrapped_turn[:, 1:].abs() / support.clamp_min(1e-6)).amax(1).numpy()
+        )
         extent_m = config.data.future_steps * config.data.expert_waypoint_spacing_m
         source = _source_metadata(examples)
         minimum_clearance = _source_minimum_clearance(decoded, source, extent_m)
 
     safe = minimum_clearance + 1e-6 >= EXTRA_CLEARANCE_M
     rejected_clearance_count = int((~safe).sum())
-    examples = [example for example, selected in zip(examples, safe, strict=True) if selected]
+    examples = [
+        example for example, selected in zip(examples, safe, strict=True) if selected
+    ]
     depth_indices = depth_indices[safe]
     point_goal = point_goal[safe]
     observation_to_current = observation_to_current[safe]
@@ -597,7 +601,9 @@ def _compile_split(
     minimum_clearance = minimum_clearance[safe]
 
     source = _source_metadata(examples)
-    observed_flow_statistics = _flow_coordinate_statistics(curve_values)
+    observed_flow_statistics = _flow_coordinate_statistics(
+        curve_values,
+    )
     if verify_flow_coordinate_statistics:
         _validate_flow_coordinate_statistics(observed_flow_statistics, config)
 
@@ -636,7 +642,7 @@ def _compile_split(
     )
     local_arc = np.asarray([_arc_length(example.metric_path) for example in examples])
     flow_coordinates = codec.coordinates_from_values(
-        torch.from_numpy(curve_values)
+        torch.from_numpy(curve_values),
     ).numpy()
     goal_distance = np.linalg.norm(point_goal, axis=1)
     endpoint = reference_path[:, -1]
@@ -719,6 +725,7 @@ def _compile_split(
         "source_configuration_space": {
             "query": SOURCE_CONFIGURATION_QUERY_TYPE,
             "spacing_m": SOURCE_CONFIGURATION_QUERY_SPACING_M,
+            "path_sampling": SOURCE_CONFIGURATION_PATH_SAMPLING,
             "out_of_bounds": "non_executable_negative_clearance",
             "grids": source_grids,
         },
@@ -739,8 +746,11 @@ def compile_policy_dataset(
     hssd = _hssd_examples(hssd_root.expanduser().resolve(), config)
     output_root = output_root.expanduser().resolve()
     building_root = output_root.with_name(output_root.name + ".building")
-    if output_root.exists() or building_root.exists():
-        raise FileExistsError(f"output dataset already exists: {output_root}")
+    replaced_root = output_root.with_name(output_root.name + ".replaced")
+    if building_root.exists() or replaced_root.exists():
+        raise FileExistsError(
+            f"unfinished dataset transaction exists beside: {output_root}"
+        )
     building_root.mkdir(parents=True)
     try:
         split_manifests = {}
@@ -774,7 +784,17 @@ def compile_policy_dataset(
         (building_root / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
         )
-        os.replace(building_root, output_root)
+        replacing = output_root.exists()
+        if replacing:
+            os.replace(output_root, replaced_root)
+        try:
+            os.replace(building_root, output_root)
+        except BaseException:
+            if replacing:
+                os.replace(replaced_root, output_root)
+            raise
+        if replacing:
+            shutil.rmtree(replaced_root)
         print(json.dumps(manifest, indent=2, ensure_ascii=False))
     except BaseException:
         shutil.rmtree(building_root, ignore_errors=True)

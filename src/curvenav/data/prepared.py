@@ -18,6 +18,7 @@ from curvenav.data.depth import depth_camera_contract
 from curvenav.data.depth_bank import PackedDepthBankSpec, PackedDepthRun
 from curvenav.data.trajectory import MAXIMUM_EXPERT_PROJECTION_ADE_RATIO
 from curvenav.data.privileged import (
+    SOURCE_CONFIGURATION_PATH_SAMPLING,
     SOURCE_CONFIGURATION_QUERY_SPACING_M,
     SOURCE_CONFIGURATION_QUERY_TYPE,
 )
@@ -39,10 +40,12 @@ POLICY_ARRAYS = {
 def flow_coordinate_statistics(trajectory: TrajectoryConfig) -> dict[str, object]:
     """Return the train-split Euclidean coordinate normalization contract."""
     return {
-        "length_pre_activation_mean": trajectory.length_pre_activation_mean,
-        "length_pre_activation_std": trajectory.length_pre_activation_std,
-        "heading_increment_mean_rad": list(trajectory.heading_increment_mean_rad),
-        "heading_increment_std_rad": list(trajectory.heading_increment_std_rad),
+        "control_increment_mean_xy_m": list(
+            trajectory.control_increment_mean_xy_m
+        ),
+        "control_increment_std_xy_m": list(
+            trajectory.control_increment_std_xy_m
+        ),
     }
 
 
@@ -62,22 +65,21 @@ def policy_dataset_contract(
             "planar_rigid_transform_from_observation_to_current_frame"
         ),
         **depth_camera_contract(data),
-        "num_curve_values": trajectory.num_heading_control_points,
+        "num_curve_values": 2 * (trajectory.num_control_points - 1),
         "num_path_points": trajectory.num_path_points,
-        "curve_value_semantics": (
-            "metric_arc_length_then_seven_cubic_heading_control_increments_rad"
-        ),
+        "curve_value_semantics": ("seven_planar_cubic_bspline_control_points_xy_m"),
         "flow_coordinate_statistics": flow_coordinate_statistics(trajectory),
-        "expert_projection": "equal_arc_heading_field_least_squares",
+        "expert_projection": "equal_arc_planar_bspline_least_squares",
         "maximum_expert_projection_ade_m": (
             data.expert_waypoint_spacing_m * MAXIMUM_EXPERT_PROJECTION_ADE_RATIO
         ),
         "production_curve_minimum_source_clearance_m": EXTRA_CLEARANCE_M,
         "trajectory_geometry_coupling": (
-            "expert_curve_only_raw_depth_observed_cspace_runtime_coupling"
+            "source_safe_expert_physical_increment_imitation"
         ),
         "source_configuration_space_truth": (
-            "native_navigation_grid_dense_0.025m_oob_non_executable"
+            "native_navigation_grid_endpoint_inclusive_dense_0.025m_"
+            "oob_non_executable"
         ),
     }
 
@@ -142,7 +144,7 @@ class PreparedPolicyDataset(Dataset):
             "observation_valid": (self.count, data.observation_frames),
             "curve_values": (
                 self.count,
-                trajectory.num_heading_control_points,
+                2 * (trajectory.num_control_points - 1),
             ),
             "source_grid_index": (self.count,),
             "source_origin_xy": (self.count, 2),
@@ -166,11 +168,6 @@ class PreparedPolicyDataset(Dataset):
             raise ValueError(
                 f"prepared policy split contains non-finite values: {split}"
             )
-        curve_values = self.arrays["curve_values"]
-        if np.any(curve_values[:, 0] <= 0):
-            raise ValueError(
-                f"prepared policy split contains non-positive arc length: {split}"
-            )
         if not self.arrays["observation_valid"][:, -1].all():
             raise ValueError(
                 f"prepared policy split has an invalid current frame: {split}"
@@ -186,13 +183,15 @@ class PreparedPolicyDataset(Dataset):
         if (
             source.get("query") != SOURCE_CONFIGURATION_QUERY_TYPE
             or source.get("spacing_m") != SOURCE_CONFIGURATION_QUERY_SPACING_M
+            or source.get("path_sampling") != SOURCE_CONFIGURATION_PATH_SAMPLING
             or source.get("out_of_bounds") != "non_executable_negative_clearance"
             or not grids
         ):
-            raise ValueError(f"prepared source configuration contract mismatch: {split}")
+            raise ValueError(
+                f"prepared source configuration contract mismatch: {split}"
+            )
         if not all(
-            (split_root / str(item.get("file", ""))).is_file()
-            for item in grids
+            (split_root / str(item.get("file", ""))).is_file() for item in grids
         ):
             raise ValueError(f"prepared source configuration grid is missing: {split}")
         grid_index = self.arrays["source_grid_index"]
@@ -257,8 +256,9 @@ class PreparedPolicyDataset(Dataset):
             for name, array in self.arrays.items()
         }
         # This runtime-only group is assigned before any distributed shuffling.
-        # It defines an exact global quarter of deployed MeanFlow boundaries;
-        # it is neither a stored expert label nor a policy condition.
+        # Four equal global strata cover the exact deployed boundary, one
+        # random interior stratum and two diagonal MeanFlow strata.  It is
+        # neither a stored expert label nor a policy condition.
         sample["flow_interval_group"] = torch.tensor(index % 4, dtype=torch.uint8)
         return sample
 

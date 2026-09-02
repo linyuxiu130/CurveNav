@@ -1,4 +1,4 @@
-"""SanD-style depth tokens with metric planar backprojection."""
+"""Shared multi-frame metric depth-token encoder."""
 
 import math
 
@@ -7,55 +7,36 @@ from torch import Tensor, nn
 
 from curvenav.layers import RMSNorm
 from curvenav.types import DepthFeatures
+
 from .geometry import MetricDepthProjector
 
 
-DEPTH_ENCODER_TYPE = (
-    "shared_resnet18_all_four_frames_plus_aligned_metric_configuration_space_field"
-)
+DEPTH_ENCODER_TYPE = "shared_multiframe_resnet18_aligned_cspace_evidence"
 
 
 def _channel_group_norm(channels: int) -> nn.GroupNorm:
-    """Normalize each sample without mutable batch or running statistics."""
     return nn.GroupNorm(32, channels)
 
 
 class ResNet18BasicBlock(nn.Module):
-    """The two-convolution residual block used by ResNet-18."""
-
     expansion = 1
 
     def __init__(self, in_channels: int, out_channels: int, stride: int = 1) -> None:
         super().__init__()
         self.convolution_1 = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=3,
-            stride=stride,
-            padding=1,
-            bias=False,
+            in_channels, out_channels, 3, stride=stride, padding=1, bias=False
         )
         self.norm_1 = _channel_group_norm(out_channels)
         self.activation = nn.ReLU(inplace=True)
         self.convolution_2 = nn.Conv2d(
-            out_channels,
-            out_channels,
-            kernel_size=3,
-            padding=1,
-            bias=False,
+            out_channels, out_channels, 3, padding=1, bias=False
         )
         self.norm_2 = _channel_group_norm(out_channels)
         self.skip = (
             nn.Identity()
             if stride == 1 and in_channels == out_channels
             else nn.Sequential(
-                nn.Conv2d(
-                    in_channels,
-                    out_channels,
-                    kernel_size=1,
-                    stride=stride,
-                    bias=False,
-                ),
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
                 _channel_group_norm(out_channels),
             )
         )
@@ -67,11 +48,7 @@ class ResNet18BasicBlock(nn.Module):
         return self.activation(value + residual)
 
 
-def _resnet18_stage(
-    in_channels: int,
-    out_channels: int,
-    stride: int,
-) -> nn.Sequential:
+def _resnet18_stage(in_channels: int, out_channels: int, stride: int) -> nn.Sequential:
     return nn.Sequential(
         ResNet18BasicBlock(in_channels, out_channels, stride),
         ResNet18BasicBlock(out_channels, out_channels),
@@ -79,40 +56,54 @@ def _resnet18_stage(
 
 
 class DepthObservationEncoder(nn.Module):
-    """Encode ordered depth frames with one shared SanD-style ResNet-18."""
+    """Encode every calibrated depth frame with one shared visual backbone.
+
+    Each image token retains its learned appearance feature and receives the
+    corresponding measured ray endpoint transformed into the current robot
+    frame. The same projection constructs observed robot configuration space;
+    no PointGoal or map completion enters perception.
+    """
 
     def __init__(
         self,
-        model_dim: int = 256,
-        frame_tokens_height: int = 8,
-        frame_tokens_width: int = 12,
-        dropout: float = 0.0,
-        max_depth_m: float = 5.0,
-        focal_x_px: float = 166.80851063829786,
-        focal_y_px: float = 166.80851063829786,
-        camera_forward_offset_m: float = 0.28618,
-        camera_height_m: float = 0.62532,
-        camera_downward_pitch_degrees: float = 10.0,
-        planning_horizon_m: float = 3.6,
+        *,
+        observation_frames: int,
+        model_dim: int,
+        frame_tokens_height: int,
+        frame_tokens_width: int,
+        dropout: float,
+        max_depth_m: float,
+        focal_x_px: float,
+        focal_y_px: float,
+        camera_forward_offset_m: float,
+        camera_height_m: float,
+        camera_downward_pitch_degrees: float,
+        planning_horizon_m: float,
     ) -> None:
         super().__init__()
+        if observation_frames < 1:
+            raise ValueError("observation_frames must be positive")
         if model_dim % 4:
-            raise ValueError(
-                "model_dim must be divisible by four for 2D position encoding"
-            )
+            raise ValueError("model_dim must be divisible by four")
+        if min(frame_tokens_height, frame_tokens_width) < 1:
+            raise ValueError("depth token grid dimensions must be positive")
+        self.observation_frames = observation_frames
         self.model_dim = model_dim
         self.tokens_height = frame_tokens_height
         self.tokens_width = frame_tokens_width
+        self.tokens_per_frame = frame_tokens_height * frame_tokens_width
+        self.max_depth_m = float(max_depth_m)
+
         self.backbone = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.Conv2d(1, 64, 7, stride=2, padding=3, bias=False),
             _channel_group_norm(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-            _resnet18_stage(64, 64, stride=1),
-            _resnet18_stage(64, 128, stride=2),
-            _resnet18_stage(128, 256, stride=2),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            _resnet18_stage(64, 64, 1),
+            _resnet18_stage(64, 128, 2),
+            _resnet18_stage(128, 256, 2),
         )
-        self.spatial_projection = nn.Conv2d(256, model_dim, kernel_size=1)
+        self.spatial_projection = nn.Conv2d(256, model_dim, 1)
         self.adaptive_pool = nn.AdaptiveAvgPool2d(
             (frame_tokens_height, frame_tokens_width)
         )
@@ -133,14 +124,16 @@ class DepthObservationEncoder(nn.Module):
             nn.Linear(model_dim, model_dim),
         )
         self.register_buffer(
-            "position_2d",
-            self._position_encoding(
-                model_dim,
-                frame_tokens_height,
-                frame_tokens_width,
-            ),
+            "image_position",
+            self._position_encoding(model_dim, frame_tokens_height, frame_tokens_width),
             persistent=True,
         )
+        self.frame_embedding = nn.Parameter(
+            torch.empty(1, observation_frames, 1, model_dim)
+        )
+        self.null_token = nn.Parameter(torch.empty(1, 1, 1, model_dim))
+        nn.init.trunc_normal_(self.frame_embedding, std=0.02)
+        nn.init.trunc_normal_(self.null_token, std=0.02)
         self.output_norm = RMSNorm(model_dim)
         self.dropout = nn.Dropout(dropout)
 
@@ -153,16 +146,15 @@ class DepthObservationEncoder(nn.Module):
         )
         rows = torch.arange(height, dtype=torch.float32)[:, None] * frequency[None]
         columns = torch.arange(width, dtype=torch.float32)[:, None] * frequency[None]
-        row_encoding = torch.cat((rows.sin(), rows.cos()), dim=-1)
-        column_encoding = torch.cat((columns.sin(), columns.cos()), dim=-1)
-        position = torch.cat(
+        row = torch.cat((rows.sin(), rows.cos()), dim=-1)
+        column = torch.cat((columns.sin(), columns.cos()), dim=-1)
+        return torch.cat(
             (
-                row_encoding[:, None].expand(-1, width, -1),
-                column_encoding[None].expand(height, -1, -1),
+                row[:, None].expand(-1, width, -1),
+                column[None].expand(height, -1, -1),
             ),
             dim=-1,
-        )
-        return position.reshape(1, height * width, model_dim)
+        ).reshape(1, 1, height * width, model_dim)
 
     def forward(
         self,
@@ -171,55 +163,52 @@ class DepthObservationEncoder(nn.Module):
         observation_valid: Tensor,
     ) -> DepthFeatures:
         if depth.ndim != 5 or depth.shape[2] != 1:
-            raise ValueError("depth must have shape [B, T, 1, H, W]")
+            raise ValueError("depth must have shape [B,F,1,H,W]")
+        if depth.shape[1] != self.observation_frames:
+            raise ValueError("depth history does not match the encoder contract")
         if observation_to_current.shape != (*depth.shape[:2], 4):
-            raise ValueError("observation_to_current must have shape [B, T, 4]")
-        if (
-            observation_valid.shape != depth.shape[:2]
-            or observation_valid.dtype != torch.bool
-        ):
-            raise ValueError("observation_valid must be boolean with shape [B, T]")
+            raise ValueError("observation transforms must have shape [B,F,4]")
+        if observation_valid.shape != depth.shape[:2]:
+            raise ValueError("observation validity must have shape [B,F]")
         batch, frames = depth.shape[:2]
-        # One shared visual encoder processes every valid temporal observation
-        # in one batched call.  The current frame remains the global visual
-        # context; all four aligned feature grids are lifted into metric BEV.
-        features = self.backbone(depth.flatten(0, 1))
-        features = self.adaptive_pool(self.spatial_projection(features))
-        features = features.flatten(2).transpose(1, 2).reshape(
-            batch,
-            frames,
-            self.tokens_height * self.tokens_width,
-            self.model_dim,
+        visual = self.backbone(depth.flatten(0, 1))
+        visual = self.adaptive_pool(self.spatial_projection(visual))
+        visual = (
+            visual.flatten(2)
+            .transpose(1, 2)
+            .reshape(batch, frames, self.tokens_per_frame, self.model_dim)
         )
-        position = self.position_2d.to(device=features.device, dtype=features.dtype)
         projection = self.metric_projector(
             depth,
             observation_to_current,
             observation_valid,
         )
-        metric_points = projection.points
-        pooled_depth = projection.depth
+        points = projection.points
+        selected_depth = projection.depth / self.max_depth_m
+        surface_hit = projection.depth < self.max_depth_m
         body_obstacle = projection.obstacle_valid & observation_valid[..., None]
-        surface_valid = pooled_depth < self.metric_projector.max_depth_m
-        visual_valid = surface_valid & observation_valid[..., None]
+        token_valid = observation_valid[..., None].expand_as(surface_hit)
         geometry = torch.cat(
             (
-                metric_points / self.metric_projector.max_depth_m,
-                pooled_depth[..., None] / self.metric_projector.max_depth_m,
-                surface_valid[..., None].to(metric_points.dtype),
-                body_obstacle.reshape_as(pooled_depth)[..., None].to(
-                    metric_points.dtype
-                ),
+                points / self.max_depth_m,
+                selected_depth[..., None],
+                surface_hit[..., None].to(points.dtype),
+                body_obstacle[..., None].to(points.dtype),
             ),
             dim=-1,
         )
-        geometry_tokens = self.geometry_projection(geometry.to(features.dtype))
-        features = self.output_norm(features + position + geometry_tokens)
-        features = self.dropout(features)
+        tokens = visual + self.geometry_projection(geometry.to(visual.dtype))
+        tokens = tokens + self.image_position.to(tokens.dtype)
+        tokens = tokens + self.frame_embedding.to(tokens.dtype)
+        tokens = torch.where(
+            token_valid[..., None],
+            tokens,
+            self.null_token.to(tokens.dtype) + self.frame_embedding.to(tokens.dtype),
+        )
+        tokens = self.dropout(self.output_norm(tokens)).flatten(1, 2)
         return DepthFeatures(
-            tokens=features[:, -1],
-            configuration_tokens=features.flatten(1, 2),
-            configuration_points=metric_points.flatten(1, 2),
-            configuration_visual_valid=visual_valid.flatten(1, 2),
+            tokens=tokens,
+            token_valid=token_valid.flatten(1),
+            metric_position=points.flatten(1, 2),
             configuration_field=projection.configuration_field,
         )

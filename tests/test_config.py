@@ -16,17 +16,17 @@ def test_base_mapping_has_one_prepared_dataset_and_fixed_future_contract() -> No
             },
             "model": {
                 "trajectory": {
-                    "num_heading_control_points": 8,
+                    "num_control_points": 8,
                 },
-                "trajectory_decoder": {"transformer_layers": 3},
+                "trajectory_decoder": {"transformer_layers": 4},
             },
         }
     )
     assert config.data.root == "data/policy_dataset"
     assert config.data.frame_spacing_m == 0.45
     assert config.data.future_steps == 24
-    assert config.trajectory.num_heading_control_points == 8
-    assert config.trajectory_decoder.transformer_layers == 3
+    assert config.trajectory.num_control_points == 8
+    assert config.trajectory_decoder.transformer_layers == 4
 
 
 def test_rejects_removed_source_specific_data_config() -> None:
@@ -50,9 +50,9 @@ def test_rejects_removed_architecture_switches() -> None:
         config_from_mapping({"model": {"trajectory": {"scale_xy": [3.0, 3.0]}}})
     with pytest.raises(TypeError, match="normalization_scale_m"):
         config_from_mapping({"model": {"trajectory": {"normalization_scale_m": 4.0}}})
-    with pytest.raises(TypeError, match="control_point_mean_xy_m"):
+    with pytest.raises(TypeError, match="residual_increment_mean_xy_m"):
         config_from_mapping(
-            {"model": {"trajectory": {"control_point_mean_xy_m": [0.0] * 13}}}
+            {"model": {"trajectory": {"residual_increment_mean_xy_m": [0.0] * 14}}}
         )
     with pytest.raises(TypeError, match="maximum_curvature_inv_m"):
         config_from_mapping(
@@ -88,6 +88,20 @@ def test_training_batch_contract_is_global_and_exact() -> None:
         config_from_mapping(
             {"training": {"global_batch_size": 32, "per_device_batch_size": 64}}
         )
+    with pytest.raises(ValueError, match="exact quarter"):
+        config_from_mapping(
+            {
+                "training": {
+                    "global_batch_size": 1022,
+                    "samples_per_epoch": 40880,
+                }
+            }
+        )
+
+
+def test_meanflow_dropout_is_structurally_disabled() -> None:
+    with pytest.raises(ValueError, match="dropout must be zero"):
+        config_from_mapping({"model": {"depth_encoder": {"dropout": 0.1}}})
 
 
 def test_rejects_invalid_trajectory_contract() -> None:
@@ -102,7 +116,7 @@ def test_rejects_invalid_trajectory_contract() -> None:
             CurveNavConfig(),
             trajectory=replace(
                 CurveNavConfig().trajectory,
-                num_heading_control_points=7,
+                num_control_points=7,
             ),
         ).validate()
 
@@ -110,9 +124,9 @@ def test_rejects_invalid_trajectory_contract() -> None:
         config_from_mapping(
             {"model": {"trajectory_decoder": {"flow_steps": 7}}}
         )
-    with pytest.raises(ValueError, match="three equal refinement stages"):
+    with pytest.raises(ValueError, match="split evenly"):
         config_from_mapping(
-            {"model": {"trajectory_decoder": {"transformer_layers": 11}}}
+            {"model": {"trajectory_decoder": {"transformer_layers": 0}}}
         )
 
 
