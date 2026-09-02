@@ -283,7 +283,7 @@ measurements, never from the raw `64x64` depth proxy alone.
 
 - one prepared dataset, loader, policy, combined generator objective, launcher and
   checkpoint schema;
-- global batch 1024, 40 updates per epoch, 200 epochs / 8000 updates;
+- global batch 1368, 30 updates per epoch, 200 epochs / 6000 updates;
 - deterministic zero-dropout training/inference;
 - compiled perception, conditioning, primal and stopped-JVP graphs;
 - twelve decoder blocks: six Flow-state-to-proposal plus six

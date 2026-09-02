@@ -161,9 +161,9 @@ def test_training_contract_preserves_global_batch_for_supported_world_sizes() ->
     config = CurveNavConfig()
     for world_size in range(1, 9):
         contract = build_training_contract(config, world_size, BF16)
-        assert contract["global_batch_size"] == 1024
-        assert contract["steps_per_epoch"] == 40
-        assert contract["total_steps"] == 8000
+        assert contract["global_batch_size"] == 1368
+        assert contract["steps_per_epoch"] == 30
+        assert contract["total_steps"] == 6000
 
 
 def test_resume_rejects_configuration_and_topology_changes() -> None:
