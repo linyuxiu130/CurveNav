@@ -959,6 +959,10 @@ details belong in `ARCHITECTURE.md`.
   for GPU2 after E012. A direct counterfactual test changes all intermediate
   reference controls while fixing `G` and proves the terminal-goal feature is
   bitwise unchanged. Commit `0a5c0ca` records that contract.
+- The complete CPU suite on the exact E013 release is `117 passed, 2 skipped`
+  in `26.76 s` with CUDA hidden and eight pinned CPU cores. The two skips are
+  exclusively the CUDA compile and CUDA prefetch tests; the former remains in
+  the automatic GPU2 gate between E012 evaluation and E013 training.
 - Paper/source basis: SanD explicitly separates generated B-splines from ESDF
   selection, while NavDP separates generation from critic selection. CurveNav
   deliberately has neither runtime selector, so trajectory-aligned observed
