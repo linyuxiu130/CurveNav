@@ -52,7 +52,7 @@ PYTHONDONTWRITEBYTECODE=1 "${CURVENAV_PYTHON}" \
 CUDA_VISIBLE_DEVICES=0,1,2,3 scripts/run_training_runtime.sh \
   scripts/train_policy.sh configs/base.yaml
 CUDA_VISIBLE_DEVICES=0 scripts/evaluate_policy.sh \
-  configs/base.yaml outputs/train_policy/checkpoint.pt
+  configs/base.yaml outputs/train_policy-e010/checkpoint.pt
 ```
 
 训练固定全局 batch 1792、200 epoch/4600 optimizer step；所有 GPU 数都按真实样本数缩放

@@ -740,3 +740,55 @@ details belong in `ARCHITECTURE.md`.
   FP16 and 8,000 target updates. This is a hardware communication-topology
   fact, not a model branch or a CurveNav loss result; throughput and model
   quality remain unreported until real updates are observed.
+- Completed run: four V100S GPUs used global batch `1792`, `200` epochs and
+  `4,600` optimizer updates, processing approximately the same number of
+  examples as E008. Final loss was `0.10050`; the EMA checkpoint SHA-256 is
+  `34b899677f32698a785fcd1ec5c8c0a1c0395a1cb344a95bde7ff69371320d2b`.
+  Source-truth offline ADE/FDE are `0.03622/0.09933 m`, full collision is
+  `11.807%`, and first `0.5/1.0 m` collision is `0.049/0.577%`. These are only
+  slightly worse than E008 and do not predict the closed-loop regression.
+- Fixed online rejection: on the exact resident Home scene, episodes `0--9`,
+  seed `1234` and `num-envs=1`, E009 reaches only `3/10` SR and `0.296271`
+  mean SPL, versus E008's `6/10` and `0.582788`. It loses E008 successes 1, 2
+  and 8. Across all ten traces, actual-position free fraction falls
+  `69.6 -> 41.2%`, commanded low-speed stall fraction rises
+  `35.4 -> 64.1%`, free-origin first-metre plan collision rises
+  `60.3 -> 69.9%`, and full-plan collision rises `81.0 -> 94.7%` on the same
+  frozen benchmark proxy. This is stable wrong-route behavior, not a server,
+  MPC, seed or episode mismatch.
+- Rejected inference: exact affine decode proves only that `z_t` denotes a
+  finite curve. Near the one-step deployment boundary it is still the fixed
+  artificial Gaussian source, not an estimate on the clean navigation
+  manifold. SanD/NavDP can repeatedly replace a noisy variable and select among
+  candidates; that does not license a path-local C-space lookup on CurveNav's
+  single-call source. E009's first lookup is mathematically defined but has the
+  wrong navigation semantics.
+
+## E010 — goal retrieval, clean-proposal geometry
+
+- Root correction: restore the metric PointGoal reference as the first six
+  blocks' spatial retrieval coordinate. It is explicitly an attention prior,
+  not an executed trajectory, additive residual or hard goal corridor. The
+  instantaneous field still receives the complete Flow state and predicts the
+  clean endpoint. Only that learned clean proposal receives candidate-path
+  C-space/BEV queries before the interval-average field produces the final
+  B-spline.
+- Scope: no extra block, head, candidate, critic, loss, projection, inference
+  iteration or fallback. The four-frame encoder, target-independent observed
+  BEV, improved-MeanFlow identity, deployment-boundary clearance objective and
+  one-call runtime are unchanged. E009 code is removed rather than retained as
+  a switch.
+- Causal training comparison: keep E009's global batch `1792`, sample budget,
+  FP16/FP32 precision contract and launcher for the first E010 run. This
+  isolates the retrieval-location correction from the separate E008/E009
+  optimizer-topology difference. Evaluate by source-truth validation and the
+  same resident ten episodes before changing batch or learning rate.
+- Completed run: four V100S GPUs reached `200` epochs and `4,600` optimizer
+  updates at a final throughput of `2,820 samples/s`. The final loss was
+  `0.06510`; the EMA checkpoint SHA-256 is
+  `57a7bbabaeeb39f1632089915624acdde05f0d191aeb9dca70e7f0ccee0af3c9`.
+  Source-truth offline ADE/FDE are `0.03758/0.10204 m`, full collision is
+  `12.187%`, and first `0.5/1.0 m` collision is `0.000/0.495%`. Relative to
+  E009, only the immediate execution prefix improves slightly; full collision
+  and imitation error do not. The fixed resident ten-episode online run is in
+  progress and remains the acceptance test.

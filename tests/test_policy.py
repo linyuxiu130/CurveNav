@@ -438,32 +438,39 @@ def test_sampling_is_one_call_with_proposal_and_clean_path_geometry() -> None:
     torch.testing.assert_close(calls[0][0], torch.zeros_like(calls[0][0]))
     torch.testing.assert_close(calls[0][1], torch.ones_like(calls[0][1]))
     assert len(geometry_inputs) == 2
-    source = policy.inference_source.expand(2, -1)
-    source_path, _ = policy.curve_codec.decode(source)
-    source_controls = policy.curve_codec.control_positions_from_coordinates(source)
-    source_geometry, _ = policy.trajectory_decoder._trajectory_geometry(
-        source_path, source_controls, encoded
+    reference_path, _ = policy.curve_codec.decode_values(
+        encoded.goal_reference.flatten(1)
     )
-    torch.testing.assert_close(geometry_inputs[0], source_geometry)
+    reference_geometry, _ = policy.trajectory_decoder._trajectory_geometry(
+        reference_path, encoded.goal_reference, encoded
+    )
+    torch.testing.assert_close(geometry_inputs[0], reference_geometry)
     assert not torch.equal(geometry_inputs[0], geometry_inputs[1])
 
 
-def test_pointgoal_does_not_relocate_flow_state_geometry_query() -> None:
+def test_pointgoal_defines_the_first_spatial_retrieval_reference() -> None:
     policy = build_policy(tiny_config()).eval()
     first = policy.encode_condition(make_condition(1))
     second = replace(first, goal_reference=-first.goal_reference)
-    state = policy.inference_source
-    controls = policy.curve_codec.control_positions_from_coordinates(state)
-    path, _ = policy.curve_codec.decode(state)
+    first_path, _ = policy.curve_codec.decode_values(
+        first.goal_reference.flatten(1)
+    )
+    second_path, _ = policy.curve_codec.decode_values(
+        second.goal_reference.flatten(1)
+    )
 
     first_path_geometry, first_goal_geometry = (
-        policy.trajectory_decoder._trajectory_geometry(path, controls, first)
+        policy.trajectory_decoder._trajectory_geometry(
+            first_path, first.goal_reference, first
+        )
     )
     second_path_geometry, second_goal_geometry = (
-        policy.trajectory_decoder._trajectory_geometry(path, controls, second)
+        policy.trajectory_decoder._trajectory_geometry(
+            second_path, second.goal_reference, second
+        )
     )
 
-    torch.testing.assert_close(first_path_geometry, second_path_geometry)
+    assert not torch.equal(first_path_geometry, second_path_geometry)
     assert not torch.equal(first_goal_geometry, second_goal_geometry)
 
 

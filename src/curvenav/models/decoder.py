@@ -10,7 +10,7 @@ from curvenav.types import ConditionFeatures
 
 
 TRAJECTORY_DECODER_TYPE = (
-    "single_call_flow_state_then_clean_proposal_cspace_improved_mean_flow"
+    "single_call_goal_reference_then_clean_proposal_cspace_improved_mean_flow"
 )
 
 
@@ -199,34 +199,40 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             2,
         ):
             raise ValueError("goal reference must have shape [B,C,2]")
-        # Standardized incremental controls are an affine Euclidean chart, so
-        # every linear-interpolant Flow state decodes to one physical curve.
-        # Query geometry at that state before estimating its clean endpoint;
-        # PointGoal supplies relative intent but never relocates the query.
-        flow_controls = curve_codec.control_positions_from_coordinates(state)
-        flow_path, _ = curve_codec.decode(state)
-        flow_path_geometry, flow_goal_geometry = self._trajectory_geometry(
-            flow_path,
-            flow_controls,
-            condition,
+        # The noisy Flow state is not a navigation proposal.  Use the metric
+        # PointGoal reference only as a spatial retrieval prior for the first
+        # field, then query C-space on the learned clean proposal below.  The
+        # reference is never decoded as, added to, or executed as a trajectory.
+        reference_controls = condition.goal_reference
+        reference_path, _ = curve_codec.decode_values(
+            reference_controls.flatten(1)
         )
-        flow_pair_geometry = self._path_relative_geometry(flow_controls, condition)
+        reference_path_geometry, reference_goal_geometry = (
+            self._trajectory_geometry(
+                reference_path,
+                reference_controls,
+                condition,
+            )
+        )
+        reference_pair_geometry = self._path_relative_geometry(
+            reference_controls, condition
+        )
         proposal_tokens = (
             base_tokens
             + self.position_embedding.to(dtype=base_tokens.dtype)
             + instantaneous_time.to(dtype=base_tokens.dtype)
             + self.path_geometry_embedding(
-                flow_path_geometry.to(base_tokens.dtype)
+                reference_path_geometry.to(base_tokens.dtype)
             )
             + self.goal_geometry_embedding(
-                flow_goal_geometry.to(base_tokens.dtype)
+                reference_goal_geometry.to(base_tokens.dtype)
             )
         )
         for index in range(self.layers_per_phase):
             proposal_tokens = self.blocks[index](
                 proposal_tokens,
                 projected_condition[index],
-                flow_pair_geometry,
+                reference_pair_geometry,
             )
         instantaneous = self.instantaneous_velocity_readout(
             self.output_norm(proposal_tokens)

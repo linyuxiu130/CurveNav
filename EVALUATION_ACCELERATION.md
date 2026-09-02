@@ -38,7 +38,7 @@ PYTHONDONTWRITEBYTECODE=1 "${CURVENAV_PYTHON}" \
 # 单模型完整离线测评（唯一入口）
 CUDA_VISIBLE_DEVICES=0 scripts/run_training_runtime.sh \
   scripts/evaluate_policy.sh \
-  configs/base.yaml outputs/train_policy/checkpoint.pt \
+  configs/base.yaml outputs/train_policy-e010/checkpoint.pt \
   --artifact-dir outputs/offline-evaluation
 
 # 使用同一 common protocol 的跨模型比较

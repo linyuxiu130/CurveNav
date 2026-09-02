@@ -49,17 +49,26 @@ first-metre plans differed by only `0.9--5.1 mm`, MPC requested
 `0.36--0.50 m/s`, and the robot repeatedly approached the same non-executable
 geometry. The internal clean proposal and final output differed by only
 `9.16 mm` offline. The remaining defect is therefore not a missing refinement
-iteration. The first geometry query is anchored to the straight PointGoal
-corridor and the second readout has little leverage to replace that route.
+iteration.
 
-SanD and NavDP instead denoise their current trajectory variable while it
-attends to visual context; neither uses a straight goal ray as the spatial
-location of its geometry query. E009 adopts that principle without importing
-their candidate sets or critics. The accepted single-step factorization is:
+E009 tested whether the first retrieval should instead be located on the
+decoded Flow state. That hypothesis is rejected by the identical resident-scene
+protocol: E009 falls to `3/10` success and `0.2963` mean SPL. It loses E008's
+successful episodes 1, 2 and 8; mean actual-position free fraction falls from
+`69.6%` to `41.2%`, and commanded low-speed stall fraction rises from `35.4%`
+to `64.1%`. A linear-interpolant Flow state has an exact B-spline decode, but
+near deployment it is still the fixed artificial Gaussian source, not a clean
+navigation proposal. Sampling path-local geometry on that curve is therefore
+mathematically defined but semantically wrong. SanD/NavDP denoising does not
+justify copying this lookup into a deterministic one-call generator: their
+iterative/candidate systems can replace the noisy variable, while CurveNav must
+construct one clean proposal before path-local geometry is meaningful.
+
+The accepted single-step factorization is:
 
 `depth history -> target-independent observed C-space visual BEV`
 
-`physical Flow-state curve + scene memory + relative goal -> instantaneous clean-endpoint estimate`
+`Flow state + goal-reference spatial retrieval + scene memory -> instantaneous clean-endpoint estimate`
 
 `proposal trajectory -> observed C-space/BEV queries`
 
@@ -69,7 +78,9 @@ their candidate sets or critics. The accepted single-step factorization is:
 
 `final B-spline x observed C-space -> training-only feasibility risk`.
 
-This is one improved-MeanFlow field with two mathematically distinct readouts,
+The straight metric goal reference is an attention/retrieval coordinate only;
+it is never added to or executed as the output. This is one improved-MeanFlow
+field with two mathematically distinct readouts,
 not a two-policy planner or a literal safety-first subpolicy. The instantaneous field is required to estimate the
 data endpoint on the linear interpolant; the average field is required for
 one-step MeanFlow transport. Safety-first means geometry-grounded generation: the
@@ -134,7 +145,7 @@ PointGoal is absent from this memory, so changing the goal cannot rewrite the
 obstacle representation. Each trajectory-control query attends to scene tokens
 with explicit relative `x/y/z`, distance, observation age and token type.
 
-## 5. Single-call Flow-state and proposal-grounded geometry
+## 5. Single-call goal retrieval and proposal-grounded geometry
 
 Let `g` be PointGoal, `H=3.6 m`, and
 
@@ -145,16 +156,14 @@ be the seven non-origin Greville abscissae. The metric reference controls are
 `R_i(g)=xi_i min(||g||,H) g/max(||g||,eps)`.
 
 They form an exact straight B-spline ray only as a metric representation of
-goal intent. They are never used as C-space or BEV query positions, added to
-generated controls, or used to constrain output length.
+goal intent. They locate the first scene-memory and observed-C-space retrieval,
+but are never added to generated controls, executed as a path, or used to
+constrain output length. This distinction is essential: the fixed Gaussian
+source has valid coordinates but no clean-path semantics.
 
-Standardized incremental controls are an affine Euclidean chart, so every
-interpolant Flow state `z_t` decodes exactly to physical controls `Z_i(z_t)`
-and a physical B-spline `p_z`. The fixed deployment source is itself a finite
-`2.56 m` forward curve. The first six Transformer blocks receive `z_t`,
-interval endpoint `(t,t)`, observed C-space sampled on `p_z`, and BEV queries
-at `Z_i`. PointGoal enters only as the relative displacement `R_i(g)-Z_i`.
-Their planar readout predicts instantaneous velocity
+The first six Transformer blocks receive the Flow state `z_t`, interval
+endpoint `(t,t)`, observed C-space sampled on the reference ray, and BEV
+attention relative to `R_i(g)`. Their planar readout predicts instantaneous velocity
 `v_theta(z_t,t,c)`. On the linear interpolant, this defines the learned clean
 proposal
 
@@ -173,15 +182,16 @@ plus BEV attention relative to `C_i`. Their readout predicts interval-average
 velocity `u_theta(z_t,r,t,c)`.
 
 This ordering keeps two meaningful spatial evaluations without an inference
-loop: the instantaneous field reads the current physical Flow variable and the
-final average field reads its learned clean estimate. PointGoal describes the
-desired displacement from each queried control; it cannot relocate either
-C-space query. E007 showed that proposal geometry is useful but insufficient
-as a safety objective. Bilinear field lookup, affine coordinate
+loop: the instantaneous field retrieves scene evidence along metric goal
+intent, and the final average field reads its learned clean estimate. Only the
+second lookup claims candidate-path semantics. E009 showed that moving the
+first lookup onto the noisy Flow source degrades closed-loop execution even
+though that source is algebraically decodable. E007 showed that proposal
+geometry is useful but insufficient as a safety objective. Bilinear field lookup, affine coordinate
 decode and B-spline evaluation are differentiable almost everywhere, so the
 MeanFlow JVP includes
 
-`z_t -> v_theta -> x_tilde_0 -> B-spline -> observed geometry -> u_theta`.
+`(z_t,R(g),c) -> v_theta -> x_tilde_0 -> B-spline -> observed geometry -> u_theta`.
 
 ## 6. Physical B-spline coordinates
 
@@ -286,7 +296,7 @@ measurements, never from the raw `64x64` depth proxy alone.
 - global batch 1792, 23 updates per epoch, 200 epochs / 4600 updates;
 - deterministic zero-dropout training/inference;
 - compiled perception, conditioning, primal and stopped-JVP graphs;
-- twelve decoder blocks: six Flow-state-to-proposal plus six
+- twelve decoder blocks: six goal-reference-retrieval-to-proposal plus six
   proposal-to-average blocks in one call;
 - DDP preserves the exact global batch and exact deployment quarter;
 - scheduler and EMA advance only after a successful optimizer update;
@@ -308,8 +318,10 @@ CUDA graph reaches a stable measured interval.
   training.
 - [NavDP](https://github.com/InternRobotics/NavDP): its noisy trajectory tokens
   attend to visual context and iterative diffusion repeatedly updates them.
-  CurveNav likewise grounds the physical Flow state, then compresses endpoint
-  estimation into one improved-MeanFlow call and one deterministic curve.
+  CurveNav keeps the Flow state as the neural transport input but does not
+  pretend its one-step Gaussian source is already a navigation proposal. It
+  retrieves goal-directed scene evidence, estimates one clean endpoint, and
+  grounds only that endpoint as a candidate path inside the same call.
   NavDP's critic and collision
   augmentation are not hidden in CurveNav. Their necessity is evidence that
   coordinate imitation alone is not a physical feasibility objective.
@@ -325,7 +337,7 @@ CUDA graph reaches a stable measured interval.
 
 The architectural contribution is a one-call, deployment-grounded improved
 MeanFlow: target-independent four-frame observed C-space BEV, physical
-Flow-state geometry, a supervised instantaneous endpoint estimate, a second
-differentiable C-space query along that estimate, query-relative PointGoal
-intent, one final physical B-spline transport and one training-only feasibility
-objective on that exact output.
+Flow coordinates, metric PointGoal retrieval, a supervised instantaneous
+endpoint estimate, a differentiable C-space query along that estimate,
+query-relative PointGoal intent, one final physical B-spline transport and one
+training-only feasibility objective on that exact output.
