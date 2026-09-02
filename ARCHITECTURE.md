@@ -51,27 +51,23 @@ geometry. The internal clean proposal and final output differed by only
 `9.16 mm` offline. The remaining defect is therefore not a missing refinement
 iteration.
 
-E009 tested whether the first retrieval should instead be located on the
-decoded Flow state. That hypothesis is rejected by the identical resident-scene
-protocol: E009 falls to `3/10` success and `0.2963` mean SPL. It loses E008's
-successful episodes 1, 2 and 8; mean actual-position free fraction falls from
-`69.6%` to `41.2%`, and commanded low-speed stall fraction rises from `35.4%`
-to `64.1%`. A linear-interpolant Flow state has an exact B-spline decode, but
-near deployment it is still the fixed artificial Gaussian source, not a clean
-navigation proposal. Sampling path-local geometry on that curve is therefore
-mathematically defined but semantically wrong. SanD/NavDP denoising does not
-justify copying this lookup into a deterministic one-call generator: their
-iterative/candidate systems can replace the noisy variable, while CurveNav must
-construct one clean proposal before path-local geometry is meaningful.
+E009 and E010 both reached `3/10`, but the published release bundles show that
+this comparison cannot be used to explain E008's `6/10 -> 3/10` regression.
+E008 and E010 have byte-identical `policy.py` and the same decoder computation;
+their decoder files differ only in comments, formatting and the contract name.
+The actual change was the optimizer topology: E008 used BF16, global batch 1024
+and 8,000 updates, while E010 used FP16, global batch 1,792 and 4,600 updates.
+They consumed nearly the same number of examples, but E010 performed 42.5%
+fewer parameter updates at the same learning rate. Large batch is a throughput
+choice, not an equivalent training transformation.
 
-E010 restored the straight metric PointGoal ray as that first retrieval path.
-It also reaches only `3/10` success and `0.2989` mean SPL; full-path offline
-collision is `12.19%`, statistically unchanged from E009. Although its median
-final goal distance and curvature improve, it recovers no additional success.
-The shared defect is now isolated: neither an artificial Gaussian curve nor a
-goal ray is an honest obstacle-query path. The former has no navigation
-semantics; the latter lets target intent decide where geometry is read before
-the generator understands the scene.
+E011 changes only the first spatial retrieval from E008/E010's metric goal
+reference to robot-origin global geometry. Its `1/10` vectorized diagnostic and
+unsafe frozen-map replay reject the trained checkpoint, but do not yet isolate
+architecture from the same 1,792/4,600 FP16 training contract. E012 therefore
+keeps the E011 graph unchanged and restores E008's 1,024/8,000 BF16 contract on
+an RTX 4090. No further decoder change is justified until this controlled run
+separates retrieval geometry from optimization dynamics.
 
 The E011 single-step factorization is:
 

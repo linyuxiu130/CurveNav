@@ -884,13 +884,30 @@ details belong in `ARCHITECTURE.md`.
   cause. The separately captured E011 B1 episode 0 also has `100%` full-plan
   collision and only `3.27%` actual-position free samples, so vector batching
   is not the source of the failure.
-- Causal correction to the experiment history: E008 to E009 was not a
-  single-variable geometry-query experiment. Commit `9f57201` changed 60 files,
-  including the perception/BEV contract, decoder tokenization, three internal
-  refinement segments, readout structure, Flow coordinates and the training
-  and evaluation implementations. The later E010/E011 tests move the first
-  query only inside this already-regressed skeleton; their shared `3/10` B1
-  outcome cannot identify the original `6/10 -> 3/10` cause. Do not add another
-  query heuristic to E011. The next architecture must retain the current
-  verified data/precision/MeanFlow contracts while isolating the decoder
-  structural change against the evidence-backed E008 behavior.
+- Causal correction from the exact published bundles supersedes the earlier
+  repository-commit audit. E008 and E010 have byte-identical `models/policy.py`;
+  their decoder computation is also identical, with differences limited to
+  comments, formatting and the contract string. The `6/10 -> 3/10` regression
+  therefore cannot be attributed to goal-reference retrieval. E008 trained in
+  BF16 with global batch `1024` for `8000` optimizer updates; E010 trained in
+  FP16 with global batch `1792` for `4600` updates. The example budgets are
+  close, but E010 made `42.5%` fewer parameter updates at the same learning
+  rate. This optimizer-topology confound must be removed before another
+  decoder mechanism is accepted.
+
+## E012 — controlled E011 optimization audit
+
+- Purpose: isolate E011's robot-origin global retrieval from the large-batch
+  training change. The model, dataset, loss, deterministic source and one-call
+  runtime are byte-for-byte E011; only the training contract returns to the
+  evidence-backed E008 values.
+- Contract: one RTX 4090, BF16/FP32 precision, global batch `1024`, three packed
+  microbatches bounded by `342`, `40960` samples per epoch, `200` epochs and
+  exactly `8000` successful optimizer updates. Learning rate remains `2e-4`;
+  it is not rescaled because the original batch is restored.
+- Decision gate: compare the final EMA checkpoint with E011 using the same
+  source-truth offline strata, then run the fixed ten episodes with
+  `num-envs=1`. If E012 remains below E008, reject robot-origin retrieval and
+  restore the goal-reference retrieval. If it recovers E008, the prior
+  regression was optimization rather than architecture. No candidate set,
+  safety projection, critic or extra loss is introduced during this audit.
