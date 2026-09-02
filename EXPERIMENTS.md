@@ -835,3 +835,23 @@ details belong in `ARCHITECTURE.md`.
   `178.74 s`. The graph remains `33,898,916` parameters with `29,018,980` in
   the decoder; E011 adds no parameter and removes one pre-proposal curve/C-space
   evaluation.
+- Current training: the exact E011 run uses V100S GPUs 0 and 3, global batch
+  `1792`, two `448`-sample microbatches per rank and FP16. At step `1820/4600`
+  it sustains approximately `1393 samples/s` with both GPUs compute-saturated
+  and about `27.9 GiB` allocated per device. This is approximately
+  `696.5 samples/s/GPU`, slightly above the prior four-V100 E010/E011 topology's
+  `692--705 samples/s/GPU`; the lower aggregate rate is entirely the two-card
+  allocation, not duplicated model or data work.
+- Throughput audit: packed depth stays resident on GPU, transfer is prefetched,
+  condition K/V is projected once per microbatch, DDP uses `no_sync` for the
+  first accumulation, AdamW/EMA are fused/foreach, and perception, conditioning,
+  primal and JVP graphs are already compiled. On an idle RTX 4090, the eager
+  FP32 MeanFlow JVP took about `150--155 ms` for the audit batch while the
+  production compiled JVP took `23.8--25.3 ms`. BF16 JVP (`166--181 ms` eager),
+  explicit attention and `max-autotune-no-cudagraphs` did not improve this path;
+  the latter spent minutes enumerating infeasible Triton kernels. The metric
+  depth projector costs only about `5 ms` in the same batch, so caching it would
+  add a second data contract for a small upper bound. These variants are
+  rejected: no code branch or custom kernel is retained. A material aggregate
+  increase therefore requires more identical GPUs; it is not available from a
+  mathematically equivalent local rewrite identified by this audit.
