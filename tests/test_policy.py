@@ -410,7 +410,7 @@ def test_average_field_is_conditioned_on_interval_start() -> None:
     assert not torch.equal(first_average, second_average)
 
 
-def test_sampling_is_one_call_with_one_clean_proposal_geometry_query() -> None:
+def test_sampling_is_one_call_with_reference_and_proposal_geometry_queries() -> None:
     policy = build_policy(tiny_config()).eval()
     inputs = make_condition(2)
     calls = []
@@ -436,21 +436,32 @@ def test_sampling_is_one_call_with_one_clean_proposal_geometry_query() -> None:
     assert len(calls) == 1
     torch.testing.assert_close(calls[0][0], torch.zeros_like(calls[0][0]))
     torch.testing.assert_close(calls[0][1], torch.ones_like(calls[0][1]))
-    assert len(geometry_inputs) == 1
-    assert geometry_inputs[0].shape == (2, 7, 7)
+    assert len(geometry_inputs) == 2
+    assert all(value.shape == (2, 7, 7) for value in geometry_inputs)
 
 
-def test_pointgoal_does_not_relocate_the_global_scene_query() -> None:
+def test_goal_reference_provides_distinct_metric_retrieval_anchors() -> None:
     policy = build_policy(tiny_config()).eval()
-    first = policy.encode_condition(make_condition(1))
-    second = replace(first, goal_reference=-first.goal_reference)
-    first_scene_geometry = policy.trajectory_decoder._global_scene_geometry(first)
-    second_scene_geometry = policy.trajectory_decoder._global_scene_geometry(second)
-    first_goal_geometry = policy.trajectory_decoder._goal_reference_geometry(first)
-    second_goal_geometry = policy.trajectory_decoder._goal_reference_geometry(second)
+    encoded = policy.encode_condition(make_condition(1))
+    geometry = policy.trajectory_decoder._path_relative_geometry(
+        encoded.goal_reference,
+        encoded,
+    )
+    assert not torch.equal(geometry[:, 0], geometry[:, -1])
 
-    torch.testing.assert_close(first_scene_geometry, second_scene_geometry)
-    assert not torch.equal(first_goal_geometry, second_goal_geometry)
+
+def test_goal_geometry_uses_one_terminal_goal_not_a_straight_template() -> None:
+    policy = build_policy(tiny_config()).eval()
+    encoded = policy.encode_condition(make_condition(1))
+    candidate = encoded.goal_reference.clone()
+    geometry = policy.trajectory_decoder._goal_geometry(candidate, encoded)
+    expected_delta = encoded.goal_reference[:, -1:, :] - candidate
+    torch.testing.assert_close(
+        geometry[..., 2:4] * policy.planning_horizon_m,
+        expected_delta,
+    )
+    assert torch.count_nonzero(geometry[:, :-1, 4]) > 0
+    torch.testing.assert_close(geometry[:, -1, 4], torch.zeros(1))
 
 
 def test_reusable_cross_attention_matches_projected_call() -> None:

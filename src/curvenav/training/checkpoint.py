@@ -109,7 +109,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "planar_axis_convention": "x_forward_y_left",
         "point_goal_semantics": "mission_destination_in_current_robot_xy",
         "point_goal_conditioning": (
-            "candidate_control_to_metric_local_goal_reference"
+            "metric_goal_reference_retrieval_plus_candidate_to_terminal_local_goal"
         ),
         "trajectory_supervision": (
             "source_cspace_gated_fixed_future_expert_planar_bspline_imitation"
@@ -145,13 +145,13 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "visual_compression": "metric_splat_and_observed_cspace_16x16_bev",
         "condition_context": "target_independent_metric_bev_plus_motion_tokens",
         "trajectory_condition_interaction": (
-            "goal_independent_global_scene_then_clean_estimate_query_observed_cspace_and_bev"
+            "goal_reference_geometry_then_clean_estimate_query_observed_cspace_and_bev"
         ),
         "path_relative_geometry": (
-            "robot_origin_scene_then_learned_clean_control_to_bev_metric_attention_bias"
+            "goal_reference_then_learned_clean_control_to_bev_metric_attention_bias"
         ),
         "goal_conditioning": (
-            "metric_goal_intent_then_candidate_control_to_goal_embedding"
+            "terminal_local_goal_vector_without_straight_template_matching"
         ),
         "temporal_modeling": (
             "shared_learned_four_frame_depth_tokens_with_metric_se2_alignment"

@@ -63,29 +63,38 @@ choice, not an equivalent training transformation.
 
 E011 changes only the first spatial retrieval from E008/E010's metric goal
 reference to robot-origin global geometry. Its `1/10` vectorized diagnostic and
-unsafe frozen-map replay reject the trained checkpoint, but do not yet isolate
-architecture from the same 1,792/4,600 FP16 training contract. E012 therefore
-keeps the E011 graph unchanged and restores E008's 1,024/8,000 BF16 contract on
-an RTX 4090. No further decoder change is justified until this controlled run
-separates retrieval geometry from optimization dynamics.
+unsafe frozen-map replay reject the trained checkpoint. E012 restores E008's
+1,024/8,000 BF16 training contract while keeping the E011 graph. The paired
+training curves isolate a structural defect: with every control query anchored
+at the origin, metric attention bias is identical across control indices. The
+network loses the exact relation between each future curve segment and each
+scene location, and learns more slowly than E008 under matched conditions.
 
-The E011 single-step factorization is:
+E013 restores distinct metric reference anchors and removes a separate hidden
+straight-path bias. E008/E010 computed the goal feature for candidate control
+`C_i` from `R_i-C_i`, where `R_i` is the corresponding control on a straight
+goal ray. That asks every intermediate control to compare itself with a
+straight template even when the safe expert takes a detour. E013 instead uses
+the same terminal local goal `G=R_7` for every control: `G-C_i`. The reference
+ray locates geometry retrieval only; terminal intent no longer specifies an
+intermediate path shape.
+
+The E013 single-step factorization is:
 
 `depth history -> target-independent observed C-space visual BEV`
 
-`Flow state + metric goal intent + robot-origin global scene attention -> instantaneous clean-endpoint estimate`
+`Flow state + terminal-goal intent + goal-reference metric scene/C-space queries -> instantaneous clean-endpoint estimate`
 
 `proposal trajectory -> observed C-space/BEV queries`
 
-`proposal geometry + candidate-relative PointGoal -> interval-average velocity`
+`proposal geometry + candidate-to-terminal-goal intent -> interval-average velocity`
 
 `fixed source - average velocity -> one final B-spline`
 
 `final B-spline x observed C-space -> training-only feasibility risk`.
 
-The straight metric goal reference is an intent encoding only. It never moves
-the scene-attention coordinate, is never added to generated controls and is
-never executed as output. This is one improved-MeanFlow
+The straight metric goal reference is a retrieval coordinate only. It is never
+added to generated controls and is never executed as output. This is one improved-MeanFlow
 field with two mathematically distinct readouts,
 not a two-policy planner or a literal safety-first subpolicy. The instantaneous field is required to estimate the
 data endpoint on the linear interpolant; the average field is required for
@@ -151,7 +160,7 @@ PointGoal is absent from this memory, so changing the goal cannot rewrite the
 obstacle representation. Each trajectory-control query attends to scene tokens
 with explicit relative `x/y/z`, distance, observation age and token type.
 
-## 5. Single-call global geometry and proposal-grounded refinement
+## 5. Single-call goal-anchored geometry and proposal-grounded refinement
 
 Let `g` be PointGoal, `H=3.6 m`, and
 
@@ -161,25 +170,25 @@ be the seven non-origin Greville abscissae. The metric reference controls are
 
 `R_i(g)=xi_i min(||g||,H) g/max(||g||,eps)`.
 
-They form an exact straight B-spline ray only as a token-wise metric encoding
-of goal intent. They are never used to sample C-space, shift scene coordinates,
-initialize generated controls, constrain length or execute a path.
+They form an exact straight B-spline ray used only to locate the first metric
+queries. They never initialize or offset generated controls, constrain length
+or execute a path. Their common endpoint is the local terminal goal `G=R_7`.
 
-Let scene-memory token `k` have robot-frame position `p_k`. For every control
-query, the first six Transformer blocks use the same target-independent metric
-relation
+Let scene-memory token `k` have robot-frame position `p_k`. The first six
+Transformer blocks preserve a distinct physical relation for control query `i`
 
-`global_ik=[p_k.xy/H,p_k.z/H,||p_k.xy||/H,surface_k,age_k,type_k]`.
+`reference_ik=[(p_k.xy-R_i)/H,p_k.z/H,||p_k.xy-R_i||/H,surface_k,age_k,type_k]`.
 
-The query token contains Flow state `z_t`, interval endpoint `(t,t)`, control
-identity and goal intent
+The straight reference itself queries observed C-space, and the query token
+contains Flow state `z_t`, interval endpoint `(t,t)`, control identity,
+reference-path geometry and terminal intent
 
-`intent_i=[0,0,R_i(g)/H,||R_i(g)||/H]`.
+`intent_i=[R_i/H,(G-R_i)/H,||G-R_i||/H]`.
 
-Thus PointGoal may determine which already represented scene evidence matters,
-but it cannot move the coordinates of that evidence. No path-local C-space
-query occurs before a path exists. The planar readout predicts instantaneous
-velocity `v_theta(z_t,t,c)`, which defines the learned clean proposal
+This does not declare the straight ray executable. It tells each control token
+where to inspect the same target-independent scene and whether the direct
+corridor is blocked. The planar readout predicts instantaneous velocity
+`v_theta(z_t,t,c)`, which defines the learned clean proposal
 
 `x_tilde_0 = z_t - t v_theta(z_t,t,c)`.
 
@@ -190,20 +199,19 @@ weights. For proposal control `C_i`, the second six blocks receive
 
 `path_i = aggregate_j[q_j/H, o*d/H, o*grad(d), o, o*forbidden]`,
 
-`goal_i = [C_i/H,(R_i-C_i)/H,||R_i-C_i||/H]`,
+`goal_i = [C_i/H,(G-C_i)/H,||G-C_i||/H]`,
 
 plus BEV attention relative to `C_i`. Their readout predicts interval-average
 velocity `u_theta(z_t,r,t,c)`.
 
-This ordering keeps one global metric scene evaluation and one meaningful
-candidate-path evaluation without an inference loop. E009 rejects the noisy
-Flow source as the first query path; E010 rejects the PointGoal ray. E007 shows
-that proposal geometry remains useful but is insufficient as a safety
-objective. Bilinear field lookup, affine coordinate
+This ordering keeps one reference-located scene/path evaluation and one
+meaningful candidate-path evaluation without an inference loop. The reference
+is not an output proposal; it supplies the distinct metric anchors that E012's
+origin-repeated query removes. Bilinear field lookup, affine coordinate
 decode and B-spline evaluation are differentiable almost everywhere, so the
 MeanFlow JVP includes
 
-`(z_t,g,c_global) -> v_theta -> x_tilde_0 -> B-spline -> observed geometry -> u_theta`.
+`(z_t,g,c_reference) -> v_theta -> x_tilde_0 -> B-spline -> observed geometry -> u_theta`.
 
 ## 6. Physical B-spline coordinates
 
@@ -305,10 +313,10 @@ measurements, never from the raw `64x64` depth proxy alone.
 
 - one prepared dataset, loader, policy, combined generator objective, launcher and
   checkpoint schema;
-- global batch 1792, 23 updates per epoch, 200 epochs / 4600 updates;
+- global batch 1024, 40 updates per epoch, 200 epochs / 8000 updates;
 - deterministic zero-dropout training/inference;
 - compiled perception, conditioning, primal and stopped-JVP graphs;
-- twelve decoder blocks: six global-scene-to-proposal plus six
+- twelve decoder blocks: six reference-geometry-to-proposal plus six
   proposal-to-average blocks in one call;
 - DDP preserves the exact global batch and exact deployment quarter;
 - scheduler and EMA advance only after a successful optimizer update;
@@ -332,8 +340,9 @@ CUDA graph reaches a stable measured interval.
   attend to visual context and iterative diffusion repeatedly updates them.
   CurveNav keeps the Flow state as the neural transport input but does not
   pretend its one-step Gaussian source is already a navigation proposal. It
-  reads the complete robot-centric scene, estimates one clean endpoint, and
-  grounds only that endpoint as a candidate path inside the same call.
+  uses a metric local-goal reference to retrieve the complete robot-centric
+  scene, estimates one clean endpoint, and grounds that endpoint as a
+  candidate path inside the same call.
   NavDP's critic and collision
   augmentation are not hidden in CurveNav. Their necessity is evidence that
   coordinate imitation alone is not a physical feasibility objective.
@@ -355,7 +364,7 @@ CUDA graph reaches a stable measured interval.
 
 The architectural contribution is a one-call, deployment-grounded improved
 MeanFlow: target-independent four-frame observed C-space BEV, physical
-Flow coordinates, robot-origin global geometry attention, separate metric
+Flow coordinates, goal-reference metric geometry attention, terminal-only
 PointGoal intent, a supervised instantaneous
 endpoint estimate, a differentiable C-space query along that estimate,
 query-relative PointGoal intent, one final physical B-spline transport and one

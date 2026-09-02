@@ -10,7 +10,7 @@ from curvenav.types import ConditionFeatures
 
 
 TRAJECTORY_DECODER_TYPE = (
-    "single_call_global_geometry_then_clean_proposal_cspace_improved_mean_flow"
+    "single_call_goal_anchored_proposal_terminal_goal_cspace_improved_mean_flow"
 )
 
 
@@ -125,8 +125,22 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             self.path_to_control_weight.to(path_features),
             path_features,
         )
-        goal_delta = condition.goal_reference - candidate_controls.float()
-        goal_features = torch.cat(
+        return control_path_features, self._goal_geometry(
+            candidate_controls,
+            condition,
+        )
+
+    def _goal_geometry(
+        self,
+        candidate_controls: Tensor,
+        condition: ConditionFeatures,
+    ) -> Tensor:
+        """Express intent as remaining displacement to one local endpoint."""
+        terminal_goal = condition.goal_reference[:, -1:, :].expand_as(
+            candidate_controls
+        )
+        goal_delta = terminal_goal - candidate_controls.float()
+        return torch.cat(
             (
                 candidate_controls.float() / self.planning_horizon_m,
                 goal_delta / self.planning_horizon_m,
@@ -135,27 +149,6 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             ),
             dim=-1,
         )
-        return control_path_features, goal_features
-
-    def _goal_reference_geometry(self, condition: ConditionFeatures) -> Tensor:
-        """Encode navigation intent without using it as an obstacle-query path."""
-        origin = torch.zeros_like(condition.goal_reference)
-        delta = condition.goal_reference.float()
-        return torch.cat(
-            (
-                origin,
-                delta / self.planning_horizon_m,
-                torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
-                / self.planning_horizon_m,
-            ),
-            dim=-1,
-        )
-
-    def _global_scene_geometry(self, condition: ConditionFeatures) -> Tensor:
-        """Relate every scene token to the robot origin, independent of intent."""
-        batch = condition.tokens.shape[0]
-        origin = condition.metric_position.new_zeros(batch, self.control_tokens, 2)
-        return self._path_relative_geometry(origin, condition)
 
     def project_condition_memory(
         self, condition: ConditionFeatures
@@ -219,18 +212,30 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             2,
         ):
             raise ValueError("goal reference must have shape [B,C,2]")
-        # Neither the Gaussian Flow state nor the PointGoal ray is an
-        # executable navigation proposal.  The proposal field therefore reads
-        # the complete metric scene relative to the robot origin.  PointGoal
-        # enters only as intent in the control queries and cannot relocate the
-        # obstacle-memory coordinates.  Path-local geometry becomes meaningful
-        # only after the instantaneous field has produced a clean proposal.
-        global_scene_geometry = self._global_scene_geometry(condition)
-        reference_goal_geometry = self._goal_reference_geometry(condition)
+        # The straight local-goal reference is a metric retrieval coordinate,
+        # not an executed trajectory or additive output.  Distinct control
+        # anchors preserve where each future curve segment reads the scene.
+        # Goal intent itself is encoded only as remaining displacement to the
+        # common terminal local goal, never as matching to the straight
+        # reference point at the same control index.
+        reference_controls = condition.goal_reference
+        reference_path, _ = curve_codec.decode_values(reference_controls.flatten(1))
+        reference_path_geometry, reference_goal_geometry = self._trajectory_geometry(
+            reference_path,
+            reference_controls,
+            condition,
+        )
+        reference_pair_geometry = self._path_relative_geometry(
+            reference_controls,
+            condition,
+        )
         proposal_tokens = (
             base_tokens
             + self.position_embedding.to(dtype=base_tokens.dtype)
             + instantaneous_time.to(dtype=base_tokens.dtype)
+            + self.path_geometry_embedding(
+                reference_path_geometry.to(base_tokens.dtype)
+            )
             + self.goal_geometry_embedding(
                 reference_goal_geometry.to(base_tokens.dtype)
             )
@@ -239,7 +244,7 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             proposal_tokens = self.blocks[index](
                 proposal_tokens,
                 projected_condition[index],
-                global_scene_geometry,
+                reference_pair_geometry,
             )
         instantaneous = self.instantaneous_velocity_readout(
             self.output_norm(proposal_tokens)

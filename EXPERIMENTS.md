@@ -925,3 +925,34 @@ details belong in `ARCHITECTURE.md`.
   restore the goal-reference retrieval. If it recovers E008, the prior
   regression was optimization rather than architecture. No candidate set,
   safety projection, critic or extra loss is introduced during this audit.
+
+## E013 — metric retrieval anchors with terminal-only goal intent
+
+- Root correction: E012 repeats the robot-origin relative geometry for all
+  seven control tokens. If memory token `k` is at `p_k`, its positional bias is
+  `beta(p_k-0)` for every control index; token identity cannot restore the
+  missing exact metric relation. E013 restores E008's distinct Greville
+  reference anchors `R_i`, so the bias is `beta(p_k-R_i)` and each future
+  segment retrieves the scene at its own physical location.
+- PointGoal correction: E008/E010 encoded candidate control `C_i` relative to
+  the corresponding straight-reference control `R_i`. That makes a safe
+  lateral detour appear as an index-wise deviation from a straight template.
+  E013 uses only the common terminal local goal `G=R_7`, encoding
+  `[C_i/H,(G-C_i)/H,||G-C_i||/H]` for every control. The straight reference
+  locates observation queries but supplies no intermediate output target.
+- Scope: one decoder call, one instantaneous clean proposal, one proposal
+  C-space query and one final B-spline remain unchanged. No parameter, block,
+  candidate, critic, loss, projection, solver step, inference branch or data
+  field is added. Relative to the accepted E008 graph, the sole learned
+  semantics change is index-wise straight-template intent to terminal-only
+  intent.
+- Paper/source basis: SanD explicitly separates generated B-splines from ESDF
+  selection, while NavDP separates generation from critic selection. CurveNav
+  deliberately has neither runtime selector, so trajectory-aligned observed
+  C-space must enter its single generator. LoGoPlanner and DiffusionAnything
+  independently support metric/trajectory-aligned geometry queries; none
+  justify treating a straight goal ray as the desired intermediate path.
+- Acceptance: first finish and evaluate E012. E013 then trains from zero with
+  the same BF16, global-1024, 8000-update contract. It must preserve E008's
+  fixed `6/10` result and reduce source-truth forward-detour collision; average
+  ADE alone cannot accept the model.
