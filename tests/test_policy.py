@@ -571,9 +571,16 @@ def test_deployment_sample_matches_the_final_path_from_proposal_diagnostics() ->
     torch.manual_seed(19)
     policy = build_policy(tiny_config()).eval()
     condition = make_condition(2)
+    final_coordinates, proposal_coordinates = policy._deployment_transport(condition)
+    expected_path, _ = policy.curve_codec.decode(final_coordinates)
     prediction = policy.sample(condition)
     proposal, _ = policy.curve_codec.decode(prediction.proposal_coordinates)
     assert prediction.path.shape == proposal.shape == (2, 64, 2)
+    torch.testing.assert_close(prediction.path, expected_path)
+    torch.testing.assert_close(
+        prediction.proposal_coordinates,
+        proposal_coordinates,
+    )
     assert torch.isfinite(prediction.path).all()
     assert torch.isfinite(proposal).all()
 
