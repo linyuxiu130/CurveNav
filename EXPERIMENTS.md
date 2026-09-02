@@ -969,6 +969,12 @@ details belong in `ARCHITECTURE.md`.
   C-space must enter its single generator. LoGoPlanner and DiffusionAnything
   independently support metric/trajectory-aligned geometry queries; none
   justify treating a straight goal ray as the desired intermediate path.
+- Official-source audit: SanD's current condition encoder first self-attends
+  depth/motion tokens and then injects one trajectory-endpoint token by cross
+  attention. NavDP repeats its goal token in the generator, but explicitly
+  zeros goal memory in the RGB-D critic that ranks safety. Both support a
+  target-independent scene representation followed by goal intent; neither
+  supports supervising intermediate controls against a straight goal ray.
 - MeanFlow audit: the official iMF implementation returns average `u` and an
   auxiliary marginal velocity `v` from one network call, directly supervises
   both, and uses predicted `v` as the stopped JVP direction. E013 follows that
