@@ -65,10 +65,14 @@ E011 changes only the first spatial retrieval from E008/E010's metric goal
 reference to robot-origin global geometry. Its `1/10` vectorized diagnostic and
 unsafe frozen-map replay reject the trained checkpoint. E012 restores E008's
 1,024/8,000 BF16 training contract while keeping the E011 graph. The paired
-training curves isolate a structural defect: with every control query anchored
-at the origin, metric attention bias is identical across control indices. The
-network loses the exact relation between each future curve segment and each
-scene location, and learns more slowly than E008 under matched conditions.
+training curves show slower early convergence, but the completed run restores
+E008's imitation accuracy and improves its source-truth offline collision
+metrics. Training topology was therefore a material confound, and the earlier
+online regression cannot by itself reject robot-origin retrieval. The remaining
+structural limitation is exact rather than empirical: with every control query
+anchored at the origin, metric attention bias is identical across control
+indices, so it does not directly encode the relation between each future curve
+segment and each scene location.
 
 E013 restores distinct metric reference anchors and removes a separate hidden
 straight-path bias. E008/E010 computed the goal feature for candidate control

@@ -931,6 +931,26 @@ details belong in `ARCHITECTURE.md`.
   restore the goal-reference retrieval. If it recovers E008, the prior
   regression was optimization rather than architecture. No candidate set,
   safety projection, critic or extra loss is introduced during this audit.
+- Completed source-truth comparison: steps `800/2400/8000` reach ADE
+  `0.05554/0.03790/0.03124 m`, full-path collision
+  `12.484/9.202/9.812%`, and first-metre collision
+  `0.726/0.396/0.247%`. The final checkpoint restores E008's imitation
+  accuracy (`0.03105 m`) while improving its full-path (`11.642%`),
+  first-metre (`0.396%`), forward-detour (`26.572%`) and forward-direct
+  (`2.152%`) collision rates to `9.812/0.247/23.456/1.174%`. It does not
+  dominate E011: E011 remains slightly better on full-path and detour
+  collision (`9.664/22.210%`), while E012 is better on first-metre and direct
+  collision. Therefore the old `6/10 -> 1/10` evidence cannot be assigned to
+  robot-origin retrieval without a matched online run; the training topology
+  was a material confound.
+- Checkpoint-selection lesson: step `2400` has the lowest full-path and detour
+  collision, but the final checkpoint has substantially lower ADE and the
+  lowest execution-prefix collision. Training loss or full-tail collision
+  alone is not a valid checkpoint selector for receding-horizon navigation.
+  At the final checkpoint, `68.24%` of colliding trajectories and all `15`
+  first-metre collisions have no matching obstacle evidence in any of the four
+  raw depth frames. More optimization of the same observation cannot directly
+  correct those invisible cases.
 
 ## E013 — metric retrieval anchors with terminal-only goal intent
 
