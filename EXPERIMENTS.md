@@ -855,3 +855,20 @@ details belong in `ARCHITECTURE.md`.
   rejected: no code branch or custom kernel is retained. A material aggregate
   increase therefore requires more identical GPUs; it is not available from a
   mathematically equivalent local rewrite identified by this audit.
+- Completed source-truth offline evaluation: ADE/FDE are `0.03713/0.09489 m`,
+  full-path collision is `9.664%`, and first `0.5/1.0 m` collision is
+  `0.000/0.346%`. Forward-direct collision is `1.516%`, but forward-detour,
+  rear-goal and expert-moves-away strata remain `22.210/62.857/67.052%`.
+  Approximately `69.97%` of colliding trajectories have no four-frame raw-depth
+  evidence at their collision points. E011 therefore improves E010's
+  `12.187%` full and `0.495%` first-metre collision, but it does not establish
+  closed-loop safety.
+- Vectorized online diagnostic: the fixed Home scene, official episodes `0--9`,
+  seed `1234` and `num-envs=10` complete at `1/10` SR and `0.096125` mean SPL.
+  Episode 6 is the sole success (`0.961246` SPL); the other nine fail. Scene
+  startup plus execution takes about `16.2 min`, while the post-ready ten-episode
+  workload takes about `8.1 min` (`1.23 episode/min`). There is no model, HTTP,
+  Isaac or evaluator exception. This B10 result is a throughput diagnostic and
+  must not be compared numerically with E008/E009/E010's B1 acceptance scores;
+  nevertheless it rejects any claim that the improved offline prefix metric by
+  itself predicts robust closed-loop navigation.
