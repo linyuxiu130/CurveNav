@@ -147,9 +147,9 @@ class TrajectoryDecoderConfig:
 @dataclass(frozen=True)
 class TrainingConfig:
     seed: int = 42
-    global_batch_size: int = 1_368
-    per_device_batch_size: int = 342
-    samples_per_epoch: int = 41_040
+    global_batch_size: int = 1_792
+    per_device_batch_size: int = 448
+    samples_per_epoch: int = 41_216
     epochs: int = 200
     num_workers: int = 2
     prefetch_factor: int = 2

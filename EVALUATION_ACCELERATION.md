@@ -17,8 +17,8 @@
   汇总之后一次性写出，不进入模型热路径。
 - 在线测评由常驻 scene evaluator 复用已加载场景；每个模型只替换 policy
   服务，不重复构建同一资产。在线终止条件和 MPC 仍由固定 benchmark 实现。
-- 生产训练配置为 `1368 = 342 × 4` 的全局 batch，200 个 epoch、每 epoch
-  30 个 optimizer update（共 6000 update）；四张 V100 每卡一次 342 样本，
+- 生产训练配置为 `1792 = 448 × 4` 的全局 batch，200 个 epoch、每 epoch
+  23 个 optimizer update（共 4600 update）；四张 V100 每卡一次 448 样本，
   不用 1024 的人为上限或无必要的梯度累积。
 - 评测输出只保留 `offline-metrics.json`、`offline-cases.json` 和
   `offline-cases.svg`（或调用方指定的等价 artifact 目录），不生成临时

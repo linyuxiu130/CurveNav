@@ -34,9 +34,9 @@ model:
     dropout: 0.0
 training:
   seed: 42
-  global_batch_size: 1368
-  per_device_batch_size: 342
-  samples_per_epoch: 41040
+  global_batch_size: 1792
+  per_device_batch_size: 448
+  samples_per_epoch: 41216
   epochs: 200
   num_workers: 2
   prefetch_factor: 2
