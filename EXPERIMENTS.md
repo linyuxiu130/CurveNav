@@ -946,6 +946,13 @@ details belong in `ARCHITECTURE.md`.
   field is added. Relative to the accepted E008 graph, the sole learned
   semantics change is index-wise straight-template intent to terminal-only
   intent.
+- Verification before CUDA: commit `41cb214` keeps exactly `33,898,916`
+  parameters (`29,018,980` decoder), fourteen Flow coordinates and seven curve
+  tokens. Focused config/checkpoint/policy/loader/precision regression is
+  `65 passed, 1 skipped`; the skip is the production CUDA compile test reserved
+  for GPU2 after E012. A direct counterfactual test changes all intermediate
+  reference controls while fixing `G` and proves the terminal-goal feature is
+  bitwise unchanged. Commit `0a5c0ca` records that contract.
 - Paper/source basis: SanD explicitly separates generated B-splines from ESDF
   selection, while NavDP separates generation from critic selection. CurveNav
   deliberately has neither runtime selector, so trajectory-aligned observed
