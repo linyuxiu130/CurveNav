@@ -905,6 +905,11 @@ details belong in `ARCHITECTURE.md`.
   microbatches bounded by `342`, `40960` samples per epoch, `200` epochs and
   exactly `8000` successful optimizer updates. Learning rate remains `2e-4`;
   it is not rescaled because the original batch is restored.
+- Active run: commit `fd76659` is running on the only free RTX 4090 (GPU2) in
+  tmux `curvenav-e012`. After one-time graph compilation, steps `20--140`
+  sustain `976--988 samples/s`; the device holds about `22.5 GiB` and reaches
+  full compute utilization. The exact log is
+  `/DataDisk2/hsb/curvenav-training-e011/train-e012.log`.
 - Decision gate: compare the final EMA checkpoint with E011 using the same
   source-truth offline strata, then run the fixed ten episodes with
   `num-envs=1`. If E012 remains below E008, reject robot-origin retrieval and
