@@ -145,13 +145,13 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "visual_compression": "metric_splat_and_observed_cspace_16x16_bev",
         "condition_context": "target_independent_metric_bev_plus_motion_tokens",
         "trajectory_condition_interaction": (
-            "goal_reference_retrieval_then_clean_estimate_query_observed_cspace_and_bev"
+            "goal_independent_global_scene_then_clean_estimate_query_observed_cspace_and_bev"
         ),
         "path_relative_geometry": (
-            "goal_reference_then_learned_clean_control_to_bev_metric_attention_bias"
+            "robot_origin_scene_then_learned_clean_control_to_bev_metric_attention_bias"
         ),
         "goal_conditioning": (
-            "candidate_control_to_metric_goal_reference_embedding"
+            "metric_goal_intent_then_candidate_control_to_goal_embedding"
         ),
         "temporal_modeling": (
             "shared_learned_four_frame_depth_tokens_with_metric_se2_alignment"

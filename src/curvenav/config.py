@@ -157,7 +157,7 @@ class TrainingConfig:
     min_learning_rate_factor: float = 0.01
     log_every_steps: int = 20
     checkpoint_every_epochs: int = 20
-    output_dir: str = "outputs/train_policy-e010"
+    output_dir: str = "outputs/train_policy-e011"
     learning_rate: float = 2e-4
     weight_decay: float = 1e-2
     grad_clip_norm: float = 1.0

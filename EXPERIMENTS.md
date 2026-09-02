@@ -800,3 +800,38 @@ details belong in `ARCHITECTURE.md`.
   plan peak-curvature p95 (`80.66 -> 36.63 m^-1`) relative to E009, but does
   not recover any additional success. The retrieval-order correction is
   therefore insufficient and must not replace E008 as the accepted baseline.
+
+## E011 — target-independent global geometry, one proposal query
+
+- Root diagnosis: E009 and E010 both use a non-proposal as the first
+  path-local obstacle query. E009 uses the fixed Gaussian Flow source and
+  reaches `3/10`; E010 uses the straight PointGoal ray and also reaches `3/10`.
+  The former has no clean navigation semantics, while the latter lets target
+  intent choose where geometry is read. Neither is repaired by more epochs.
+- Paper/source basis: LoGoPlanner first extracts task-specific metric geometry
+  and state context, then fuses goal intent into its diffusion policy. Its
+  released runtime still uses ten denoising steps, sixteen samples and a critic;
+  those mechanisms are explicitly excluded. CurveNav already has calibrated
+  depth and known SE(2) history, so learned localization and point-cloud heads
+  would duplicate more accurate inputs.
+- Unique change: the first six blocks attend to the complete BEV/motion memory
+  with metric bias relative to the robot origin. PointGoal remains in query
+  content but cannot relocate memory coordinates, and no C-space path lookup
+  occurs. The instantaneous field produces one clean proposal; only that
+  proposal is decoded and queried against observed C-space before the final six
+  blocks produce the MeanFlow average field.
+- Complexity contract: one deterministic source, one decoder call, one clean
+  proposal, one candidate C-space query and one final B-spline. No new block,
+  head, candidate, critic, loss, projection, recurrent inference or fallback.
+  Removing the E010 reference-ray decode/query slightly reduces work.
+- Acceptance gate: preserve or improve E008's `6/10` fixed online result while
+  reducing source-truth first-metre and forward-detour collision. E009/E010's
+  `3/10` result rejects the version even when ADE, progress or curvature looks
+  better. Training and measurements must remain bound to the E011 code commit.
+- Pre-training verification: the complete CPU suite passes (`114 passed, 4
+  skipped`; two visualization skips lack Matplotlib and two are CUDA-only).
+  The production V100 runtime passes compiled FP16 perception, conditioning,
+  MeanFlow primal/JVP, backward, optimizer step and deployment sampling in
+  `178.74 s`. The graph remains `33,898,916` parameters with `29,018,980` in
+  the decoder; E011 adds no parameter and removes one pre-proposal curve/C-space
+  evaluation.

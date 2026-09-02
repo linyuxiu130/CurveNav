@@ -410,10 +410,9 @@ def test_average_field_is_conditioned_on_interval_start() -> None:
     assert not torch.equal(first_average, second_average)
 
 
-def test_sampling_is_one_call_with_proposal_and_clean_path_geometry() -> None:
+def test_sampling_is_one_call_with_one_clean_proposal_geometry_query() -> None:
     policy = build_policy(tiny_config()).eval()
     inputs = make_condition(2)
-    encoded = policy.encode_condition(inputs)
     calls = []
     geometry_inputs = []
 
@@ -437,40 +436,20 @@ def test_sampling_is_one_call_with_proposal_and_clean_path_geometry() -> None:
     assert len(calls) == 1
     torch.testing.assert_close(calls[0][0], torch.zeros_like(calls[0][0]))
     torch.testing.assert_close(calls[0][1], torch.ones_like(calls[0][1]))
-    assert len(geometry_inputs) == 2
-    reference_path, _ = policy.curve_codec.decode_values(
-        encoded.goal_reference.flatten(1)
-    )
-    reference_geometry, _ = policy.trajectory_decoder._trajectory_geometry(
-        reference_path, encoded.goal_reference, encoded
-    )
-    torch.testing.assert_close(geometry_inputs[0], reference_geometry)
-    assert not torch.equal(geometry_inputs[0], geometry_inputs[1])
+    assert len(geometry_inputs) == 1
+    assert geometry_inputs[0].shape == (2, 7, 7)
 
 
-def test_pointgoal_defines_the_first_spatial_retrieval_reference() -> None:
+def test_pointgoal_does_not_relocate_the_global_scene_query() -> None:
     policy = build_policy(tiny_config()).eval()
     first = policy.encode_condition(make_condition(1))
     second = replace(first, goal_reference=-first.goal_reference)
-    first_path, _ = policy.curve_codec.decode_values(
-        first.goal_reference.flatten(1)
-    )
-    second_path, _ = policy.curve_codec.decode_values(
-        second.goal_reference.flatten(1)
-    )
+    first_scene_geometry = policy.trajectory_decoder._global_scene_geometry(first)
+    second_scene_geometry = policy.trajectory_decoder._global_scene_geometry(second)
+    first_goal_geometry = policy.trajectory_decoder._goal_reference_geometry(first)
+    second_goal_geometry = policy.trajectory_decoder._goal_reference_geometry(second)
 
-    first_path_geometry, first_goal_geometry = (
-        policy.trajectory_decoder._trajectory_geometry(
-            first_path, first.goal_reference, first
-        )
-    )
-    second_path_geometry, second_goal_geometry = (
-        policy.trajectory_decoder._trajectory_geometry(
-            second_path, second.goal_reference, second
-        )
-    )
-
-    assert not torch.equal(first_path_geometry, second_path_geometry)
+    torch.testing.assert_close(first_scene_geometry, second_scene_geometry)
     assert not torch.equal(first_goal_geometry, second_goal_geometry)
 
 

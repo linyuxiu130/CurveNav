@@ -58,7 +58,7 @@ def test_checkpoint_records_the_clean_depth_grounded_flow_contract() -> None:
     contract = value["policy_contract"]
     assert value["checkpoint_type"] == "curvenav_metric_curve_mean_flow_policy"
     assert contract["trajectory_decoder_type"] == (
-        "single_call_goal_reference_then_clean_proposal_cspace_improved_mean_flow"
+        "single_call_global_geometry_then_clean_proposal_cspace_improved_mean_flow"
     )
     assert contract["training_objective"] == (
         "standardized_euclidean_mean_flow_plus_deployed_"
@@ -79,10 +79,10 @@ def test_checkpoint_records_the_clean_depth_grounded_flow_contract() -> None:
         "plus_deployed_curve_training_risk"
     )
     assert contract["trajectory_condition_interaction"] == (
-        "goal_reference_retrieval_then_clean_estimate_query_observed_cspace_and_bev"
+        "goal_independent_global_scene_then_clean_estimate_query_observed_cspace_and_bev"
     )
     assert contract["path_relative_geometry"] == (
-        "goal_reference_then_learned_clean_control_to_bev_metric_attention_bias"
+        "robot_origin_scene_then_learned_clean_control_to_bev_metric_attention_bias"
     )
     assert contract["decoder_flow_fields"] == 2
     assert contract["flow_solver"] == "none_direct_average_velocity"

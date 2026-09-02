@@ -10,7 +10,7 @@ from curvenav.types import ConditionFeatures
 
 
 TRAJECTORY_DECODER_TYPE = (
-    "single_call_goal_reference_then_clean_proposal_cspace_improved_mean_flow"
+    "single_call_global_geometry_then_clean_proposal_cspace_improved_mean_flow"
 )
 
 
@@ -137,6 +137,26 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         )
         return control_path_features, goal_features
 
+    def _goal_reference_geometry(self, condition: ConditionFeatures) -> Tensor:
+        """Encode navigation intent without using it as an obstacle-query path."""
+        origin = torch.zeros_like(condition.goal_reference)
+        delta = condition.goal_reference.float()
+        return torch.cat(
+            (
+                origin,
+                delta / self.planning_horizon_m,
+                torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
+                / self.planning_horizon_m,
+            ),
+            dim=-1,
+        )
+
+    def _global_scene_geometry(self, condition: ConditionFeatures) -> Tensor:
+        """Relate every scene token to the robot origin, independent of intent."""
+        batch = condition.tokens.shape[0]
+        origin = condition.metric_position.new_zeros(batch, self.control_tokens, 2)
+        return self._path_relative_geometry(origin, condition)
+
     def project_condition_memory(
         self, condition: ConditionFeatures
     ) -> tuple[ProjectedCondition, ...]:
@@ -199,31 +219,18 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             2,
         ):
             raise ValueError("goal reference must have shape [B,C,2]")
-        # The noisy Flow state is not a navigation proposal.  Use the metric
-        # PointGoal reference only as a spatial retrieval prior for the first
-        # field, then query C-space on the learned clean proposal below.  The
-        # reference is never decoded as, added to, or executed as a trajectory.
-        reference_controls = condition.goal_reference
-        reference_path, _ = curve_codec.decode_values(
-            reference_controls.flatten(1)
-        )
-        reference_path_geometry, reference_goal_geometry = (
-            self._trajectory_geometry(
-                reference_path,
-                reference_controls,
-                condition,
-            )
-        )
-        reference_pair_geometry = self._path_relative_geometry(
-            reference_controls, condition
-        )
+        # Neither the Gaussian Flow state nor the PointGoal ray is an
+        # executable navigation proposal.  The proposal field therefore reads
+        # the complete metric scene relative to the robot origin.  PointGoal
+        # enters only as intent in the control queries and cannot relocate the
+        # obstacle-memory coordinates.  Path-local geometry becomes meaningful
+        # only after the instantaneous field has produced a clean proposal.
+        global_scene_geometry = self._global_scene_geometry(condition)
+        reference_goal_geometry = self._goal_reference_geometry(condition)
         proposal_tokens = (
             base_tokens
             + self.position_embedding.to(dtype=base_tokens.dtype)
             + instantaneous_time.to(dtype=base_tokens.dtype)
-            + self.path_geometry_embedding(
-                reference_path_geometry.to(base_tokens.dtype)
-            )
             + self.goal_geometry_embedding(
                 reference_goal_geometry.to(base_tokens.dtype)
             )
@@ -232,7 +239,7 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             proposal_tokens = self.blocks[index](
                 proposal_tokens,
                 projected_condition[index],
-                reference_pair_geometry,
+                global_scene_geometry,
             )
         instantaneous = self.instantaneous_velocity_readout(
             self.output_norm(proposal_tokens)

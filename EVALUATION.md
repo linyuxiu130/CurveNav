@@ -63,7 +63,7 @@ condition swap 只在真实 held-out 条件之间做确定性配对，不生成�
 ```bash
 CUDA_VISIBLE_DEVICES=0 scripts/run_training_runtime.sh \
   scripts/evaluate_policy.sh \
-  configs/base.yaml outputs/train_policy-e010/checkpoint.pt \
+  configs/base.yaml outputs/train_policy-e011/checkpoint.pt \
   --artifact-dir outputs/offline-evaluation
 ```
 
