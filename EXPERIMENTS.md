@@ -1060,3 +1060,20 @@ details belong in `ARCHITECTURE.md`.
   frozen-C-space first-hit labels. If E014 does not improve the executable
   prefix and visible first-hit rate, reject the anchor hypothesis instead of
   adding another penalty or inference stage.
+
+## E012 — resident online B10 (2026-09-03)
+
+- Checkpoint: `outputs/train_policy-e012/checkpoint.pt`; fixed Home scene
+  `MVUCSQAKTKJ5EAABAAAAABA8_usd`, seed `1234`, `num-envs=10`, GPU2.
+- Result: `0/10` success and mean SPL `0.000000`; all ten episodes timed out.
+  The run is a throughput/architecture diagnostic, not a fixed-protocol score.
+- Runtime: one resident scene startup took `941.703 s`; after that, the ten
+  episodes completed without a model, HTTP, Isaac, or Acados crash. The
+  trajectory trace contains 829 plans per episode, mean policy latency
+  `200.34 ms`, mean MPC latency `262.27 ms`, and mean total plan latency
+  `462.61 ms`.
+- Interpretation: E012's offline source-truth collision reduction does not
+  transfer to closed-loop execution on this scene. The trace must be read with
+  the per-plan frozen-C-space hit/OOB labels before attributing the failure to
+  the model or controller; no checkpoint is accepted from this run.
+- Artifacts: `/DataDisk2/hsb/eval-server-audit/runs/curvenav-e012-online10-20260903/pointgoal-v2/resident/20260902_202230/`.
