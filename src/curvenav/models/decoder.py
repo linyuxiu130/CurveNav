@@ -10,7 +10,7 @@ from curvenav.types import ConditionFeatures
 
 
 TRAJECTORY_DECODER_TYPE = (
-    "single_call_goal_anchored_proposal_terminal_goal_cspace_improved_mean_flow"
+    "single_call_metric_horizon_anchored_proposal_terminal_goal_cspace_improved_mean_flow"
 )
 
 
@@ -136,7 +136,7 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         condition: ConditionFeatures,
     ) -> Tensor:
         """Express intent as remaining displacement to one local endpoint."""
-        terminal_goal = condition.goal_reference[:, -1:, :].expand_as(
+        terminal_goal = condition.terminal_goal[:, None, :].expand_as(
             candidate_controls
         )
         goal_delta = terminal_goal - candidate_controls.float()
@@ -206,19 +206,19 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
         base_tokens = self.state_embedding(
             state.reshape(state.shape[0], self.control_tokens, 2)
         )
-        if condition.goal_reference.shape != (
+        if condition.metric_reference.shape != (
             state.shape[0],
             self.control_tokens,
             2,
         ):
-            raise ValueError("goal reference must have shape [B,C,2]")
-        # The straight local-goal reference is a metric retrieval coordinate,
-        # not an executed trajectory or additive output.  Distinct control
-        # anchors preserve where each future curve segment reads the scene.
-        # Goal intent itself is encoded only as remaining displacement to the
-        # common terminal local goal, never as matching to the straight
-        # reference point at the same control index.
-        reference_controls = condition.goal_reference
+            raise ValueError("metric reference must have shape [B,C,2]")
+        if condition.terminal_goal.shape != (state.shape[0], 2):
+            raise ValueError("terminal goal must have shape [B,2]")
+        # Fixed forward metric slots locate the target-independent scene.  They
+        # are not an executed trajectory or additive output.  PointGoal enters
+        # only through the common terminal intent below, so it cannot relocate
+        # the first obstacle lookup or impose a straight intermediate route.
+        reference_controls = condition.metric_reference
         reference_path, _ = curve_codec.decode_values(reference_controls.flatten(1))
         reference_path_geometry, reference_goal_geometry = self._trajectory_geometry(
             reference_path,

@@ -259,7 +259,8 @@ class CurveNavPolicy(nn.Module):
             surface_hit=encoded.surface_hit[positive_width],
             frame_age=encoded.frame_age[positive_width],
             motion_token=encoded.motion_token[positive_width],
-            goal_reference=encoded.goal_reference[positive_width],
+            metric_reference=encoded.metric_reference[positive_width],
+            terminal_goal=encoded.terminal_goal[positive_width],
             configuration_field=encoded.configuration_field[positive_width],
         )
         positive_projected_condition = tuple(

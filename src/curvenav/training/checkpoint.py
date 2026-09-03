@@ -111,7 +111,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             "mission_destination_in_current_robot_xy_clamped_to_local_terminal"
         ),
         "point_goal_conditioning": (
-            "metric_goal_reference_retrieval_plus_candidate_to_terminal_local_goal"
+            "terminal_local_goal_intent_only"
         ),
         "trajectory_supervision": (
             "source_cspace_gated_fixed_future_expert_planar_bspline_imitation"
@@ -147,10 +147,10 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "visual_compression": "metric_splat_and_observed_cspace_16x16_bev",
         "condition_context": "target_independent_metric_bev_plus_motion_tokens",
         "trajectory_condition_interaction": (
-            "goal_reference_geometry_then_clean_estimate_query_observed_cspace_and_bev"
+            "metric_horizon_geometry_then_clean_estimate_query_observed_cspace_and_bev"
         ),
         "path_relative_geometry": (
-            "goal_reference_then_learned_clean_control_to_bev_metric_attention_bias"
+            "metric_horizon_then_learned_clean_control_to_bev_metric_attention_bias"
         ),
         "goal_conditioning": (
             "terminal_local_goal_vector_without_straight_template_matching"

@@ -55,7 +55,7 @@ class ConfigurationFeatures:
 
 @dataclass
 class ConditionFeatures:
-    """Target-independent local scene memory and a metric goal reference."""
+    """Target-independent local scene memory and separate metric intents."""
 
     tokens: Tensor
     token_valid: Tensor
@@ -63,7 +63,8 @@ class ConditionFeatures:
     surface_hit: Tensor
     frame_age: Tensor
     motion_token: Tensor
-    goal_reference: Tensor
+    metric_reference: Tensor
+    terminal_goal: Tensor
     configuration_field: Tensor
 
 

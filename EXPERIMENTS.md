@@ -1022,3 +1022,41 @@ details belong in `ARCHITECTURE.md`.
   `0.41474/0.39513/0.01961`. This is evidence of improved optimization only;
   the retained checkpoint still requires the same source-truth and online
   acceptance tests.
+
+## E014 — target-independent metric horizon retrieval
+
+- Root diagnosis: E013 restored distinct retrieval anchors, but placed them on
+  the PointGoal ray. That lets the target choose where the first obstacle
+  lookup occurs; E012's repeated robot-origin query has the opposite defect and
+  cannot distinguish future metric locations. Neither is a clean safety
+  contract.
+- Unique architectural change: replace the first-stage query anchors with the
+  fixed forward metric slots `A_i=(xi_i H,0)`, where `xi_i` are the seven
+  non-origin cubic-B-spline Greville abscissae and `H=3.6 m`. These slots are
+  scene-retrieval coordinates only. The clipped PointGoal terminal `G` remains
+  a separate common intent `[A_i/H,(G-A_i)/H,||G-A_i||/H]`; it cannot move the
+  safety query or impose a straight intermediate route.
+- The rest of the contract is unchanged: four calibrated frames, observed
+  metric C-space/BEV, one deterministic fixed-source improved-MeanFlow call,
+  one clean proposal query, one final B-spline and the existing deployment-path
+  clearance objective. No candidate set, critic, extra loss, hard projection,
+  inference loop or data branch is introduced.
+- Mathematical gate: changing PointGoal while holding depth and state fixed
+  must leave `metric_reference`, the first-stage reference path and its scene
+  relative geometry bitwise unchanged, while changing only terminal intent and
+  the final trajectory. Each anchor must be distinct and decode to the identity
+  forward segment from the robot origin to `H`; the anchors are never output
+  initialization.
+- Paper basis: SanD and NavDP separate target-conditioned generation from
+  target-independent visual geometry before their ESDF/critic selection;
+  LoGoPlanner uses metric task geometry rather than a straight output template.
+  E014 adopts only that factorization while preserving CurveNav's single-step
+  constraint. The fixed slots provide each future control a physical scene
+  location without allowing PointGoal to bias the safety representation.
+- Acceptance: run the focused mathematical/gradient suite, then train from
+  zero with the E012 contract on the fastest available homogeneous GPUs. Do not
+  select a checkpoint by ADE alone. Require source-truth full/first-metre and
+  forward-detour strata plus the fixed ten-episode online trace with per-plan
+  frozen-C-space first-hit labels. If E014 does not improve the executable
+  prefix and visible first-hit rate, reject the anchor hypothesis instead of
+  adding another penalty or inference stage.

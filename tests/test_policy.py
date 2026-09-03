@@ -22,7 +22,7 @@ from curvenav.models.blocks import (
     ReusableConditionCrossAttention,
 )
 from curvenav.precision import cuda_precision
-from curvenav.trajectory import metric_goal_reference
+from curvenav.trajectory import local_terminal_goal, metric_horizon_reference
 from curvenav.training.optimizer import build_optimizer
 from curvenav.training.runtime import (
     compile_static_training_functions,
@@ -95,16 +95,14 @@ def test_control_increment_coordinates_are_exactly_invertible() -> None:
     )
 
 
-def test_greville_goal_reference_is_an_exact_straight_bspline() -> None:
+def test_metric_horizon_reference_is_target_independent_forward_slots() -> None:
     codec = build_policy(tiny_config()).curve_codec
-    goals = torch.tensor([[2.0, 1.0], [10.0, 0.0], [0.0, 0.0]])
-    reference = metric_goal_reference(goals, 3.6)
+    reference = metric_horizon_reference(
+        3, 3.6, device=torch.device("cpu"), dtype=torch.float32
+    )
     path, _ = codec.decode_values(reference.flatten(1))
     endpoint = reference[:, -1]
-    expected = (
-        torch.linspace(0.0, 1.0, codec.num_path_points)[None, :, None]
-        * endpoint[:, None]
-    )
+    expected = torch.linspace(0.0, 1.0, codec.num_path_points)[None, :, None] * endpoint[:, None]
     torch.testing.assert_close(path, expected, atol=5e-6, rtol=5e-6)
 
 
@@ -134,30 +132,29 @@ def test_pointgoal_never_rewrites_scene_memory() -> None:
     first_encoded = policy.encode_condition(first)
     second_encoded = policy.encode_condition(second)
     torch.testing.assert_close(first_encoded.tokens, second_encoded.tokens)
-    assert not torch.equal(
-        first_encoded.goal_reference, second_encoded.goal_reference
-    )
+    torch.testing.assert_close(first_encoded.metric_reference, second_encoded.metric_reference)
+    assert not torch.equal(first_encoded.terminal_goal, second_encoded.terminal_goal)
     assert first_encoded.tokens.shape[1] == 16 * 16 + 3
     torch.testing.assert_close(first_encoded.token_valid, second_encoded.token_valid)
 
 
-def test_pointgoal_reference_is_metric_local_and_does_not_constrain_output() -> None:
+def test_terminal_goal_is_metric_local_and_does_not_constrain_output() -> None:
     policy = build_policy(tiny_config()).eval()
     encoder = policy.condition_encoder
     goals = torch.tensor(
         [[1.0, 0.0], [1000.0, 0.0], [0.0, 1000.0], [0.0, 0.0]]
     )
-    reference = encoder._goal_reference(goals)
+    terminal = local_terminal_goal(goals, 3.6)
 
-    assert torch.isfinite(reference).all()
+    assert torch.isfinite(terminal).all()
     torch.testing.assert_close(
-        reference[0, -1],
+        terminal[0],
         goals[0],
     )
-    torch.testing.assert_close(reference[1, -1], torch.tensor([3.6, 0.0]))
-    torch.testing.assert_close(reference[2, -1], torch.tensor([0.0, 3.6]))
-    torch.testing.assert_close(reference[3], torch.zeros(7, 2))
-    # The reference is conditioning geometry, not a codec constraint.
+    torch.testing.assert_close(terminal[1], torch.tensor([3.6, 0.0]))
+    torch.testing.assert_close(terminal[2], torch.tensor([0.0, 3.6]))
+    torch.testing.assert_close(terminal[3], torch.zeros(2))
+    # The terminal intent is conditioning, not a codec constraint.
     decoded, _ = policy.curve_codec.decode(torch.full((4, 14), 10.0))
     assert torch.linalg.vector_norm(decoded[:, -1], dim=-1).max() > 3.6
 
@@ -178,7 +175,7 @@ def test_trajectory_block_promotes_reusable_condition_to_query_dtype() -> None:
     assert output.shape == trajectory.shape and torch.isfinite(output).all()
 
 
-def test_pointgoal_enters_decoder_only_as_metric_reference_geometry() -> None:
+def test_pointgoal_enters_decoder_only_as_terminal_intent() -> None:
     policy = build_policy(tiny_config()).eval()
     names = tuple(name for name, _ in policy.named_parameters())
     assert not any(
@@ -192,7 +189,7 @@ def test_pointgoal_enters_decoder_only_as_metric_reference_geometry() -> None:
     second_encoded = policy.encode_condition(second)
     second_with_first_reference = replace(
         second_encoded,
-        goal_reference=first_encoded.goal_reference,
+        metric_reference=first_encoded.metric_reference,
     )
     state = torch.randn(1, 14)
     start = torch.zeros(1)
@@ -213,7 +210,7 @@ def test_pointgoal_enters_decoder_only_as_metric_reference_geometry() -> None:
             second_with_first_reference
         ),
     )[0]
-    torch.testing.assert_close(first_velocity, second_velocity)
+    assert not torch.equal(first_velocity, second_velocity)
 
 
 def test_depth_and_pointgoal_both_condition_the_trajectory() -> None:
@@ -440,31 +437,35 @@ def test_sampling_is_one_call_with_reference_and_proposal_geometry_queries() -> 
     assert all(value.shape == (2, 7, 7) for value in geometry_inputs)
 
 
-def test_goal_reference_provides_distinct_metric_retrieval_anchors() -> None:
+def test_metric_reference_provides_distinct_target_independent_anchors() -> None:
     policy = build_policy(tiny_config()).eval()
     encoded = policy.encode_condition(make_condition(1))
     geometry = policy.trajectory_decoder._path_relative_geometry(
-        encoded.goal_reference,
+        encoded.metric_reference,
         encoded,
     )
     assert not torch.equal(geometry[:, 0], geometry[:, -1])
 
 
-def test_goal_geometry_uses_one_terminal_goal_not_a_straight_template() -> None:
+def test_goal_geometry_uses_one_terminal_goal_not_metric_slots() -> None:
     policy = build_policy(tiny_config()).eval()
     encoded = policy.encode_condition(make_condition(1))
-    candidate = encoded.goal_reference.clone()
+    candidate = encoded.metric_reference.clone()
     geometry = policy.trajectory_decoder._goal_geometry(candidate, encoded)
-    expected_delta = encoded.goal_reference[:, -1:, :] - candidate
+    expected_delta = encoded.terminal_goal[:, None, :] - candidate
     torch.testing.assert_close(
         geometry[..., 2:4] * policy.planning_horizon_m,
         expected_delta,
     )
     assert torch.count_nonzero(geometry[:, :-1, 4]) > 0
-    torch.testing.assert_close(geometry[:, -1, 4], torch.zeros(1))
-    changed_reference = encoded.goal_reference.clone()
+    terminal_candidate = encoded.terminal_goal[:, None, :].expand_as(candidate)
+    terminal_geometry = policy.trajectory_decoder._goal_geometry(
+        terminal_candidate, encoded
+    )
+    torch.testing.assert_close(terminal_geometry[:, -1, 4], torch.zeros(1))
+    changed_reference = encoded.metric_reference.clone()
     changed_reference[:, :-1] += torch.randn_like(changed_reference[:, :-1])
-    changed = replace(encoded, goal_reference=changed_reference)
+    changed = replace(encoded, metric_reference=changed_reference)
     torch.testing.assert_close(
         policy.trajectory_decoder._goal_geometry(candidate, changed),
         geometry,
@@ -479,7 +480,7 @@ def test_reusable_cross_attention_matches_projected_call() -> None:
     encoded = policy.encode_condition(make_condition(2))
     projected = layer.project_condition(encoded)
     geometry = policy.trajectory_decoder._path_relative_geometry(
-        encoded.goal_reference, encoded
+        encoded.metric_reference, encoded
     )
     output = layer(query, projected, geometry)
     assert output.shape == query.shape and torch.isfinite(output).all()
@@ -498,7 +499,7 @@ def test_reusable_cross_attention_excludes_invalid_history_tokens() -> None:
     first_condition = replace(encoded, token_valid=valid)
     second_condition = replace(encoded, tokens=changed, token_valid=valid)
     geometry = policy.trajectory_decoder._path_relative_geometry(
-        encoded.goal_reference, encoded
+        encoded.metric_reference, encoded
     )
     first = layer(query, layer.project_condition(first_condition), geometry)
     second = layer(query, layer.project_condition(second_condition), geometry)
@@ -512,7 +513,7 @@ def test_reusable_cross_attention_promotes_cached_memory_to_query_dtype() -> Non
     encoded = policy.encode_condition(make_condition(2))
     key, value, *geometry = layer.project_condition(encoded)
     pair_geometry = policy.trajectory_decoder._path_relative_geometry(
-        encoded.goal_reference, encoded
+        encoded.metric_reference, encoded
     )
     output = layer(
         query,
@@ -594,7 +595,7 @@ def test_goal_does_not_relocate_candidate_relative_scene_queries() -> None:
     baseline = policy.trajectory_decoder._path_relative_geometry(
         candidate_controls, encoded
     )
-    changed = replace(encoded, goal_reference=-encoded.goal_reference)
+    changed = replace(encoded, metric_reference=-encoded.metric_reference)
     torch.testing.assert_close(
         baseline,
         policy.trajectory_decoder._path_relative_geometry(
