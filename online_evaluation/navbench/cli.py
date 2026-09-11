@@ -42,7 +42,7 @@ PAPER_SEED = 1234
 STOP = threading.Event()
 ACTIVE: set[subprocess.Popen] = set()
 ACTIVE_LOCK = threading.Lock()
-INPUT_LAYOUT_VERSION = "mdl-overlay-v1"
+INPUT_LAYOUT_VERSION = "mdl-overlay-v2"
 UE4_MDL_MODULES = (
     "OmniUe4Base",
     "OmniUe4Function",
@@ -720,7 +720,11 @@ def isaac_ue4_mdl_root(eval_python: str) -> Path:
     return valid[0]
 
 
-def _symlink_asset(source: str, target: str) -> str:
+def _materialize_asset(source: str, target: str) -> str:
+    # USD/MDL resolve relative dependencies from their file location. Keep those
+    # documents in the overlay where the canonical MDL imports are installed.
+    if Path(source).suffix.lower() in {".usd", ".usda", ".usdc", ".mdl"}:
+        return shutil.copy2(source, target)
     Path(target).symlink_to(Path(source).absolute())
     return target
 
@@ -733,14 +737,22 @@ def _ignore_isaac_mdl_dependencies(_directory: str, names: list[str]) -> set[str
 def materialize_scene_overlay(
     source: Path, target: Path, mdl_root: Path,
 ) -> int:
-    """Mirror immutable assets by symlink and close their relative MDL imports."""
+    """Keep scene documents local, link bulk assets and close relative MDL imports."""
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        excluded = _ignore_isaac_mdl_dependencies(directory, names)
+        if Path(directory) == source:
+            excluded.add("models")
+        return excluded
+
     shutil.copytree(
         source,
         target,
         symlinks=True,
-        copy_function=_symlink_asset,
-        ignore=_ignore_isaac_mdl_dependencies,
+        copy_function=_materialize_asset,
+        ignore=ignore,
     )
+    if (source / "models").is_dir():
+        (target / "models").symlink_to((source / "models").absolute(), target_is_directory=True)
     linked = 0
     mdl_directories = sorted({path.parent for path in target.rglob("*.mdl")})
     for directory in mdl_directories:

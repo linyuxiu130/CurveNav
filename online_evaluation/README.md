@@ -39,10 +39,10 @@ cp config/local.env.example config/local.env
 ```bash
 NAVBENCH_EVAL_PYTHON=/opt/conda/envs/curvenav-unified/bin/python
 NAVBENCH_SERVER_PYTHON=/opt/conda/envs/curvenav-unified/bin/python
-NAVBENCH_SCENE_ROOT=/shibo_huang/general-navigation-benchmark/assets/scenes
-NAVBENCH_WEIGHT_ROOT=/shibo_huang/general-navigation-benchmark/weights
-NAVBENCH_XNAVDP_ROOT=/shibo_huang/general-navigation-benchmark/.runtime/x-navdp-878740a20118/baselines/x-navdp
-ACADOS_SOURCE_DIR=/shibo_huang/general-navigation-benchmark/.runtime/acados-48e223e85f04
+NAVBENCH_SCENE_ROOT=/shibo_huang/CurveNav/online_evaluation/assets/scenes
+NAVBENCH_WEIGHT_ROOT=/shibo_huang/CurveNav/online_evaluation/weights
+NAVBENCH_XNAVDP_ROOT=/shibo_huang/CurveNav/online_evaluation/.runtime/x-navdp-878740a20118/baselines/x-navdp
+ACADOS_SOURCE_DIR=/shibo_huang/CurveNav/online_evaluation/.runtime/acados-48e223e85f04
 NAVBENCH_CACHE_ROOT=/shibo_huang/.cache/navbench
 NAVBENCH_GPUS=1
 NAVBENCH_NUM_ENVS=16
@@ -84,8 +84,8 @@ SanD、NavDP、X-NavDP 共用一次场景加载：先创建两个模型清单目
 mkdir -p cache/model-artifacts/sandplanner cache/model-artifacts/x-navdp
 cp config/artifacts/sandplanner/artifact.json cache/model-artifacts/sandplanner/
 cp config/artifacts/x-navdp/artifact.json cache/model-artifacts/x-navdp/
-ln -s /shibo_huang/general-navigation-benchmark/weights/sandplanner/NoMax.pth cache/model-artifacts/sandplanner/checkpoint.pt
-ln -s /shibo_huang/general-navigation-benchmark/weights/x-navdp/x-navdp_posttrain.ckpt cache/model-artifacts/x-navdp/checkpoint.pt
+ln -s /shibo_huang/CurveNav/online_evaluation/weights/sandplanner/NoMax.pth cache/model-artifacts/sandplanner/checkpoint.pt
+ln -s /shibo_huang/CurveNav/online_evaluation/weights/x-navdp/x-navdp_posttrain.ckpt cache/model-artifacts/x-navdp/checkpoint.pt
 python -m navbench --model navdp --gpus 1 --num-envs 16 \
   --artifact-bundle cache/model-artifacts/sandplanner \
   --artifact-bundle cache/model-artifacts/x-navdp \

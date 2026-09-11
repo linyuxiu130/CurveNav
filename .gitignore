@@ -42,3 +42,6 @@ torchinductor/
 .env.*
 !.env.example
 config/local.env
+
+# Local recovery archives
+/backups/

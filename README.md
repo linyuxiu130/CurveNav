@@ -24,6 +24,19 @@ CurveNav 是 PointGoal 条件的米制局部轨迹生成器。当前输入为深
 checkpoint 测评。三条链路共用 `encoders/`、`conditioning/`、`models/`、`trajectory/`
 中的模型与几何实现。详细定义见 [架构说明](ARCHITECTURE.md) 和 [测评说明](EVALUATION.md)。
 
+## 本地目录分工
+
+唯一项目根目录为 `/shibo_huang/CurveNav`，不再保留独立 review 或旧测评仓库。
+
+| 目录 | 分工 |
+| --- | --- |
+| `src/`、`configs/`、`scripts/` | 当前数据生成、模型和训练代码 |
+| `data/` | HSSD 资产与当前训练数据 |
+| `online_evaluation/` | 按模型组织的在线测评代码 |
+| `online_evaluation/assets/`、`weights/`、`.runtime/` | 测评场景、基线权重与固定运行时，均在 online_evaluation 下 |
+| `outputs/` | 当前专家源轨迹、训练 checkpoint、测评结果和实验依据 |
+| `backups/recovery/` | 一份当前环境恢复包与恢复脚本 |
+
 ## GitHub 上传范围
 
 本仓库已上传上述三条链路的源码、配置、入口脚本、测试和中文文档。
@@ -39,8 +52,8 @@ CurveNav 接入，继续使用 `python -m navbench` 入口。各模型的启动�
 
 ## 运行流程
 
-重启后恢复：`bash /shibo_huang/curvenav-recovery/restore.sh`。
-备份目录、资产位置和兼容性约束见 `/shibo_huang/curvenav-recovery/README.md`。
+重启后恢复：`bash /shibo_huang/CurveNav/scripts/restore_environment.sh`。
+备份目录、资产位置和兼容性约束见 `/shibo_huang/CurveNav/backups/recovery/README.md`。
 
 本地训练和测评共用 `curvenav-unified`（Python 3.11、PyTorch 2.7.0 / CUDA 12.6）：
 

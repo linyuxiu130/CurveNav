@@ -383,10 +383,17 @@ class PaperContractTests(unittest.TestCase):
             modules.mkdir()
             for name in ("OmniUe4Base", "OmniUe4Function", "OmniUe4Translucent"):
                 (modules / f"{name}.mdl").write_text(f"mdl 1.6; // {name}\n")
+            (source / "models").mkdir()
+            (source / "models/geometry.usd").write_text("#usda 1.0\n")
             target = root / "overlay"
             linked = materialize_scene_overlay(source, target, modules)
+            self.assertTrue((target / "models").is_symlink())
+            self.assertEqual((target / "models").resolve(), source / "models")
             self.assertEqual(linked, 1)
-            self.assertTrue((target / "room/mesh.usd").is_symlink())
+            self.assertFalse((target / "room/mesh.usd").is_symlink())
+            self.assertFalse((target / "room/material/chair.mdl").is_symlink())
+            self.assertEqual((target / "room/material/chair.mdl").read_text(),
+                             (material / "chair.mdl").read_text())
             self.assertTrue((target / "room/material/OmniUe4Base.mdl").is_symlink())
             self.assertTrue((material / "OmniUe4Base.mdl").is_file())
 
