@@ -70,10 +70,10 @@ python -m pip check
 Conda 提供，系统需有 GCC。PyTorch 安装版本参见
 [官方历史版本说明](https://pytorch.org/get-started/previous-versions/#v260)。
 
-2026-09-10 的几何渲染、GPU 测试、真实数据短训练及闭环验证记录见
-`outputs/eval-alignment-20260910/RESULTS.md`。环境安装记录保留在
-`outputs/environment-20260910/`；数据生成以输出目录的 `audit/summary.json`
-通过为完成标志，准备目录使用实际拟合的 `config.yaml`。
+当前环境验证、离线测评和在线测评日志保留在
+`outputs/evaluation-flow-20260911/`；在线测评是否完成以实际生成的结果为准。
+数据生成以输出目录的 `audit/summary.json` 通过为完成标志，
+准备目录使用实际拟合的 `config.yaml`。
 
 在包含 Habitat-Sim 的已激活环境中，直接生产训练格式并编译标签：
 
