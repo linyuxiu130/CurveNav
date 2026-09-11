@@ -1,0 +1,12 @@
+config:
+  sem: true
+  rgb: false
+  img_input_size: [360, 640]
+  in_channel: 16
+  knodes: 5
+  pre_train_sem: true
+  pre_train_freeze: true
+  decoder_small: false
+  data_cfg:
+    max_depth: 15.0
+    max_goal_distance: 15.0

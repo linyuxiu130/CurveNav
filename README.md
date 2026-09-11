@@ -30,8 +30,9 @@ checkpoint 测评。三条链路共用 `encoders/`、`conditioning/`、`models/`
 数据集、场景资产、模型权重、运行结果、Conda 环境和编译缓存保留在本地，由
 [.gitignore](.gitignore) 排除。
 
-SanD、NavDP、X-NavDP 的仿真执行器与服务代码位于独立本地目录
-`/shibo_huang/general-navigation-benchmark`，未包含在本次 CurveNav 仓库上传中。
+在线仿真测评的调度器、模型适配器、固定题目与运行时准备脚本也已纳入
+[online_evaluation/](online_evaluation/README.md)，支持 SanD、NavDP、X-NavDP 和
+CurveNav 接入，继续使用 `python -m navbench` 入口。
 本机测评缓存位于 `/shibo_huang/.cache/navbench`。
 下文 `/shibo_huang/` 路径和 `outputs/` 验证记录均为本机位置，并非 GitHub 附件。
 

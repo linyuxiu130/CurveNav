@@ -1,0 +1,160 @@
+diff --git a/requirements.txt b/requirements.txt
+index f6901fc..411aee7 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -4,8 +4,8 @@ imageio
+ imageio-ffmpeg
+ matplotlib
+ numba
+-numpy==1.26.4
++numpy>=1.26,<2
+ numpy-quaternion
+-pillow==10.4.0
++pillow>=10.4,<12
+ scipy>=1.10.1
+ tqdm
+diff --git a/src/esp/assets/ResourceManager.cpp b/src/esp/assets/ResourceManager.cpp
+index 8301d84..bf7631d 100644
+--- a/src/esp/assets/ResourceManager.cpp
++++ b/src/esp/assets/ResourceManager.cpp
+@@ -2031,7 +2031,9 @@ Mn::Trade::MaterialData createUniversalMaterial(
+     if (!setTexMatrix &&
+         (!pbrMaterial.hasAttribute(MaterialAttribute::TextureMatrix))) {
+       arrayAppend(newAttributes, {MaterialAttribute::TextureMatrix,
+-                                  pbrMaterial.commonTextureMatrix()});
++                                  pbrMaterial.hasAttribute(MaterialAttribute::BaseColorTexture)
++                                      ? pbrMaterial.baseColorTextureMatrix()
++                                      : pbrMaterial.commonTextureMatrix()});
+       setTexMatrix = true;
+     }
+ 
+diff --git a/src/esp/gfx/PbrDrawable.cpp b/src/esp/gfx/PbrDrawable.cpp
+index f6222ec..847ca64 100644
+--- a/src/esp/gfx/PbrDrawable.cpp
++++ b/src/esp/gfx/PbrDrawable.cpp
+@@ -67,9 +67,18 @@ void PbrDrawable::setMaterialValuesInternal(
+   matCache.metalness = tmpMaterialData.metalness();
+   matCache.emissiveColor = tmpMaterialData.emissiveColor();
+ 
+-  if (tmpMaterialData.commonTextureMatrix() != Mn::Matrix3{}) {
++  const auto textureMatrix = tmpMaterialData.hasCommonTextureTransformation()
++                                 ? tmpMaterialData.commonTextureMatrix()
++                                 : tmpMaterialData.baseColorTextureMatrix();
++  CORRADE_ASSERT(!tmpMaterialData.hasAttribute(Mn::Trade::MaterialAttribute::NormalTexture) ||
++                     tmpMaterialData.normalTextureMatrix() == textureMatrix,
++                 "PbrDrawable: normal and base-color texture transforms differ", );
++  CORRADE_ASSERT(!tmpMaterialData.hasAttribute(Mn::Trade::MaterialAttribute::EmissiveTexture) ||
++                     tmpMaterialData.emissiveTextureMatrix() == textureMatrix,
++                 "PbrDrawable: emissive and base-color texture transforms differ", );
++  matCache.textureMatrix = textureMatrix;
++  if (textureMatrix != Mn::Matrix3{}) {
+     flags_ |= PbrShader::Flag::TextureTransformation;
+-    matCache.textureMatrix = tmpMaterialData.commonTextureMatrix();
+   }
+   if (const auto baseColorTexturePtr =
+           materialData->findAttribute<Mn::GL::Texture2D*>(
+@@ -83,6 +92,11 @@ void PbrDrawable::setMaterialValuesInternal(
+               "noneRoughnessMetallicTexturePointer")) {
+     flags_ |= PbrShader::Flag::NoneRoughnessMetallicTexture;
+     matCache.noneRoughnessMetallicTexture = *noneRoughMetalTexturePtr;
++    // The shader's texCoord already contains the base-color transform.
++    matCache.metallicRoughnessTextureMatrix =
++        tmpMaterialData.hasCommonTextureTransformation()
++            ? Mn::Matrix3{}
++            : tmpMaterialData.roughnessTextureMatrix() * textureMatrix.inverted();
+   }
+ 
+   if (const auto normalTexturePtr =
+@@ -523,6 +537,7 @@ void PbrDrawable::draw(const Mn::Matrix4& transformationMatrix,
+   if (flags_ >= PbrShader::Flag::NoneRoughnessMetallicTexture) {
+     shader_->bindMetallicRoughnessTexture(
+         *matCache.noneRoughnessMetallicTexture);
++    shader_->setMetallicRoughnessTextureMatrix(matCache.metallicRoughnessTextureMatrix);
+   }
+ 
+   if (flags_ >= PbrShader::Flag::NormalTexture) {
+diff --git a/src/esp/gfx/PbrDrawable.h b/src/esp/gfx/PbrDrawable.h
+index e7e9a2d..2ef58d1 100644
+--- a/src/esp/gfx/PbrDrawable.h
++++ b/src/esp/gfx/PbrDrawable.h
+@@ -29,6 +29,7 @@ class PbrDrawable : public Drawable {
+     float metalness = 1.0f;
+     Mn::Color3 emissiveColor{};
+     Mn::Matrix3 textureMatrix{};
++    Mn::Matrix3 metallicRoughnessTextureMatrix{};
+ 
+     Mn::GL::Texture2D* baseColorTexture = nullptr;
+ 
+diff --git a/src/esp/gfx/PbrShader.cpp b/src/esp/gfx/PbrShader.cpp
+index 1c733b0..8d2e32b 100644
+--- a/src/esp/gfx/PbrShader.cpp
++++ b/src/esp/gfx/PbrShader.cpp
+@@ -328,6 +328,10 @@ PbrShader::PbrShader(const Configuration& config)
+   }
+ 
+   // materials
++  if (flags_ >= Flag::NoneRoughnessMetallicTexture) {
++    metallicRoughnessTextureMatrixUniform_ = uniformLocation("uMetallicRoughnessTextureMatrix");
++    setUniform(metallicRoughnessTextureMatrixUniform_, Mn::Matrix3{});
++  }
+   baseColorUniform_ = uniformLocation("uMaterial.baseColor");
+   roughnessUniform_ = uniformLocation("uMaterial.roughness");
+   metallicUniform_ = uniformLocation("uMaterial.metallic");
+@@ -791,6 +795,11 @@ PbrShader& PbrShader::setCameraWorldPosition(
+   return *this;
+ }
+ 
++PbrShader& PbrShader::setMetallicRoughnessTextureMatrix(const Mn::Matrix3& matrix) {
++  setUniform(metallicRoughnessTextureMatrixUniform_, matrix);
++  return *this;
++}
++
+ PbrShader& PbrShader::setTextureMatrix(const Mn::Matrix3& matrix) {
+   CORRADE_ASSERT(flags_ >= Flag::TextureTransformation,
+                  "PbrShader::setTextureMatrix(): the shader was not "
+diff --git a/src/esp/gfx/PbrShader.h b/src/esp/gfx/PbrShader.h
+index 19d0e07..d94c3c4 100644
+--- a/src/esp/gfx/PbrShader.h
++++ b/src/esp/gfx/PbrShader.h
+@@ -496,6 +496,7 @@ class PbrShader : public Magnum::GL::AbstractShaderProgram {
+    * @return Reference to self (for method chaining)
+    */
+   PbrShader& setTextureMatrix(const Magnum::Matrix3& matrix);
++  PbrShader& setMetallicRoughnessTextureMatrix(const Magnum::Matrix3& matrix);
+ 
+   /**
+    *  @brief Set "projection" matrix to the uniform on GPU
+@@ -868,6 +869,7 @@ class PbrShader : public Magnum::GL::AbstractShaderProgram {
+   int emissiveColorUniform_ = ID_UNDEFINED;
+   int objectIdUniform_ = ID_UNDEFINED;
+   int textureMatrixUniform_ = ID_UNDEFINED;
++  int metallicRoughnessTextureMatrixUniform_ = ID_UNDEFINED;
+   int normalTextureScaleUniform_ = ID_UNDEFINED;
+   int lightColorsUniform_ = ID_UNDEFINED;
+   int lightRangesUniform_ = ID_UNDEFINED;
+diff --git a/src/shaders/gfx/pbrMaterials.glsl b/src/shaders/gfx/pbrMaterials.glsl
+index de61887..ded45d9 100644
+--- a/src/shaders/gfx/pbrMaterials.glsl
++++ b/src/shaders/gfx/pbrMaterials.glsl
+@@ -182,7 +182,8 @@ PBRData buildPBRData() {
+   pbrInfo.metallic = uMaterial.metallic;
+ #if defined(NONE_ROUGHNESS_METALLIC_TEXTURE)
+   vec3 RoughnessMetallicSample =
+-      texture(uMetallicRoughnessTexture, texCoord).rgb;
++      texture(uMetallicRoughnessTexture,
++              (uMetallicRoughnessTextureMatrix * vec3(texCoord, 1.0)).xy).rgb;
+ 
+   pbrInfo.perceivedRoughness *= RoughnessMetallicSample.g;
+   pbrInfo.metallic *= RoughnessMetallicSample.b;
+diff --git a/src/shaders/gfx/pbrUniforms.glsl b/src/shaders/gfx/pbrUniforms.glsl
+index fa4a1d6..586aa20 100644
+--- a/src/shaders/gfx/pbrUniforms.glsl
++++ b/src/shaders/gfx/pbrUniforms.glsl
+@@ -59,6 +59,7 @@ uniform sampler2D uBaseColorTexture;
+ #endif
+ #if defined(NONE_ROUGHNESS_METALLIC_TEXTURE)
+ uniform sampler2D uMetallicRoughnessTexture;
++uniform highp mat3 uMetallicRoughnessTextureMatrix;
+ #endif
+ #if defined(NORMAL_TEXTURE)
+ uniform float uNormalTextureScale;

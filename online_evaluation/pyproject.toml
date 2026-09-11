@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "general-navigation-benchmark"
+version = "0.1.0"
+description = "A reproducible, multi-GPU benchmark for visual navigation policies"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+navbench = "navbench.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["navbench*"]
+namespaces = false

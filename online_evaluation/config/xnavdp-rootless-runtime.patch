@@ -1,0 +1,470 @@
+diff --git a/baselines/x-navdp/src/environment/controllers/__init__.py b/baselines/x-navdp/src/environment/controllers/__init__.py
+index 81d3557..bb08ca7 100644
+--- a/baselines/x-navdp/src/environment/controllers/__init__.py
++++ b/baselines/x-navdp/src/environment/controllers/__init__.py
+@@ -1,11 +1,5 @@
+-"""Robot velocity controller implementations."""
++"""Differential-drive controller used by the wheeled evaluator."""
+ 
+ from .differential_controller import DifferentialController
+-from .humanoid_controller import G1VelocityController
+-from .quadruped_controller import Go2VelocityController
+ 
+-__all__ = [
+-    "DifferentialController",
+-    "G1VelocityController",
+-    "Go2VelocityController",
+-]
++__all__ = ["DifferentialController"]
+diff --git a/baselines/x-navdp/src/environment/env_wrapper.py b/baselines/x-navdp/src/environment/env_wrapper.py
+index 69be005..f5360a5 100644
+--- a/baselines/x-navdp/src/environment/env_wrapper.py
++++ b/baselines/x-navdp/src/environment/env_wrapper.py
+@@ -2,26 +2,17 @@
+ 
+ import os
+ from typing import Union
+-from .scenes import PointNavSceneCfg, PointNavEvalSceneCfg, GOAL_CFG, BENCH_TERRAIN_CFG
++from .scenes import PointNavSceneCfg, BENCH_TERRAIN_CFG
+ from .robots import (
+-    DINGO_CFG, DINGO_ContactCfg, DINGO_CameraCfg, DINGO_BirdEye_CameraCfg,
++    DINGO_CFG, DINGO_ContactCfg, DINGO_CameraCfg,
+     DINGO_WHEEL_BASE, DINGO_WHEEL_RADIUS,
+-    G1_CFG, G1_ContactCfg, G1_CameraCfg, G1_BirdEye_CameraCfg,
+-    GO2_CFG, GO2_ContactCfg, GO2_CameraCfg, GO2_BirdEye_CameraCfg,
+-)
+-from .wheeled_tasks import DingoEvalPointNavCfg, DingoRLPointNavOffStage1Cfg, BaseVelocityActionsCfg, BasePositionActionsCfg, QuadrupedPositionActionsCfg
+-from .tasks.observation_utils import (
+-    PointNavObservationsDingoCfg,
+-    PointNavObservationsUnitreeG1Cfg,
+-    PointNavObservationsUnitreeGo2Cfg,
+-    PointNavEvalObservationsDingoCfg,
+-    PointNavEvalObservationsUnitreeG1Cfg,
+-    PointNavEvalObservationsUnitreeGo2Cfg,
+ )
++from .wheeled_tasks import DingoEvalPointNavCfg, DingoRLPointNavOffStage1Cfg, BaseVelocityActionsCfg
++from .tasks.observation_utils import PointNavObservationsDingoCfg
+ from .tasks.curriculum_utils import _EMBODIMENT_DECIMATION_CFG
+ from isaaclab.envs import ManagerBasedRLEnv
+ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+-from .controllers import DifferentialController, G1VelocityController, Go2VelocityController
++from .controllers import DifferentialController
+ import omni.usd
+ from pxr import Usd, UsdGeom, Gf, UsdPhysics, PhysxSchema
+ 
+@@ -362,29 +353,17 @@ def adjust_usd_scale(
+ 
+ # 具身形态到配置的映射
+ 
+-_EMBODIMENT_ROBOT_CFG = {'dingo': DINGO_CFG, 'unitree_g1': G1_CFG, 'unitree_go2': GO2_CFG}
+-_EMBODIMENT_CONTACT_CFG = {'dingo': DINGO_ContactCfg, 'unitree_g1': G1_ContactCfg, 'unitree_go2': GO2_ContactCfg}
+-_EMBODIMENT_CAMERA_CFG = {'dingo': DINGO_CameraCfg, 'unitree_g1': G1_CameraCfg, 'unitree_go2': GO2_CameraCfg}
+-_EMBODIMENT_BIRDEYE_CAMERA_CFG = {
+-    'dingo': DINGO_BirdEye_CameraCfg,
+-    'unitree_g1': G1_BirdEye_CameraCfg,
+-    'unitree_go2': GO2_BirdEye_CameraCfg,
+-}
+-_EMBODIMENT_ACTION_CFG = {'dingo': BaseVelocityActionsCfg, 'unitree_g1': BasePositionActionsCfg, 'unitree_go2': QuadrupedPositionActionsCfg}
+-_EMBODIMENT_OBSERVATION_CFG = {'dingo': PointNavObservationsDingoCfg, 'unitree_g1': PointNavObservationsUnitreeG1Cfg, 'unitree_go2': PointNavObservationsUnitreeGo2Cfg}
+-_EMBODIMENT_EVAL_OBSERVATION_CFG = {
+-    'dingo': PointNavEvalObservationsDingoCfg,
+-    'unitree_g1': PointNavEvalObservationsUnitreeG1Cfg,
+-    'unitree_go2': PointNavEvalObservationsUnitreeGo2Cfg,
+-}
+-_EMBODIMENT_HEIGHT_OFFSET_CFG = {'dingo': 0.1, 'unitree_g1': 0.74, 'unitree_go2': 0.4}
++_EMBODIMENT_ROBOT_CFG = {'dingo': DINGO_CFG}
++_EMBODIMENT_CONTACT_CFG = {'dingo': DINGO_ContactCfg}
++_EMBODIMENT_CAMERA_CFG = {'dingo': DINGO_CameraCfg}
++_EMBODIMENT_ACTION_CFG = {'dingo': BaseVelocityActionsCfg}
++_EMBODIMENT_OBSERVATION_CFG = {'dingo': PointNavObservationsDingoCfg}
++_EMBODIMENT_HEIGHT_OFFSET_CFG = {'dingo': 0.1}
+ HOME_COMMERCIAL_SCENE_SCALE = (0.01, 0.01, 0.01)
+ HOME_COMMERCIAL_SCALE_FACTOR = 1.0
+ 
+ _EMBODIMENT_CLUTTER_SCENE_SCALE = {
+     'dingo': 0.5,
+-    'unitree_go2': 0.5,
+-    'unitree_g1': 0.75,
+ }
+ 
+ 
+@@ -413,24 +392,7 @@ def _make_dingo_controller(device, controller_config=None):
+     return DifferentialController(**config)
+ 
+ 
+-def _make_g1_controller(device, controller_config=None):
+-    """Build the learned velocity controller for Unitree G1."""
+-    config = dict(controller_config or {})
+-    config.pop("type", None)
+-    config.pop("device", None)
+-    config.setdefault("name", "g1_control")
+-    return G1VelocityController(device=device, **config)
+-
+-
+-def _make_go2_controller(device, controller_config=None):
+-    """Build the learned velocity controller for Unitree Go2."""
+-    config = dict(controller_config or {})
+-    config.pop("type", None)
+-    config.pop("device", None)
+-    config.setdefault("name", "go2_control")
+-    return Go2VelocityController(device=device, **config)
+-
+-_EMBODIMENT_CONTROLLER_CFG = {'dingo': _make_dingo_controller, 'unitree_g1': _make_g1_controller, 'unitree_go2': _make_go2_controller}
++_EMBODIMENT_CONTROLLER_CFG = {'dingo': _make_dingo_controller}
+ 
+ def create_dingonav_environment(scene_list: list,
+                                 scene_index: int,
+@@ -466,7 +428,7 @@ def create_dingonav_environment(scene_list: list,
+     scene_config.env_spacing = 0.0
+     scene_config.terrain = BENCH_TERRAIN_CFG
+     scene_config.terrain.usd_path = usd_path
+-    scene_config.goal = GOAL_CFG
++    scene_config.goal = None
+     scene_config.robot = _EMBODIMENT_ROBOT_CFG[embodiment]
+     scene_config.contact_sensor = _EMBODIMENT_CONTACT_CFG[embodiment]
+     scene_config.camera_sensor = _EMBODIMENT_CAMERA_CFG[embodiment]
+@@ -529,23 +491,26 @@ def create_dingoeval_environment(scene_dir: str,
+         if is_clutter and len(set(scene_scale_value)) == 1:
+             scale_factor = scene_scale_value[0]
+     height_offset = _EMBODIMENT_HEIGHT_OFFSET_CFG[embodiment]
+-    scene_config = PointNavEvalSceneCfg()
++    scene_config = PointNavSceneCfg()
+     scene_config.num_envs = num_envs
+     scene_config.env_spacing = 0.0
+     scene_config.terrain = BENCH_TERRAIN_CFG
+     scene_config.terrain.usd_path = usd_path
+-    scene_config.goal = GOAL_CFG
++    scene_config.goal = None
+     scene_config.robot = _EMBODIMENT_ROBOT_CFG[embodiment]
+-    scene_config.contact_sensor = _EMBODIMENT_CONTACT_CFG[embodiment]
++    scene_config.contact_sensor = None
+     scene_config.camera_sensor = _EMBODIMENT_CAMERA_CFG[embodiment]
+-    scene_config.birdeye_camera = _EMBODIMENT_BIRDEYE_CAMERA_CFG[embodiment]
+ 
+     env_config = DingoEvalPointNavCfg()
+     env_config.actions = _EMBODIMENT_ACTION_CFG[embodiment]()
+-    env_config.observations = _EMBODIMENT_EVAL_OBSERVATION_CFG[embodiment]()
++    env_config.observations = _EMBODIMENT_OBSERVATION_CFG[embodiment]()
++    env_config.observations.obs_rgb = None
++    env_config.observations.obs_depth = None
++    env_config.observations.goal_pose = None
+     env_config.decimation = _EMBODIMENT_DECIMATION_CFG[embodiment]
+     env_config.scene = scene_config
+     env_config.sim.device = device
++    env_config.seed = 1234
+     env_config.events.reset_pose.params = {"init_point_path": init_path,
+                                            "global_occ_path": occ_path,
+                                            'height_offset': height_offset,
+diff --git a/baselines/x-navdp/src/environment/robots/__init__.py b/baselines/x-navdp/src/environment/robots/__init__.py
+index 06145f1..2950881 100644
+--- a/baselines/x-navdp/src/environment/robots/__init__.py
++++ b/baselines/x-navdp/src/environment/robots/__init__.py
+@@ -1,5 +1,3 @@
+-"""Robot configuration exports for Dingo, G1, and Go2."""
++"""Dingo configuration used by the wheeled PointGoal evaluator."""
+ 
+ from .dingo_config import *
+-from .g1_config import *
+-from .go2_config import *
+diff --git a/baselines/x-navdp/src/environment/robots/dingo_config.py b/baselines/x-navdp/src/environment/robots/dingo_config.py
+index db53841..83db675 100644
+--- a/baselines/x-navdp/src/environment/robots/dingo_config.py
++++ b/baselines/x-navdp/src/environment/robots/dingo_config.py
+@@ -3,7 +3,7 @@
+ import isaaclab.sim as sim_utils
+ from isaaclab.actuators import ImplicitActuatorCfg
+ from isaaclab.assets.articulation import ArticulationCfg
+-from isaaclab.sensors import ContactSensorCfg, CameraCfg
++from isaaclab.sensors import ContactSensorCfg, CameraCfg, TiledCameraCfg
+ 
+ DINGO_BASE_LINK = 'base_link'
+ DINGO_WHEEL_JOINTS = ["left_wheel_joint","right_wheel_joint"]
+@@ -53,9 +53,12 @@ DINGO_ContactCfg = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/%s"%DINGO_BA
+                                     track_air_time=True,
+                                     update_period=0.02)
+ 
+-DINGO_CameraCfg = CameraCfg(
++DINGO_CameraCfg = TiledCameraCfg(
+     prim_path="{ENV_REGEX_NS}/Robot/%s/front_cam"%DINGO_BASE_LINK,
+-    update_period=0.05,
++    # Rendering/observation decimation owns the 10 Hz clock. Avoid a second
++    # FP32 period threshold that can skip a freshly rendered frame.
++    update_period=0.0,
++    update_latest_camera_pose=True,
+     height=D455_DEPTH_HEIGHT,
+     width=D455_DEPTH_WIDTH,
+     data_types=["rgb", "distance_to_image_plane"],
+diff --git a/baselines/x-navdp/src/environment/tasks/event_utils.py b/baselines/x-navdp/src/environment/tasks/event_utils.py
+index d95bd85..44599d0 100644
+--- a/baselines/x-navdp/src/environment/tasks/event_utils.py
++++ b/baselines/x-navdp/src/environment/tasks/event_utils.py
+@@ -8,7 +8,6 @@ from isaaclab.utils import configclass
+ from isaacsim.core.utils.prims import create_prim
+ from isaaclab.managers import EventTermCfg as EventTerm
+ from isaaclab.managers import SceneEntityCfg
+-from isaacsim.core.prims import XFormPrim
+ import isaacsim.core.utils.numpy.rotations as rot_utils
+ from isaaclab.envs import ManagerBasedEnv
+ from isaaclab.assets import Articulation, RigidObject
+@@ -45,6 +44,18 @@ from .curriculum_utils import (
+ reset_counter = 0
+ eval_random_orientation = False
+ 
++
++def _set_goal_positions(env, env_ids, positions):
++    """Update the single world-frame goal tensor for vector environments."""
++    if not hasattr(env, "_goal_pos_w"):
++        env._goal_pos_w = torch.empty(
++            (env.num_envs, positions.shape[-1]),
++            dtype=positions.dtype,
++            device=positions.device,
++        )
++    env._goal_pos_w[env_ids] = positions
++
++
+ def filter_outlier_points(matrix, neighborhood_size=3, min_neighbors=7):
+     """
+     过滤二值矩阵中的离群离散点
+@@ -290,9 +301,7 @@ def pointnav_reset(env: ManagerBasedEnv,
+     angle = angle.unsqueeze(-1).cpu().numpy()
+     batch_init_rotation = torch.tensor(rot_utils.euler_angles_to_quats(np.concatenate((angle*0.0, angle*0.0, angle), axis=-1))).to(robot_asset.data.root_pos_w.device)
+     robot_asset.write_root_pose_to_sim(torch.concat((tensor_robot_points, batch_init_rotation.to(torch.float32)),dim=-1),env_ids)
+-    for i, env_id in enumerate(env_ids):
+-        goal_primview = XFormPrim(prim_paths_expr=f"/World/envs/env_{env_id}/Goal", name="xform_view")
+-        goal_primview.set_world_poses(tensor_goal_points[i].unsqueeze(0),batch_init_rotation[i].unsqueeze(0))
++    _set_goal_positions(env, env_ids, tensor_goal_points)
+     reset_counter += env_ids.shape[0]
+ 
+     _reset_arrival_timer(env, env_ids)
+@@ -339,6 +348,8 @@ def pointnav_reset_eval(env: ManagerBasedEnv,
+     _reset_arrival_timer(env, env_ids)
+     if not hasattr(env, '_sample_idx'):
+         env._sample_idx = np.zeros(env.num_envs, dtype=np.int32)
++    if not hasattr(env, '_next_sample_idx'):
++        env._next_sample_idx = 0
+     global reset_counter
+     np.random.seed(1234)
+     robot_asset: RigidObject | Articulation = env.scene[robot_asset_cfg.name]
+@@ -358,10 +369,10 @@ def pointnav_reset_eval(env: ManagerBasedEnv,
+     random_robot_points = []
+     random_goal_points = []
+     random_init_orientions = []
+-    count = reset_counter - env.num_envs
+ 
+     for i in range(env_ids.shape[0]):
+-        idx = int(count % sample_points.shape[0])
++        idx = int(env._next_sample_idx % sample_points.shape[0])
++        env._next_sample_idx += 1
+         start_goal_pair = sample_points[idx].copy()
+         start_goal_pair[:4] = start_goal_pair[:4] * scale_factor
+         start_points = np.array([start_goal_pair[0], start_goal_pair[1], 0])
+@@ -377,7 +388,6 @@ def pointnav_reset_eval(env: ManagerBasedEnv,
+         env_id = env_ids[i]
+         env._sample_idx[env_id] = idx
+ 
+-        count += 1
+         random_robot_points.append(start_points)
+         random_goal_points.append(goal_points)
+         random_init_orientions.append(init_orientions)
+@@ -397,9 +407,7 @@ def pointnav_reset_eval(env: ManagerBasedEnv,
+     angle = angle.unsqueeze(-1).cpu().numpy()
+     batch_init_rotation = torch.tensor(rot_utils.euler_angles_to_quats(np.concatenate((angle*0.0, angle*0.0, angle), axis=-1))).to(robot_asset.data.root_pos_w.device)
+     robot_asset.write_root_pose_to_sim(torch.concat((tensor_robot_points, batch_init_rotation.to(torch.float32)),dim=-1),env_ids)
+-    for i, env_id in enumerate(env_ids):
+-        goal_primview = XFormPrim(prim_paths_expr=f"/World/envs/env_{env_id}/Goal", name="xform_view")
+-        goal_primview.set_world_poses(tensor_goal_points[i].unsqueeze(0),batch_init_rotation[i].unsqueeze(0))
++    _set_goal_positions(env, env_ids, tensor_goal_points)
+     reset_counter += env_ids.shape[0]
+ 
+ @configclass
+diff --git a/baselines/x-navdp/src/environment/tasks/observation_utils.py b/baselines/x-navdp/src/environment/tasks/observation_utils.py
+index 31047fb..efeabbd 100644
+--- a/baselines/x-navdp/src/environment/tasks/observation_utils.py
++++ b/baselines/x-navdp/src/environment/tasks/observation_utils.py
+@@ -6,7 +6,6 @@ from isaaclab.utils import configclass
+ from isaaclab.managers import ObservationGroupCfg as ObsGroup
+ from isaaclab.managers import ObservationTermCfg as ObsTerm
+ from isaaclab.managers import SceneEntityCfg
+-from isaacsim.core.prims import XFormPrim
+ import isaaclab.envs.mdp as mdp
+ import isaaclab.utils.math as math_utils
+ from isaaclab.envs import ManagerBasedEnv
+@@ -148,12 +147,13 @@ def oracle_imu_pose_data(env: ManagerBasedEnv,
+     robot_asset = env.scene[robot_asset_cfg.name]
+     robot_rot = math_utils.matrix_from_quat(robot_asset.data.root_quat_w)
+     robot_pos = robot_asset.data.root_pos_w
+-    goal_primview = XFormPrim(prim_paths_expr="/World/envs/env_.*/Goal", name="xform_view")
+-    goal_pos = goal_primview.get_world_poses()[0]
+-    rel_pos = torch.zeros((goal_pos.shape[0], 3),device=robot_pos.device)
+-    for i in range(rel_pos.shape[0]):
+-        rel_pos[i] = torch.matmul(torch.inverse(robot_rot[i]), goal_pos[i] - robot_pos[i])
+-    return rel_pos
++    if not hasattr(env, "_goal_pos_w"):
++        # ObservationManager probes term shapes before the first reset.
++        env._goal_pos_w = torch.zeros_like(robot_pos)
++    goal_pos = env._goal_pos_w
++    return torch.bmm(
++        robot_rot.transpose(1, 2), (goal_pos - robot_pos).unsqueeze(-1)
++    ).squeeze(-1)
+ 
+ def nonhead_joint_pos(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+     """Return non-head joint position offsets from defaults."""
+diff --git a/baselines/x-navdp/src/environment/tasks/reward_utils.py b/baselines/x-navdp/src/environment/tasks/reward_utils.py
+index 318fc51..0327ba9 100644
+--- a/baselines/x-navdp/src/environment/tasks/reward_utils.py
++++ b/baselines/x-navdp/src/environment/tasks/reward_utils.py
+@@ -5,7 +5,6 @@ from isaaclab.envs import ManagerBasedRLEnv
+ from isaaclab.utils import configclass
+ from isaaclab.managers import RewardTermCfg as RewTerm
+ from isaaclab.managers import SceneEntityCfg
+-from isaacsim.core.prims import XFormPrim
+ import isaaclab.envs.mdp as mdp
+ import numpy as np
+ from collections import deque
+@@ -407,8 +406,7 @@ def goal_arrival_reward(env: ManagerBasedRLEnv,
+     enable_curriculum = getattr(env, '_enable_curriculum_learning', ENABLE_CURRICULUM_LEARNING)
+     robot_asset = env.scene[robot_asset_cfg.name]
+     robot_pos = robot_asset.data.root_pos_w
+-    goal_primview = XFormPrim(prim_paths_expr="/World/envs/env_.*/Goal", name="xform_view")
+-    goal_pos = goal_primview.get_world_poses()[0]
++    goal_pos = env._goal_pos_w
+     robot_vel = robot_asset.data.root_lin_vel_w
+     distance = torch.square(robot_pos[:,0:2] - goal_pos[:,0:2]).sum(axis=1).sqrt()
+     velocity = torch.abs(robot_vel).sum(axis=1)
+@@ -472,8 +470,7 @@ def goal_arrival_reward_eval(env: ManagerBasedRLEnv,
+ 
+     robot_asset = env.scene[robot_asset_cfg.name]
+     robot_pos = robot_asset.data.root_pos_w
+-    goal_primview = XFormPrim(prim_paths_expr="/World/envs/env_.*/Goal", name="xform_view")
+-    goal_pos = goal_primview.get_world_poses()[0]
++    goal_pos = env._goal_pos_w
+     robot_vel = robot_asset.data.root_lin_vel_w
+ 
+     distance = torch.square(robot_pos[:,0:2] - goal_pos[:,0:2]).sum(axis=1).sqrt()
+diff --git a/baselines/x-navdp/src/environment/wheeled_tasks.py b/baselines/x-navdp/src/environment/wheeled_tasks.py
+index f2da754..b2f8331 100644
+--- a/baselines/x-navdp/src/environment/wheeled_tasks.py
++++ b/baselines/x-navdp/src/environment/wheeled_tasks.py
+@@ -38,6 +38,7 @@ class DingoEvalPointNavCfg(ManagerBasedRLEnvCfg):
+         """Set deterministic evaluation timing and episode length."""
+         self.sim.render_interval = 10
+         self.decimation = 10
++        self.rerender_on_reset = True
+         self.episode_length_s = 122.0
+         self.sim.dt = 0.01
+         self.sim.disable_contact_processing = True
+diff --git a/baselines/x-navdp/src/utils/mpc_tracking.py b/baselines/x-navdp/src/utils/mpc_tracking.py
+index 4de20e0..5a61252 100644
+--- a/baselines/x-navdp/src/utils/mpc_tracking.py
++++ b/baselines/x-navdp/src/utils/mpc_tracking.py
+@@ -55,19 +55,18 @@ class MobilePlatformModel:
+ class MPC_Controller_Fast:
+     """Fast MPC controller based on Acados"""
+     def __init__(self, N=15, desired_v=0.5, v_max=0.5, w_max=0.5, ref_gap=1, T=0.1,
+-                 ref_traj_length_m=2.0, ref_desired_v=0.5, min_desired_v=0.1, **_deprecated):
++                 ref_traj_length_m=2.0, ref_desired_v=0.5, **_deprecated):
+         """Configure and build a single acados MPC solver instance."""
+         self.v_max = v_max
+         self.w_max = w_max
+         self.ref_traj_length_m = ref_traj_length_m
+         self.ref_desired_v = ref_desired_v
+-        self.min_desired_v = min_desired_v
+ 
+         self.N, self.desired_v, self.ref_gap, self.T = N, desired_v, ref_gap, T
+         # Create model with unique name for each N
+         platform_model = MobilePlatformModel()
+         model = platform_model.model
+-        model.name = f'mobile_platform_N{N}'  # Unique name for each horizon
++        model.name = f'mobile_platform_forward_N{N}'  # Distinct forward-only solver cache
+ 
+         nx = model.x.size()[0]  # 3
+         self.nx = nx
+@@ -104,7 +103,7 @@ class MPC_Controller_Fast:
+         ocp.cost.Vx_e = np.eye(nx)
+ 
+         # Set control constraints
+-        ocp.constraints.lbu = np.array([-v_max, -w_max])
++        ocp.constraints.lbu = np.array([0.0, -w_max])
+         ocp.constraints.ubu = np.array([v_max, w_max])
+         ocp.constraints.idxbu = np.array([0, 1])
+ 
+@@ -128,13 +127,13 @@ class MPC_Controller_Fast:
+         acados_source_path = os.environ.get('ACADOS_SOURCE_DIR', '')
+         if acados_source_path:
+             # acados_include_path is read-only and set automatically, don't set it
+-            # Only set acados_lib_path through code_gen_opts if the path exists
++            # Only set acados_lib_path if the path exists
+             acados_lib_path = os.path.join(acados_source_path, 'lib')
+             link_libs_json = os.path.join(acados_lib_path, 'link_libs.json')
+             # Only set acados_lib_path if the path exists and contains link_libs.json
+             # Otherwise, let acados use its default auto-detected path
+             if os.path.exists(link_libs_json):
+-                ocp.code_gen_opts.acados_lib_path = acados_lib_path
++                ocp.acados_lib_path = acados_lib_path
+         # Create solver (unique for each N value)
+         # Use rank-specific dir to avoid JSON corruption when multiple DDP ranks generate simultaneously
+         rank = os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0'))
+@@ -149,7 +148,7 @@ class MPC_Controller_Fast:
+         os.makedirs(code_gen_dir, exist_ok=True)
+         json_file = os.path.join(code_gen_dir, f'{model.name}_acados_ocp.json')
+         # Set code export directory to ensure files are generated in the correct location
+-        ocp.code_gen_opts.code_export_directory = code_gen_dir
++        ocp.code_export_directory = code_gen_dir
+         # Thread-safe check and creation of solver
+         with _solver_init_lock:
+             # Check if code already exists to avoid recompilation in parallel scenarios
+@@ -227,7 +226,7 @@ class MPC_Controller_Fast:
+         status = self.solver.solve()
+ 
+         if status != 0:
+-            print(f"WARNING: Acados solver returned status {status}")
++            raise RuntimeError(f"Acados failed with status {status}; no executable command")
+ 
+         # Extract solution
+         x_opt = np.array([self.solver.get(i, 'x') for i in range(self.N + 1)])
+@@ -261,7 +260,6 @@ class MPC_Controller_Fast:
+ 
+         dx = np.gradient(traj[:, 0])
+         dy = np.gradient(traj[:, 1])
+-        dy[0] = 0.0
+ 
+         ddx = np.gradient(dx)
+         ddy = np.gradient(dy)
+@@ -281,7 +279,6 @@ class MPC_Controller_Fast:
+         v_max_constraint = self.v_max
+         v_curvature_constraint = self.w_max / k
+         desired_v = min(v_max_constraint, v_curvature_constraint)
+-        desired_v = max(self.min_desired_v, desired_v)
+ 
+         return desired_v
+ 
+@@ -295,10 +292,10 @@ class MPC_Controller_Fast:
+ 
+     def desired_v_from_trajectory_length(self, length_m):
+         """Scale desired velocity down for short reference trajectories."""
+-        length_m = max(float(length_m), 1e-6)
++        length_m = float(length_m)
+         scale = min(length_m / self.ref_traj_length_m, 1.0)
+         v = self.ref_desired_v * scale
+-        return max(self.min_desired_v, min(self.v_max, v))
++        return min(self.v_max, v)
+ 
+     def find_reference_traj(self, x0, global_planed_traj, lookahead_points=10):
+         """Find reference trajectory points
+@@ -332,7 +329,7 @@ class MPC_Controller_Fast:
+ class BatchMPCController:
+     """Batch wrapper that reuses one MPC solver across reference trajectories."""
+     def __init__(self, batch=1, N=15, desired_v=0.5, v_max=0.5, w_max=0.5, ref_gap=1, T=0.1,
+-                 ref_traj_length_m=2.0, ref_desired_v=0.5, min_desired_v=0.05, **_deprecated):
++                 ref_traj_length_m=2.0, ref_desired_v=0.5, **_deprecated):
+         """Create the reusable MPC controller used for batched training plans."""
+         self.controller = MPC_Controller_Fast(
+             N=N,
+@@ -343,7 +340,6 @@ class BatchMPCController:
+             T=T,
+             ref_traj_length_m=ref_traj_length_m,
+             ref_desired_v=ref_desired_v,
+-            min_desired_v=min_desired_v,
+         )
+     def solve(self,batch_ref_trajectories):
+         """Solve MPC for each reference trajectory in the batch."""

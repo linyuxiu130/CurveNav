@@ -1,0 +1,13 @@
+diff --git a/interfaces/acados_template/setup.py b/interfaces/acados_template/setup.py
+index 4d6a9f2..0000000 100644
+--- a/interfaces/acados_template/setup.py
++++ b/interfaces/acados_template/setup.py
+@@ -28,7 +28,7 @@ if sys.version_info < (3,5):
+     sys.exit('Python version 3.5 or later required. Exiting.')
+ 
+ setup(name='acados_template',
+-    version='0.1',
++    version='0.5.1',
+     python_requires='>=3.5',
+     description='A templating framework for acados',
+     url='http://github.com/acados/acados',

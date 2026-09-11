@@ -1,0 +1,13 @@
+.runtime/
+.venv/
+config/local.env
+runs/
+cache/
+weights/
+incoming/
+outputs/
+*.mp4
+/assets/scenes/**
+!/assets/scenes/**/
+!/assets/scenes/scene_split.json
+!/assets/scenes/**/pointgoal_start_goal_pairs.npy
