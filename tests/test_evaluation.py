@@ -40,7 +40,9 @@ def test_cross_model_set_requires_explicit_axis_and_source_geometry(
         load_common_protocol(common)
 
 
-def test_condition_intervention_pairs_real_samples_without_changing_other_fields() -> None:
+def test_condition_intervention_pairs_real_samples_without_changing_other_fields() -> (
+    None
+):
     batch = {
         "point_goal": torch.arange(8, dtype=torch.float32).reshape(4, 2),
         "depth": torch.arange(4, dtype=torch.float32)[:, None],
@@ -200,7 +202,7 @@ def test_configuration_safety_uses_robot_configuration_space() -> None:
         ]
     )
     field = torch.zeros(3, 5, 9, 9)
-    field[:, 0] = torch.tensor([-0.05, 0.05, 1.0])[:, None, None]
+    field[:, 0] = torch.tensor([-0.05, 0.2, 1.0])[:, None, None]
     field[:2, 3] = 1.0
 
     metrics = configuration_space_safety_metrics(path, field, 1.0)
@@ -245,9 +247,7 @@ def test_source_safety_reports_the_executed_prefix_without_another_query() -> No
 
 
 def test_controller_metrics_match_the_fixed_benchmark_speed_law() -> None:
-    straight = torch.stack(
-        (torch.linspace(0.0, 2.0, 64), torch.zeros(64)), dim=-1
-    )
+    straight = torch.stack((torch.linspace(0.0, 2.0, 64), torch.zeros(64)), dim=-1)
     angle = torch.linspace(0.0, torch.pi / 2.0, 64)
     sharp = torch.stack((0.25 * angle.sin(), 0.25 * (1.0 - angle.cos())), dim=-1)
 
@@ -302,9 +302,7 @@ def test_collision_detection_separates_perception_from_generation() -> None:
             [True, False, False, False]
         ),
         "truth_collision_point_current_depth_count": torch.tensor([0, 0, 0, 0]),
-        "truth_collision_point_history_only_depth_count": torch.tensor(
-            [1, 0, 0, 0]
-        ),
+        "truth_collision_point_history_only_depth_count": torch.tensor([1, 0, 0, 0]),
         "truth_collision_point_unrecognized_by_full_depth_count": torch.tensor(
             [1, 1, 0, 0]
         ),
@@ -329,9 +327,7 @@ def test_collision_detection_separates_perception_from_generation() -> None:
         "first_collision_unrecognized_by_full_depth": torch.tensor(
             [False, True, False, False]
         ),
-        "execution_prefix_1p0m_collision": torch.tensor(
-            [True, True, False, False]
-        ),
+        "execution_prefix_1p0m_collision": torch.tensor([True, True, False, False]),
         "path_endpoint_collision": torch.tensor([False, True, False, False]),
         "terminal_0p25m_collision": torch.tensor([True, True, False, False]),
         "collision_confined_to_terminal_0p25m": torch.tensor(
@@ -352,35 +348,29 @@ def test_collision_detection_separates_perception_from_generation() -> None:
 
     assert summary["ground_truth_collision_trajectory_count"] == 2
     assert summary["ground_truth_collision_point_count"] == 3
-    assert summary[
-        "ground_truth_collision_points_recognized_by_raw_depth_count"
-    ] == 1
+    assert summary["ground_truth_collision_points_recognized_by_raw_depth_count"] == 1
     assert summary[
         "ground_truth_collision_points_recognized_by_raw_depth_fraction"
     ] == pytest.approx(1 / 3)
     assert summary[
         "ground_truth_collision_points_inside_raw_ray_coverage_fraction"
     ] == pytest.approx(2 / 3)
-    assert summary[
-        "ground_truth_collision_points_raw_ray_coverage_but_missed_count"
-    ] == 1
+    assert (
+        summary["ground_truth_collision_points_raw_ray_coverage_but_missed_count"] == 1
+    )
     assert summary["collision_points_visible_only_through_history_count"] == 1
-    assert summary[
-        "collision_trajectories_recognized_only_through_history_count"
-    ] == 1
+    assert summary["collision_trajectories_recognized_only_through_history_count"] == 1
     assert summary["first_collision_visible_only_through_history_count"] == 1
-    assert summary["first_collision_unrecognized_by_all_four_frames_count"] == 1
+    assert summary["first_collision_unrecognized_by_all_history_frames_count"] == 1
     assert summary["execution_prefix_1p0m_collision_count"] == 2
     assert summary[
         "first_collision_within_1p0m_visible_only_through_history_fraction"
     ] == pytest.approx(0.5)
     assert summary[
-        "first_collision_within_1p0m_unrecognized_by_all_four_frames_fraction"
+        "first_collision_within_1p0m_unrecognized_by_all_history_frames_fraction"
     ] == pytest.approx(0.5)
     assert summary["path_endpoint_collision_count"] == 1
-    assert summary[
-        "endpoint_collision_point_visible_only_through_history_count"
-    ] == 1
+    assert summary["endpoint_collision_point_visible_only_through_history_count"] == 1
 
 
 def test_collision_attribution_separates_current_history_and_unseen_points() -> None:
@@ -396,8 +386,13 @@ def test_collision_attribution_separates_current_history_and_unseen_points() -> 
     current[:, 0] = 1.0
     full[:, 3] = 1.0
     current[:, 3] = 1.0
-    full[:, 0, 4, 6] = -1.0
-    current[1, 0, 4, 6] = -1.0
+    y, x = torch.meshgrid(
+        torch.linspace(-1, 1, 9), torch.linspace(-1, 1, 9), indexing="ij"
+    )
+    # A metric distance field must obey the 1-Lipschitz distance invariant.
+    obstacle_distance = torch.sqrt((x - 0.5).square() + y.square()) - 0.05
+    full[:, 0] = obstacle_distance
+    current[1, 0] = obstacle_distance
     source_query = SourcePathQuery(
         local_path=local_path,
         clearance_m=torch.tensor([[1.0, -1.0, 1.0], [1.0, -1.0, -1.0]]),
@@ -405,9 +400,7 @@ def test_collision_attribution_separates_current_history_and_unseen_points() -> 
         active=torch.ones(2, 3, dtype=torch.bool),
     )
 
-    attribution = collision_visibility_attribution(
-        source_query, full, current, 1.0
-    )
+    attribution = collision_visibility_attribution(source_query, full, current, 1.0)
     metrics = attribution.metrics
 
     assert metrics["truth_collision_point_count"].tolist() == [1, 2]
@@ -433,9 +426,10 @@ def test_collision_attribution_separates_current_history_and_unseen_points() -> 
     ]
     assert attribution.history_only_visible_points[0, 1]
     assert attribution.unrecognized_points[1, 2]
-    assert metrics[
-        "path_endpoint_collision_unrecognized_by_full_depth"
-    ].tolist() == [False, True]
+    assert metrics["path_endpoint_collision_unrecognized_by_full_depth"].tolist() == [
+        False,
+        True,
+    ]
 
 
 def test_case_selection_includes_the_worst_source_collision() -> None:
@@ -447,9 +441,7 @@ def test_case_selection_includes_the_worst_source_collision() -> None:
         "fixed_horizon_ade_m": torch.arange(4, dtype=torch.float32),
         "footprint_collision": torch.tensor([True, True, False, False]),
         "min_clearance_m": torch.tensor([-0.2, -0.3, 0.2, 0.3]),
-        "execution_prefix_1p0m_collision": torch.tensor(
-            [False, False, True, False]
-        ),
+        "execution_prefix_1p0m_collision": torch.tensor([False, False, True, False]),
         "distance_to_first_collision_m": torch.tensor([0.25, 1.5, 0.10, 2.0]),
         "first_collision_current_depth_visible": torch.tensor(
             [True, False, False, False]
@@ -506,14 +498,17 @@ def test_case_visualization_is_one_dependency_free_metric_svg(tmp_path: Path) ->
     assert "history obstacle" in text
     assert "unseen hit" in text
     assert "first hit 0.75m" in text
-    assert "transform=\"translate(12,12)\"" not in text
+    assert 'transform="translate(12,12)"' not in text
 
 
 def test_safety_sampling_detects_obstacle_between_output_points() -> None:
     path = torch.tensor([[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]])
     field = torch.zeros(1, 5, 9, 9)
     field[:, 0] = 1.0
-    field[:, 0, 4, 6] = -0.05
+    y, x = torch.meshgrid(
+        torch.linspace(-2, 2, 9), torch.linspace(-2, 2, 9), indexing="ij"
+    )
+    field[:, 0] = torch.sqrt((x - 0.5).square() + y.square()) - 0.05
     field[:, 3] = 1.0
 
     metrics = configuration_space_safety_metrics(path, field, 2.0)
@@ -524,12 +519,8 @@ def test_safety_sampling_detects_obstacle_between_output_points() -> None:
 def test_strata_separate_visible_detours_and_rear_goals() -> None:
     metrics = {
         "point_goal_is_behind": torch.tensor([False, False, True]),
-        "reference_safety_margin_violation": torch.tensor(
-            [False, False, False]
-        ),
-        "straight_safety_margin_violation": torch.tensor(
-            [False, True, True]
-        ),
+        "reference_safety_margin_violation": torch.tensor([False, False, False]),
+        "straight_safety_margin_violation": torch.tensor([False, True, True]),
         "reference_goal_progress_m": torch.tensor([1.0, 0.5, -0.1]),
     }
 

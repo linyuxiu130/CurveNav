@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-export PYTHONPATH="$project_root/src"
-cd "$project_root"
-exec python3 -m curvenav.data_generation.assets configs/hssd_dataset.json
+source "$(dirname "${BASH_SOURCE[0]}")/common_env.sh"
+exec "${CURVENAV_PYTHON}" -m curvenav.data_generation.assets configs/hssd_dataset.json

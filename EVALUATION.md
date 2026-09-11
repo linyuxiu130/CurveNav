@@ -23,7 +23,7 @@
 
 ## raw depth C-space 的正确用途
 
-策略和评估器用同一确定性投影从四帧深度构造 `64×64` observed C-space，网格间距约 `0.114 m`。它是策略的目标无关输入表示，也是判断 source-truth 碰撞是否被传感器观测到的诊断场；它不是物理真值、训练目标或 learned completion，不能替代 native `0.05 m` source grid。连续路径位置只有四个双线性支撑格全部 observed 时才可报告 raw signed clearance；部分 observed stencil 不作为安全证据。
+策略和评估器用同一确定性投影从四帧深度构造 `64×64` observed C-space，网格间距约 `0.114 m`。它是策略的目标无关输入表示，也是判断 source-truth 碰撞是否被传感器观测到的诊断场；它不是物理真值、训练目标或 learned completion，不能替代 native `0.05 m` source grid。连续路径位置只有所有非零插值权重的支撑格都 observed 时才可报告净空下界；部分 observed stencil 不作为安全证据。
 
 离线报告仍会把 source-truth 碰撞点与 raw field 的同一点查询对齐，输出：
 
@@ -61,9 +61,8 @@ condition swap 只在真实 held-out 条件之间做确定性配对，不生成�
 ## 运行
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 scripts/run_training_runtime.sh \
-  scripts/evaluate_policy.sh \
-  configs/base.yaml outputs/train_policy-e013/checkpoint.pt \
+CUDA_VISIBLE_DEVICES=1 scripts/evaluate_policy.sh \
+  data/policy_dataset-depth-forward/config.yaml outputs/train_policy-depth-forward/checkpoint.pt \
   --artifact-dir outputs/offline-evaluation
 ```
 
@@ -75,7 +74,11 @@ CUDA_VISIBLE_DEVICES=0 scripts/run_training_runtime.sh \
 
 ## 在线闭环解释
 
-`navigator_reset` 必须把模拟器实际 `3x3` 相机内参传给 CurveNav runtime；runtime 按该矩阵把原生深度重采样到训练相机。server 不再忽略请求内参，也没有硬编码内参 fallback。当前 Dingo 的实际矩阵与训练标定近似一致，因此这个接口缺口不是旧 1/10 SR 的主因，但它必须在新模型测评前消除。
+测评采集端读取实际 K、光学相机位姿和 10 Hz 时间戳，按传感器时钟生成四帧 深度 快照。`navigator_reset` 返回 checkpoint 对应的观测配置，推理服务不再维护按请求次数累积的历史。原生相机、半整数像素中心、深度 缩放与训练共用契约；生成数据必须重渲染到测评视场，不能靠替换旧图像的内参实现统一。
+
+训练与测评统一 BF16 神经网络计算，几何和 Flow 数学保持 FP32。真实训练集拟合出的归一化统计保存在准备目录的 `config.yaml` 中，加载 checkpoint 时必须使用对应配置。
+
+观测场连续净空使用 1-Lipschitz 下界 `max(lower(node)-distance(query,node))`。覆盖不足仍是未知；它是观测诊断，source-grid 和官方 SR/SPL 定义保持不变。
 
 固定 Dingo evaluator 的实际终止项只有 `arrive_goal` 和 `time_out`。它不使用 YAML 中未接入环境的 `arrival_threshold: 1.0`；真正的固定到达条件是距离 `<0.5 m`、速度 `<0.25 m/s`，之后到达计时累计 40 个 Dingo 控制步。官方 success 为 `1-time_out`，SPL 为 `success*d0/max(path_length,d0)`；trace 必须独立重算并与 `metric.csv` 逐回合一致。上游到达计时器启动后不会在暂时离开阈值区时清零，这只可能使 success 偏高，不可能把真成功变成超时；为保持与 NavDP/X-NavDP 固定协议可比，CurveNav 不单独改动这一上游语义。
 
@@ -106,3 +109,8 @@ fallback 绕过。
 官方 success、timeout 或 SPL；对应单元测试固定格心、半开边界和 origin/future 分离语义。
 
 离线评估仍是 held-out expert observation 上的 teacher-forced 测量，不能伪装成闭环 SR 预测器：它不包含策略导致的状态分布漂移、接触动力学或累计控制误差。评估器因此不构造随机目标、假闭环或复合“离线成功率”；最终导航结论仍由固定在线协议给出，离线负责更快、更准确地筛掉明显不安全或不可跟踪的 checkpoint。
+
+本地前进控制协议（2026-09-11）：MPC 的底盘线速度域为 [0, v_max]，
+急弯与近目标减速不设置额外最低速度，求解失败直接报错。
+该协议修改已保存在 benchmark 的运行时维护补丁中；与此前允许倒车的成绩比较时，
+必须先统一执行器协议，不能将两者作为同协议的模型改进结果。

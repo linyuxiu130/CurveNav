@@ -2,6 +2,7 @@
 
 import torch
 from torch import Tensor, nn
+from curvenav.precision import NEURAL_DTYPE
 
 from curvenav.configuration_space import query_configuration_field
 from curvenav.layers import RMSNorm
@@ -153,7 +154,8 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
     def project_condition_memory(
         self, condition: ConditionFeatures
     ) -> tuple[ProjectedCondition, ...]:
-        return tuple(block.project_condition(condition) for block in self.blocks)
+        with torch.autocast(device_type=condition.tokens.device.type, dtype=NEURAL_DTYPE):
+            return tuple(block.project_condition(condition) for block in self.blocks)
 
     def _path_relative_geometry(
         self,
@@ -201,11 +203,12 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             raise ValueError("MeanFlow interval times must have shape [B]")
         if len(projected_condition) != len(self.blocks):
             raise ValueError("projected condition must cover every decoder block")
-        instantaneous_time = self.time_embedding(end_time, end_time)[:, None]
-        interval_time = self.time_embedding(start_time, end_time)[:, None]
-        base_tokens = self.state_embedding(
-            state.reshape(state.shape[0], self.control_tokens, 2)
-        )
+        with torch.autocast(device_type=state.device.type, dtype=NEURAL_DTYPE):
+            instantaneous_time = self.time_embedding(end_time, end_time)[:, None]
+            interval_time = self.time_embedding(start_time, end_time)[:, None]
+            base_tokens = self.state_embedding(
+                state.reshape(state.shape[0], self.control_tokens, 2)
+            )
         if condition.metric_reference.shape != (
             state.shape[0],
             self.control_tokens,
@@ -229,26 +232,27 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             reference_controls,
             condition,
         )
-        proposal_tokens = (
-            base_tokens
-            + self.position_embedding.to(dtype=base_tokens.dtype)
-            + instantaneous_time.to(dtype=base_tokens.dtype)
-            + self.path_geometry_embedding(
-                reference_path_geometry.to(base_tokens.dtype)
+        with torch.autocast(device_type=state.device.type, dtype=NEURAL_DTYPE):
+            proposal_tokens = (
+                base_tokens
+                + self.position_embedding.to(dtype=base_tokens.dtype)
+                + instantaneous_time.to(dtype=base_tokens.dtype)
+                + self.path_geometry_embedding(
+                    reference_path_geometry.to(base_tokens.dtype)
+                )
+                + self.goal_geometry_embedding(
+                    reference_goal_geometry.to(base_tokens.dtype)
+                )
             )
-            + self.goal_geometry_embedding(
-                reference_goal_geometry.to(base_tokens.dtype)
+            for index in range(self.layers_per_phase):
+                proposal_tokens = self.blocks[index](
+                    proposal_tokens,
+                    projected_condition[index],
+                    reference_pair_geometry,
+                )
+            instantaneous = self.instantaneous_velocity_readout(
+                self.output_norm(proposal_tokens)
             )
-        )
-        for index in range(self.layers_per_phase):
-            proposal_tokens = self.blocks[index](
-                proposal_tokens,
-                projected_condition[index],
-                reference_pair_geometry,
-            )
-        instantaneous = self.instantaneous_velocity_readout(
-            self.output_norm(proposal_tokens)
-        )
 
         estimated_clean = state - end_time[:, None] * instantaneous.float()
         estimated_path, _ = curve_codec.decode(estimated_clean)
@@ -261,17 +265,18 @@ class ConditionalCurveMeanFlowDecoder(nn.Module):
             condition,
         )
         pair_geometry = self._path_relative_geometry(estimated_controls, condition)
-        average_tokens = (
-            proposal_tokens
-            + (interval_time - instantaneous_time).to(proposal_tokens.dtype)
-            + self.path_geometry_embedding(path_geometry.to(proposal_tokens.dtype))
-            + self.goal_geometry_embedding(goal_geometry.to(proposal_tokens.dtype))
-        )
-        for index in range(self.layers_per_phase, len(self.blocks)):
-            average_tokens = self.blocks[index](
-                average_tokens,
-                projected_condition[index],
-                pair_geometry,
+        with torch.autocast(device_type=state.device.type, dtype=NEURAL_DTYPE):
+            average_tokens = (
+                proposal_tokens
+                + (interval_time - instantaneous_time).to(proposal_tokens.dtype)
+                + self.path_geometry_embedding(path_geometry.to(proposal_tokens.dtype))
+                + self.goal_geometry_embedding(goal_geometry.to(proposal_tokens.dtype))
             )
-        average = self.average_velocity_readout(self.output_norm(average_tokens))
+            for index in range(self.layers_per_phase, len(self.blocks)):
+                average_tokens = self.blocks[index](
+                    average_tokens,
+                    projected_condition[index],
+                    pair_geometry,
+                )
+            average = self.average_velocity_readout(self.output_norm(average_tokens))
         return average[:, None], instantaneous[:, None]

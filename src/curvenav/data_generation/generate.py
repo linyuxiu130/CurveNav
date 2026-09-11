@@ -1,4 +1,4 @@
-"""Generate 500 continuous, unperturbed HSSD expert routes."""
+"""Generate bounded HSSD depth directly in the policy storage format."""
 
 from __future__ import annotations
 
@@ -10,12 +10,18 @@ import math
 import multiprocessing
 import os
 from pathlib import Path
-import shutil
 from typing import Any
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt, label
 
+from curvenav.data.depth import (
+    BENCHMARK_INTRINSICS,
+    depth_camera_contract,
+    preprocess_depth,
+)
+from curvenav.config_io import load_config
+from curvenav.data.history import OBSERVATION_PERIOD_S
 from curvenav.config import DataConfig
 from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data_generation.assets import (
@@ -25,15 +31,14 @@ from curvenav.data_generation.assets import (
 )
 from curvenav.data_generation.geometry import (
     ENDPOINT_CLEARANCE_M,
-    MAX_SNAP_M,
     MIN_CLEARANCE_M,
     SAFETY_STEP_M,
     Grid,
     PlanningError,
     candidate_pairs,
-    headings,
+    Plan,
+    timed_route,
     path_length,
-    points_at_arc,
     sha256_file,
     source_family,
     source_route,
@@ -48,7 +53,7 @@ from curvenav.physical import (
 
 
 GRID_CELL_M = 0.05
-SCHEMA = "curvenav_hssd_expert_routes"
+SCHEMA = "curvenav_hssd_policy_depth_routes_v4"
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -225,58 +230,63 @@ def render_depth(
     xyz: np.ndarray,
     yaw: np.ndarray,
     path: Path,
-    image_height: int,
-    image_width: int,
+    data: DataConfig,
 ) -> tuple[str, float]:
     frames = len(xyz)
     if len(yaw) != frames:
         raise ValueError("route positions and headings must have equal length")
-    stack = np.lib.format.open_memmap(
-        path,
-        mode="w+",
-        dtype=np.float32,
-        shape=(frames, image_height, image_width),
-    )
     invalid = 0
-    for index, (position, heading) in enumerate(zip(xyz, yaw)):
-        set_pose(simulator, position, float(heading))
-        depth = np.asarray(simulator.get_sensor_observations()["depth"])
-        if depth.dtype != np.float32 or depth.shape != (image_height, image_width):
-            raise RuntimeError("Habitat returned an unexpected depth tensor")
-        stack[index] = depth
-        invalid += int((~np.isfinite(depth) | (depth <= 0)).sum())
-    stack.flush()
-    del stack
+    image_height, image_width = data.image_height, data.image_width
+    # Sequential writes avoid remote mmap page faults on shared filesystems.
+    with path.open("wb") as depth_file:
+        np.lib.format.write_array_header_1_0(depth_file, {
+            "descr": np.lib.format.dtype_to_descr(np.dtype(np.float16)),
+            "fortran_order": False,
+            "shape": (frames, image_height, image_width),
+        })
+        for position, heading in zip(xyz, yaw):
+            set_pose(simulator, position, float(heading))
+            depth = np.asarray(simulator.get_sensor_observations()["depth"])
+            if depth.dtype != np.float32 or depth.shape != (BENCHMARK_INTRINSICS.height, BENCHMARK_INTRINSICS.width):
+                raise RuntimeError("Habitat returned an unexpected depth tensor")
+            depth, _ = preprocess_depth(
+                depth, source_intrinsics=BENCHMARK_INTRINSICS,
+                maximum_m=data.max_depth_m, height=image_height, width=image_width,
+            )
+            packed = depth.astype(np.float16)
+            depth_file.write(packed.tobytes())
+            invalid += int((packed == 0).sum())
     return sha256_file(path), invalid / (frames * image_height * image_width)
 
 
 def sampled_route(
     simulator: Any,
-    planned_xy: np.ndarray,
+    plan: Plan,
     floor_m: float,
-    spacing_m: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    length = path_length(planned_xy)
-    arcs = np.linspace(0.0, length, math.ceil(length / spacing_m) + 1)
-    requested_xy = points_at_arc(planned_xy, arcs)
+    period_s: float,
+    speed_m_s: float,
+    angular_speed_rad_s: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    route_xy, route_yaw, controls = timed_route(
+        plan.curve, period_s, speed_m_s, angular_speed_rad_s
+    )
     requested_xyz = np.column_stack(
-        (requested_xy[:, 0], np.full(len(requested_xy), floor_m), requested_xy[:, 1])
+        (route_xy[:, 0], np.full(len(route_xy), floor_m), route_xy[:, 1])
     )
-    habitat_xyz = np.asarray(
+    snapped = np.asarray(
         [simulator.pathfinder.snap_point(point) for point in requested_xyz],
-        dtype=np.float32,
+        dtype=np.float64,
     )
-    if not np.isfinite(habitat_xyz).all():
+    if not np.isfinite(snapped).all():
         raise PlanningError("route contains an invalid Habitat pose")
-    route_xy = habitat_xyz[:, [0, 2]].astype(np.float32)
-    snap_error = np.linalg.norm(route_xy - requested_xy, axis=1).astype(np.float32)
-    if float(snap_error.max()) > MAX_SNAP_M:
-        raise PlanningError("route pose snap exceeds the physical contract")
-    route_arcs = np.concatenate(
-        ([0.0], np.cumsum(np.linalg.norm(np.diff(route_xy, axis=0), axis=1)))
-    )
-    route_yaw = headings(route_xy, route_arcs)
-    return route_xy, route_yaw.astype(np.float32), habitat_xyz, snap_error
+    snap_error = np.linalg.norm(snapped[:, [0, 2]] - route_xy, axis=1)
+    # Horizontal snapping changes the analytic trajectory and its heading.
+    # Only floating-point/navmesh storage error is permitted; height comes from the floor.
+    tolerance = 8 * np.finfo(np.float32).eps * max(1., abs(route_xy).max())
+    if snap_error.max() > tolerance:
+        raise PlanningError("expert curve leaves the Habitat navigation surface")
+    requested_xyz[:, 1] = snapped[:, 1]
+    return route_xy, route_yaw, requested_xyz, snap_error, controls
 
 
 def generate_route(
@@ -291,6 +301,7 @@ def generate_route(
     config: dict[str, Any],
     floor_m: float,
     seed: int,
+    data: DataConfig,
 ) -> dict[str, Any]:
     route_name = f"run_{route_index + 1:04d}"
     pairs = candidate_pairs(
@@ -307,55 +318,81 @@ def generate_route(
                 start,
                 goal,
             )
-            route_xy, route_yaw, habitat_xyz, snap_error = sampled_route(
+            route_xy, route_yaw, habitat_xyz, snap_error, controls = sampled_route(
                 simulator,
-                plan.path_xy,
+                plan,
                 floor_m,
-                config["route_sample_spacing_m"],
+                config["observation_period_s"],
+                config["expert_speed_m_s"],
+                config["expert_angular_speed_rad_s"],
             )
             if not grid.safe(route_xy):
                 raise PlanningError("sampled expert route violates clearance")
             endpoint_distance = float(np.linalg.norm(route_xy[-1] - route_xy[0]))
             if not distance_range_m[0] <= endpoint_distance < distance_range_m[1]:
                 raise PlanningError("sampled endpoint left its distance band")
-            directory.mkdir(parents=True, exist_ok=False)
-            np.save(directory / "traj_xy.npy", route_xy, allow_pickle=False)
-            np.save(directory / "traj_yaw.npy", route_yaw, allow_pickle=False)
-            depth_sha, invalid_fraction = render_depth(
-                simulator,
-                habitat_xyz,
-                route_yaw,
-                directory / "depth_m.npy",
-                int(config["camera"]["image_height"]),
-                int(config["camera"]["image_width"]),
-            )
-            route_id = f"{scene['split']}/dataset_hssd_{scene['scene_id']}/{route_name}"
-            record = {
-                "route_id": route_id,
-                "route_directory": str(directory.relative_to(root)),
-                "split": scene["split"],
-                "scene_id": scene["scene_id"],
-                "source_family": source_family(scene["scene_id"]),
-                "frames": len(route_xy),
-                "route_arc_m": path_length(route_xy),
-                "endpoint_distance_m": endpoint_distance,
-                "endpoint_distance_band": distance_band,
-                "endpoint_distance_range_m": distance_range_m,
-                "maximum_navmesh_snap_m": float(snap_error.max()),
-                "planner": {
-                    "difficulty": plan.difficulty,
-                    "difficulty_tags": plan.difficulty_tags,
-                    "metrics": plan.metrics,
-                },
-                "depth": {
-                    "sha256": depth_sha,
-                    "invalid_fraction": invalid_fraction,
-                },
-            }
-            write_json(directory / "metadata.json", record)
-            return record
         except PlanningError:
-            shutil.rmtree(directory, ignore_errors=True)
+            continue
+        directory.mkdir(parents=True, exist_ok=False)
+        np.save(directory / "expert_controls.npy", controls.astype(np.float32), allow_pickle=False)
+        np.save(directory / "traj_xy.npy", route_xy.astype(np.float32), allow_pickle=False)
+        np.save(directory / "traj_yaw.npy", route_yaw.astype(np.float32), allow_pickle=False)
+        poses = np.broadcast_to(np.eye(4), (len(route_xy), 4, 4)).copy()
+        c, sn = np.cos(route_yaw), np.sin(route_yaw)
+        poses[:, 0, 0], poses[:, 0, 1] = c, sn
+        poses[:, 1, 0], poses[:, 1, 1] = -sn, c
+        base = np.stack([base_position_from_navmesh(p) for p in habitat_xyz])
+        poses[:, :3, 3] = base[:, [0, 2, 1]] * [1, -1, 1]
+        np.save(
+            directory / "body_to_world.npy",
+            poses.astype(np.float32),
+            allow_pickle=False,
+        )
+        # Uniform observation clock along the sampled kinematic route, not wall time.
+        route_time = (
+            np.arange(len(route_xy), dtype=np.float64)
+            * config["observation_period_s"]
+        )
+        np.save(
+            directory / "timestamps.npy",
+            route_time.astype(np.float64),
+            allow_pickle=False,
+        )
+
+        depth_sha, invalid_fraction = render_depth(
+            simulator,
+            habitat_xyz,
+            route_yaw,
+            directory / "depth.npy",
+            data,
+        )
+        route_id = f"{scene['split']}/dataset_hssd_{scene['scene_id']}/{route_name}"
+        record = {
+            "route_id": route_id,
+            "route_directory": str(directory.relative_to(root)),
+            "split": scene["split"],
+            "scene_id": scene["scene_id"],
+            "source_family": source_family(scene["scene_id"]),
+            "frames": len(route_xy),
+            "timestamp_semantics": "uniform_sensor_clock",
+            "motion_model": "forward_differential_drive_curve_clock",
+            "route_arc_m": path_length(route_xy),
+            "endpoint_distance_m": endpoint_distance,
+            "endpoint_distance_band": distance_band,
+            "endpoint_distance_range_m": distance_range_m,
+            "maximum_navmesh_snap_m": float(snap_error.max()),
+            "planner": {
+                "difficulty": plan.difficulty,
+                "difficulty_tags": plan.difficulty_tags,
+                "metrics": plan.metrics,
+            },
+            "depth": {
+                "sha256": depth_sha,
+                "invalid_fraction": invalid_fraction,
+            },
+        }
+        write_json(directory / "metadata.json", record)
+        return record
     raise RuntimeError(
         f"{scene['scene_id']} {route_name} exhausted endpoint candidates"
     )
@@ -370,7 +407,8 @@ def route_bands(config: dict[str, Any]) -> list[str]:
 
 
 def generate_scene(
-    scene: dict[str, str], config: dict[str, Any], root: str, gpu: int
+    scene: dict[str, str], config: dict[str, Any], root: str, gpu: int,
+    data: DataConfig,
 ) -> list[dict[str, Any]]:
     root_path = Path(root)
     scene_dir = root_path / scene["split"] / f"dataset_hssd_{scene['scene_id']}"
@@ -405,6 +443,7 @@ def generate_scene(
                 config,
                 floor,
                 seed,
+                data,
             )
             for route_index, band in enumerate(route_bands(config))
         ]
@@ -424,24 +463,27 @@ def generate_scene(
 
 
 def scene_batch(
-    batch: list[dict[str, str]], config: dict[str, Any], root: str, gpu: int
+    batch: list[dict[str, str]], config: dict[str, Any], root: str, gpu: int,
+    data: DataConfig,
 ) -> list[dict[str, Any]]:
     records = []
     for scene in batch:
-        records.extend(generate_scene(scene, config, root, gpu))
+        records.extend(generate_scene(scene, config, root, gpu, data))
     return records
 
 
-def validate_config(config: dict[str, Any]) -> None:
+def validate_config(config: dict[str, Any], data: DataConfig) -> None:
+    if not math.isfinite(config["expert_angular_speed_rad_s"]) or config["expert_angular_speed_rad_s"] <= 0:
+        raise ValueError("expert_angular_speed_rad_s must be positive")
+    if not math.isfinite(config["expert_speed_m_s"]) or config["expert_speed_m_s"] <= 0:
+        raise ValueError("expert_speed_m_s must be positive")
     scenes = config["selected_scenes"]
     train = [item for item in scenes if item["split"] == "train"]
     validation = [item for item in scenes if item["split"] == "validation"]
-    if len(scenes) != 20 or len(train) != 16 or len(validation) != 4:
-        raise ValueError(
-            "selected_scenes must contain 16 train and 4 validation scenes"
-        )
-    if {item["scene_id"] for item in train} & {item["scene_id"] for item in validation}:
-        raise ValueError("scene split leakage")
+    if not train or not validation or len(train) + len(validation) != len(scenes):
+        raise ValueError("selected_scenes must contain train and validation scenes")
+    if len({item["scene_id"] for item in scenes}) != len(scenes):
+        raise ValueError("selected_scenes must be unique")
     if {source_family(item["scene_id"]) for item in train} & {
         source_family(item["scene_id"]) for item in validation
     }:
@@ -463,14 +505,10 @@ def validate_config(config: dict[str, Any]) -> None:
         for left, right in zip(distance_ranges[:-1], distance_ranges[1:])
     ):
         raise ValueError("endpoint distance ranges must be contiguous")
-    if sum(quotas.values()) != config["routes_per_scene"]:
-        raise ValueError("route distance quotas must equal routes_per_scene")
-    if config["routes_per_scene"] * len(scenes) != config["expected_routes"]:
-        raise ValueError("route count contract does not match selected scenes")
-    if not math.isclose(config["route_sample_spacing_m"], 0.15):
-        raise ValueError(
-            "expert route sampling must match the 0.15 m training contract"
-        )
+    if any(type(count) is not int or count < 1 for count in quotas.values()):
+        raise ValueError("route distance quotas must be positive integers")
+    if config["observation_period_s"] != OBSERVATION_PERIOD_S:
+        raise ValueError("expert observations must match the benchmark 10 Hz camera")
     if config["workers"] < 1 or config["gpu_device"] < 0:
         raise ValueError("workers must be positive and gpu_device must be non-negative")
     camera = config["camera"]
@@ -481,14 +519,15 @@ def validate_config(config: dict[str, Any]) -> None:
         camera["focal_y_px"],
         camera["height_m"],
     )
-    if not all(math.isfinite(float(value)) and float(value) > 0 for value in numeric_camera):
+    if not all(
+        math.isfinite(float(value)) and float(value) > 0 for value in numeric_camera
+    ):
         raise ValueError("camera dimensions, focal lengths and height must be positive")
-    data = DataConfig()
     expected_camera = {
-        "image_width": data.image_width,
-        "image_height": data.image_height,
-        "focal_x_px": data.canonical_focal_x_px,
-        "focal_y_px": data.canonical_focal_y_px,
+        "image_width": BENCHMARK_INTRINSICS.width,
+        "image_height": BENCHMARK_INTRINSICS.height,
+        "focal_x_px": BENCHMARK_INTRINSICS.fx,
+        "focal_y_px": BENCHMARK_INTRINSICS.fy,
         "forward_offset_m": data.camera_forward_offset_m,
         "height_m": data.camera_height_m,
         "downward_pitch_degrees": data.camera_downward_pitch_degrees,
@@ -500,8 +539,10 @@ def validate_config(config: dict[str, Any]) -> None:
 def generate(config_path: Path) -> dict[str, Any]:
     config_path = config_path.resolve()
     config = read_json(config_path)
-    validate_config(config)
     project_root = config_path.parent.parent
+    policy_config = load_config(project_root / config["policy_config"])
+    data = policy_config.data
+    validate_config(config, data)
     output = (project_root / config["output_root"]).resolve()
     asset_root = (project_root / config["asset_root"]).resolve()
     asset_manifest = read_json(asset_root / "download_manifest.json")
@@ -517,61 +558,67 @@ def generate(config_path: Path) -> dict[str, Any]:
         raise FileExistsError(output)
     partial = output.with_name(output.name + f".partial.{os.getpid()}")
     partial.mkdir(parents=True)
-    try:
-        config = {**config, "asset_root": str(asset_root), "output_root": str(output)}
-        write_json(partial / "config.json", config)
-        batches = [
-            config["selected_scenes"][index :: config["workers"]]
-            for index in range(config["workers"])
+    config = {**config, "asset_root": str(asset_root), "output_root": str(output)}
+    write_json(partial / "config.json", config)
+    batches = [
+        config["selected_scenes"][index :: config["workers"]]
+        for index in range(config["workers"])
+    ]
+    context = multiprocessing.get_context("spawn")
+    records = []
+    with ProcessPoolExecutor(
+        max_workers=config["workers"], mp_context=context
+    ) as executor:
+        futures = [
+            executor.submit(
+                scene_batch,
+                batch,
+                config,
+                str(partial),
+                config["gpu_device"],
+                data,
+            )
+            for batch in batches
         ]
-        context = multiprocessing.get_context("spawn")
-        records = []
-        with ProcessPoolExecutor(
-            max_workers=config["workers"], mp_context=context
-        ) as executor:
-            futures = [
-                executor.submit(
-                    scene_batch, batch, config, str(partial), config["gpu_device"]
-                )
-                for batch in batches
-            ]
-            for future in as_completed(futures):
-                records.extend(future.result())
-        records.sort(key=lambda item: item["route_id"])
-        if len(records) != config["expected_routes"]:
-            raise RuntimeError(f"generated {len(records)} routes in {partial}")
-        write_jsonl(partial / "routes.jsonl", records)
-        manifest = {
-            "schema": SCHEMA,
-            "seed": config["seed"],
-            "asset_root": str(asset_root),
-            "asset_repository": HSSD_REPOSITORY,
-            "asset_commit": HSSD_COMMIT,
-            "output_root": str(output),
-            "routes": len(records),
-            "frames": sum(item["frames"] for item in records),
-            "scenes": config["selected_scenes"],
-            "camera": camera_contract(config["camera"]),
-            "route_contract": {
-                "navigation_geometry": expert_navigation_geometry_contract(),
-                "unperturbed": True,
-                "sample_spacing_m": config["route_sample_spacing_m"],
-                "continuous_safety_step_m": SAFETY_STEP_M,
-                "minimum_clearance_m": MIN_CLEARANCE_M,
-                "maximum_navmesh_snap_m": MAX_SNAP_M,
-                "endpoint_distance_bands_m": config["endpoint_distance_bands_m"],
-                "routes_per_scene_by_distance": config["routes_per_scene_by_distance"],
-            },
-        }
-        write_json(partial / "dataset_manifest.json", manifest)
-        from curvenav.data_generation.audit import audit_dataset
+        for future in as_completed(futures):
+            records.extend(future.result())
+    records.sort(key=lambda item: item["route_id"])
+    if len(records) != len(config["selected_scenes"]) * len(route_bands(config)):
+        raise RuntimeError(f"generated {len(records)} routes in {partial}")
+    write_jsonl(partial / "routes.jsonl", records)
+    manifest = {
+        "schema": SCHEMA,
+        "seed": config["seed"],
+        "asset_root": str(asset_root),
+        "asset_repository": HSSD_REPOSITORY,
+        "asset_commit": HSSD_COMMIT,
+        "output_root": str(output),
+        "routes": len(records),
+        "frames": sum(item["frames"] for item in records),
+        "scenes": config["selected_scenes"],
+        "camera": camera_contract(config["camera"]),
+        "observation": depth_camera_contract(data),
+        "route_contract": {
+            "navigation_geometry": expert_navigation_geometry_contract(),
+            "unperturbed": True,
+            "observation_period_s": config["observation_period_s"],
+            "expert_speed_m_s": config["expert_speed_m_s"],
+            "expert_angular_speed_rad_s": config["expert_angular_speed_rad_s"],
+            "continuous_safety_step_m": SAFETY_STEP_M,
+            "minimum_clearance_m": MIN_CLEARANCE_M,
+            "horizontal_snap": "float32_storage_tolerance_only",
+            "endpoint_distance_bands_m": config["endpoint_distance_bands_m"],
+            "routes_per_scene_by_distance": config["routes_per_scene_by_distance"],
+        },
+    }
+    write_json(partial / "dataset_manifest.json", manifest)
+    from curvenav.data_generation.audit import audit_dataset
 
-        summary = audit_dataset(partial)
-        partial.rename(output)
-        return summary
-    except BaseException:
-        shutil.rmtree(partial, ignore_errors=True)
-        raise
+    summary = audit_dataset(partial)
+    partial.rename(output)
+    from curvenav.data.prepare import compile_policy_dataset
+    compile_policy_dataset(output, project_root / data.root, policy_config)
+    return summary
 
 
 def main(argv: list[str] | None = None) -> None:

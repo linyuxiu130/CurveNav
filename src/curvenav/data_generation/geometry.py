@@ -7,11 +7,12 @@ import hashlib
 import heapq
 import math
 from pathlib import Path
-import warnings
 from typing import Any
 
 import numpy as np
-from scipy.interpolate import splev, splprep
+from scipy.interpolate import BSpline
+from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
 
 from curvenav.physical import EXTRA_CLEARANCE_M, ROBOT_FOOTPRINT_RADIUS_M
 
@@ -19,7 +20,6 @@ from curvenav.physical import EXTRA_CLEARANCE_M, ROBOT_FOOTPRINT_RADIUS_M
 SAFETY_STEP_M = 0.025
 MIN_CLEARANCE_M = EXTRA_CLEARANCE_M
 ENDPOINT_CLEARANCE_M = 0.30
-MAX_SNAP_M = 0.06
 
 
 class PlanningError(RuntimeError):
@@ -157,13 +157,9 @@ def curvature(path: np.ndarray) -> np.ndarray:
     )
 
 
-def headings(path: np.ndarray, arcs_m: np.ndarray) -> np.ndarray:
-    delta = points_at_arc(path, arcs_m + 0.03) - points_at_arc(path, arcs_m - 0.03)
-    return np.arctan2(delta[:, 1], delta[:, 0])
-
-
 @dataclass(frozen=True)
 class Plan:
+    curve: BSpline
     path_xy: np.ndarray
     metrics: dict[str, float]
     difficulty: str
@@ -253,72 +249,64 @@ def _simplify_route(grid: Grid, path: np.ndarray) -> np.ndarray:
     return np.asarray(output)
 
 
-def _smooth(grid: Grid, path: np.ndarray, spacing_m: float) -> np.ndarray:
-    length = path_length(path)
-    candidates: list[np.ndarray] = []
-    if len(path) >= 3:
-        segment = np.linalg.norm(np.diff(path, axis=0), axis=1)
-        parameter = np.concatenate([[0.0], np.cumsum(segment)]) / length
-        weights = np.ones(len(path))
-        weights[[0, -1]] = 1e3
-        for tolerance in (0.05, 0.025, 0.0):
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    spline, _ = splprep(
-                        path.T,
-                        u=parameter,
-                        w=weights,
-                        k=min(3, len(path) - 1),
-                        s=len(path) * tolerance**2,
-                    )
-                candidate = np.column_stack(
-                    splev(
-                        np.linspace(
-                            0.0, 1.0, max(2, math.ceil(length / spacing_m) + 1)
-                        ),
-                        spline,
-                    )
-                )
-                candidate[[0, -1]] = path[[0, -1]]
-                if grid.safe(candidate):
-                    candidates.append(candidate)
-            except (TypeError, ValueError):
-                pass
-    for ratio in (0.25, 0.15, 0.08):
-        candidate = path.copy()
-        for _ in range(3):
-            pieces = [
-                (1 - ratio) * a + ratio * b
-                for a, b in zip(candidate[:-1], candidate[1:])
-            ]
-            other = [
-                ratio * a + (1 - ratio) * b
-                for a, b in zip(candidate[:-1], candidate[1:])
-            ]
-            candidate = np.vstack(
-                [
-                    candidate[0],
-                    np.column_stack((pieces, other)).reshape(-1, 2),
-                    candidate[-1],
-                ]
-            )
-        candidate = resample(candidate, spacing_m)
-        if grid.safe(candidate):
-            candidates.append(candidate)
-    if not candidates:
-        candidate = resample(path, spacing_m)
-        if not grid.safe(candidate):
-            raise PlanningError("route smoothing violated clearance")
-        return candidate
-    return min(
-        candidates,
-        key=lambda item: (
-            np.percentile(curvature(item), 95),
-            curvature(item).max(),
-            path_length(item),
-        ),
-    )
+def _smooth(grid: Grid, path: np.ndarray, spacing_m: float) -> tuple[BSpline, np.ndarray]:
+    """One convex-hull B-spline approximation; no interpolant endpoint overshoot."""
+    controls = resample(path, spacing_m)
+    degree = min(3, len(controls) - 1)
+    knots = np.r_[np.zeros(degree), np.linspace(0, 1, len(controls) - degree + 1),
+                  np.ones(degree)]
+    curve = BSpline(knots, controls, degree)
+    # Derivative control hull bounds the distance travelled per parameter step.
+    derivative = curve.derivative()
+    bound = np.linalg.norm(derivative.c, axis=1).max()
+    parameter = np.linspace(0, 1, max(2, math.ceil(bound / spacing_m) + 1))
+    sampled = curve(parameter)
+    if not grid.safe(sampled):
+        raise PlanningError("smooth route leaves the source configuration space")
+    return curve, sampled
+
+
+def timed_route(curve: BSpline, period_s: float, speed_m_s: float,
+                angular_speed_rad_s: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Time-parameterize the same analytic curve used for planning and rendering.
+
+    dt/du=max(|p'|/v_max, |dtheta/du|/omega_max). Thus v>=0,
+    lateral body velocity is zero, and both velocity limits hold pointwise.
+    This is a kinematic model; no uncalibrated acceleration limit is invented.
+    """
+    first = curve.derivative()
+    second = curve.derivative(2) if curve.k >= 2 else None
+
+    def clock_rate(u, _):
+        tangent = first(u)
+        norm2 = float(tangent @ tangent)
+        if norm2 <= np.finfo(float).eps ** 2:
+            raise PlanningError("expert curve has a stationary tangent")
+        acceleration = second(u) if second is not None else np.zeros(2)
+        turn = (tangent[0] * acceleration[1] - tangent[1] * acceleration[0]) / norm2
+        return [max(math.sqrt(norm2) / speed_m_s, abs(turn) / angular_speed_rad_s)]
+
+    clock = solve_ivp(clock_rate, (0., 1.), [0.], rtol=1e-11, atol=1e-12,
+                      max_step=1 / (8 * len(curve.c)), dense_output=True)
+    if not clock.success:
+        raise PlanningError(clock.message)
+    duration = float(clock.y[0, -1])
+    intervals = math.ceil(duration / period_s)
+    # Stretch to the next sensor tick; never append a shorter final time step.
+    ticks = np.linspace(0., duration, intervals + 1)
+    u = np.array([0., *[brentq(lambda x: clock.sol(x)[0] - t, 0., 1.)
+                         for t in ticks[1:-1]], 1.])
+    tangent = first(u)
+    xy = curve(u)
+    yaw = np.arctan2(tangent[:, 1], tangent[:, 0])
+    rates = np.array([clock_rate(x, None)[0] for x in u])
+    du_dt = duration / (intervals * period_s) / rates
+    v = np.linalg.norm(tangent, axis=1) * du_dt
+    acceleration = second(u) if second is not None else np.zeros_like(tangent)
+    w = (tangent[:, 0]*acceleration[:, 1]-tangent[:, 1]*acceleration[:, 0]) / (
+        tangent*tangent).sum(1) * du_dt
+    # Habitat XZ yaw is opposite to the policy's planning-world yaw.
+    return xy, yaw, np.column_stack((v, -w))
 
 
 def plan_route(
@@ -330,7 +318,7 @@ def plan_route(
     start, goal = grid.snap(start_xy), grid.snap(goal_xy)
     cells = _astar(grid, start, goal)
     discrete_path = np.vstack([start_xy, grid.grid_to_world(cells), goal_xy])
-    path = _smooth(
+    curve_spline, path = _smooth(
         grid,
         _simplify_route(grid, discrete_path),
         spacing_m,
@@ -362,7 +350,7 @@ def plan_route(
     if metrics["total_turn_radians"] > math.pi / 2 or metrics["curvature_p95"] > 1.0:
         tags.append("turning")
     tags = tags or ["open"]
-    return Plan(path.astype(np.float32), metrics, tags[0], tuple(tags))
+    return Plan(curve_spline, path.astype(np.float32), metrics, tags[0], tuple(tags))
 
 
 def source_route(grid: Grid, start_xy: np.ndarray, goal_xy: np.ndarray) -> Plan:

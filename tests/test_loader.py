@@ -8,18 +8,16 @@ from curvenav.config import CurveNavConfig, DataConfig, TrajectoryConfig
 from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.depth import BENCHMARK_INTRINSICS
 from curvenav.data.depth_bank import gather_depth_observations, load_packed_depth_bank
+from test_depth_memory import condition as depth_condition
+from dataclasses import fields
 from curvenav.data.loader import (
     build_policy_training_loader,
     build_policy_validation_loader,
 )
 from curvenav.data.prepare import (
-    _cumulative_distance,
     _flow_coordinate_statistics,
-    _frame_indices,
     _fixed_future,
-    _observation_to_current,
     _planar_local,
-    _validate_flow_coordinate_statistics,
 )
 from curvenav.data.prepared import (
     PreparedPolicyDataset,
@@ -30,7 +28,6 @@ from curvenav.data.prepared import (
 from curvenav.data.privileged import (
     SourceConfigurationSpaceQuery,
 )
-from curvenav.deployment.runtime import DepthContextBuffer
 from curvenav.factory import build_policy
 from curvenav.training.batching import (
     DistributedStepBatchSampler,
@@ -57,9 +54,14 @@ def _write_dataset(root, count: int = 4) -> None:
         arrays = {
             "depth_indices": np.tile(np.arange(4, dtype=np.uint32), (count, 1)),
             "point_goal": np.ones((count, 2), np.float32),
-            "observation_to_current": np.tile(
-                np.array([0.0, 0.0, 0.0, 1.0], np.float32), (count, 4, 1)
+            "observation_to_current": np.broadcast_to(
+                np.eye(4, dtype=np.float32), (count, 4, 4, 4)
             ),
+            "observation_age_s": np.tile(
+                np.array([1.6, 0.9, 0.1, 0], np.float32), (count, 1)
+            ),
+            "camera_intrinsics": depth_condition(count).camera_intrinsics.numpy(),
+            "camera_to_body": depth_condition(count).camera_to_body.numpy(),
             "observation_valid": np.ones((count, 4), np.bool_),
             "curve_values": np.tile(
                 np.linspace(0.1, 1.4, 14, dtype=np.float32),
@@ -81,12 +83,18 @@ def _write_dataset(root, count: int = 4) -> None:
             "samples": count,
             "arrays": metadata,
             "depth": {
-                "dtype": "float16_normalized",
+                "dtype": "depth_float16_zero_invalid",
                 "height": 126,
                 "width": 224,
                 "max_depth_m": 5.0,
                 "total_frames": 8,
-                "runs": [{"file": "depth/00000.npy", "offset": 0, "frames": 8}],
+                "runs": [
+                    {
+                        "file": "depth/00000.npy",
+                        "offset": 0,
+                        "frames": 8,
+                    }
+                ],
             },
             "source_configuration_space": {
                 "query": "source_dingo_signed_clearance_cell_lookup",
@@ -115,6 +123,9 @@ def test_prepared_dataset_has_one_fixed_tensor_contract(tmp_path) -> None:
     sample = dataset[0]
     assert set(sample) == {
         "depth_indices",
+        "camera_intrinsics",
+        "camera_to_body",
+        "observation_age_s",
         "point_goal",
         "observation_to_current",
         "observation_valid",
@@ -133,13 +144,11 @@ def test_prepared_dataset_has_one_fixed_tensor_contract(tmp_path) -> None:
 
 def test_unpack_policy_batch_accepts_integer_global_interval_groups() -> None:
     batch_size = 2
+    c = depth_condition(batch_size)
     prepared = unpack_policy_batch(
         {
-            "depth": torch.zeros((batch_size, 4, 1, 126, 224)),
-            "point_goal": torch.zeros((batch_size, 2)),
-            "observation_to_current": torch.zeros((batch_size, 4, 4)),
-            "observation_valid": torch.ones((batch_size, 4), dtype=torch.bool),
-            "curve_values": torch.zeros((batch_size, 14)),
+            **{f.name: getattr(c, f.name) for f in fields(c)},
+            "curve_values": torch.zeros(batch_size, 14),
             "flow_interval_group": torch.tensor([0, 3], dtype=torch.uint8),
         }
     )
@@ -154,50 +163,6 @@ def test_habitat_xz_routes_are_converted_to_x_forward_y_left() -> None:
     points = np.array([[1.0, -2.0], [1.0, 2.0]], dtype=np.float32)
     local = _planar_local(points, np.zeros(2, dtype=np.float32), 0.0)
     np.testing.assert_allclose(local, [[1.0, 2.0], [1.0, -2.0]])
-
-    # A past pose whose route angle is +90 degrees is a physical right turn,
-    # hence its body-yaw delta in the current left-positive frame is -90.
-    transform = _observation_to_current(
-        np.zeros((4, 2), dtype=np.float32),
-        np.array([np.pi / 2, 0.0, 0.0, 0.0], dtype=np.float32),
-        0.0,
-        4,
-    )
-    np.testing.assert_allclose(transform[0, 2:], [-1.0, 0.0], atol=1e-6)
-
-
-def test_training_and_deployment_history_transforms_are_identical() -> None:
-    route_xz = np.array(
-        [[0.0, 0.0], [0.45, 0.0], [0.45, 0.45], [0.9, 0.45]],
-        dtype=np.float32,
-    )
-    route_yaw = np.array([0.0, np.pi / 2, 0.0, -np.pi / 2], dtype=np.float32)
-    local_origins = _planar_local(route_xz, route_xz[-1], float(route_yaw[-1]))
-    prepared_transform = _observation_to_current(
-        local_origins,
-        route_yaw,
-        float(route_yaw[-1]),
-        4,
-    )
-
-    context = DepthContextBuffer(CurveNavConfig())
-    context.reset(1, BENCHMARK_INTRINSICS.matrix())
-    depth = np.ones((1, 360, 640, 1), dtype=np.float32)
-    selected = None
-    for position_xz, yaw in zip(route_xz, route_yaw, strict=True):
-        # Habitat +Z is physical right, while deployment world +Y is left.
-        position_xy = np.array([[position_xz[0], -position_xz[1]]], dtype=np.float32)
-        selected = context.update(
-            depth,
-            position_xy,
-            np.array([-yaw], dtype=np.float32),
-        )
-    assert selected is not None
-    np.testing.assert_allclose(
-        selected.observation_to_current[0],
-        prepared_transform,
-        atol=1e-6,
-    )
 
 
 def test_prepared_dataset_rejects_geometry_contract_mismatch(tmp_path) -> None:
@@ -222,34 +187,43 @@ def test_prepared_dataset_rejects_non_finite_control(tmp_path) -> None:
     np.save(curve_values_path, curve_values)
 
     with pytest.raises(ValueError, match="non-finite values"):
-        PreparedPolicyDataset(root, "train", DataConfig(root=str(root)), TrajectoryConfig())
+        PreparedPolicyDataset(
+            root, "train", DataConfig(root=str(root)), TrajectoryConfig()
+        )
 
 
-def test_prepared_dataset_requires_serialized_source_safety_certificate(tmp_path) -> None:
+def test_prepared_dataset_requires_serialized_source_safety_certificate(
+    tmp_path,
+) -> None:
     root = tmp_path / "policy"
     _write_dataset(root)
     manifest_path = root / "train" / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    manifest["audit"]["source_configuration_space"][
-        "expert_all_margin_safe"
-    ] = False
+    manifest["audit"]["source_configuration_space"]["expert_all_margin_safe"] = False
     manifest_path.write_text(json.dumps(manifest))
 
     with pytest.raises(ValueError, match="source configuration audit"):
-        PreparedPolicyDataset(root, "train", DataConfig(root=str(root)), TrajectoryConfig())
+        PreparedPolicyDataset(
+            root, "train", DataConfig(root=str(root)), TrajectoryConfig()
+        )
 
 
-def test_source_gated_flow_statistics_reject_stale_trajectory_scale() -> None:
-    config = CurveNavConfig()
-    _validate_flow_coordinate_statistics(
-        flow_coordinate_statistics(config.trajectory), config
-    )
-    codec = build_policy(config).curve_codec
-    values = codec.values_from_coordinates(torch.zeros(32, 14)).numpy()
+def test_flow_statistics_are_measured_from_physical_control_increments() -> None:
+    torch.manual_seed(44)
+    codec = build_policy(CurveNavConfig()).curve_codec
+    values = codec.values_from_coordinates(torch.randn(32, 14)).numpy()
     observed = _flow_coordinate_statistics(values)
-
-    with pytest.raises(ValueError, match="trajectory normalization"):
-        _validate_flow_coordinate_statistics(observed, config)
+    controls = values.astype(np.float64).reshape(32, 7, 2)
+    increments = np.diff(
+        np.concatenate((np.zeros((32, 1, 2)), controls), axis=1), axis=1
+    ).reshape(32, 14)
+    np.testing.assert_allclose(
+        observed["control_increment_mean_xy_m"], increments.mean(0)
+    )
+    np.testing.assert_allclose(
+        observed["control_increment_std_xy_m"],
+        np.repeat(np.sqrt(increments.reshape(-1, 7, 2).var(0, ddof=1).mean(-1)), 2)
+    )
 
 
 def test_training_and_validation_preserve_deterministic_batch_order(tmp_path) -> None:
@@ -285,8 +259,8 @@ def test_training_sampler_covers_each_cycle_once_and_resume_continues() -> None:
         def __len__(self):
             return 7
 
-        def __getitem__(self, index):
-            return {"index": torch.tensor(index)}
+        def __getitems__(self, indices):
+            return {"index": torch.tensor(indices)}
 
     base = IndexedDataset()
     complete = RepeatedPolicyDataset(base, count=14, seed=42)
@@ -298,6 +272,10 @@ def test_training_sampler_covers_each_cycle_once_and_resume_continues() -> None:
     assert [int(resumed[index]["index"]) for index in range(6)] == [
         int(complete[index]["index"]) for index in range(8, 14)
     ]
+    # A worker batch can cross a shuffle-cycle boundary, including on resume.
+    batched = resumed.__getitems__(list(range(6)))
+    for name, values in batched.items():
+        assert torch.equal(values, torch.stack([resumed[i][name] for i in range(6)]))
     assert [int(complete[index]["flow_interval_group"]) for index in range(8)] == [
         0,
         1,
@@ -310,62 +288,37 @@ def test_training_sampler_covers_each_cycle_once_and_resume_continues() -> None:
     ]
 
 
-def test_six_rank_batches_cover_exact_global_step_without_padding() -> None:
-    layout = build_distributed_batch_layout(1024, 171, 6)
-    assert layout.rank_batch_sizes == (171, 171, 171, 171, 170, 170)
-    assert layout.micro_batches_per_step == 1
-
-    rank_batches = [
-        list(DistributedStepBatchSampler(1, 1024, 171, rank, 6))
-        for rank in range(6)
-    ]
-    assert [list(map(len, batches)) for batches in rank_batches] == [
-        [171],
-        [171],
-        [171],
-        [171],
-        [170],
-        [170],
-    ]
-    covered = [index for batches in rank_batches for batch in batches for index in batch]
-    assert sorted(covered) == list(range(1024))
-    assert len(set(covered)) == 1024
-    ddp_weight = sum(6 * len(batch) / 1024 for batches in rank_batches for batch in batches)
-    assert ddp_weight / 6 == pytest.approx(1.0)
-
-
-def test_global_flow_interval_groups_are_exactly_quartered_for_all_topologies() -> None:
+def test_fixed_micro_batches_cover_global_stream_and_flow_strata() -> None:
     for world_size in range(1, 9):
+        micro_batch = 320
+        accumulation = 2
+        global_batch = micro_batch * world_size * accumulation
+        layout = build_distributed_batch_layout(global_batch, micro_batch, world_size)
+        assert layout.rank_batch_sizes == (micro_batch * accumulation,) * world_size
+        assert layout.micro_batches_per_step == accumulation
         batches = [
             batch
             for rank in range(world_size)
-            for batch in DistributedStepBatchSampler(
-                1,
-                1024,
-                342,
-                rank,
-                world_size,
-            )
+            for batch in DistributedStepBatchSampler(2, global_batch, micro_batch, rank, world_size)
         ]
-        groups = torch.tensor([index % 4 for batch in batches for index in batch])
-        torch.testing.assert_close(torch.bincount(groups, minlength=4), torch.full((4,), 256))
+        assert all(len(batch) == micro_batch for batch in batches)
+        covered = [index for batch in batches for index in batch]
+        assert sorted(covered) == list(range(2 * global_batch))
+        groups = torch.tensor(covered) % 4
+        torch.testing.assert_close(
+            torch.bincount(groups, minlength=4), torch.full((4,), global_batch // 2)
+        )
+    with pytest.raises(ValueError, match="complete fixed-size"):
+        build_distributed_batch_layout(1000, 320, 2)
 
 
-def test_micro_batches_are_balanced_for_one_static_shape() -> None:
-    four_gpu = DistributedStepBatchSampler(1, 1024, 192, rank=0, world_size=4)
-    assert list(map(len, four_gpu)) == [128, 128]
-
-    two_gpu = DistributedStepBatchSampler(1, 1024, 192, rank=0, world_size=2)
-    assert list(map(len, two_gpu)) == [171, 171, 170]
-
-
-def test_fixed_future_uses_steps_without_rescaling_metric_length() -> None:
+def test_fixed_future_metric_horizon_is_independent_of_observation_density() -> None:
     far = np.array([[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]], np.float32)
     near = np.array([[0.0, 0.0], [1.2, 0.2]], np.float32)
-    far_prefix, far_reached = _fixed_future(far, 1)
-    near_prefix, near_reached = _fixed_future(near, 24)
+    far_prefix, far_reached = _fixed_future(far, 1, 0.15)
+    near_prefix, near_reached = _fixed_future(near, 24, 0.15)
 
-    np.testing.assert_allclose(far_prefix[-1], [2.0, 0.0])
+    np.testing.assert_allclose(far_prefix[-1], [0.15, 0.0])
     np.testing.assert_allclose(near_prefix[-1], near[-1])
     assert not far_reached
     assert near_reached
@@ -419,26 +372,13 @@ def test_source_query_detects_an_obstacle_between_sparse_curve_points(tmp_path) 
     assert result.minimum_clearance_m.item() < 0.0
 
 
-def test_fixed_future_preserves_stationary_steps_in_the_prediction_window() -> None:
+def test_fixed_future_does_not_spend_metric_horizon_on_stationary_observations() -> (
+    None
+):
     path = np.array(
         [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.15, 0.0]],
         np.float32,
     )
-    prefix, reached = _fixed_future(path, 2)
-    np.testing.assert_array_equal(prefix, path[:3])
-    assert not reached
-
-
-def test_observation_frames_use_distance_and_keep_current_when_stationary() -> None:
-    positions = np.array(
-        [[0.0, 0.0], [0.2, 0.0], [0.4, 0.0], [0.4, 0.0], [0.9, 0.0]],
-        np.float32,
-    )
-    cumulative = _cumulative_distance(positions)
-
-    data = DataConfig()
-    moving = _frame_indices(4, cumulative, data)
-    stationary = _frame_indices(3, cumulative, data)
-
-    np.testing.assert_array_equal(moving, [0, 0, 3, 4])
-    assert stationary[-1] == 3
+    prefix, reached = _fixed_future(path, 2, 0.15)
+    np.testing.assert_allclose(prefix[-1], path[-1])
+    assert reached

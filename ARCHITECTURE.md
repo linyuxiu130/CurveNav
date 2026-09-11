@@ -1,389 +1,122 @@
-# CurveNav architecture
-
-This document is the exact contract of the only CurveNav model. Experimental
-results and rejected designs are recorded in `EXPERIMENTS.md`.
-
-CurveNav maps four calibrated depth frames, their relative SE(2) poses and a
-robot-frame PointGoal to one 64-point planar cubic B-spline. Inference is one
-deterministic improved-MeanFlow function call and one state update. The first
-geometric retrieval uses fixed, target-independent metric horizon slots; the
-PointGoal is only a terminal intent. There is no
-candidate set, critic, safety head, map completion, trajectory projection,
-online optimizer, fallback or legacy model branch. Training contains one
-deployment-path feasibility term; inference contains no safety computation.
-
-## 1. Evidence-backed root diagnosis
-
-E005 reached 3.40 cm teacher-forced ADE but only 1/10 success in the fixed
-closed loop. E006 moved all spatial queries from the straight goal reference to
-the current Flow candidate. Under the identical ten-episode protocol it reached
-5/10 success and mean SPL 0.451, so explicit configuration-space/path coupling
-is useful and must be retained.
-
-E006 nevertheless converged to 12.78% full-path source collision and failed five
-online episodes. In failures, MPC commands remained nonzero and comparable to
-successful episodes, while actual speed collapsed. Replans were highly stable,
-not noisy, but repeatedly pointed into frozen non-executable geometry at corners
-and blocked corridors. Official SR/SPL, PointGoal axes, trajectory-origin
-insertion and MPC interfaces were independently reproduced; they do not explain
-the failures.
-
-E007 corrected a precise E006 information defect. At deployment its only decoder input is
-the fixed Gaussian typical-set source `e*`. E006 decoded that source as a
-physical curve and queried depth C-space along it, then jumped directly to the
-answer. The generated curve was never the object of a geometry query. More
-epochs cannot repair this information boundary, so E007 estimates a clean
-endpoint before making the path-relative query.
-
-The complete E007 step-2,400 audit rejects the stronger claim that this query
-alone teaches safety. MeanFlow loss fell to 0.0425, yet source-truth collision
-remained 12.27% and forward-detour collision 28.05%. The internal proposal was
-less safe than the final path (13.39% versus 12.27%); proposal-safe to
-final-collision occurred in only 0.79%, while the final field rescued 1.91%.
-Therefore PointGoal's final update is not the primary destroyer. Both Flow
-readouts are rewarded only for coordinate imitation, so low average error does
-not require the deployed path to respond correctly to visible clearance.
-
-E008 then completed the fixed ten-episode online run at `6/10` success and
-`0.5828` mean SPL, versus `5/10` for the official NavDP checkpoint on the same
-first ten episodes. Its four failed executions did not oscillate: adjacent
-first-metre plans differed by only `0.9--5.1 mm`, MPC requested
-`0.36--0.50 m/s`, and the robot repeatedly approached the same non-executable
-geometry. The internal clean proposal and final output differed by only
-`9.16 mm` offline. The remaining defect is therefore not a missing refinement
-iteration.
-
-E009 and E010 both reached `3/10`, but the published release bundles show that
-this comparison cannot be used to explain E008's `6/10 -> 3/10` regression.
-E008 and E010 have byte-identical `policy.py` and the same decoder computation;
-their decoder files differ only in comments, formatting and the contract name.
-The actual change was the optimizer topology: E008 used BF16, global batch 1024
-and 8,000 updates, while E010 used FP16, global batch 1,792 and 4,600 updates.
-They consumed nearly the same number of examples, but E010 performed 42.5%
-fewer parameter updates at the same learning rate. Large batch is a throughput
-choice, not an equivalent training transformation.
-
-E011 changes only the first spatial retrieval from E008/E010's metric goal
-reference to robot-origin global geometry. Its `1/10` vectorized diagnostic and
-unsafe frozen-map replay reject the trained checkpoint. E012 restores E008's
-1,024/8,000 BF16 training contract while keeping the E011 graph. The paired
-training curves show slower early convergence, but the completed run restores
-E008's imitation accuracy and improves its source-truth offline collision
-metrics. Training topology was therefore a material confound, and the earlier
-online regression cannot by itself reject robot-origin retrieval. The remaining
-structural limitation is exact rather than empirical: with every control query
-anchored at the origin, metric attention bias is identical across control
-indices, so it does not directly encode the relation between each future curve
-segment and each scene location.
-
-E013 restores distinct metric reference anchors and removes a separate hidden
-straight-path bias. E008/E010 computed the goal feature for candidate control
-`C_i` from `R_i-C_i`, where `R_i` is the corresponding control on a straight
-goal ray. That asks every intermediate control to compare itself with a
-straight template even when the safe expert takes a detour. E013 instead uses
-the same terminal local goal `G=R_7` for every control: `G-C_i`. The reference
-ray locates geometry retrieval only; terminal intent no longer specifies an
-intermediate path shape.
-
-The current E014 single-step factorization is:
-
-`depth history -> target-independent observed C-space visual BEV`
-
-`Flow state + terminal-goal intent + fixed-horizon metric scene/C-space queries -> instantaneous clean-endpoint estimate`
-
-`proposal trajectory -> observed C-space/BEV queries`
-
-`proposal geometry + candidate-to-terminal-goal intent -> interval-average velocity`
-
-`fixed source - average velocity -> one final B-spline`
-
-`final B-spline x observed C-space -> training-only feasibility risk`.
-
-The fixed metric horizon reference is a retrieval coordinate only. It is never
-added to generated controls and is never executed as output. This is one improved-MeanFlow
-field with two mathematically distinct readouts,
-not a two-policy planner or a literal safety-first subpolicy. The instantaneous field is required to estimate the
-data endpoint on the linear interpolant; the average field is required for
-one-step MeanFlow transport. Safety-first means geometry-grounded generation: the
-same final curve must imitate the expert while remaining outside the visible
-footprint-inflated C-obstacle. It does not mean that a depth-only subnetwork
-must guess one route before it knows the goal.
+# CurveNav：统一的测评相机、传感器时钟与几何链路
 
-The train split contains 25,777 observations from 16 scenes. This limits scene
-diversity and policy-induced recovery evidence, but it is not used to excuse an
-architectural error: SanD demonstrates that expert-only generator training can
-work when its complete inference system supplies explicit geometric selection.
-CurveNav first requires its own single generated trajectory to read the correct
-geometry. Data aggregation is a later closed-loop generalization question, not
-a substitute for this root correction.
+当前契约：`depth_sensor10hz_halfpixel_sample4_v5`。原始深度、已准备数据和 checkpoint 不通过修改元数据伪装为新版本；旧观测接口不保留兼容分支。
 
-## 2. Tensor, frame and precision contract
+## 数据到执行
 
-- depth: `[B,4,1,126,224]`, calibrated pinhole depth normalized by 5 m;
-- observation transforms: `[B,4,4]=(x,y,sin(yaw),cos(yaw))`, mapping each
-  observation frame into the current robot frame;
-- PointGoal: `[B,2]` in current `x-forward,y-left` metres;
-- Flow state: `[B,14]`, standardized physical increments of seven planar
-  B-spline controls;
-- output: `[B,64,2]` metres in the current robot frame.
+```
+Habitat / Isaac 原生 深度、K、相机位姿、机体位姿、时间戳
+    → 同一像素约定与 深度 预处理
+    → 10 Hz 传感器历史 → 四帧不可变快照
+    → 米制 SE(3) 对齐 → 当前 BEV
+    → 单步 improved MeanFlow → B-spline 局部路径
+    → 固定 benchmark MPC → 仿真器 → 下一次观测
+```
 
-The benchmark supplies its actual camera matrix at reset. Deployment resamples
-native depth into the canonical `126x224` training camera. Projection, SE(2),
-configuration-space construction, B-spline algebra, Flow state, JVP and loss
-arithmetic use FP32. Neural convolution, linear and attention kernels use BF16
-on supported GPUs or FP16 with GradScaler on V100. Training, offline evaluation
-and deployment use the same capability-selected precision route.
+网络仍是共享 深度 视觉编码、目标无关几何 BEV、三个历史运动 token 与目标条件曲线解码。四帧、16×16 BEV 和单步生成方式不变。没有额外候选筛选器、旧模型分支、自动补齐传感器输入或推理后的兜底路径。
 
-## 3. Four-frame calibrated perception
+## 相机与坐标契约
 
-All four depth frames pass through one shared ResNet-18-style backbone in one
-`B*4` batch and produce four `8x12` learned grids. Calibrated ray endpoints are
-back-projected into the Dingo body frame and transformed into the current robot
-frame before fusion. Thus an obstacle seen only in history remains spatially
-available after leaving the current image.
+采集端 `DepthContextBuffer.update` 接收：
 
-The same depth projection builds one `64x64` observed configuration field over
-`[-3.6,3.6]^2`. Body-height returns are inflated by the benchmark Dingo
-footprint. Channels are signed clearance, its normalized planar gradient,
-observed support and forbidden state. Learned geometry is canonicalized as
+| 数据 | 形状 | 语义 |
+|---|---|---|
+| depth_m | B×H×W×1 | float32 光学 Z，单位米 |
+| camera_intrinsics | B×3×3 | 对应实际图像分辨率的零 skew K |
+| camera_to_body | B×4×4 | 光学相机到重力对齐规划机体系 |
+| body_to_world | B×4×4 | 规划机体系到世界 |
+| timestamps | B | 回合内观测时间，秒 |
 
-`(o*d, o*dx, o*dy, o, o*forbidden)`.
+机体系 x 向前、y 向左、z 向上；光学系 x 向右、y 向下、z 向前。实际机器人 roll/pitch 不进入水平规划系，但保留在实际相机外参中。Isaac 使用 `quat_w_ros`、实际 `pos_w` 和传感器 K。相机配置在创建时启用逐帧位姿更新，缓存更新周期设为 0（读取最新渲染），环境配置在重置后重新渲染；不在会话中事后修改默认值。
 
-Unknown EDT extrapolation therefore cannot masquerade as observed free space.
-Maximum-range depth is valid observed-free ray evidence but not a surface hit.
-The native navigation grid is privileged truth used only to certify experts and
-evaluate predictions; it never enters the policy.
+Habitat 世界坐标转换为 `(X,-Z,Y)`，路线 yaw 在规划世界中取负号；光学相机安装高度、前移和俯角与 Dingo 一致。Navmesh 上的点先增加 base-link 离地高度，再放置机器人相机。
 
-## 4. Target-independent metric BEV and history
+## 像素、视场与深度
 
-Learned frame tokens are bilinearly splatted at aligned metric positions into a
-`16x16` robot-centric BEV. A convolutional encoder maps the observed `64x64`
-C-space to the same grid. Their sum plus metric positional encoding forms 256
-target-independent scene tokens. Three motion tokens encode valid historical
-relative poses, for 259 tokens total.
+两套仿真器均采用半整数像素中心：像素数组 `[v,u]` 对应齐次坐标 `[u+0.5,v+0.5,1]`。原生相机是 640×360，`fx=fy=326.398559570312`，`cx=320, cy=180`，水平视场约 88.866°。训练重新按这一视场渲染；旧窄视场图像不能通过替换 K 修复。
 
-PointGoal is absent from this memory, so changing the goal cannot rewrite the
-obstacle representation. Each trajectory-control query attends to scene tokens
-with explicit relative `x/y/z`, distance, observation age and token type.
+深度 共用 nearest 采样到 224×126，保留原视场：
 
-## 5. Single-call metric-horizon geometry and proposal-grounded refinement
+```
+u_source_index = floor((u_target_index + 0.5) / sx)
+v_source_index = floor((v_target_index + 0.5) / sy)
+fx' = sx fx, cx' = sx cx
+fy' = sy fy, cy' = sy cy
+```
 
-Let `g` be PointGoal, `H=3.6 m`, and
+目标焦距约 114.2395，主点 `(112,63)`。K 的连续缩放与最近邻离散选样的误差是两个概念；nearest 不跨深度边缘插值，但也不是无损射线重投影。
 
-`xi=(1/15,1/5,2/5,3/5,4/5,14/15,1)`
+`Z` 是光轴深度，不是射线欧氏距离。非有限或非正值为未知；有限值低于最大量程为表面命中；有限值达到最大量程为截断射线。FP16 存储保留 `0=未知`、`0<d<1=命中`、`1=有限量程截断`，命中值不会因舍入变成未知或截断。Habitat 的远平面背景 0 和 Isaac 的 Inf 都不能作为自由空间证据。
 
-be the seven non-origin Greville abscissae. The target-independent metric
-retrieval controls are
+缓存与在线采集使用同一预处理。历史快照传输 深度 float16，推理入口再转 float32；几何始终 FP32。训练与测评统一 BF16 神经网络运算，几何、Flow 状态、JVP 输出及其组合和损失保持 FP32。
 
-`A_i=(xi_i H,0)`.
+## 传感器时钟与异步规划
 
-They form a fixed forward horizon used only to locate the first metric queries.
-They never initialize or offset generated controls, constrain length or execute
-a path. The terminal intent is independently defined as
-`G=min(||g||,H)g/max(||g||,eps)`.
+`OBSERVATION_PERIOD_S=0.1`。Dingo 的物理步长 0.01 s、decimation 10、render interval 10，实际观测为 10 Hz。相机不再叠加另一套 0.1 s 的 FP32 更新阈值；该阈值会因物理步累计舍入，在约 32 秒后漏更新。原生传感器的 400 步试验中，旧阈值漏 40 帧，按渲染读取漏 0 帧。
 
-Let scene-memory token `k` have robot-frame position `p_k`. The first six
-Transformer blocks preserve a distinct physical relation for control query `i`
+```
+W=16, F=4
+s_j=floor(15j/2), j=0,1,2
+输入传感器序号=[k-16,k-9,k-1,k]
+完整历史年龄≈[1.6,0.9,0.1,0] 秒
+```
 
-`reference_ik=[(p_k.xy-A_i)/H,p_k.z/H,||p_k.xy-A_i||/H,surface_k,age_k,type_k]`.
+采集端在每个环境步更新历史，随后生成不可变快照。异步 planner 可以跳过过时快照，但不会跳过传感器历史的采集。推理进程只读取快照，没有第二份按 HTTP 请求次数累积的历史。回合重置在采集端清空相应环境，旧的在途快照由已有 episode generation 机制排除。
 
-The fixed reference path queries observed C-space, and the query token contains
-Flow state `z_t`, interval endpoint `(t,t)`, control identity, reference-path
-geometry and terminal intent
+不足窗口的左侧槽位使用显式无效掩码，不贡献几何或注意力。时间戳必须递增，采集间隔必须匹配 10 Hz；0.1 ms 容差仅覆盖 Isaac FP32 时钟的累积舍入。
 
-`intent_i=[A_i/H,(G-A_i)/H,||G-A_i||/H]`.
+训练在采样路线参数上使用同样的 0.1 s 时钟。它仍是静态场景中的运动学专家，不是实际控制器执行的动态轨迹。观测时钟与标签分辨率分离：专家标签按 0.15 m 弧长采样、24 步，最远 3.6 m；接近目标时保留真实终点。
 
-This does not declare the forward slots executable. It tells each control token
-where to inspect the same target-independent scene at a distinct future
-distance, while PointGoal cannot relocate that safety lookup or impose an
-intermediate straight route. The planar readout predicts instantaneous velocity
-`v_theta(z_t,t,c)`, which defines the learned clean proposal
+## 投影、记忆与 BEV
 
-`x_tilde_0 = z_t - t v_theta(z_t,t,c)`.
+```
+p_optical = Z K^-1 [u+0.5,v+0.5,1]
+T_current_camera_j = inverse(T_world_current) T_world_body_j T_body_j_camera_j
+p_current = T_current_camera_j [p_optical,1]
+```
 
-The codec immediately decodes `x_tilde_0` into seven physical controls and a
-64-point B-spline. Every path point queries deployed observed C-space; the 64
-features are aggregated to controls by normalized positive B-spline basis
-weights. For proposal control `C_i`, the second six blocks receive
+外部边界拒绝非有限位姿、尺度、反射和非法 K。全局坐标系的共同刚体变换不改变相对几何。
 
-`path_i = aggregate_j[q_j/H, o*d/H, o*grad(d), o, o*forbidden]`,
+历史表面重投影到每个较新且有效的保留帧相机时，连续像素坐标先减 0.5 转为数组索引。使用四个相邻深度的最小值判定较新自由射线是否否定旧点，避免深度边缘插值制造空隙。容差来自 FP16 深度存储误差的 SE(3) 传播；未知和遮挡不构成删除旧表面的证据。历史始终受 16 次传感器观测窗口限制。
 
-`goal_i = [C_i/H,(G-C_i)/H,||G-C_i||/H]`,
+深度编码器仅接收深度和由深度推导的有效性两通道。CNN 使用对称奇数卷积核，stride=16，特征位置 i 对应输入数组索引 16i。深度分区选择有效代表像素（优先机体高度带障碍），同一像素索引同时用于深度反投影和特征双线性采样。特征采样使用明确的 stride 坐标与 align_corners=False；末端特征中心外采用边界延拓。CNN 有感受野，这不意味着特征只含单像素信息。删除了独立的视觉自适应池化和冗余二维位置编码。
 
-plus BEV attention relative to `C_i`. Their readout predicts interval-average
-velocity `u_theta(z_t,r,t,c)`.
+64×64 栅格节点覆盖 `[-3.6,3.6] m`，`h=7.2/63`。两层 kernel=2/stride=2 卷积后，第 j 个 BEV 中心对应原节点 `4j+1.5`，而非重新把输出中心铺到边界。视觉 splat、位置编码和覆盖聚合共用这一坐标。双线性权重及累加保持 FP32。
 
-This ordering keeps one reference-located scene/path evaluation and one
-meaningful candidate-path evaluation without an inference loop. The reference
-is not an output proposal; it supplies distinct metric horizon anchors that
-E011/E012's origin-repeated query removes. Bilinear field lookup, affine coordinate
-decode and B-spline evaluation are differentiable almost everywhere, so the
-MeanFlow JVP includes
+当前表示是水平规划机体系内的机体碰撞场。落入机器人碰撞高度带的表面保留为障碍，不再因局部法向平坦就删除平台或家具。地面连通性、未来底盘高度与坡道通行需要额外的地形模型；当前二维规划器不以一个坡度标签冒充这类证明。
 
-`(z_t,g,c_reference) -> v_theta -> x_tilde_0 -> B-spline -> observed geometry -> u_theta`.
+## 连续净空的数学边界
 
-## 6. Physical B-spline coordinates
+障碍点 p 落到最近栅格节点 c，满足 `||p-c||<=h/sqrt(2)`。节点净空下界为：
 
-The first control is fixed at `P_0=(0,0)`. Seven generated planar increments
-obey
+```
+lower(q) = EDT_to_rasterized_obstacles(q) - robot_radius - h/sqrt(2)
+```
 
-`Delta_i=P_i-P_(i-1)`, `P_i=sum_(j<=i) Delta_j`.
+到固定障碍点集的距离是 1-Lipschitz。对任意连续位置 x，从邻近节点取得：
 
-Each of the fourteen physical components is standardized using the source-safe
-training split:
+```
+lower(x) = max_q [lower(q) - ||x-q||]
+```
 
-`e_k=(Delta_k-mu_k)/sigma_k`.
+这仍是到已观测障碍点集的净空下界；双线性插值距离不具有这一保证，因此不再用于返回连续净空。覆盖、视觉和方向特征仍可按权重插值，覆盖不足单独标为未知。离线真实安全分数仍使用原生 source navigation grid，观测场不替代真值。
 
-This is a nonsingular diagonal affine Euclidean coordinate change, so Gaussian
-interpolation and MeanFlow velocity remain mathematically valid. Decoding
-depends only on generated coordinates; PointGoal never leaks through an
-analytic output reference.
+该证明不覆盖未观测障碍、连续表面中漏采的部分或动态障碍的未来运动。二维点云和射线覆盖不是完整三维扫掠体安全证书；不能据此宣称绝对无碰撞。
 
-The final path is one fixed clamped cubic B-spline
+## 数据、归一化与训练
 
-`p(u)=sum_(i=0)^7 N_i(u)P_i`, `u in [0,1]`.
+原生渲染仅作临时输入，调用与在线相同的 深度 缩放和量化，直接顺序写入训练尺寸的 NPY：深度 FP16。不存在原生 640×360 图像落盘或二次缓存模块。10 Hz 连续帧保存一次，四帧样本使用索引共享；编译目录以硬链接引用帧文件。
 
-It is origin anchored and `C2` continuous without curvature clipping, length
-clipping or a target-distance constraint.
+默认 20 场景 × 每场景 5/10/10 条近/中/远路线，共 500 条（400 训练、100 验证），保持 16/4 场景隔离。移除容量配额，生成器直接输出训练尺寸和深度编码。
 
-## 7. One-step improved MeanFlow
+只从 source-safe 训练专家的物理曲线增量计算均值和标准差；验证集不参与拟合。准备目录保存实际 `config.yaml`，训练和测评使用它及对应 checkpoint，数据契约继续拒绝不匹配的归一化统计。不会套用旧数据统计强行启动新训练。
 
-For expert coordinates `x`, Gaussian source `e`, and end time `t`,
+完整 深度 bank 留在主机内存，CUDA 预取只传当前批次，避免数据规模直接挤占模型显存。全局有效 batch 与微批大小分别定义。
 
-`z_t=(1-t)x+t e`, `v*=e-x`.
+## 验证与证据
 
-The instantaneous readout is structurally independent of interval start `r`.
-The average readout predicts `u_theta(z_t,r,t,c)`. With stopped FP32 material
-derivative, improved MeanFlow trains
-
-`v_theta -> v*`,
-
-`u_theta + (t-r) stopgrad(D_t u_theta) -> v*`,
-
-and `L_MF` is the equal mean of those two standardized Euclidean squared
-errors.
-
-Here `D_t u_theta` is the JVP in direction `(v_theta,0,1)`. This is iMF's
-learned marginal-velocity direction, emitted by the auxiliary instantaneous
-readout in the same decoder call and supervised by `v*`; it is not the
-sample-specific expert velocity injected into the prediction function. The
-first half of the shared decoder exposes that readout early only so its clean
-estimate can locate the second half's trajectory-aligned geometry query.
-
-For the exact deployment quarter only, let
-`x_hat=e*-u_theta(e*,0,1,c)` and densely sample its decoded path at 2.5 cm. At
-query `q_j`, `d_j` is raw signed clearance and `s_j` is true only when every
-bilinear support cell is observed. The dimensionless feasibility risk is
-
-`L_vis = mean_j 1[s_j] [relu((0.10-d_j)/0.10)]^2`.
-
-The denominator is the fixed 3.6 m query-grid size, not observed count or path
-length. Before querying, the curve is identity-normalized with detached arc
-length: its forward value is unchanged, while the risk has zero derivative in
-the uniform radial-scale direction. Thus `L_vis` changes turning shape rather
-than teaching uniform shortening. Unknown EDT values never contribute. The
-unique objective is `L=L_MF+L_vis`, with both terms nondimensionalized and unit
-weight; there is no critic, ranking target, privileged map, reconstruction loss
-or inference-time penalty.
-
-Exactly one quarter of each global batch uses `(r,t)=(0,1)` and the same fixed
-typical-set source used by deployment. One quarter samples positive-width
-interior intervals and one half uses diagonal intervals. The instantaneous
-field provides the stopped JVP tangent and is directly supervised by `v*`.
-
-Inference performs exactly one decoder call:
-
-`x_hat = e* - u_theta(e*,0,1,c)`.
-
-`x_hat` is decoded once to the sole 64-point trajectory. There is no Euler/ODE
-loop and no candidate selection.
-
-Offline evaluation may also decode the already-computed internal
-`x_tilde_0=e*-v_theta` to measure proposal/final alignment. This does not add a
-deployment forward pass, candidate, score or selector: runtime still returns
-only `x_hat`. A high `proposal-safe -> final-collision` rate would falsify the
-assumption that proposal-grounded geometry reaches the deployed average field.
-
-## 8. What is and is not guaranteed
-
-Every serialized expert is re-certified against native source C-space at
-2.5 cm spacing, with at least 0.10 m clearance and OOB non-executable. Expert
-imitation therefore supplies a physically safe target. The learned clean
-proposal gives the average field output-relative geometry; the final-path risk
-adds the missing direct derivative from visible footprint clearance to the
-deployed controls. Expert regression retains route and progress supervision,
-while the risk has no uniform-length gradient. Neither term is a second policy.
-
-This remains learned constrained imitation, not a hard collision guarantee.
-Local depth cannot certify unseen topology, and a single deterministic generator does not
-inherit the candidate selector of SanD or critic of NavDP. Evaluation therefore
-separates the first `0.5/1.0 m`, the full path and the visibility of the first
-source-truth collision. First-hit current-frame, history-only and four-frame
-unrecognized masks form an exact partition; an ``any point visible`` label is
-reported only as perception support and must not be interpreted as the cause of
-the first collision. The stated engineering target is below 1% physical
-collision, but it can only be claimed from source truth and fixed closed-loop
-measurements, never from the raw `64x64` depth proxy alone.
-
-## 9. Training and efficiency contract
-
-- one prepared dataset, loader, policy, combined generator objective, launcher and
-  checkpoint schema;
-- global batch 1024, 40 updates per epoch, 200 epochs / 8000 updates;
-- deterministic zero-dropout training/inference;
-- compiled perception, conditioning, primal and stopped-JVP graphs;
-- twelve decoder blocks: six reference-geometry-to-proposal plus six
-  proposal-to-average blocks in one call;
-- DDP preserves the exact global batch and exact deployment quarter;
-- an FP16 overflow recomputes the same global sample batch and Flow source at
-  the reduced loss scale; step, scheduler and EMA advance only after the
-  optimizer commits the update;
-- step-800 source-truth gate before a full run;
-- RTX-4090 steady-state architecture gate at least 3000 samples/s.
-
-The single-call block count matches E006's inference cost order. The instantiated
-policy contains `33,898,916` parameters, including `29,018,980` in the decoder.
-Latency and steady training throughput are reported only after the production
-CUDA graph reaches a stable measured interval.
-
-## 10. Relation to public systems
-
-- [SanD-Planner](https://github.com/WangJinCheng1998/sandplanner): CurveNav keeps
-  short depth history, a scratch visual encoder, low-dimensional cubic curve
-  and expert imitation. SanD's complete inference samples trajectories and
-  scores them with ESDF; CurveNav deliberately has neither inference mechanism
-  and instead differentiates observed clearance through its sole output during
-  training.
-- [NavDP](https://github.com/InternRobotics/NavDP): its noisy trajectory tokens
-  attend to visual context and iterative diffusion repeatedly updates them.
-  CurveNav keeps the Flow state as the neural transport input but does not
-  pretend its one-step Gaussian source is already a navigation proposal. It
-  uses fixed metric horizon slots to retrieve the complete robot-centric scene,
-  keeps terminal PointGoal intent separate, estimates one clean endpoint, and grounds that endpoint as a
-  candidate path inside the same call.
-  NavDP's critic and collision
-  augmentation are not hidden in CurveNav. Their necessity is evidence that
-  coordinate imitation alone is not a physical feasibility objective.
-- [X-NavDP](https://arxiv.org/abs/2607.28560): its reinforcement post-training is
-  outside the present supervised generator.
-- [FlowPilot](https://arxiv.org/abs/2608.00635): its world/action coupling
-  supports the principle that predicted future geometry should inform action,
-  but CurveNav does not add a future-depth decoder or multi-step Euler solver.
-- [MeanFlow](https://arxiv.org/abs/2505.13447): CurveNav preserves direct
-  average-velocity transport and exact `(0,1)` deployment-boundary coverage.
-  The instantaneous proposal is the improved-MeanFlow endpoint estimate used
-  to place the geometry query inside the same function call.
-- [LoGoPlanner](https://arxiv.org/abs/2512.19629): its task-specific state and
-  geometry queries establish metric scene context before goal-conditioned
-  diffusion. CurveNav adopts only that information-factorization principle:
-  known SE(2) history and calibrated depth already provide more direct metric
-  geometry than learned pose/point-cloud heads. It does not adopt VGGT, implicit
-  localization, ten-step diffusion, sixteen candidates or the released critic.
-
-The architectural contribution is a one-call, deployment-grounded improved
-MeanFlow: target-independent four-frame observed C-space BEV, physical
-Flow coordinates, metric-horizon geometry attention, terminal-only
-PointGoal intent, a supervised instantaneous
-endpoint estimate, a differentiable C-space query along that estimate,
-query-relative PointGoal intent, one final physical B-spline transport and one
-training-only feasibility objective on that exact output.
+纯深度改造记录在 `outputs/depth-only-500-20260910`；此前相机验证记录在 `outputs/eval-alignment-20260910`：源码快照、Isaac/Habitat 斜平面渲染、传感器时钟与异步推理分离测试、真实 HSSD 路线、数据编译、GPU 测试和训练/测评日志。进展与限制以该目录的审计报告为准，不从单元测试推断导航成功率。
+
+SAND、XNavDP、LoGoPlanner 和 MulDP 是设计参考，不等于完整复现其架构与结果。保留度量 深度、显式 SE(3)、短期四帧记忆与单步 improved MeanFlow；进一步扩展地形连通、动态跟踪或执行约束需要对应数据和实验支撑。
+
+精度在神经计算区域定义：CNN、MLP、注意力使用 BF16，主参数与 AdamW 状态保留 FP32。训练器和推理器不设置全局 autocast；几何层没有禁用或恢复精度的分支。JVP 对同一 BF16 神经函数求导，导数输出和 Flow 组合使用 FP32，不再另跑 FP32 神经前向。FP32 矩阵乘法使用 highest 精度。

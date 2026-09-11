@@ -6,9 +6,7 @@ from torch import nn
 
 def configure_cuda_training_backend() -> None:
     """Select the static-shape Tensor Core route without unbounded workspaces."""
-    torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("highest")
     # CurveNav compiles only internal static functions.  DDPOptimizer is for
     # compiling an enclosing DDP model and cannot split a torch.func JVP graph.
     torch._dynamo.config.optimize_ddp = False
@@ -20,24 +18,12 @@ def configure_cuda_training_backend() -> None:
 
 
 def compile_static_training_functions(policy: nn.Module) -> None:
-    """Fuse fixed-shape perception, conditioning, primal, and stopped JVP."""
-    policy.depth_encoder.forward = torch.compile(
-        policy.depth_encoder.forward,
-        fullgraph=True,
-        dynamic=False,
-    )
-    policy.condition_encoder.forward = torch.compile(
-        policy.condition_encoder.forward,
-        fullgraph=True,
-        dynamic=False,
-    )
-    policy._trainable_velocity_primal = torch.compile(
-        policy._trainable_velocity_primal,
-        fullgraph=True,
-        dynamic=False,
-    )
-    policy._mean_flow_total_time_derivative = torch.compile(
-        policy._mean_flow_total_time_derivative,
-        fullgraph=True,
-        dynamic=False,
-    )
+    """Fuse perception, conditioning, shared K/V, primal, and stopped JVP."""
+    for module, name in (
+        (policy.depth_encoder, "forward"),
+        (policy.condition_encoder, "forward"),
+        (policy.trajectory_decoder, "project_condition_memory"),
+        (policy, "_trainable_velocity_primal"),
+        (policy, "_mean_flow_total_time_derivative"),
+    ):
+        setattr(module, name, torch.compile(getattr(module, name), fullgraph=True, dynamic=False))

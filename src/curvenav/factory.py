@@ -23,17 +23,11 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
     )
 
     depth_encoder = DepthObservationEncoder(
-        observation_frames=config.data.observation_frames,
         model_dim=depth.model_dim,
         frame_tokens_height=depth.frame_tokens_height,
         frame_tokens_width=depth.frame_tokens_width,
         dropout=depth.dropout,
         max_depth_m=config.data.max_depth_m,
-        focal_x_px=config.data.canonical_focal_x_px,
-        focal_y_px=config.data.canonical_focal_y_px,
-        camera_forward_offset_m=config.data.camera_forward_offset_m,
-        camera_height_m=config.data.camera_height_m,
-        camera_downward_pitch_degrees=(config.data.camera_downward_pitch_degrees),
         planning_horizon_m=planning_horizon_m,
     )
     configuration_encoder = ConfigurationSpaceEncoder(
@@ -44,9 +38,6 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
     condition_encoder = PolicyConditionEncoder(
         configuration_encoder,
         observation_frames=config.data.observation_frames,
-        history_horizon_m=(
-            (config.data.observation_frames - 1) * config.data.frame_spacing_m
-        ),
         planning_horizon_m=planning_horizon_m,
         control_tokens=trajectory.num_control_points - 1,
         model_dim=condition.model_dim,
@@ -84,10 +75,5 @@ def build_evaluation_projector(config: CurveNavConfig) -> MetricDepthProjector:
         token_height=config.depth_encoder.frame_tokens_height,
         token_width=config.depth_encoder.frame_tokens_width,
         max_depth_m=data.max_depth_m,
-        focal_x_px=data.canonical_focal_x_px,
-        focal_y_px=data.canonical_focal_y_px,
-        camera_forward_offset_m=data.camera_forward_offset_m,
-        camera_height_m=data.camera_height_m,
-        camera_downward_pitch_degrees=data.camera_downward_pitch_degrees,
         planning_horizon_m=data.future_steps * data.expert_waypoint_spacing_m,
     )

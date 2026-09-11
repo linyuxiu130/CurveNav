@@ -23,7 +23,7 @@ def query_configuration_field(
     path: Tensor,
     planning_horizon_m: float,
 ) -> ConfigurationFieldQuery:
-    """Bilinearly query raw C-space without treating unknown cells as free.
+    """Query a continuous clearance lower bound and interpolated observations.
 
     Channels are signed clearance, its planar unit gradient, ray coverage, and
     the footprint-inflated obstacle indicator.  Geometry from an unobserved
@@ -58,7 +58,22 @@ def query_configuration_field(
         ((1 - wx) * (1 - wy), wx * (1 - wy), (1 - wx) * wy, wx * wy),
         dim=-1,
     )
-    raw = (corners * weights[..., None]).sum(dim=-2)
+    # Distance to a fixed obstacle set is 1-Lipschitz. Each node lower bound
+    # therefore gives d(p) >= d_lower(node) - ||p-node||. Their maximum remains
+    # a lower bound; bilinear distance interpolation does not have this property.
+    node_x = torch.stack((x0, x1, x0, x1), dim=-1).float()
+    node_y = torch.stack((y0, y0, y1, y1), dim=-1).float()
+    nodes = torch.stack(
+        (
+            node_x * (2 * planning_horizon_m / (width - 1)) - planning_horizon_m,
+            node_y * (2 * planning_horizon_m / (height - 1)) - planning_horizon_m,
+        ),
+        dim=-1,
+    )
+    lower_bound = (
+        corners[..., 0]
+        - torch.linalg.vector_norm(path.float()[..., None, :] - nodes, dim=-1)
+    ).amax(dim=-1)
     inside = (normalized.abs() <= 1).all(dim=-1)
     observed = corners[..., 3].clamp(0, 1)
     support_observed = inside & torch.where(
@@ -70,15 +85,16 @@ def query_configuration_field(
         corners[..., :3] * observed[..., None] * weights[..., None]
     ).sum(dim=-2)
     coverage = (observed * weights).sum(dim=-1, keepdim=True)
-    forbidden = (
-        corners[..., 4:5] * observed[..., None] * weights[..., None]
-    ).sum(dim=-2)
-    inside_value = inside[..., None].to(raw.dtype)
+    observed_geometry = torch.cat(
+        (lower_bound[..., None] * coverage, observed_geometry[..., 1:]), dim=-1
+    )
+    forbidden = (corners[..., 4:5] * observed[..., None] * weights[..., None]).sum(
+        dim=-2
+    )
+    inside_value = inside[..., None].to(lower_bound.dtype)
     return ConfigurationFieldQuery(
-        observed_features=torch.cat(
-            (observed_geometry, coverage, forbidden), dim=-1
-        )
+        observed_features=torch.cat((observed_geometry, coverage, forbidden), dim=-1)
         * inside_value,
-        signed_clearance_m=raw[..., 0] * inside_value.squeeze(-1),
+        signed_clearance_m=lower_bound,
         support_observed=support_observed,
     )

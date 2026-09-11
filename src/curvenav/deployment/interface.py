@@ -9,16 +9,9 @@ import numpy as np
 from curvenav.deployment.runtime import CurveNavRuntime, RuntimePrediction, load_policy
 
 
-REQUEST_FIELDS = frozenset(
-    {
-        "point_goal",
-        "depth_m",
-        "robot_position",
-        "robot_quaternion",
-        "camera_intrinsics",
-        "reset",
-    }
-)
+from curvenav.data.observation import DEPTH_CONTEXT_FIELDS
+
+REQUEST_FIELDS = DEPTH_CONTEXT_FIELDS | {"point_goal"}
 RESPONSE_FIELDS = frozenset({"path"})
 
 
@@ -30,11 +23,13 @@ def _read_request(payload: bytes) -> dict[str, np.ndarray]:
                 f"CurveNav request fields must be {sorted(REQUEST_FIELDS)}, got {sorted(fields)}"
             )
         request = {name: np.array(archive[name], copy=True) for name in archive.files}
-    for name in REQUEST_FIELDS - {"reset"}:
+    for name in REQUEST_FIELDS - {"observation_valid", "depth"}:
         if request[name].dtype != np.float32:
             raise TypeError(f"{name} must be float32")
-    if request["reset"].dtype != np.bool_:
-        raise TypeError("reset must be bool")
+    if request["depth"].dtype != np.float16:
+        raise TypeError("normalized depth must be float16")
+    if request["observation_valid"].dtype != np.bool_:
+        raise TypeError("observation_valid must be bool")
     return request
 
 
@@ -51,7 +46,7 @@ def _write_response(prediction: RuntimePrediction) -> bytes:
 
 
 class CurveNavNpzInterface:
-    """Translate one exact benchmark request into one stateful policy step."""
+    """Translate one exact benchmark request into one stateless policy step."""
 
     def __init__(self, runtime: CurveNavRuntime) -> None:
         self.runtime = runtime
@@ -59,19 +54,9 @@ class CurveNavNpzInterface:
     def predict(self, payload: bytes) -> bytes:
         request = _read_request(payload)
         batch_size = int(request["point_goal"].shape[0])
-        reset = request["reset"]
-        if reset.shape != (batch_size,):
-            raise ValueError(f"reset must have shape [{batch_size}]")
         if self.runtime.batch_size != batch_size:
-            self.runtime.reset(batch_size, request["camera_intrinsics"])
-        for env_id in np.flatnonzero(reset):
-            self.runtime.reset_env(int(env_id))
-        prediction = self.runtime.step(
-            request["point_goal"],
-            request["depth_m"],
-            request["robot_position"],
-            request["robot_quaternion"],
-        )
+            self.runtime.reset(batch_size)
+        prediction = self.runtime.step(request.pop("point_goal"), request)
         return _write_response(prediction)
 
 

@@ -2,9 +2,10 @@
 
 import torch
 from torch import Tensor, nn
+from curvenav.precision import NEURAL_DTYPE
 
 
-HISTORICAL_STATE_FEATURES = "normalized_xy_sine_cosine"
+HISTORICAL_STATE_FEATURES = "metric_xyz_rotation_columns_time"
 
 
 class HistoricalMotionEncoder(nn.Module):
@@ -20,24 +21,22 @@ class HistoricalMotionEncoder(nn.Module):
         self,
         *,
         observation_frames: int,
-        history_horizon_m: float,
+        translation_scale_m: float,
         model_dim: int,
     ) -> None:
         super().__init__()
         if observation_frames < 2:
             raise ValueError("motion encoding requires a past observation")
-        if history_horizon_m <= 0:
-            raise ValueError("history_horizon_m must be positive")
+        if translation_scale_m <= 0:
+            raise ValueError("translation_scale_m must be positive")
         self.state_tokens = observation_frames - 1
-        self.history_horizon_m = float(history_horizon_m)
+        self.translation_scale_m = float(translation_scale_m)
         self.projection = nn.Sequential(
-            nn.Linear(4, model_dim),
+            nn.Linear(10, model_dim),
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
-        self.slot_embedding = nn.Parameter(
-            torch.zeros(1, self.state_tokens, model_dim)
-        )
+        self.slot_embedding = nn.Parameter(torch.zeros(1, self.state_tokens, model_dim))
         self.null_token = nn.Parameter(torch.zeros(1, 1, model_dim))
         nn.init.trunc_normal_(self.slot_embedding, std=0.02)
         nn.init.trunc_normal_(self.null_token, std=0.02)
@@ -46,27 +45,18 @@ class HistoricalMotionEncoder(nn.Module):
         self,
         observation_to_current: Tensor,
         observation_valid: Tensor,
+        observation_age_s: Tensor,
     ) -> Tensor:
-        if (
-            observation_to_current.ndim != 3
-            or observation_to_current.shape[-1] != 4
-        ):
-            raise ValueError("observation transforms must have shape [B,F,4]")
-        if observation_valid.shape != observation_to_current.shape[:2]:
-            raise ValueError("observation validity must have shape [B,F]")
         past = observation_to_current[:, :-1].float()
         features = torch.cat(
             (
-                past[..., :2] / self.history_horizon_m,
-                past[..., 2:4],
+                past[..., :3, 3] / self.translation_scale_m,
+                past[..., :3, :2].flatten(-2),
+                observation_age_s[:, :-1, None],
             ),
             dim=-1,
         )
-        encoded = self.projection(features)
-        valid = observation_valid[:, :-1, None]
-        encoded = torch.where(
-            valid,
-            encoded,
-            self.null_token.expand(encoded.shape[0], self.state_tokens, -1),
-        )
+        with torch.autocast(device_type=features.device.type, dtype=NEURAL_DTYPE):
+            encoded = self.projection(features)
+        encoded = torch.where(observation_valid[:, :-1, None], encoded, self.null_token)
         return encoded + self.slot_embedding

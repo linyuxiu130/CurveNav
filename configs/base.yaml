@@ -1,25 +1,49 @@
 data:
-  root: data/policy_dataset-source-cspace
+  root: data/policy_dataset-depth-forward
   observation_frames: 4
-  frame_spacing_m: 0.45
   expert_waypoint_spacing_m: 0.15
   future_steps: 24
   image_height: 126
   image_width: 224
   max_depth_m: 5.0
-  canonical_focal_x_px: 166.80851063829786
-  canonical_focal_y_px: 166.80851063829786
   camera_forward_offset_m: 0.28618
   camera_height_m: 0.62532
   camera_downward_pitch_degrees: 10.0
-
 model:
   trajectory:
     num_control_points: 8
     spline_degree: 3
     num_path_points: 64
-    control_increment_mean_xy_m: [0.19575905874489494, 0.000013560529621743297, 0.3902212095715023, 0.002008237219028404, 0.558451868792498, 0.007029782353195491, 0.5213567234781906, 0.009539148157356049, 0.4803115149944964, 0.009542148952045124, 0.29207692008915925, 0.005783167418347843, 0.13902845983512357, 0.003241675585678419]
-    control_increment_std_xy_m: [0.06963118493486234, 0.009753948216963312, 0.1396785939096103, 0.06463728684735078, 0.20765432388349703, 0.1990670224631178, 0.22015131716511072, 0.27216707621942426, 0.24343845568601458, 0.32393372700831924, 0.18216146996698057, 0.24085929622333027, 0.09459704496084137, 0.12324686272239309]
+    control_increment_mean_xy_m:
+    - 0.19575905874489494
+    - 1.3560529621743297e-05
+    - 0.3902212095715023
+    - 0.002008237219028404
+    - 0.558451868792498
+    - 0.007029782353195491
+    - 0.5213567234781906
+    - 0.009539148157356049
+    - 0.4803115149944964
+    - 0.009542148952045124
+    - 0.29207692008915925
+    - 0.005783167418347843
+    - 0.13902845983512357
+    - 0.003241675585678419
+    control_increment_std_xy_m:
+    - 0.06963118493486234
+    - 0.009753948216963312
+    - 0.1396785939096103
+    - 0.06463728684735078
+    - 0.20765432388349703
+    - 0.1990670224631178
+    - 0.22015131716511072
+    - 0.27216707621942426
+    - 0.24343845568601458
+    - 0.32393372700831924
+    - 0.18216146996698057
+    - 0.24085929622333027
+    - 0.09459704496084137
+    - 0.12324686272239309
   depth_encoder:
     model_dim: 384
     frame_tokens_height: 8
@@ -34,8 +58,8 @@ model:
     dropout: 0.0
 training:
   seed: 42
-  global_batch_size: 1024
-  per_device_batch_size: 342
+  gradient_accumulation_steps: 1
+  per_device_batch_size: 416
   samples_per_epoch: 40960
   epochs: 200
   num_workers: 2
@@ -44,7 +68,7 @@ training:
   min_learning_rate_factor: 0.01
   log_every_steps: 20
   checkpoint_every_epochs: 20
-  output_dir: outputs/train_policy-e013
+  output_dir: outputs/train_policy-depth-forward
   learning_rate: 0.0002
   weight_decay: 0.01
   grad_clip_norm: 1.0

@@ -1,7 +1,6 @@
 """Calibrated metric-depth reprojection shared by data preparation and deployment."""
 
 from dataclasses import dataclass
-from functools import lru_cache
 
 import numpy as np
 
@@ -74,76 +73,63 @@ BENCHMARK_INTRINSICS = PinholeIntrinsics(
     cx=320.0,
     cy=180.0,
 )
-CANONICAL_INTRINSICS = PinholeIntrinsics(
-    width=224,
-    height=126,
-    fx=166.80851063829786,
-    fy=166.80851063829786,
-    cx=112.0,
-    cy=63.0,
-)
+CANONICAL_INTRINSICS = BENCHMARK_INTRINSICS.at_resolution(224, 126)
 
 
-def depth_camera_contract(data: DataConfig) -> dict[str, int | float]:
+def depth_camera_contract(data: DataConfig) -> dict[str, int | float | str]:
     """Return the one metric-depth calibration used by every data source."""
     return {
+        "depth_encoding": "fp16_zero_unknown_one_censored_interior_hit_v2",
         "image_height": data.image_height,
         "image_width": data.image_width,
         "max_depth_m": data.max_depth_m,
-        "canonical_focal_x_px": data.canonical_focal_x_px,
-        "canonical_focal_y_px": data.canonical_focal_y_px,
+        "intrinsic_matrix": CANONICAL_INTRINSICS.matrix().tolist(),
+        "pixel_centres": "half_integer",
         "camera_forward_offset_m": data.camera_forward_offset_m,
         "camera_height_m": data.camera_height_m,
         "camera_downward_pitch_degrees": data.camera_downward_pitch_degrees,
     }
 
 
-@lru_cache(maxsize=8)
-def _pinhole_remap(
-    source: PinholeIntrinsics,
-    target: PinholeIntrinsics,
-) -> tuple[np.ndarray, np.ndarray]:
-    row, column = np.meshgrid(
-        np.arange(target.height, dtype=np.float32),
-        np.arange(target.width, dtype=np.float32),
-        indexing="ij",
-    )
-    ray_x = (column - target.cx) / target.fx
-    ray_y = (row - target.cy) / target.fy
-    source_x = source.fx * ray_x + source.cx
-    source_y = source.fy * ray_y + source.cy
-    return source_x.astype(np.float32), source_y.astype(np.float32)
-
-
-def preprocess_metric_depth(
+def preprocess_depth(
     depth_m: np.ndarray,
     *,
     source_intrinsics: PinholeIntrinsics,
     maximum_m: float,
-) -> np.ndarray:
-    """Reproject one calibrated FoV at its delivered sampling resolution."""
-    frame = np.asarray(depth_m, dtype=np.float32)
-    if frame.ndim != 2:
-        raise ValueError(f"depth must be a two-dimensional image, got {frame.shape}")
-    sampled_intrinsics = source_intrinsics.at_resolution(
-        width=frame.shape[1],
-        height=frame.shape[0],
+    height: int,
+    width: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resize optical-Z; preserve FoV and invalid depth.
+
+    Pixels have half-integer centres, as in the simulator rasterizer;
+    K follows that same mapping. No depth interpolation crosses object edges.
+    """
+    if depth_m.ndim != 2 or depth_m.shape != (
+        source_intrinsics.height,
+        source_intrinsics.width,
+    ):
+        raise ValueError("depth and calibration image dimensions must agree")
+    if not np.isfinite(maximum_m) or maximum_m <= 0:
+        raise ValueError("maximum depth must be finite and positive")
+    y = np.minimum(
+        ((np.arange(height) + 0.5) * depth_m.shape[0] / height).astype(int),
+        depth_m.shape[0] - 1,
     )
-    invalid = ~np.isfinite(frame) | (frame <= 0.0)
-    frame = frame.copy()
-    frame[invalid] = maximum_m
-    map_x, map_y = _pinhole_remap(sampled_intrinsics, CANONICAL_INTRINSICS)
-    source_x = np.floor(map_x + 0.5).astype(np.int64)
-    source_y = np.floor(map_y + 0.5).astype(np.int64)
-    inside = (
-        (source_x >= 0)
-        & (source_x < frame.shape[1])
-        & (source_y >= 0)
-        & (source_y < frame.shape[0])
+    x = np.minimum(
+        ((np.arange(width) + 0.5) * depth_m.shape[1] / width).astype(int),
+        depth_m.shape[1] - 1,
     )
-    canonical = np.full(map_x.shape, maximum_m, dtype=np.float32)
-    canonical[inside] = frame[source_y[inside], source_x[inside]]
-    return np.ascontiguousarray(
-        np.clip(canonical, 0.0, maximum_m) / maximum_m,
-        dtype=np.float32,
+    depth = depth_m[y[:, None], x].astype(np.float32)
+    valid = np.isfinite(depth) & (depth > 0)
+    hit = valid & (depth < maximum_m)
+    # Reserve 0 for unknown and 1 for finite measurements at/beyond the
+    # planning range. FP16 rounding must not change a surface into either.
+    smallest = float(np.nextafter(np.float16(0), np.float16(1)))
+    largest = float(np.nextafter(np.float16(1), np.float16(0)))
+    depth = np.where(
+        hit, np.clip(depth / maximum_m, smallest, largest), np.where(valid, 1, 0)
+    ).astype(np.float32)
+    intrinsic = (
+        source_intrinsics.at_resolution(width, height).matrix().astype(np.float32)
     )
+    return depth, intrinsic

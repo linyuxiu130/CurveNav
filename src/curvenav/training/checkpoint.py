@@ -9,6 +9,7 @@ from torch import nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
+from curvenav.data.history import history_contract
 from curvenav.config import CurveNavConfig
 from curvenav.conditioning import (
     CONDITION_ENCODER_TYPE,
@@ -19,6 +20,7 @@ from curvenav.encoders.configuration import CONFIGURATION_ENCODER_TYPE
 from curvenav.models import TRAJECTORY_DECODER_TYPE
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.batching import build_distributed_batch_layout
+from curvenav.precision import PRECISION_NAME
 from curvenav.trajectory import INCREMENTAL_CONTROL_PARAMETERIZATION_TYPE
 from curvenav.models.policy import (
     INFERENCE_SOURCE_SEED,
@@ -27,12 +29,6 @@ from curvenav.models.policy import (
 
 
 CHECKPOINT_TYPE = "curvenav_metric_curve_mean_flow_policy"
-SUPPORTED_TRAINING_PRECISIONS = frozenset(
-    {
-        "bf16_neural_fp32_geometry_flow_jvp",
-        "fp16_neural_fp32_geometry_flow_jvp",
-    }
-)
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
 
@@ -46,16 +42,20 @@ def build_training_contract(
         raise ValueError(
             f"world_size must be one of {PRODUCTION_WORLD_SIZES}, got {world_size}"
         )
-    if mixed_precision not in SUPPORTED_TRAINING_PRECISIONS:
+    if mixed_precision != PRECISION_NAME:
         raise ValueError(f"unsupported CurveNav precision: {mixed_precision}")
-    global_batch_size = config.training.global_batch_size
     per_device_batch_size = config.training.per_device_batch_size
+    global_batch_size = (
+        per_device_batch_size * world_size * config.training.gradient_accumulation_steps
+    )
     layout = build_distributed_batch_layout(
         global_batch_size,
         per_device_batch_size,
         world_size,
     )
     steps_per_epoch = config.training.samples_per_epoch // global_batch_size
+    if steps_per_epoch < 1:
+        raise ValueError("samples_per_epoch must cover at least one global batch")
     return {
         "mixed_precision": mixed_precision,
         "world_size": world_size,
@@ -64,6 +64,7 @@ def build_training_contract(
         "per_device_batch_size": per_device_batch_size,
         "micro_batches_per_step": layout.micro_batches_per_step,
         "global_batch_size": global_batch_size,
+        "samples_per_epoch": steps_per_epoch * global_batch_size,
         "flow_interval_assignment": "global_sample_stream_index_mod_four",
         "steps_per_epoch": steps_per_epoch,
         "total_steps": config.training.epochs * steps_per_epoch,
@@ -77,18 +78,16 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
     decoder = config.trajectory_decoder
     condition = config.condition_encoder
     return {
+        "observation_schema": "depth_sensor10hz_halfpixel_sample4_v5",
+        "history": history_contract(),
+        "precision": PRECISION_NAME,
+        "trajectory_math": "fp32_metric_math_bf16_neural_regions",
         "observation_frames": data.observation_frames,
-        "frame_spacing_m": data.frame_spacing_m,
         "expert_waypoint_spacing_m": data.expert_waypoint_spacing_m,
         "future_steps": data.future_steps,
         "depth_image_size": [data.image_height, data.image_width],
         "max_depth_m": data.max_depth_m,
-        "canonical_focal_px": [data.canonical_focal_x_px, data.canonical_focal_y_px],
-        "camera_extrinsics": {
-            "forward_offset_m": data.camera_forward_offset_m,
-            "height_m": data.camera_height_m,
-            "downward_pitch_degrees": data.camera_downward_pitch_degrees,
-        },
+        "camera_calibration": "per_frame_K_and_optical_camera_to_body_SE3",
         "depth_encoder_type": DEPTH_ENCODER_TYPE,
         "model_architecture": {
             "model_dim": depth.model_dim,
@@ -110,13 +109,11 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "point_goal_semantics": (
             "mission_destination_in_current_robot_xy_clamped_to_local_terminal"
         ),
-        "point_goal_conditioning": (
-            "terminal_local_goal_intent_only"
-        ),
+        "point_goal_conditioning": ("terminal_local_goal_intent_only"),
         "trajectory_supervision": (
             "source_cspace_gated_fixed_future_expert_planar_bspline_imitation"
         ),
-        "expert_curve_projection": "equal_arc_planar_bspline_least_squares",
+        "expert_curve_projection": "equal_arc_bspline_forward_tangent_endpoint_fit",
         "trajectory_endpoint_policy": "one_step_improved_mean_flow_curve",
         "curve_boundary_conditions": "fixed_robot_origin",
         "trajectory_decoder_type": TRAJECTORY_DECODER_TYPE,
@@ -137,11 +134,11 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "trajectory_prediction": ("one_step_improved_mean_flow_planar_cubic_bspline"),
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
         "visual_context": (
-            "goal_independent_four_frame_visual_observed_configuration_bev"
+            "goal_independent_temporal_visual_observed_configuration_bev"
         ),
-        "depth_token_pooling": "nearest_metric_surface_per_image_token",
+        "depth_token_pooling": "body_hit_else_surface_same_pixel_stride16_feature_sample",
         "observation_to_current": (
-            "planar_rigid_transform_used_for_metric_xyz_alignment_and_motion_state"
+            "se3_rigid_transform_used_for_metric_xyz_alignment_and_motion_state"
         ),
         "configuration_encoder_type": CONFIGURATION_ENCODER_TYPE,
         "visual_compression": "metric_splat_and_observed_cspace_16x16_bev",
@@ -156,11 +153,11 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             "terminal_local_goal_vector_without_straight_template_matching"
         ),
         "temporal_modeling": (
-            "shared_learned_four_frame_depth_tokens_with_metric_se2_alignment"
+            "depth_pixel_sample_stride16_se3_all_newer_consistency"
         ),
         "state_token_features": HISTORICAL_STATE_FEATURES,
         "state_translation_scale_m": (
-            (data.observation_frames - 1) * data.frame_spacing_m
+            data.future_steps * data.expert_waypoint_spacing_m
         ),
         "state_token_count": data.observation_frames - 1,
         "condition_token_count": (
@@ -188,12 +185,8 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "curve_coordinates": INCREMENTAL_CONTROL_PARAMETERIZATION_TYPE,
         "visual_planning_scale_m": (data.future_steps * data.expert_waypoint_spacing_m),
         "curve_value_semantics": ("seven_planar_cubic_bspline_control_points_xy_m"),
-        "control_increment_mean_xy_m": list(
-            trajectory.control_increment_mean_xy_m
-        ),
-        "control_increment_std_xy_m": list(
-            trajectory.control_increment_std_xy_m
-        ),
+        "control_increment_mean_xy_m": list(trajectory.control_increment_mean_xy_m),
+        "control_increment_std_xy_m": list(trajectory.control_increment_std_xy_m),
         "flow_coordinate_transform": (
             "per_dimension_standardized_physical_control_increments"
         ),
@@ -210,7 +203,6 @@ def build_training_checkpoint(
     *,
     training_contract: Mapping[str, int | str],
     rng_states: Mapping[str, Tensor],
-    amp_state: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Build the complete state required to resume mixed-precision updates."""
     if step < 0:
@@ -233,9 +225,6 @@ def build_training_checkpoint(
             or state.shape[0] != world_size
         ):
             raise ValueError(f"{name} RNG state must be uint8 [world_size, N]")
-    uses_scaler = mixed_precision.startswith("fp16_")
-    if uses_scaler != (amp_state is not None):
-        raise ValueError("checkpoint AMP state does not match mixed precision")
     return {
         "checkpoint_type": CHECKPOINT_TYPE,
         "step": step,
@@ -246,7 +235,6 @@ def build_training_checkpoint(
         "config": asdict(config),
         "policy_contract": build_policy_contract(config),
         "training_contract": expected_training_contract,
-        "amp_state": dict(amp_state) if amp_state is not None else None,
         "rng_states": {
             "cpu": rng_states["cpu"].cpu(),
             "cuda": rng_states["cuda"].cpu(),
@@ -278,12 +266,6 @@ def validate_training_resume(
             or state.shape[0] != world_size
         ):
             raise ValueError(f"resume checkpoint has invalid {name} RNG state")
-    amp_state = checkpoint.get("amp_state")
-    if mixed_precision.startswith("fp16_"):
-        if not isinstance(amp_state, Mapping):
-            raise ValueError("FP16 resume checkpoint has no scaler state")
-    elif amp_state is not None:
-        raise ValueError("BF16 resume checkpoint unexpectedly has scaler state")
 
 
 def restore_process_rng_state(
@@ -327,7 +309,6 @@ def restore_training_state(
     scheduler: Any,
     ema: ExponentialMovingAverage,
     config: CurveNavConfig,
-    scaler: Any | None,
 ) -> int:
     """Restore the complete state needed to continue optimizer updates."""
     validate_policy_contract(checkpoint, config)
@@ -341,7 +322,6 @@ def restore_training_state(
         "config",
         "policy_contract",
         "training_contract",
-        "amp_state",
         "rng_states",
     }
     if set(checkpoint) != expected_keys:
@@ -352,14 +332,6 @@ def restore_training_state(
     optimizer.load_state_dict(checkpoint["optimizer"])
     scheduler.load_state_dict(checkpoint["scheduler"])
     ema.load_state_dict(checkpoint["ema"])
-    amp_state = checkpoint["amp_state"]
-    if scaler is None:
-        if amp_state is not None:
-            raise ValueError("checkpoint scaler state requires FP16 runtime")
-    else:
-        if not isinstance(amp_state, Mapping):
-            raise ValueError("FP16 runtime requires checkpoint scaler state")
-        scaler.load_state_dict(dict(amp_state))
     step = int(checkpoint["step"])
     if step < 0:
         raise ValueError("checkpoint step cannot be negative")

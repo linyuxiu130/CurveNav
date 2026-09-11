@@ -1,48 +1,122 @@
 {
   "asset_root": "data/scene_assets/hssd-hab",
-  "output_root": "outputs/hssd_policy_dataset",
+  "output_root": "outputs/hssd_policy_depth_500_forward",
   "seed": 20260822,
   "workers": 4,
-  "gpu_device": 0,
-  "expected_routes": 500,
+  "gpu_device": 1,
   "candidate_limit": 64,
-  "routes_per_scene": 25,
-  "route_sample_spacing_m": 0.15,
+  "observation_period_s": 0.1,
+  "expert_speed_m_s": 0.3,
   "camera": {
-    "image_width": 224,
-    "image_height": 126,
-    "focal_x_px": 166.80851063829786,
-    "focal_y_px": 166.80851063829786,
+    "image_width": 640,
+    "image_height": 360,
+    "focal_x_px": 326.398559570312,
+    "focal_y_px": 326.398559570312,
     "forward_offset_m": 0.28618,
     "height_m": 0.62532,
     "downward_pitch_degrees": 10.0
   },
   "endpoint_distance_bands_m": {
-    "near": [3.0, 6.0],
-    "middle": [6.0, 8.5],
-    "far": [8.5, 10.5]
+    "near": [
+      3.0,
+      6.0
+    ],
+    "middle": [
+      6.0,
+      8.5
+    ],
+    "far": [
+      8.5,
+      10.5
+    ]
   },
-  "routes_per_scene_by_distance": {"near": 5, "middle": 10, "far": 10},
+  "routes_per_scene_by_distance": {
+    "near": 5,
+    "middle": 10,
+    "far": 10
+  },
   "selected_scenes": [
-    {"scene_id": "106366323_174226647", "split": "train"},
-    {"scene_id": "104348181_171513120", "split": "train"},
-    {"scene_id": "104862396_172226349", "split": "train"},
-    {"scene_id": "108294537_176710050", "split": "train"},
-    {"scene_id": "104348160_171513093", "split": "train"},
-    {"scene_id": "104862534_172226625", "split": "train"},
-    {"scene_id": "102815859", "split": "train"},
-    {"scene_id": "108736611_177263226", "split": "train"},
-    {"scene_id": "102817200", "split": "train"},
-    {"scene_id": "106366353_174226695", "split": "train"},
-    {"scene_id": "106365897_174225972", "split": "train"},
-    {"scene_id": "104862681_172226874", "split": "train"},
-    {"scene_id": "104862621_172226772", "split": "train"},
-    {"scene_id": "102817053", "split": "train"},
-    {"scene_id": "102344193", "split": "train"},
-    {"scene_id": "106878945_174887058", "split": "train"},
-    {"scene_id": "107734158_175999998", "split": "validation"},
-    {"scene_id": "102816036", "split": "validation"},
-    {"scene_id": "103997586_171030669", "split": "validation"},
-    {"scene_id": "105515379_173104395", "split": "validation"}
-  ]
+    {
+      "scene_id": "106366323_174226647",
+      "split": "train"
+    },
+    {
+      "scene_id": "104348181_171513120",
+      "split": "train"
+    },
+    {
+      "scene_id": "104862396_172226349",
+      "split": "train"
+    },
+    {
+      "scene_id": "108294537_176710050",
+      "split": "train"
+    },
+    {
+      "scene_id": "104348160_171513093",
+      "split": "train"
+    },
+    {
+      "scene_id": "104862534_172226625",
+      "split": "train"
+    },
+    {
+      "scene_id": "102815859",
+      "split": "train"
+    },
+    {
+      "scene_id": "108736611_177263226",
+      "split": "train"
+    },
+    {
+      "scene_id": "102817200",
+      "split": "train"
+    },
+    {
+      "scene_id": "106366353_174226695",
+      "split": "train"
+    },
+    {
+      "scene_id": "106365897_174225972",
+      "split": "train"
+    },
+    {
+      "scene_id": "104862681_172226874",
+      "split": "train"
+    },
+    {
+      "scene_id": "104862621_172226772",
+      "split": "train"
+    },
+    {
+      "scene_id": "102817053",
+      "split": "train"
+    },
+    {
+      "scene_id": "102344193",
+      "split": "train"
+    },
+    {
+      "scene_id": "106878945_174887058",
+      "split": "train"
+    },
+    {
+      "scene_id": "107734158_175999998",
+      "split": "validation"
+    },
+    {
+      "scene_id": "102816036",
+      "split": "validation"
+    },
+    {
+      "scene_id": "103997586_171030669",
+      "split": "validation"
+    },
+    {
+      "scene_id": "105515379_173104395",
+      "split": "validation"
+    }
+  ],
+  "policy_config": "configs/base.yaml",
+  "expert_angular_speed_rad_s": 0.5
 }

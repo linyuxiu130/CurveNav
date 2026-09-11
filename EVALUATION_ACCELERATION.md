@@ -17,9 +17,9 @@
   汇总之后一次性写出，不进入模型热路径。
 - 在线测评由常驻 scene evaluator 复用已加载场景；每个模型只替换 policy
   服务，不重复构建同一资产。在线终止条件和 MPC 仍由固定 benchmark 实现。
-- 生产训练配置为 `1792 = 448 × 4` 的全局 batch，200 个 epoch、每 epoch
-  23 个 optimizer update（共 4600 update）；四张 V100 每卡一次 448 样本，
-  不用 1024 的人为上限或无必要的梯度累积。
+- 当前训练配置为每卡 416 样本、累积 1 次、200 epoch；全局 batch 由
+  每卡微批、GPU 数和累积次数计算。每 epoch 的样本预算向下取完整全局批次，
+  实际更新次数写入训练日志和 checkpoint。
 - 评测输出只保留 `offline-metrics.json`、`offline-cases.json` 和
   `offline-cases.svg`（或调用方指定的等价 artifact 目录），不生成临时
   checkpoint、第二套 launcher 或缩减版成绩。
@@ -36,9 +36,8 @@ PYTHONDONTWRITEBYTECODE=1 "${CURVENAV_PYTHON}" \
   -m pytest -q -p no:cacheprovider
 
 # 单模型完整离线测评（唯一入口）
-CUDA_VISIBLE_DEVICES=0 scripts/run_training_runtime.sh \
-  scripts/evaluate_policy.sh \
-  configs/base.yaml outputs/train_policy-e013/checkpoint.pt \
+CUDA_VISIBLE_DEVICES=1 scripts/evaluate_policy.sh \
+  data/policy_dataset-depth-v2/config.yaml outputs/train_policy-depth-forward/checkpoint.pt \
   --artifact-dir outputs/offline-evaluation
 
 # 使用同一 common protocol 的跨模型比较
@@ -68,8 +67,8 @@ batch-1 统计，不把两种数字混在一起。
 3. 几何指标按 batch 计算并缓存中间查询；案例筛选和绘图放在 forward 之后，
    只处理紧凑案例集。
 4. 在线使用一个常驻场景和一个统一 server/adapter 接口。多卡只按 scene
-   shard 并行；同一 scene 不启动多个冷实例。`num-envs` 只作为独立吞吐
-   诊断，固定协议默认值保持 `1`。
+   shard 并行；同一 scene 不启动多个冷实例。当前 PointGoal B16 正式协议
+   使用 `num-envs=16`，其他 batch 只用于诊断，不能混入正式结果。
 5. 每次运行使用新的 artifact 目录，日志和指标不覆盖旧结果；不在运行中途
    修改代码或切换权重。
 
@@ -103,7 +102,7 @@ batch-1 统计，不把两种数字混在一起。
 
 ## 维护记录
 
-训练与测评脚本共享 `scripts/common_env.sh` 的 Python、CPATH、
+数据、训练与测评脚本共享 `scripts/common_env.sh` 的 Python、
 TorchInductor 和 `PYTHONPATH` 初始化。新增加速必须先证明它不改变上述
 测评合同，并在本文件补充命令、硬件、稳定吞吐、延迟和失败根因；不得另建
 计划文档或第二条运行链路。

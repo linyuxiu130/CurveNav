@@ -9,7 +9,7 @@ from curvenav.training.prefetch import CudaPrefetchLoader
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_prefetch_preserves_batch_values_and_order(tmp_path) -> None:
     device = torch.device("cuda", torch.cuda.current_device())
-    packed = np.arange(24 * 8 * 8, dtype=np.float16).reshape(24, 8, 8)
+    packed = np.linspace(0, 1, 24 * 8 * 8, dtype=np.float16).reshape(24, 8, 8)
     packed_path = tmp_path / "depth.npy"
     np.save(packed_path, packed)
     depth_bank = PackedDepthBankSpec(

@@ -1,4 +1,4 @@
-"""Metric 3D geometry for the canonical calibrated depth camera."""
+"""Optical-Z backprojection and bounded SE(3)-aligned depth geometry."""
 
 from dataclasses import dataclass
 import math
@@ -10,16 +10,13 @@ from torch.nn import functional as F
 from curvenav.physical import (
     BODY_OBSTACLE_MIN_Z_M,
     EXTRA_CLEARANCE_M,
-    MAXIMUM_TRAVERSABLE_SLOPE_DEGREES,
     ROBOT_COLLISION_TOP_Z_M,
     ROBOT_FOOTPRINT_RADIUS_M,
 )
 
 
 CONFIGURATION_GRID_SIZE = 64
-# The canonical camera's longest planar ray is below 6.3 m.  Sixty-four
-# samples keep adjacent ray points closer than one 7.2/63 m grid cell, so the
-# rounded visibility raster cannot skip a cell along a valid sensor ray.
+# Finite sampled ray coverage is observation evidence, not a swept-body free-space certificate.
 VISIBILITY_RAY_SAMPLES = 64
 
 
@@ -32,6 +29,8 @@ class MetricDepthProjection:
     obstacle_points: Tensor
     obstacle_valid: Tensor
     configuration_field: Tensor
+    token_valid: Tensor
+    pixel_indices: Tensor
 
 
 class MetricDepthProjector(nn.Module):
@@ -42,164 +41,26 @@ class MetricDepthProjector(nn.Module):
         token_height: int,
         token_width: int,
         max_depth_m: float,
-        focal_x_px: float,
-        focal_y_px: float,
-        camera_forward_offset_m: float,
-        camera_height_m: float,
-        camera_downward_pitch_degrees: float,
         planning_horizon_m: float,
     ) -> None:
         super().__init__()
-        if token_height < 1 or token_width < 1:
-            raise ValueError("planar token dimensions must be positive")
-        if max_depth_m <= 0 or focal_x_px <= 0 or focal_y_px <= 0:
-            raise ValueError("depth scale and focal length must be positive")
-        self.token_height = token_height
-        self.token_width = token_width
-        self.max_depth_m = float(max_depth_m)
-        self.focal_x_px = float(focal_x_px)
-        self.focal_y_px = float(focal_y_px)
-        self.camera_forward_offset_m = float(camera_forward_offset_m)
-        self.camera_height_m = float(camera_height_m)
-        if planning_horizon_m <= 0:
-            raise ValueError("planning_horizon_m must be positive")
-        self.planning_horizon_m = float(planning_horizon_m)
+        self.token_height, self.token_width = token_height, token_width
+        self.max_depth_m = max_depth_m
+        self.planning_horizon_m = planning_horizon_m
         self.configuration_grid_size = CONFIGURATION_GRID_SIZE
         self.configuration_resolution_m = (
-            2.0 * self.planning_horizon_m / (CONFIGURATION_GRID_SIZE - 1)
+            2 * planning_horizon_m / (CONFIGURATION_GRID_SIZE - 1)
         )
-        self.minimum_traversable_normal_z = math.cos(
-            math.radians(MAXIMUM_TRAVERSABLE_SLOPE_DEGREES)
-        )
-        pitch = math.radians(camera_downward_pitch_degrees)
-        self.pitch_sine = math.sin(pitch)
-        self.pitch_cosine = math.cos(pitch)
         axis = torch.linspace(
-            -self.planning_horizon_m,
-            self.planning_horizon_m,
-            CONFIGURATION_GRID_SIZE,
+            -planning_horizon_m, planning_horizon_m, CONFIGURATION_GRID_SIZE
         )
-        self.register_buffer("configuration_axis_m", axis, persistent=True)
-        axis_index = torch.arange(CONFIGURATION_GRID_SIZE, dtype=torch.float32)
+        self.register_buffer("configuration_axis_m", axis)
+        index = torch.arange(CONFIGURATION_GRID_SIZE, dtype=torch.float32)
         self.register_buffer(
             "axis_squared_distance",
-            (axis_index[:, None] - axis_index[None]).square(),
+            (index[:, None] - index[None]).square(),
             persistent=False,
         )
-
-    def _traversable_surface(self, body_points: Tensor, valid: Tensor) -> Tensor:
-        """Classify locally supported surfaces by their gravity-relative slope.
-
-        Each pixel participates in four image-grid triangles.  A surface is
-        traversable when at least one valid adjacent triangle has a normal no
-        steeper than the robot's physical slope limit.  Taking the best local
-        triangle avoids turning a traversable ramp into a vertical obstacle at
-        depth discontinuities, while vertical furniture faces remain invalid.
-        """
-        if body_points.shape[:-1] != valid.shape or body_points.shape[-1] != 3:
-            raise ValueError("body points and validity mask shapes do not match")
-        padded_points = F.pad(
-            body_points.permute(0, 3, 1, 2),
-            (1, 1, 1, 1),
-            mode="replicate",
-        ).permute(0, 2, 3, 1)
-        center = padded_points[:, 1:-1, 1:-1]
-        directions = (
-            padded_points[:, 1:-1, 2:] - center,
-            padded_points[:, 2:, 1:-1] - center,
-            padded_points[:, 1:-1, :-2] - center,
-            padded_points[:, :-2, 1:-1] - center,
-        )
-        padded_valid = F.pad(valid, (1, 1, 1, 1), value=False)
-        neighbor_valid = (
-            padded_valid[:, 1:-1, 2:],
-            padded_valid[:, 2:, 1:-1],
-            padded_valid[:, 1:-1, :-2],
-            padded_valid[:, :-2, 1:-1],
-        )
-        traversable = torch.zeros_like(valid)
-        for index in range(4):
-            following = (index + 1) % 4
-            normal = torch.linalg.cross(
-                directions[index],
-                directions[following],
-                dim=-1,
-            )
-            normal_z = normal[..., 2].abs() / torch.linalg.vector_norm(
-                normal,
-                dim=-1,
-            ).clamp_min(1e-8)
-            triangle_valid = (
-                valid & neighbor_valid[index] & neighbor_valid[following]
-            )
-            traversable |= triangle_valid & (
-                normal_z >= self.minimum_traversable_normal_z
-            )
-        return traversable
-
-    def _body_points(
-        self,
-        selected_depth_m: Tensor,
-        selected_index: Tensor,
-        image_height: int,
-        image_width: int,
-    ) -> Tensor:
-        """Backproject selected pinhole-depth pixels into the robot body frame."""
-        column = selected_index.remainder(image_width).float()
-        row = torch.div(
-            selected_index,
-            image_width,
-            rounding_mode="floor",
-        ).float()
-        ray_x = (column - image_width / 2.0) / self.focal_x_px
-        ray_y = (row - image_height / 2.0) / self.focal_y_px
-        optical_y = selected_depth_m * ray_y
-        return torch.stack(
-            (
-                self.camera_forward_offset_m
-                + self.pitch_cosine * selected_depth_m
-                - self.pitch_sine * optical_y,
-                -selected_depth_m * ray_x,
-                self.camera_height_m
-                - self.pitch_cosine * optical_y
-                - self.pitch_sine * selected_depth_m,
-            ),
-            dim=-1,
-        )
-
-    def _backproject(
-        self,
-        selected_depth_m: Tensor,
-        selected_index: Tensor,
-        image_height: int,
-        image_width: int,
-        observation_to_current: Tensor,
-    ) -> Tensor:
-        body_points = self._body_points(
-            selected_depth_m,
-            selected_index,
-            image_height,
-            image_width,
-        )
-        forward, lateral, vertical = body_points.unbind(dim=-1)
-
-        translation = observation_to_current[..., :2].float()
-        sine = observation_to_current[..., 2].float()
-        cosine = observation_to_current[..., 3].float()
-        x_current = cosine[..., None, None] * forward - sine[
-            ..., None, None
-        ] * lateral
-        y_current = sine[..., None, None] * forward + cosine[
-            ..., None, None
-        ] * lateral
-        return torch.stack(
-            (
-                x_current + translation[..., None, None, 0],
-                y_current + translation[..., None, None, 1],
-                vertical,
-            ),
-            dim=-1,
-        ).flatten(2, 3)
 
     def _rasterize(self, points: Tensor, valid: Tensor) -> Tensor:
         """Rasterize aligned planar samples into the fixed robot-centric grid."""
@@ -208,17 +69,15 @@ class MetricDepthProjector(nn.Module):
         batch = points.shape[0]
         size = self.configuration_grid_size
         coordinate = (
-            (points + self.planning_horizon_m)
-            / (2.0 * self.planning_horizon_m)
-            * (size - 1)
-        ).round().long()
-        inside = (
-            valid
-            & (coordinate[..., 0] >= 0)
-            & (coordinate[..., 0] < size)
-            & (coordinate[..., 1] >= 0)
-            & (coordinate[..., 1] < size)
+            (
+                (points + self.planning_horizon_m)
+                / (2.0 * self.planning_horizon_m)
+                * (size - 1)
+            )
+            .round()
+            .long()
         )
+        inside = valid & (points.abs() <= self.planning_horizon_m).all(dim=-1)
         x = coordinate[..., 0].clamp(0, size - 1)
         y = coordinate[..., 1].clamp(0, size - 1)
         batch_index = torch.arange(batch, device=points.device).view(
@@ -251,12 +110,10 @@ class MetricDepthProjector(nn.Module):
             torch.full((), torch.inf, device=mask.device),
         )
         squared = self.axis_squared_distance.to(mask.device)
-        horizontal = (
-            occupied_cost[:, :, None, :] + squared[None, None]
-        ).amin(dim=-1)
-        distance_squared = (
-            horizontal[:, None, :, :] + squared[None, :, :, None]
-        ).amin(dim=2)
+        horizontal = (occupied_cost[:, :, None, :] + squared[None, None]).amin(dim=-1)
+        distance_squared = (horizontal[:, None, :, :] + squared[None, :, :, None]).amin(
+            dim=2
+        )
         maximum = 2.0 * self.planning_horizon_m
         distance = distance_squared.sqrt() * self.configuration_resolution_m
         return torch.where(torch.isfinite(distance), distance, maximum)
@@ -267,7 +124,7 @@ class MetricDepthProjector(nn.Module):
         body_pixel: Tensor,
         surface_points: Tensor,
         surface_valid: Tensor,
-        observation_to_current: Tensor,
+        camera_to_current: Tensor,
         observation_valid: Tensor,
     ) -> Tensor:
         occupancy = self._rasterize(
@@ -277,21 +134,14 @@ class MetricDepthProjector(nn.Module):
         signed_clearance = (
             self._euclidean_distance_transform(occupancy)
             - ROBOT_FOOTPRINT_RADIUS_M
+            # Nearest-node rasterization moves a measured point by at most
+            # sqrt(2)*resolution/2. Triangle inequality makes this a lower
+            # bound on clearance to measured points at each grid node.
+            - self.configuration_resolution_m / math.sqrt(2)
         )
         forbidden = signed_clearance[:, None] <= 0.0
 
-        translation = observation_to_current[..., :2].float()
-        sine = observation_to_current[..., 2].float()
-        cosine = observation_to_current[..., 3].float()
-        camera_x = (
-            translation[..., 0]
-            + cosine * self.camera_forward_offset_m
-        )
-        camera_y = (
-            translation[..., 1]
-            + sine * self.camera_forward_offset_m
-        )
-        origin = torch.stack((camera_x, camera_y), dim=-1)[..., None, :]
+        origin = camera_to_current[..., :2, 3][..., None, :]
         endpoint = surface_points[..., :2]
         alpha = torch.linspace(
             0.0,
@@ -302,9 +152,9 @@ class MetricDepthProjector(nn.Module):
         ray = origin[..., None, :] + alpha[None, None, None, :, None] * (
             endpoint[..., None, :] - origin[..., None, :]
         )
-        ray_valid = (
-            surface_valid & observation_valid[..., None]
-        )[..., None].expand_as(ray[..., 0])
+        ray_valid = (surface_valid & observation_valid[..., None])[..., None].expand_as(
+            ray[..., 0]
+        )
         observed = self._rasterize(ray, ray_valid)
         # A measured obstacle makes every robot-centre configuration inside
         # its footprint plus safety margin known-unsafe, even if that centre
@@ -314,12 +164,12 @@ class MetricDepthProjector(nn.Module):
 
         clearance = signed_clearance[:, None]
         padded = F.pad(clearance, (1, 1, 1, 1), mode="replicate")
-        gradient_x = (
-            padded[:, :, 1:-1, 2:] - padded[:, :, 1:-1, :-2]
-        ) / (2.0 * self.configuration_resolution_m)
-        gradient_y = (
-            padded[:, :, 2:, 1:-1] - padded[:, :, :-2, 1:-1]
-        ) / (2.0 * self.configuration_resolution_m)
+        gradient_x = (padded[:, :, 1:-1, 2:] - padded[:, :, 1:-1, :-2]) / (
+            2.0 * self.configuration_resolution_m
+        )
+        gradient_y = (padded[:, :, 2:, 1:-1] - padded[:, :, :-2, 1:-1]) / (
+            2.0 * self.configuration_resolution_m
+        )
         gradient_norm = torch.sqrt(gradient_x.square() + gradient_y.square()).clamp_min(
             1e-6
         )
@@ -334,158 +184,131 @@ class MetricDepthProjector(nn.Module):
             dim=1,
         )
 
-    def forward(
-        self,
-        depth: Tensor,
-        observation_to_current: Tensor,
-        observation_valid: Tensor,
-    ) -> MetricDepthProjection:
-        if depth.ndim != 5 or depth.shape[2] != 1:
-            raise ValueError("depth must have shape [B, T, 1, H, W]")
-        if observation_to_current.shape != (*depth.shape[:2], 4):
-            raise ValueError("observation_to_current must have shape [B, T, 4]")
-        if observation_valid.shape != depth.shape[:2] or observation_valid.dtype != torch.bool:
-            raise ValueError("observation_valid must be boolean with shape [B, T]")
-        batch, frames, _, height, width = depth.shape
-        normalized_depth = depth.squeeze(2).flatten(0, 1)
-
-        # Preserve the nearest visible surface for scene geometry.
-        pooled_negative_depth, nearest_index = F.adaptive_max_pool2d(
-            -normalized_depth.unsqueeze(1),
-            (self.token_height, self.token_width),
-            return_indices=True,
+    def forward(self, condition) -> MetricDepthProjection:
+        depth = condition.depth.float().squeeze(2)
+        batch, frames, height, width = depth.shape
+        k = condition.camera_intrinsics.float()
+        camera_to_current = (
+            condition.observation_to_current.float() @ condition.camera_to_body.float()
         )
-        surface_depth = -pooled_negative_depth.squeeze(1).reshape(
-            batch,
-            frames,
-            self.token_height,
-            self.token_width,
+        y, x = torch.meshgrid(
+            torch.arange(height, device=depth.device) + 0.5,
+            torch.arange(width, device=depth.device) + 0.5,
+            indexing="ij",
         )
-        surface_index = nearest_index.squeeze(1).reshape(
-            batch,
-            frames,
-            self.token_height,
-            self.token_width,
-        )
-
-        # Select the nearest body-height obstacle independently.  Selecting a
-        # generic nearest surface first can choose the floor and permanently
-        # discard a wall occupying the same adaptive cell.
-        dense_depth_m = normalized_depth.float() * self.max_depth_m
-        dense_index = torch.arange(
-            height * width,
-            device=depth.device,
-        ).reshape(1, height, width)
-        dense_body_points = self._body_points(
-            dense_depth_m,
-            dense_index,
-            height,
-            width,
-        )
-        dense_valid = normalized_depth.float() < 1.0
-        traversable_surface = self._traversable_surface(
-            dense_body_points,
-            dense_valid,
-        )
-        vertical = dense_body_points[..., 2]
-        body_pixel_flat = (
-            dense_valid
-            & (vertical >= BODY_OBSTACLE_MIN_Z_M)
-            & (vertical <= ROBOT_COLLISION_TOP_Z_M)
-            & ~traversable_surface
-        )
-        dense_body_points = dense_body_points.reshape(
-            batch,
-            frames,
-            height,
-            width,
-            3,
-        )
-        dense_forward, dense_lateral, dense_vertical = dense_body_points.unbind(dim=-1)
-        translation = observation_to_current[..., :2].float()
-        sine = observation_to_current[..., 2].float()
-        cosine = observation_to_current[..., 3].float()
-        aligned_dense_body_points = torch.stack(
+        rays = torch.stack(
             (
-                cosine[..., None, None] * dense_forward
-                - sine[..., None, None] * dense_lateral
-                + translation[..., None, None, 0],
-                sine[..., None, None] * dense_forward
-                + cosine[..., None, None] * dense_lateral
-                + translation[..., None, None, 1],
-                dense_vertical,
+                (x - k[..., 0, 2, None, None]) / k[..., 0, 0, None, None],
+                (y - k[..., 1, 2, None, None]) / k[..., 1, 1, None, None],
+                torch.ones_like(depth),
             ),
             dim=-1,
         )
-        body_pixel = body_pixel_flat.reshape(batch, frames, height, width)
-        masked_negative_depth = torch.where(
-            body_pixel_flat,
-            -normalized_depth.float(),
-            -2.0,
+        optical = rays * (depth * self.max_depth_m)[..., None]
+        points = torch.einsum(
+            "bfij,bfhwj->bfhwi", camera_to_current[..., :3, :3], optical
         )
-        obstacle_negative_depth, obstacle_index = F.adaptive_max_pool2d(
-            masked_negative_depth.unsqueeze(1),
-            (self.token_height, self.token_width),
-            return_indices=True,
+        points = points + camera_to_current[..., None, None, :3, 3]
+        valid = (depth > 0) & condition.observation_valid[..., None, None]
+        hit = valid & (depth < 1)
+        # Discard old measured points contradicted by a newer free-space ray.
+        # Occluded or out-of-view history remains in the sixteen-observation window.
+        for newer in range(1, frames):
+            current_rotation = camera_to_current[:, newer, :3, :3]
+            current_origin = camera_to_current[:, newer, :3, 3]
+            in_current = torch.einsum(
+                "bij,bfhwi->bfhwj",
+                current_rotation,
+                points - current_origin[:, None, None, None],
+            )
+            z = in_current[..., 2]
+            current_k = k[:, newer]
+            u = (
+                current_k[:, None, None, None, 0, 0]
+                * in_current[..., 0]
+                / z.clamp_min(1e-6)
+                + current_k[:, None, None, None, 0, 2]
+                - 0.5
+            )
+            v = (
+                current_k[:, None, None, None, 1, 1]
+                * in_current[..., 1]
+                / z.clamp_min(1e-6)
+                + current_k[:, None, None, None, 1, 2]
+                - 0.5
+            )
+            inside = (z > 0) & (u >= 0) & (u <= width - 1) & (v >= 0) & (v <= height - 1)
+            # Use the nearest depth in the four surrounding pixels. Bilinear depth
+            # or one rounded pixel can invent free space across a depth discontinuity.
+            u0 = u.floor().clamp(0, width - 1).long()
+            v0 = v.floor().clamp(0, height - 1).long()
+            u1, v1 = (u0 + 1).clamp_max(width - 1), (v0 + 1).clamp_max(height - 1)
+            latest = depth[:, newer].flatten(1)
+            samples = [
+                latest.gather(1, (yy * width + xx).flatten(1)).reshape_as(depth)
+                for xx, yy in ((u0, v0), (u1, v0), (u0, v1), (u1, v1))
+            ]
+            measured = torch.stack(samples).amin(0) * self.max_depth_m
+            # Propagate the storage quantization bound through the optical-Z
+            # transform: z_current = a * Z_history + b. One FP16 epsilon over
+            # [0,max_depth] also covers the reserved endpoint encodings. This
+            # is a numerical tolerance, not an assumed sensor-noise model.
+            z_scale = torch.einsum(
+                "bi,bfij,bfhwj->bfhw",
+                current_rotation[:, :, 2],
+                camera_to_current[..., :3, :3],
+                rays,
+            ).abs()
+            tolerance = self.max_depth_m * torch.finfo(torch.float16).eps * (1 + z_scale)
+            contradicted = inside & (measured > 0) & (z < measured - tolerance)
+            historical = (
+                torch.arange(frames, device=depth.device)[None, :, None, None] < newer
+            )
+            contradicted = contradicted & condition.observation_valid[:, newer, None, None, None]
+            valid = valid & ~(historical & hit & contradicted)
+        hit = hit & valid
+        # This is a planar body-collision field, not a terrain-connectivity map.
+        # A flat surface in the body band is still an obstacle (e.g. a platform).
+        body_pixel = (
+            hit
+            & (points[..., 2] >= BODY_OBSTACLE_MIN_Z_M)
+            & (points[..., 2] <= ROBOT_COLLISION_TOP_Z_M)
         )
-        obstacle_negative_depth = obstacle_negative_depth.squeeze(1).reshape(
-            batch,
-            frames,
-            self.token_height,
-            self.token_width,
-        )
-        obstacle_valid = obstacle_negative_depth > -1.5
-        obstacle_depth = torch.where(
-            obstacle_valid,
-            -obstacle_negative_depth,
-            surface_depth.float(),
-        )
-        obstacle_index = obstacle_index.squeeze(1).reshape_as(surface_index)
 
-        surface_depth_m = surface_depth.float() * self.max_depth_m
-        obstacle_depth_m = obstacle_depth.float() * self.max_depth_m
-        surface_points = self._backproject(
-            surface_depth_m,
-            surface_index,
-            height,
-            width,
-            observation_to_current,
-        )
-        obstacle_points = self._backproject(
-            obstacle_depth_m,
-            obstacle_index,
-            height,
-            width,
-            observation_to_current,
-        )
-        flat_obstacle_valid = obstacle_valid.flatten(2)
-        # A maximum-range return is still a calibrated negative observation:
-        # the complete camera ray is free up to max depth even though it has
-        # no surface hit.  Keep it in visibility while excluding it from the
-        # obstacle and surface-normal calculations above.
-        surface_valid = torch.ones_like(surface_depth, dtype=torch.bool)
-        configuration_field = self._configuration_field(
-            aligned_dense_body_points,
+        def select(mask):
+            value, indices = F.adaptive_max_pool2d(
+                torch.where(mask, -depth, -2.0).flatten(0, 1).unsqueeze(1),
+                (self.token_height, self.token_width),
+                return_indices=True,
+            )
+            indices = indices.reshape(batch, frames, -1)
+            selected_points = points.flatten(2, 3).gather(
+                2, indices[..., None].expand(-1, -1, -1, 3)
+            )
+            selected_depth = depth.flatten(2).gather(2, indices) * self.max_depth_m
+            return (
+                selected_points,
+                selected_depth,
+                value.reshape(batch, frames, -1) > -1.5,
+                indices,
+            )
+
+        surface, surface_depth, surface_valid, surface_indices = select(valid)
+        obstacle, obstacle_depth, obstacle_valid, obstacle_indices = select(body_pixel)
+        field = self._configuration_field(
+            points,
             body_pixel,
-            surface_points.reshape(batch, frames, -1, 3),
-            surface_valid.flatten(2),
-            observation_to_current,
-            observation_valid,
-        )
-        points = torch.where(
-            flat_obstacle_valid[..., None],
-            obstacle_points,
-            surface_points,
-        )
-        selected_depth = torch.where(
-            flat_obstacle_valid,
-            obstacle_depth_m.flatten(2),
-            surface_depth_m.flatten(2),
+            surface,
+            surface_valid,
+            camera_to_current,
+            condition.observation_valid,
         )
         return MetricDepthProjection(
-            points=points,
-            depth=selected_depth,
-            obstacle_points=obstacle_points[..., :2],
-            obstacle_valid=flat_obstacle_valid,
-            configuration_field=configuration_field,
+            points=torch.where(obstacle_valid[..., None], obstacle, surface),
+            depth=torch.where(obstacle_valid, obstacle_depth, surface_depth),
+            obstacle_points=obstacle[..., :2],
+            obstacle_valid=obstacle_valid,
+            configuration_field=field,
+            token_valid=surface_valid,
+            pixel_indices=torch.where(obstacle_valid, obstacle_indices, surface_indices),
         )

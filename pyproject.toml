@@ -8,7 +8,7 @@ version = "1.0.0"
 description = "CurveNav: PointGoal-conditioned smooth metric local navigation"
 requires-python = ">=3.10"
 dependencies = [
-  "torch>=2.6,<2.7",
+  "torch>=2.6,<2.8",
   "numpy>=1.24",
   "scipy>=1.10",
   "matplotlib>=3.7",

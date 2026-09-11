@@ -12,16 +12,13 @@ from curvenav.physical import (
 
 @dataclass(frozen=True)
 class DataConfig:
-    root: str = "data/policy_dataset-source-cspace"
+    root: str = "data/policy_dataset-depth-forward"
     observation_frames: int = 4
-    frame_spacing_m: float = 0.45
     expert_waypoint_spacing_m: float = 0.15
     future_steps: int = 24
     image_height: int = 126
     image_width: int = 224
     max_depth_m: float = 5.0
-    canonical_focal_x_px: float = 166.80851063829786
-    canonical_focal_y_px: float = 166.80851063829786
     camera_forward_offset_m: float = DINGO_CAMERA_FORWARD_OFFSET_M
     camera_height_m: float = DINGO_CAMERA_HEIGHT_M
     camera_downward_pitch_degrees: float = DINGO_CAMERA_DOWNWARD_PITCH_DEGREES
@@ -36,7 +33,6 @@ class DataConfig:
         if not all(
             math.isfinite(value) and value > 0
             for value in (
-                self.frame_spacing_m,
                 self.expert_waypoint_spacing_m,
                 self.max_depth_m,
             )
@@ -147,9 +143,9 @@ class TrajectoryDecoderConfig:
 @dataclass(frozen=True)
 class TrainingConfig:
     seed: int = 42
-    global_batch_size: int = 1_792
-    per_device_batch_size: int = 448
-    samples_per_epoch: int = 41_216
+    gradient_accumulation_steps: int = 1
+    per_device_batch_size: int = 416
+    samples_per_epoch: int = 40_960
     epochs: int = 200
     num_workers: int = 2
     prefetch_factor: int = 2
@@ -157,7 +153,7 @@ class TrainingConfig:
     min_learning_rate_factor: float = 0.01
     log_every_steps: int = 20
     checkpoint_every_epochs: int = 20
-    output_dir: str = "outputs/train_policy-e011"
+    output_dir: str = "outputs/train_policy-depth-forward"
     learning_rate: float = 2e-4
     weight_decay: float = 1e-2
     grad_clip_norm: float = 1.0
@@ -232,7 +228,7 @@ class CurveNavConfig:
         if not 0 <= self.training.seed < 2**32:
             raise ValueError("training.seed must be in [0, 2**32)")
         positive_integers = {
-            "global_batch_size": self.training.global_batch_size,
+            "gradient_accumulation_steps": self.training.gradient_accumulation_steps,
             "per_device_batch_size": self.training.per_device_batch_size,
             "samples_per_epoch": self.training.samples_per_epoch,
             "epochs": self.training.epochs,
@@ -244,14 +240,10 @@ class CurveNavConfig:
         invalid = [name for name, value in positive_integers.items() if value < 1]
         if invalid:
             raise ValueError(f"training values must be positive: {invalid}")
-        if self.training.per_device_batch_size > self.training.global_batch_size:
-            raise ValueError("per_device_batch_size cannot exceed global_batch_size")
-        if self.training.global_batch_size % 4:
+        if self.training.per_device_batch_size % 4:
             raise ValueError(
-                "global_batch_size must contain an exact quarter of deployment intervals"
+                "per_device_batch_size must contain an exact quarter of deployment intervals"
             )
-        if self.training.samples_per_epoch % self.training.global_batch_size:
-            raise ValueError("samples_per_epoch must be divisible by global_batch_size")
         if not 0 <= self.training.warmup_epochs < self.training.epochs:
             raise ValueError("training.warmup_epochs must be in [0, epochs)")
         if not 0 < self.training.min_learning_rate_factor <= 1:

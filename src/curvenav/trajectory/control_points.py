@@ -104,7 +104,7 @@ class IncrementalBSplineTrajectory(nn.Module):
         basis, first_basis = bspline_basis_and_first_derivative(
             num_control_points, degree, num_path_points
         )
-        learned_basis = basis[:, 1:]
+        learned_basis = basis[:, 2:-1]
         fit_inverse = torch.linalg.solve(
             learned_basis.T @ learned_basis,
             learned_basis.T,
@@ -197,8 +197,16 @@ class IncrementalBSplineTrajectory(nn.Module):
         reference_path = reference_path.float()
         if torch.count_nonzero(reference_path[:, 0]).item():
             raise ValueError("expert paths must begin at the robot origin")
-        learned_controls = torch.einsum("cp,bpd->bcd", self.fit_inverse, reference_path)
-        values = learned_controls.flatten(1)
+        # Arc-length parameterization gives p'(0)=(length,0) in the body frame.
+        # For the clamped cubic, p'(0)=15*P1. Fix this boundary and the endpoint
+        # before least squares, rather than clamping a fitted backwards tangent.
+        length = torch.linalg.vector_norm(torch.diff(reference_path, dim=1), dim=-1).sum(1)
+        first = torch.stack((length / 15.0, torch.zeros_like(length)), dim=1)
+        last = reference_path[:, -1]
+        residual = reference_path - self.basis[:, 1][None, :, None] * first[:, None]
+        residual = residual - self.basis[:, -1][None, :, None] * last[:, None]
+        interior = torch.einsum("cp,bpd->bcd", self.fit_inverse, residual)
+        values = torch.cat((first[:, None], interior, last[:, None]), dim=1).flatten(1)
         path, _ = self.decode_values(values)
         return values, path
 

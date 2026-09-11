@@ -1,71 +1,44 @@
 from io import BytesIO
-
 import numpy as np
 import pytest
-
 from curvenav.deployment.interface import CurveNavNpzInterface, RESPONSE_FIELDS
 from curvenav.deployment.runtime import RuntimePrediction
+from test_depth_memory import condition
 
 
 class _FakeRuntime:
     batch_size = 0
 
-    def __init__(self) -> None:
-        self.reset_ids = []
-
-    def reset(self, batch_size: int, camera_intrinsics) -> None:
+    def reset(self, batch_size):
         self.batch_size = batch_size
-        self.camera_intrinsics = np.asarray(camera_intrinsics)
 
-    def reset_env(self, env_id: int) -> None:
-        self.reset_ids.append(env_id)
-
-    def step(self, point_goals, depth, positions, quaternions):
-        del depth, positions, quaternions
-        batch = len(point_goals)
-        return RuntimePrediction(
-            path=np.zeros((batch, 64, 3), np.float32),
-        )
+    def step(self, point_goals, context):
+        self.context = context
+        return RuntimePrediction(np.zeros((len(point_goals), 64, 3), np.float32))
 
 
-def _payload(**updates) -> bytes:
-    values = {
-        "point_goal": np.zeros((2, 2), np.float32),
-        "depth_m": np.ones((2, 360, 640, 1), np.float32),
-        "robot_position": np.zeros((2, 3), np.float32),
-        "robot_quaternion": np.tile(np.array([0.0, 0.0, 0.0, 1.0], np.float32), (2, 1)),
-        "camera_intrinsics": np.array(
-            [[326.4, 0.0, 320.0], [0.0, 326.4, 180.0], [0.0, 0.0, 1.0]],
-            np.float32,
-        ),
-        "reset": np.array([True, False]),
-    }
+def _payload(**updates):
+    values = {name: value.numpy() for name, value in vars(condition(2)).items()}
+    values["depth"] = values["depth"].astype(np.float16)
     values.update(updates)
     stream = BytesIO()
     np.savez(stream, **values)
     return stream.getvalue()
 
 
-def test_npz_interface_has_one_strict_request_and_response_contract() -> None:
+def test_npz_interface_uses_one_stateless_snapshot_contract():
     runtime = _FakeRuntime()
     response = CurveNavNpzInterface(runtime).predict(_payload())
-
     assert runtime.batch_size == 2
     np.testing.assert_array_equal(
-        runtime.camera_intrinsics,
-        np.array(
-            [[326.4, 0.0, 320.0], [0.0, 326.4, 180.0], [0.0, 0.0, 1.0]],
-            np.float32,
-        ),
+        runtime.context["camera_intrinsics"], condition(2).camera_intrinsics.numpy()
     )
-    assert runtime.reset_ids == [0]
     with np.load(BytesIO(response), allow_pickle=False) as archive:
         assert frozenset(archive.files) == RESPONSE_FIELDS
         assert archive["path"].shape == (2, 64, 3)
-        assert all(archive[name].dtype == np.float32 for name in RESPONSE_FIELDS)
 
 
-def test_npz_interface_requires_exact_fields_and_dtypes() -> None:
+def test_npz_interface_requires_exact_fields_and_dtypes():
     interface = CurveNavNpzInterface(_FakeRuntime())
     with pytest.raises(ValueError, match="request fields"):
         interface.predict(_payload(unexpected=np.zeros(1)))

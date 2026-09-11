@@ -1,192 +1,85 @@
 from types import SimpleNamespace
-
+import warnings
 import numpy as np
 import pytest
 import torch
-
-from curvenav.config import CurveNavConfig
-from curvenav.data.depth import BENCHMARK_INTRINSICS, preprocess_metric_depth
-from curvenav.deployment.runtime import (
-    CurveNavRuntime,
-    DepthContextBuffer,
-)
+from curvenav.deployment.runtime import CurveNavRuntime
+from curvenav.data.observation import DepthContextBuffer
+from test_depth_memory import config, condition
 
 
-class _RecordingPolicy:
-    def __init__(self) -> None:
+class RecordingPolicy:
+    def __init__(self):
         self.conditions = []
 
     def sample(self, condition):
         self.conditions.append(condition)
-        path = torch.zeros(len(condition.point_goal), 64, 2)
-        path[..., 0] = torch.arange(64)
-        return SimpleNamespace(path=path)
+        return SimpleNamespace(path=torch.zeros(len(condition.point_goal), 64, 2))
 
 
-def test_invalid_depth_is_encoded_as_sensor_limit():
-    depth = np.full((360, 640), 4.0, dtype=np.float32)
-    depth[round(BENCHMARK_INTRINSICS.cy), round(BENCHMARK_INTRINSICS.cx)] = np.nan
-
-    normalized = preprocess_metric_depth(
-        depth, source_intrinsics=BENCHMARK_INTRINSICS, maximum_m=5.0
-    )
-
-    assert normalized.shape == (126, 224)
-    assert normalized[63, 112] == 1.0
-    np.testing.assert_allclose(normalized[0, 0], 0.8)
-
-
-def test_benchmark_depth_resolution_rescales_the_same_camera_rays():
-    half = BENCHMARK_INTRINSICS.at_resolution(width=320, height=180)
-    assert half.fx == BENCHMARK_INTRINSICS.fx / 2
-    assert half.fy == BENCHMARK_INTRINSICS.fy / 2
-    assert half.cx == 160.0
-    assert half.cy == 90.0
-
-    full_depth = np.full((360, 640), 2.0, dtype=np.float32)
-    half_depth = np.full((180, 320), 2.0, dtype=np.float32)
-    full = preprocess_metric_depth(
-        full_depth, source_intrinsics=BENCHMARK_INTRINSICS, maximum_m=5.0
-    )
-    downsampled = preprocess_metric_depth(
-        half_depth, source_intrinsics=BENCHMARK_INTRINSICS, maximum_m=5.0
-    )
-    np.testing.assert_array_equal(downsampled, full)
-
-
-def test_runtime_uses_the_intrinsic_matrix_supplied_by_the_evaluator() -> None:
-    context = DepthContextBuffer(CurveNavConfig())
-    shifted = BENCHMARK_INTRINSICS.matrix()
-    shifted[0, 2] += 20.0
-    context.reset(1, shifted)
-    depth = np.tile(
-        np.linspace(0.5, 4.5, 640, dtype=np.float32)[None, :, None],
-        (360, 1, 1),
-    )[None]
-    selected = context.update(
-        depth,
-        np.zeros((1, 2), dtype=np.float32),
-        np.zeros(1, dtype=np.float32),
-    )
-    baseline = preprocess_metric_depth(
-        depth[0, ..., 0],
-        source_intrinsics=BENCHMARK_INTRINSICS,
-        maximum_m=5.0,
-    )
-    assert not np.array_equal(selected.depth[0, -1, 0], baseline)
-
-
-def test_depth_preprocessing_rejects_non_image_input():
-    with pytest.raises(ValueError, match="two-dimensional"):
-        preprocess_metric_depth(
-            np.ones((1, 180, 320), dtype=np.float32),
-            source_intrinsics=BENCHMARK_INTRINSICS,
-            maximum_m=5.0,
-        )
-
-
-def test_runtime_reset_warms_the_actual_batch_execution() -> None:
-    policy = _RecordingPolicy()
-    runtime = CurveNavRuntime(CurveNavConfig(), policy, device="cpu")
-
-    runtime.reset(3, BENCHMARK_INTRINSICS.matrix())
-
-    assert runtime.batch_size == 3
-    assert len(policy.conditions) == 1
-    condition = policy.conditions[0]
-    assert condition.depth.shape == (3, 4, 1, 126, 224)
-    assert condition.point_goal.shape == (3, 2)
-    assert torch.all(condition.observation_valid)
-    assert torch.all(condition.observation_to_current[..., 3] == 1.0)
-    assert not hasattr(runtime, "flow_source")
-
-
-def test_environment_reset_only_clears_that_observation_history() -> None:
-    policy = _RecordingPolicy()
-    runtime = CurveNavRuntime(CurveNavConfig(), policy, device="cpu")
-    runtime.reset(3, BENCHMARK_INTRINSICS.matrix())
-    depth = np.ones((3, 360, 640, 1), dtype=np.float32)
-    positions = np.zeros((3, 2), dtype=np.float32)
-    runtime.context_buffer.update(depth, positions, np.zeros(3, dtype=np.float32))
-
-    runtime.reset_env(1)
-
-    assert len(runtime.context_buffer.samples[0]) == 1
-    assert len(runtime.context_buffer.samples[1]) == 0
-    assert len(runtime.context_buffer.samples[2]) == 1
-
-
-def test_runtime_sends_only_future_points_to_the_benchmark() -> None:
-    runtime = CurveNavRuntime(CurveNavConfig(), _RecordingPolicy(), device="cpu")
-    runtime.reset(1, BENCHMARK_INTRINSICS.matrix())
-
-    prediction = runtime.step(
-        np.array([[3.0, 0.0]], dtype=np.float32),
-        np.ones((1, 360, 640, 1), dtype=np.float32),
-        np.zeros((1, 3), dtype=np.float32),
-        np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float32),
-    )
-
-    assert prediction.path.shape == (1, 63, 3)
-    np.testing.assert_array_equal(prediction.path[0, 0], [1.0, 0.0, 0.0])
-
-
-def test_depth_context_uses_expert_spatial_offsets():
-    context_buffer = DepthContextBuffer(CurveNavConfig())
-    context_buffer.reset(1, BENCHMARK_INTRINSICS.matrix())
-    selected = None
-    for index in range(15):
-        depth = np.full((1, 360, 640, 1), 1.0 + index * 0.2, dtype=np.float32)
-        position = np.array([[index * 0.1, 0.0]], dtype=np.float32)
-        selected = context_buffer.update(depth, position, np.zeros(1, dtype=np.float32))
-
-    assert selected is not None
-    selected_indices = (
-        selected.depth[0, :, 0].mean(axis=(1, 2)) * 5.0 - 1.0
-    ) / 0.2
-    selected_distances = selected_indices * 0.1
+def test_sensor_history_is_independent_of_async_inference_and_resets_per_env():
+    policy = RecordingPolicy()
+    cfg = config()
+    runtime = CurveNavRuntime(cfg, policy, "cpu")
+    runtime.reset(2)
+    buffer = DepthContextBuffer(cfg.data)
+    buffer.reset(2)
+    c = condition(2)
+    args = [
+        np.full((2, 126, 224, 1), 2.0, np.float32),
+        np.tile(np.eye(4, dtype=np.float32), (2, 1, 1)),
+        c.camera_intrinsics[:, 0].numpy(),
+        c.camera_to_body[:, 0].numpy(),
+        np.zeros(2, np.float64),
+    ]
+    snapshots = []
+    # The sensor runs 21 times; the planner only consumes ticks 0, 6, 20.
+    for tick in range(21):
+        args[-1][:] = tick * 0.1
+        snapshot = buffer.update(*args)
+        if tick in (0, 6, 20):
+            snapshots.append(snapshot)
+            result = runtime.step(np.zeros((2, 2), np.float32), snapshot)
+            assert result.path.shape == (2, 63, 3)
     np.testing.assert_allclose(
-        selected_distances,
-        [0.05, 0.50, 0.95, 1.40],
-        atol=0.051,
+        snapshots[-1]["observation_age_s"], [[1.6, 0.9, 0.1, 0]] * 2, atol=1e-6
     )
-
-
-def test_stationary_context_uses_the_current_observation():
-    context_buffer = DepthContextBuffer(CurveNavConfig())
-    context_buffer.reset(1, BENCHMARK_INTRINSICS.matrix())
-    context_buffer.update(
-        np.full((1, 360, 640, 1), 1.0, dtype=np.float32),
-        np.zeros((1, 2), dtype=np.float32),
-        np.zeros(1, dtype=np.float32),
+    assert snapshots[0]["observation_valid"].sum() == 2  # immutable in-flight snapshot
+    buffer.reset_env(0)
+    args[-1][:] = 2.1
+    snapshot = buffer.update(*args)
+    assert snapshot["observation_valid"][0].sum() == 1
+    assert snapshot["observation_valid"][1].sum() == 4
+    # Replaying a snapshot cannot mutate the model's history.
+    for value in snapshots[-1].values():
+        value.setflags(write=False)  # raw HTTP buffers are immutable
+    with warnings.catch_warnings(action="error", category=UserWarning):
+        runtime.step(np.zeros((2, 2), np.float32), snapshots[-1])
+    torch.testing.assert_close(
+        policy.conditions[-1].observation_age_s, policy.conditions[-2].observation_age_s
     )
-    selected = context_buffer.update(
-        np.full((1, 360, 640, 1), 4.0, dtype=np.float32),
-        np.zeros((1, 2), dtype=np.float32),
-        np.zeros(1, dtype=np.float32),
-    )
-
-    np.testing.assert_allclose(selected.depth, 0.8)
-
-
-def test_depth_context_reports_observation_transforms_in_current_coordinates():
-    context_buffer = DepthContextBuffer(CurveNavConfig())
-    context_buffer.reset(1, BENCHMARK_INTRINSICS.matrix())
-    depth = np.ones((1, 360, 640, 1), dtype=np.float32)
-    context_buffer.update(
-        depth,
-        np.array([[0.0, 0.0]], dtype=np.float32),
-        np.array([0.0], dtype=np.float32),
-    )
-    selected = context_buffer.update(
-        depth,
-        np.array([[1.0, 0.0]], dtype=np.float32),
-        np.array([np.pi / 2], dtype=np.float32),
-    )
-
+    policy.conditions[-1].observation_age_s.zero_()
     np.testing.assert_allclose(
-        selected.observation_to_current[-1, -1], [0.0, 0.0, 0.0, 1.0]
+        snapshots[-1]["observation_age_s"], [[1.6, 0.9, 0.1, 0]] * 2, atol=1e-6
     )
-    np.testing.assert_allclose(
-        selected.observation_to_current[0, 0], [0.0, 1.0, -1.0, 0.0], atol=1e-6
-    )
+
+
+def test_sensor_boundary_rejects_bad_calibration_and_dropped_clock_ticks():
+    buffer = DepthContextBuffer(config().data)
+    buffer.reset(1)
+    c = condition()
+    args = [
+        np.ones((1, 126, 224, 1), np.float32),
+        np.eye(4, dtype=np.float32)[None],
+        c.camera_intrinsics[:, 0].numpy(),
+        c.camera_to_body[:, 0].numpy(),
+        np.zeros(1, np.float64),
+    ]
+    buffer.update(*args)
+    args[-1][:] = 0.2
+    with pytest.raises(ValueError, match="10 Hz"):
+        buffer.update(*args)
+    args[-1][:] = 0.1
+    args[2][:, 0, 0] = 0
+    with pytest.raises(ValueError, match="focal"):
+        buffer.update(*args)

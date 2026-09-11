@@ -1,6 +1,6 @@
 """Benchmark deployment for the fixed CurveNav policy contract."""
 
-from .runtime import CurveNavRuntime, DepthContextBuffer, load_policy
+from .runtime import CurveNavRuntime, load_policy
 from .interface import (
     CurveNavNpzInterface,
     REQUEST_FIELDS,
@@ -13,7 +13,6 @@ __all__ = [
     "CurveNavRuntime",
     "REQUEST_FIELDS",
     "RESPONSE_FIELDS",
-    "DepthContextBuffer",
     "load_policy",
     "load_npz_interface",
 ]

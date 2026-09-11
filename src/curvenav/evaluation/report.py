@@ -53,7 +53,7 @@ def select_cases(metrics: dict[str, Tensor]) -> list[tuple[str, int]]:
             "distance_to_first_collision_m",
         ),
         (
-            "four_frame_unrecognized_collision",
+            "temporal_unrecognized_collision",
             "first_collision_unrecognized_by_full_depth",
             "distance_to_first_collision_m",
         ),

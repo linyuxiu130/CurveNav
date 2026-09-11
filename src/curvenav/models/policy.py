@@ -89,21 +89,13 @@ class CurveNavPolicy(nn.Module):
 
     def encode_condition(self, condition: PolicyCondition) -> ConditionFeatures:
         condition.validate()
-        depth = torch.where(
-            condition.observation_valid[:, :, None, None, None],
-            condition.depth,
-            torch.zeros_like(condition.depth),
-        )
-        observation = self.depth_encoder(
-            depth,
-            condition.observation_to_current.float(),
-            condition.observation_valid,
-        )
+        observation = self.depth_encoder(condition)
         return self.condition_encoder(
             observation,
             condition.point_goal,
             condition.observation_valid,
             condition.observation_to_current,
+            condition.observation_age_s,
         )
 
     def _predict_stage_velocities(
@@ -149,7 +141,7 @@ class CurveNavPolicy(nn.Module):
         condition: ConditionFeatures,
         projected_condition: tuple[ProjectedCondition, ...],
     ) -> Tensor:
-        """Evaluate the stopped MeanFlow material derivative in float32."""
+        """Differentiate the same neural function; return a float32 Flow derivative."""
 
         def average_velocity(
             flow_state: Tensor,
@@ -162,7 +154,7 @@ class CurveNavPolicy(nn.Module):
                 end_time,
                 condition,
                 projected_condition,
-            )[0]
+            )[0].float()
 
         return torch.func.jvp(
             average_velocity,
@@ -251,38 +243,34 @@ class CurveNavPolicy(nn.Module):
         # identically absent on the diagonal half of the training law.  Evaluate
         # its stopped JVP only for positive-width rows; this is algebraically
         # identical to a full-batch JVP followed by the zero interval product.
-        positive_width = flow_interval_group.long() < 2
+        # Resolve the subset once; repeated boolean indexing synchronizes CUDA
+        # separately for every condition tensor to discover its output size.
+        positive_indices = torch.nonzero(flow_interval_group < 2, as_tuple=True)[0]
         positive_condition = ConditionFeatures(
-            tokens=encoded.tokens[positive_width],
-            token_valid=encoded.token_valid[positive_width],
-            metric_position=encoded.metric_position[positive_width],
-            surface_hit=encoded.surface_hit[positive_width],
-            frame_age=encoded.frame_age[positive_width],
-            motion_token=encoded.motion_token[positive_width],
-            metric_reference=encoded.metric_reference[positive_width],
-            terminal_goal=encoded.terminal_goal[positive_width],
-            configuration_field=encoded.configuration_field[positive_width],
+            tokens=encoded.tokens[positive_indices],
+            token_valid=encoded.token_valid[positive_indices],
+            metric_position=encoded.metric_position[positive_indices],
+            surface_hit=encoded.surface_hit[positive_indices],
+            frame_age=encoded.frame_age[positive_indices],
+            motion_token=encoded.motion_token[positive_indices],
+            metric_reference=encoded.metric_reference[positive_indices],
+            terminal_goal=encoded.terminal_goal[positive_indices],
+            configuration_field=encoded.configuration_field[positive_indices],
         )
         positive_projected_condition = tuple(
-            tuple(value[positive_width] for value in projected)
+            tuple(value[positive_indices] for value in projected)
             for projected in projected_condition
         )
         # The auxiliary marginal-velocity readout is structurally independent
         # of r. The same primal therefore supplies iMF's stopped predicted-v
         # JVP tangent without a second decoder evaluation.
-        jvp_tangent = instantaneous_velocities[positive_width, -1].float()
-        with (
-            torch.no_grad(),
-            torch.autocast(
-                device_type=state.device.type,
-                enabled=False,
-            ),
-        ):
+        jvp_tangent = instantaneous_velocities[positive_indices, -1].float()
+        with torch.no_grad():
             with sdpa_kernel([SDPBackend.MATH]):
                 total_time_derivatives = self._mean_flow_total_time_derivative(
-                    state[positive_width],
-                    start_time[positive_width],
-                    end_time[positive_width],
+                    state[positive_indices],
+                    start_time[positive_indices],
+                    end_time[positive_indices],
                     jvp_tangent.detach(),
                     positive_condition,
                     positive_projected_condition,
@@ -291,8 +279,8 @@ class CurveNavPolicy(nn.Module):
         # interval integration in float32 instead of quantizing it back into
         # the neural autocast dtype before forming the MeanFlow target.
         interval_correction = torch.zeros_like(average_velocities, dtype=GEOMETRY_DTYPE)
-        interval_correction[positive_width] = (end_time - start_time)[
-            positive_width, None, None
+        interval_correction[positive_indices] = (end_time - start_time)[
+            positive_indices, None, None
         ] * total_time_derivatives.detach()
         reparameterized_velocities = average_velocities.float() + interval_correction
         stage_target = conditional_velocity[:, None]
@@ -307,11 +295,15 @@ class CurveNavPolicy(nn.Module):
             flow_source[deployment] - average_velocities[deployment, -1].float()
         )
         deployment_path, _ = self.curve_codec.decode(deployment_coordinates)
-        visible_clearance_loss = observed_clearance_loss(
-            deployment_path,
-            encoded.configuration_field[deployment],
-            self.planning_horizon_m,
-        ).sum().mul(4.0 / clean.shape[0])
+        visible_clearance_loss = (
+            observed_clearance_loss(
+                deployment_path,
+                encoded.configuration_field[deployment],
+                self.planning_horizon_m,
+            )
+            .sum()
+            .mul(4.0 / clean.shape[0])
+        )
         return CurveNavLoss(
             loss=mean_flow_loss + visible_clearance_loss,
             mean_flow_loss=mean_flow_loss,

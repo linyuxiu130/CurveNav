@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import Tensor, nn
+from curvenav.precision import NEURAL_DTYPE
 from torch.nn import functional as F
 
 from curvenav.layers import RMSNorm
@@ -30,7 +31,7 @@ def observed_configuration_features(field: Tensor) -> Tensor:
 
 
 class ConfigurationSpaceEncoder(nn.Module):
-    """Fuse four-frame visual features into one calibrated robot-centric BEV."""
+    """Fuse aligned depth features into one calibrated robot-centric BEV."""
 
     def __init__(
         self,
@@ -49,9 +50,9 @@ class ConfigurationSpaceEncoder(nn.Module):
         self.grid_size = grid_size
         self.token_count = grid_size**2
         self.field_encoder = nn.Sequential(
-            nn.Conv2d(RAW_CONFIGURATION_FIELD_CHANNELS, 64, 3, stride=2, padding=1),
+            nn.Conv2d(RAW_CONFIGURATION_FIELD_CHANNELS, 64, 2, stride=2),
             nn.SiLU(),
-            nn.Conv2d(64, model_dim, 3, stride=2, padding=1),
+            nn.Conv2d(64, model_dim, 2, stride=2),
             nn.SiLU(),
             nn.Conv2d(model_dim, model_dim, 3, padding=1),
         )
@@ -67,7 +68,7 @@ class ConfigurationSpaceEncoder(nn.Module):
         grid_size: int,
         planning_horizon_m: float,
     ) -> tuple[Tensor, Tensor]:
-        axis = torch.linspace(-planning_horizon_m, planning_horizon_m, grid_size)
+        axis = ((torch.arange(grid_size) * 4 + 1.5) / 63 * 2 - 1) * planning_horizon_m
         y, x = torch.meshgrid(axis, axis, indexing="ij")
         position = torch.stack((x, y, torch.zeros_like(x)), dim=-1).reshape(
             1, grid_size**2, 3
@@ -96,14 +97,18 @@ class ConfigurationSpaceEncoder(nn.Module):
         if valid.shape != (batch, count) or valid.dtype != torch.bool:
             raise ValueError("visual validity must be boolean [B,N]")
         normalized = points[..., :2].float() / self.planning_horizon_m
-        coordinate = (normalized + 1.0) * 0.5 * (self.grid_size - 1)
+        coordinate = ((normalized + 1.0) * 0.5 * 63 - 1.5) / 4
+        coordinate = coordinate.clamp(0, self.grid_size - 1)
         inside = valid & (normalized.abs() <= 1.0).all(dim=-1)
         x0 = coordinate[..., 0].floor().clamp(0, self.grid_size - 1).long()
         y0 = coordinate[..., 1].floor().clamp(0, self.grid_size - 1).long()
         x1 = (x0 + 1).clamp_max(self.grid_size - 1)
         y1 = (y0 + 1).clamp_max(self.grid_size - 1)
         wx, wy = coordinate[..., 0] - x0, coordinate[..., 1] - y0
-        projected = self.visual_projection(tokens)
+        # All selected frames contribute to one cell. Accumulate weighted
+        # sums and mass in FP32, outside the BF16 neural projection.
+        with torch.autocast(device_type=tokens.device.type, dtype=NEURAL_DTYPE):
+            projected = self.visual_projection(tokens).float()
         bev = projected.new_zeros(batch, self.token_count, model_dim)
         mass = projected.new_zeros(batch, self.token_count, 1)
         for x, y, weight in (
@@ -130,7 +135,8 @@ class ConfigurationSpaceEncoder(nn.Module):
         canonical = observed_configuration_features(field.float())
         normalized = canonical.clone()
         normalized[:, 0] /= self.planning_horizon_m
-        raster = self.field_encoder(normalized).flatten(2).transpose(1, 2)
+        with torch.autocast(device_type=field.device.type, dtype=NEURAL_DTYPE):
+            raster = self.field_encoder(normalized).flatten(2).transpose(1, 2)
         visual = self._splat_visual(visual_tokens, visual_points, visual_valid)
         tokens = self.output_norm(
             raster + visual + self.metric_encoding.to(dtype=raster.dtype)

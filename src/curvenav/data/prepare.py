@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 import os
@@ -14,14 +14,24 @@ from typing import Callable
 
 import numpy as np
 import torch
+import yaml
 from torch import Tensor
 
 from curvenav.config import CurveNavConfig, DataConfig
 from curvenav.config_io import load_config
 from curvenav.data.contracts import expert_navigation_geometry_contract
-from curvenav.data.depth import depth_camera_contract
+from curvenav.data.depth import (
+    BENCHMARK_INTRINSICS,
+    CANONICAL_INTRINSICS,
+    depth_camera_contract,
+)
+from curvenav.data.history import (
+    OBSERVATION_PERIOD_S,
+    ObservationHistory,
+    validate_transform,
+)
+from curvenav.data_generation.geometry import points_at_arc
 from curvenav.data.prepared import (
-    flow_coordinate_statistics,
     policy_dataset_contract,
 )
 from curvenav.data.privileged import (
@@ -52,6 +62,9 @@ class _Example:
     point_goal: np.ndarray
     observation_to_current: np.ndarray
     observation_valid: np.ndarray
+    observation_age_s: np.ndarray
+    camera_intrinsics: np.ndarray
+    camera_to_body: np.ndarray
     source_grid_path: Path
     source_origin_xy: np.ndarray
     source_yaw_rad: float
@@ -64,85 +77,19 @@ def _arc_length(path: np.ndarray) -> float:
     return float(np.linalg.norm(np.diff(path, axis=0), axis=1).sum())
 
 
-def _fixed_future(path: np.ndarray, future_steps: int) -> tuple[np.ndarray, bool]:
-    """Keep future expert transitions without imposing a metric trajectory length."""
+def _fixed_future(
+    path: np.ndarray, future_steps: int, spacing_m: float
+) -> tuple[np.ndarray, bool]:
+    """Clip the recorded path to the metric horizon without discarding short turns."""
     path = np.asarray(path, dtype=np.float32)
     if path.ndim != 2 or path.shape[1] != 2 or len(path) < 2:
         raise ValueError("expert path must have shape [N,2] with N >= 2")
-    if len(path) <= future_steps + 1:
-        return path, True
-    return path[: future_steps + 1], False
-
-
-def _cumulative_distance(positions: np.ndarray) -> np.ndarray:
-    positions = np.asarray(positions, dtype=np.float64)
-    if positions.ndim != 2 or len(positions) < 1:
-        raise ValueError("route positions must have shape [N, D]")
-    return np.concatenate(
-        (
-            np.zeros(1, dtype=np.float64),
-            np.cumsum(np.linalg.norm(np.diff(positions, axis=0), axis=1)),
-        )
-    )
-
-
-def _frame_indices(
-    anchor: int,
-    cumulative_distance: np.ndarray,
-    data: DataConfig,
-) -> np.ndarray:
-    """Select the nearest past frames at fixed traveled-distance offsets."""
-    cumulative_distance = np.asarray(cumulative_distance, dtype=np.float64)
-    if cumulative_distance.ndim != 1 or not 0 <= anchor < len(cumulative_distance):
-        raise ValueError("invalid route cumulative distance or anchor")
-    offsets = np.arange(data.observation_frames - 1, -1, -1) * data.frame_spacing_m
-    targets = cumulative_distance[anchor] - offsets
-    available = cumulative_distance[: anchor + 1]
-    upper = np.searchsorted(available, targets, side="right")
-    upper = np.minimum(upper, anchor)
-    lower = np.maximum(upper - 1, 0)
-    choose_upper = np.abs(available[upper] - targets) <= np.abs(
-        available[lower] - targets
-    )
-    return np.where(choose_upper, upper, lower).astype(np.uint32)
-
-
-def _observation_valid(indices: np.ndarray, observation_frames: int) -> np.ndarray:
-    """Keep only the latest occurrence of a repeated padded observation."""
-    indices = np.asarray(indices)
-    if indices.shape != (observation_frames,):
-        raise ValueError("frame indices must match the fixed observation count")
-    valid = np.ones(observation_frames, dtype=np.bool_)
-    valid[:-1] = indices[:-1] != indices[1:]
-    valid[-1] = True
-    return valid
-
-
-def _observation_to_current(
-    local_origins: np.ndarray,
-    frame_yaw: np.ndarray,
-    current_yaw: float,
-    observation_frames: int,
-) -> np.ndarray:
-    """Describe every selected camera pose in the current robot frame."""
-    local_origins = np.asarray(local_origins, dtype=np.float32)
-    frame_yaw = np.asarray(frame_yaw, dtype=np.float32)
-    if local_origins.shape != (observation_frames, 2):
-        raise ValueError("local frame origins do not match observation count")
-    if frame_yaw.shape != (observation_frames,):
-        raise ValueError("frame yaw does not match observation count")
-    # Habitat routes live in the world XZ plane.  ``atan2(dz, dx)`` increases
-    # towards the robot's right because world Y, not world Z, is up.  CurveNav
-    # uses the ROS/Isaac body convention x-forward, y-left, so body yaw is the
-    # negative of that stored route angle.
-    delta_yaw = float(current_yaw) - frame_yaw
-    return np.column_stack(
-        (
-            local_origins,
-            np.sin(delta_yaw),
-            np.cos(delta_yaw),
-        )
-    ).astype(np.float32)
+    length = _arc_length(path)
+    horizon = future_steps * spacing_m
+    arc = np.r_[0., np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
+    end = min(length, horizon)
+    endpoint = points_at_arc(path, np.array([end]))
+    return np.vstack((path[arc < end], endpoint)).astype(np.float32), length <= horizon
 
 
 def _planar_local(points: np.ndarray, origin: np.ndarray, yaw: float) -> np.ndarray:
@@ -185,13 +132,7 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
     body_from_camera = np.asarray(
         camera.get("body_from_camera_optical", ()), dtype=np.float64
     )
-    expected_intrinsic = np.asarray(
-        [
-            [data.canonical_focal_x_px, 0.0, data.image_width / 2.0],
-            [0.0, data.canonical_focal_y_px, data.image_height / 2.0],
-            [0.0, 0.0, 1.0],
-        ]
-    )
+    expected_intrinsic = BENCHMARK_INTRINSICS.matrix()
     if (
         intrinsic.shape != (3, 3)
         or body_from_camera.shape != (4, 4)
@@ -199,12 +140,12 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
         or not np.allclose(body_from_camera, expected_camera_transform, atol=1e-6)
     ):
         raise ValueError("HSSD camera calibration does not match CurveNav")
-    cache = root / f"curvenav_hssd_depth_{data.image_height}x{data.image_width}_float16"
-    manifest = json.loads((cache / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("dtype") != "float16" or manifest.get(
-        "target_camera"
-    ) != depth_camera_contract(data):
-        raise ValueError("HSSD depth cache does not match the CurveNav data contract")
+    intrinsic = CANONICAL_INTRINSICS.matrix()
+    if (
+        source_manifest.get("schema") != "curvenav_hssd_policy_depth_routes_v4"
+        or source_manifest.get("observation") != depth_camera_contract(data)
+    ):
+        raise ValueError("HSSD must contain the exact policy depth storage contract")
     records = [
         json.loads(line)
         for line in (root / "routes.jsonl").read_text(encoding="utf-8").splitlines()
@@ -215,54 +156,55 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
         if split not in output:
             raise ValueError(f"invalid HSSD split: {split}")
         route_id = str(record["route_id"])
-        cached = manifest.get("runs", {}).get(route_id)
         route_root = root / str(record["route_directory"])
         source_grid_path = (route_root.parent / "navigation_grid.npz").resolve()
         xy = np.load(route_root / "traj_xy.npy").astype(np.float32)
         yaw = np.load(route_root / "traj_yaw.npy").astype(np.float32)
+        poses = np.load(route_root / "body_to_world.npy")
+        times = np.load(route_root / "timestamps.npy")
+        validate_transform(poses)
+        if poses.shape != (len(xy), 4, 4) or times.shape != (len(xy),):
+            raise ValueError("depth route poses/timestamps do not match frames")
         if (
-            not isinstance(cached, dict)
-            or int(cached.get("frames", -1)) != len(xy)
-            or len(xy) != len(yaw)
+            int(record["frames"]) != len(xy) or len(xy) != len(yaw)
         ):
-            raise ValueError(f"HSSD route is missing from the depth cache: {route_id}")
-        spacing = np.linalg.norm(np.diff(xy, axis=0), axis=1)
-        if not math.isclose(
-            float(np.median(spacing)),
-            data.expert_waypoint_spacing_m,
-            abs_tol=0.01,
-        ):
+            raise ValueError(f"HSSD route frame count mismatch: {route_id}")
+        if not np.allclose(np.diff(times), OBSERVATION_PERIOD_S, atol=1e-6, rtol=0):
             raise ValueError(
-                f"HSSD waypoint spacing does not match CurveNav: {route_id}"
+                f"HSSD observations must follow the 10 Hz sensor clock: {route_id}"
             )
         depth = _DepthRun(
-            source=cache / str(cached["file"]),
+            source=route_root / "depth.npy",
             frames=len(xy),
             name=f"hssd/{route_id}",
         )
-        cumulative_distance = _cumulative_distance(xy)
+        history = ObservationHistory()
         for anchor in range(len(xy) - 1):
-            frame_indices = _frame_indices(anchor, cumulative_distance, data)
+            frame_indices, relative, age, valid = history.update(
+                anchor, poses[anchor], float(times[anchor])
+            )
             transform: Callable[[np.ndarray], np.ndarray] = (
                 lambda points, anchor=anchor: _planar_local(
                     points, xy[anchor], float(yaw[anchor])
                 )
             )
             full_local = transform(xy[anchor:])
-            local_path, reached_goal = _fixed_future(full_local, data.future_steps)
+            local_path, reached_goal = _fixed_future(
+                full_local, data.future_steps, data.expert_waypoint_spacing_m
+            )
             output[split].append(
                 _Example(
                     depth_run=depth,
                     depth_indices=frame_indices,
                     point_goal=full_local[-1],
-                    observation_to_current=_observation_to_current(
-                        transform(xy[frame_indices]),
-                        yaw[frame_indices],
-                        float(yaw[anchor]),
-                        data.observation_frames,
+                    observation_to_current=relative,
+                    observation_valid=valid,
+                    observation_age_s=age,
+                    camera_intrinsics=np.broadcast_to(
+                        intrinsic, (data.observation_frames, 3, 3)
                     ),
-                    observation_valid=_observation_valid(
-                        frame_indices, data.observation_frames
+                    camera_to_body=np.broadcast_to(
+                        body_from_camera, (data.observation_frames, 4, 4)
                     ),
                     source_grid_path=source_grid_path,
                     source_origin_xy=xy[anchor].copy(),
@@ -345,44 +287,13 @@ def _flow_coordinate_statistics(
         np.concatenate((np.zeros((len(controls), 1, 2)), controls), axis=1),
         axis=1,
     )
-    increments = increments.reshape(len(controls), -1)
+    # One physical XY scale per control preserves the Euclidean metric and
+    # remains defined when a boundary condition makes one axis deterministic.
+    scale = np.sqrt(increments.var(axis=0, ddof=1).mean(axis=-1))
     return {
-        "control_increment_mean_xy_m": increments.mean(axis=0).tolist(),
-        "control_increment_std_xy_m": increments.std(axis=0, ddof=1).tolist(),
+        "control_increment_mean_xy_m": increments.mean(axis=0).ravel().tolist(),
+        "control_increment_std_xy_m": np.repeat(scale, 2).tolist(),
     }
-
-
-def _validate_flow_coordinate_statistics(
-    observed: dict[str, object],
-    config: CurveNavConfig,
-) -> None:
-    """Reject a stale trajectory scale before it defines Flow coordinates."""
-    expected = flow_coordinate_statistics(config.trajectory)
-    observed_values = np.concatenate(
-        (
-            np.asarray(
-                observed["control_increment_mean_xy_m"], dtype=np.float64
-            ),
-            np.asarray(
-                observed["control_increment_std_xy_m"], dtype=np.float64
-            ),
-        )
-    )
-    expected_values = np.concatenate(
-        (
-            np.asarray(
-                expected["control_increment_mean_xy_m"], dtype=np.float64
-            ),
-            np.asarray(
-                expected["control_increment_std_xy_m"], dtype=np.float64
-            ),
-        )
-    )
-    if not np.allclose(observed_values, expected_values, rtol=0.0, atol=1e-9):
-        raise ValueError(
-            "trajectory normalization does not match the source-gated train split; "
-            f"configured={expected}, observed={observed}"
-        )
 
 
 def _copy_source_configuration_grids(
@@ -475,8 +386,6 @@ def _compile_split(
     examples: list[_Example],
     seed: int,
     config: CurveNavConfig,
-    *,
-    verify_flow_coordinate_statistics: bool,
 ) -> dict[str, object]:
     split_root.mkdir(parents=True)
     depth_root = split_root / "depth"
@@ -524,12 +433,8 @@ def _compile_split(
         num_control_points=config.trajectory.num_control_points,
         degree=config.trajectory.spline_degree,
         num_path_points=config.trajectory.num_path_points,
-        control_increment_mean_xy_m=(
-            config.trajectory.control_increment_mean_xy_m
-        ),
-        control_increment_std_xy_m=(
-            config.trajectory.control_increment_std_xy_m
-        ),
+        control_increment_mean_xy_m=(config.trajectory.control_increment_mean_xy_m),
+        control_increment_std_xy_m=(config.trajectory.control_increment_std_xy_m),
     )
     curve_batches = []
     reference_batches = []
@@ -604,8 +509,6 @@ def _compile_split(
     observed_flow_statistics = _flow_coordinate_statistics(
         curve_values,
     )
-    if verify_flow_coordinate_statistics:
-        _validate_flow_coordinate_statistics(observed_flow_statistics, config)
 
     arrays = {
         "depth_indices": _save_array(split_root, "depth_indices", depth_indices),
@@ -633,6 +536,12 @@ def _compile_split(
             source.yaw_rad,
         ),
     }
+    for name in ("observation_age_s", "camera_intrinsics", "camera_to_body"):
+        arrays[name] = _save_array(
+            split_root,
+            name,
+            np.stack([getattr(e, name) for e in examples]).astype(np.float32),
+        )
     source_grids = _copy_source_configuration_grids(split_root, source)
     serialized_source_audit = _audit_serialized_source_contract(
         split_root,
@@ -715,7 +624,7 @@ def _compile_split(
         "samples": len(examples),
         "arrays": arrays,
         "depth": {
-            "dtype": "float16_normalized",
+            "dtype": "depth_float16_zero_invalid",
             "height": config.data.image_height,
             "width": config.data.image_width,
             "max_depth_m": config.data.max_depth_m,
@@ -763,13 +672,69 @@ def compile_policy_dataset(
                 examples,
                 config.training.seed + index,
                 config,
-                verify_flow_coordinate_statistics=split == "train",
             )
+            if split == "train":
+                statistics = split_manifests[split]["audit"][
+                    "production_curve_coordinate_statistics"
+                ]
+                fitted = {
+                    name: tuple(statistics[name])
+                    for name in (
+                        "control_increment_mean_xy_m",
+                        "control_increment_std_xy_m",
+                    )
+                }
+                config = replace(
+                    config,
+                    trajectory=replace(config.trajectory, **fitted),
+                    data=replace(config.data, root=str(output_root)),
+                )
+                config.validate()
+                # Recompute this diagnostic using the fitted training scale.
+                values = np.load(building_root / split / "curve_values.npy")
+                controls = values.astype(np.float64).reshape(-1, 7, 2)
+                increments = np.diff(
+                    np.concatenate((np.zeros((len(controls), 1, 2)), controls), axis=1),
+                    axis=1,
+                ).reshape(-1, 14)
+                statistics["standardized_coordinate_rms"] = float(
+                    np.sqrt(
+                        np.mean(
+                            (
+                                (
+                                    increments
+                                    - np.array(fitted["control_increment_mean_xy_m"])
+                                )
+                                / np.array(fitted["control_increment_std_xy_m"])
+                            )
+                            ** 2
+                        )
+                    )
+                )
+                (building_root / split / "manifest.json").write_text(
+                    json.dumps(split_manifests[split], indent=2)
+                )
+        configuration = {
+            "data": asdict(config.data),
+            "training": asdict(config.training),
+            "model": {
+                name: asdict(getattr(config, name))
+                for name in (
+                    "trajectory",
+                    "depth_encoder",
+                    "condition_encoder",
+                    "trajectory_decoder",
+                )
+            },
+        }
+        (building_root / "config.yaml").write_text(
+            yaml.safe_dump(configuration, sort_keys=False)
+        )
         manifest = {
             "contract": {
                 **policy_dataset_contract(config.data, config.trajectory),
                 "point_goal_semantics": "mission_destination_in_current_robot_xy",
-                "expert_path_source": "fixed_future_waypoints_or_true_goal",
+                "expert_path_source": "metric_arc_horizon_or_true_goal",
                 "expert_endpoint_policy": "implicit_local_subgoal_unless_near_goal",
                 "metric_scale_forced": False,
             },

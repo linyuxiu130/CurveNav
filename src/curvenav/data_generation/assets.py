@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 from pathlib import Path
 import shutil
 import struct
+import time
 from typing import Any
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 
 HSSD_REPOSITORY = "hssd/hssd-hab"
 HSSD_COMMIT = "4369cb9876214c7fbebcf552eb532380e4d287e4"
-DOWNLOAD_WORKERS = 8
+HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+# Keep enough connections that a stalled large GLB does not block the queue.
+DOWNLOAD_WORKERS = 32
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -23,8 +27,8 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _repository_paths() -> list[str]:
-    url = f"https://huggingface.co/api/datasets/{HSSD_REPOSITORY}/revision/{HSSD_COMMIT}"
-    with urlopen(url) as response:
+    url = f"{HF_ENDPOINT}/api/datasets/{HSSD_REPOSITORY}/revision/{HSSD_COMMIT}"
+    with urlopen(Request(url, headers={"User-Agent": "CurveNav/1.0"}), timeout=60) as response:
         repository = json.load(response)
     return [item["rfilename"] for item in repository["siblings"]]
 
@@ -34,18 +38,30 @@ def _download(root: Path, path: str) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".partial")
     url = (
-        f"https://huggingface.co/datasets/{HSSD_REPOSITORY}/resolve/"
+        f"{HF_ENDPOINT}/datasets/{HSSD_REPOSITORY}/resolve/"
         f"{HSSD_COMMIT}/{path}"
     )
-    with urlopen(url) as response, temporary.open("wb") as output:
-        shutil.copyfileobj(response, output)
-    os.replace(temporary, destination)
+    for attempt in range(4):
+        try:
+            with urlopen(Request(url, headers={"User-Agent": "CurveNav/1.0"}), timeout=60) as response, temporary.open("wb") as output:
+                shutil.copyfileobj(response, output)
+            os.replace(temporary, destination)
+            return
+        except (URLError, TimeoutError, ConnectionError) as error:
+            if attempt == 3 or (isinstance(error, HTTPError) and error.code not in {429, 500, 502, 503, 504}):
+                raise
+            time.sleep(2 ** attempt)
 
 
 def _download_paths(root: Path, paths: set[str]) -> None:
     pending = [path for path in sorted(paths) if not (root / path).is_file()]
+    print(f"Assets: {len(paths) - len(pending)}/{len(paths)} present; downloading {len(pending)} with {DOWNLOAD_WORKERS} workers", flush=True)
     with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
-        list(executor.map(lambda path: _download(root, path), pending))
+        futures = [executor.submit(_download, root, path) for path in pending]
+        for count, future in enumerate(as_completed(futures), 1):
+            future.result()
+            if count % 100 == 0 or count == len(pending):
+                print(f"Downloaded {count}/{len(pending)} pending assets", flush=True)
 
 
 def selected_asset_paths(
@@ -118,11 +134,18 @@ def download_assets(config_path: Path) -> dict[str, Any]:
     project_root = config_path.parent.parent
     root = (project_root / config["asset_root"]).resolve()
     building = root.with_name(root.name + ".building")
-    if root.exists() or building.exists():
+    if root.exists():
         raise FileExistsError(root)
-    building.mkdir(parents=True)
+    building.mkdir(parents=True, exist_ok=True)
     scene_ids = [scene["scene_id"] for scene in config["selected_scenes"]]
-    repository_paths = _repository_paths()
+    index = building / "repository_files.json"
+    if index.exists():
+        repository = _read_json(index)
+        if repository["revision"] != HSSD_COMMIT:
+            raise ValueError("HSSD repository index does not match the frozen commit")
+        repository_paths = repository["files"]
+    else:
+        repository_paths = _repository_paths()
     (building / "repository_files.json").write_text(
         json.dumps(
             {"revision": HSSD_COMMIT, "files": repository_paths},

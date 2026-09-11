@@ -31,7 +31,6 @@ from curvenav.evaluation.protocol import (
 from curvenav.evaluation.report import write_case_report
 from curvenav.factory import build_evaluation_projector, build_policy
 from curvenav.models import CurveNavPolicy
-from curvenav.precision import CudaPrecision, cuda_precision
 from curvenav.training.checkpoint import validate_policy_contract
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.prefetch import CudaPrefetchLoader
@@ -57,11 +56,9 @@ class PolicyMeasurements:
 def _sample(
     policy: CurveNavPolicy,
     batch: dict[str, Tensor],
-    precision: CudaPrecision,
 ):
     prepared = unpack_policy_batch(batch)
-    with torch.autocast(device_type="cuda", dtype=precision.autocast_dtype):
-        prediction = policy.sample(prepared.condition)
+    prediction = policy.sample(prepared.condition)
     return prepared, prediction
 
 
@@ -88,9 +85,7 @@ def _intervention_metrics(
     source_yaw_rad: Tensor,
     planning_horizon_m: float,
 ) -> dict[str, Tensor]:
-    metrics = {
-        "path_change_from_policy_m": paired_path_change_m(path, baseline_path)
-    }
+    metrics = {"path_change_from_policy_m": paired_path_change_m(path, baseline_path)}
     source = source_query.query(
         path,
         source_grid_index,
@@ -117,16 +112,10 @@ def _collision_detection_summary(metrics: dict[str, Tensor]) -> dict[str, int | 
         return float(numerator / max(int(denominator.item()), 1))
 
     raw_points = aggregate("truth_collision_point_raw_depth_count")
-    raw_ray_coverage_points = aggregate(
-        "truth_collision_point_raw_ray_coverage_count"
-    )
-    raw_trajectories = aggregate(
-        "truth_collision_trajectory_recognized_by_raw_depth"
-    )
+    raw_ray_coverage_points = aggregate("truth_collision_point_raw_ray_coverage_count")
+    raw_trajectories = aggregate("truth_collision_trajectory_recognized_by_raw_depth")
     current_points = aggregate("truth_collision_point_current_depth_count")
-    history_only_points = aggregate(
-        "truth_collision_point_history_only_depth_count"
-    )
+    history_only_points = aggregate("truth_collision_point_history_only_depth_count")
     unrecognized_points = aggregate(
         "truth_collision_point_unrecognized_by_full_depth_count"
     )
@@ -148,19 +137,13 @@ def _collision_detection_summary(metrics: dict[str, Tensor]) -> dict[str, int | 
     prefix_1m = metrics["execution_prefix_1p0m_collision"]
     prefix_1m_count = int(prefix_1m.sum().item())
     prefix_1m_first_current = int(
-        (prefix_1m & metrics["first_collision_current_depth_visible"])
-        .sum()
-        .item()
+        (prefix_1m & metrics["first_collision_current_depth_visible"]).sum().item()
     )
     prefix_1m_first_history = int(
-        (prefix_1m & metrics["first_collision_history_only_depth_visible"])
-        .sum()
-        .item()
+        (prefix_1m & metrics["first_collision_history_only_depth_visible"]).sum().item()
     )
     prefix_1m_first_unrecognized = int(
-        (prefix_1m & metrics["first_collision_unrecognized_by_full_depth"])
-        .sum()
-        .item()
+        (prefix_1m & metrics["first_collision_unrecognized_by_full_depth"]).sum().item()
     )
 
     def prefix_fraction(count: int) -> float:
@@ -199,10 +182,10 @@ def _collision_detection_summary(metrics: dict[str, Tensor]) -> dict[str, int | 
         "collision_points_visible_only_through_history_fraction": fraction(
             history_only_points, truth_points
         ),
-        "collision_points_unrecognized_by_all_four_frames_count": (
+        "collision_points_unrecognized_by_all_history_frames_count": (
             unrecognized_points
         ),
-        "collision_points_unrecognized_by_all_four_frames_fraction": fraction(
+        "collision_points_unrecognized_by_all_history_frames_fraction": fraction(
             unrecognized_points, truth_points
         ),
         "collision_trajectories_recognized_in_current_frame_count": (
@@ -220,10 +203,10 @@ def _collision_detection_summary(metrics: dict[str, Tensor]) -> dict[str, int | 
         "collision_trajectories_with_additional_history_evidence_count": (
             additional_history_trajectories
         ),
-        "collision_trajectories_unrecognized_by_all_four_frames_count": (
+        "collision_trajectories_unrecognized_by_all_history_frames_count": (
             unrecognized_trajectories
         ),
-        "collision_trajectories_unrecognized_by_all_four_frames_fraction": fraction(
+        "collision_trajectories_unrecognized_by_all_history_frames_fraction": fraction(
             unrecognized_trajectories, truth_trajectories
         ),
         "first_collision_visible_in_current_frame_count": first_current,
@@ -234,8 +217,8 @@ def _collision_detection_summary(metrics: dict[str, Tensor]) -> dict[str, int | 
         "first_collision_visible_only_through_history_fraction": fraction(
             first_history, truth_trajectories
         ),
-        "first_collision_unrecognized_by_all_four_frames_count": first_unrecognized,
-        "first_collision_unrecognized_by_all_four_frames_fraction": fraction(
+        "first_collision_unrecognized_by_all_history_frames_count": first_unrecognized,
+        "first_collision_unrecognized_by_all_history_frames_fraction": fraction(
             first_unrecognized, truth_trajectories
         ),
         "execution_prefix_1p0m_collision_count": prefix_1m_count,
@@ -251,10 +234,10 @@ def _collision_detection_summary(metrics: dict[str, Tensor]) -> dict[str, int | 
         "first_collision_within_1p0m_visible_only_through_history_fraction": (
             prefix_fraction(prefix_1m_first_history)
         ),
-        "first_collision_within_1p0m_unrecognized_by_all_four_frames_count": (
+        "first_collision_within_1p0m_unrecognized_by_all_history_frames_count": (
             prefix_1m_first_unrecognized
         ),
-        "first_collision_within_1p0m_unrecognized_by_all_four_frames_fraction": (
+        "first_collision_within_1p0m_unrecognized_by_all_history_frames_fraction": (
             prefix_fraction(prefix_1m_first_unrecognized)
         ),
         "path_endpoint_collision_count": aggregate("path_endpoint_collision"),
@@ -264,7 +247,7 @@ def _collision_detection_summary(metrics: dict[str, Tensor]) -> dict[str, int | 
         "endpoint_collision_point_visible_only_through_history_count": aggregate(
             "path_endpoint_collision_history_only_depth_visible"
         ),
-        "endpoint_collision_point_unrecognized_by_all_four_frames_count": aggregate(
+        "endpoint_collision_point_unrecognized_by_all_history_frames_count": aggregate(
             "path_endpoint_collision_unrecognized_by_full_depth"
         ),
         "terminal_0p25m_collision_count": aggregate("terminal_0p25m_collision"),
@@ -293,16 +276,15 @@ def _time_model(
     policy: CurveNavPolicy,
     batch: dict[str, Tensor],
     repeats: int,
-    precision: CudaPrecision,
 ) -> Tensor:
     first = {name: value[:1] for name, value in batch.items()}
     for _ in range(2):
-        _sample(policy, first, precision)
+        _sample(policy, first)
     torch.cuda.synchronize()
     latency = []
     for _ in range(repeats):
         started = time.perf_counter()
-        _sample(policy, first, precision)
+        _sample(policy, first)
         torch.cuda.synchronize()
         latency.append((time.perf_counter() - started) * 1000.0)
     return torch.tensor(latency, dtype=torch.float64)
@@ -320,9 +302,8 @@ def measure_policy(
     """Collect one deterministic path and one history ablation per observation."""
     policy.to(device).eval()
     depth_projector.to(device).eval()
-    precision = cuda_precision(device)
     warmup = next(iter(loader))
-    _sample(policy, warmup, precision)
+    _sample(policy, warmup)
     torch.cuda.synchronize(device)
 
     values: dict[str, list[Tensor]] = {}
@@ -337,7 +318,7 @@ def measure_policy(
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        prepared, prediction = _sample(policy, batch, precision)
+        prepared, prediction = _sample(policy, batch)
         proposal_path, _ = policy.curve_codec.decode(
             prediction.proposal_coordinates.float()
         )
@@ -350,20 +331,25 @@ def measure_policy(
         current_frame_valid[:, -1] = True
         current_frame_batch["observation_valid"] = current_frame_valid
         current_prepared, current_prediction = _sample(
-            policy, current_frame_batch, precision
+            policy, current_frame_batch
         )
         _, depth_swap_prediction = _sample(
             policy,
             _condition_intervention(
                 batch,
-                ("depth", "observation_to_current", "observation_valid"),
+                (
+                    "depth",
+                    "camera_intrinsics",
+                    "camera_to_body",
+                    "observation_to_current",
+                    "observation_age_s",
+                    "observation_valid",
+                ),
             ),
-            precision,
         )
         _, point_goal_swap_prediction = _sample(
             policy,
             _condition_intervention(batch, ("point_goal",)),
-            precision,
         )
 
         reference_path, _ = policy.curve_codec.decode_values(
@@ -391,19 +377,11 @@ def measure_policy(
             reference_path,
             prepared.condition.point_goal.float(),
         )
-        metrics["valid_observation_frames"] = (
-            prepared.condition.observation_valid.sum(dim=-1)
+        metrics["valid_observation_frames"] = prepared.condition.observation_valid.sum(
+            dim=-1
         )
-        projection = depth_projector(
-            prepared.condition.depth,
-            prepared.condition.observation_to_current.float(),
-            prepared.condition.observation_valid,
-        )
-        current_projection = depth_projector(
-            current_prepared.condition.depth,
-            current_prepared.condition.observation_to_current.float(),
-            current_prepared.condition.observation_valid,
-        )
+        projection = depth_projector(prepared.condition)
+        current_projection = depth_projector(current_prepared.condition)
         depth_safety = configuration_space_safety_metrics(
             prediction.path.float(),
             projection.configuration_field,
@@ -472,9 +450,8 @@ def measure_policy(
             reference_path.shape[1],
             device=reference_path.device,
         )[None, :, None]
-        straight_path = (
-            reference_path[:, :1]
-            + straight_progress * (reference_path[:, -1:] - reference_path[:, :1])
+        straight_path = reference_path[:, :1] + straight_progress * (
+            reference_path[:, -1:] - reference_path[:, :1]
         )
         straight_obstacle_metrics = source_query.safety_metrics(
             straight_path,
@@ -508,7 +485,9 @@ def measure_policy(
                 policy.planning_horizon_m,
             )
         )
-        current_metrics.update(source_execution_prefix_metrics(current_source_prediction))
+        current_metrics.update(
+            source_execution_prefix_metrics(current_source_prediction)
+        )
         current_visibility = collision_visibility_attribution(
             current_source_prediction,
             projection.configuration_field,
@@ -592,7 +571,7 @@ def measure_policy(
         },
         batch_latency_ms=torch.tensor(batch_latency, dtype=torch.float64),
         model_latency_ms=(
-            _time_model(policy, warmup, model_latency_repeats, precision)
+            _time_model(policy, warmup, model_latency_repeats)
             if model_latency_repeats
             else torch.empty(0, dtype=torch.float64)
         ),
@@ -634,22 +613,29 @@ def evaluate_measurements(measurements: PolicyMeasurements) -> dict[str, object]
             ],
             "fixed_horizon_ade_increase_m": current_frame_summary[
                 "fixed_horizon_ade_m_mean"
-            ] - policy_summary["fixed_horizon_ade_m_mean"],
+            ]
+            - policy_summary["fixed_horizon_ade_m_mean"],
             "fixed_horizon_fde_m_mean": current_frame_summary[
                 "fixed_horizon_fde_m_mean"
             ],
             "goal_progress_regret_m_mean": current_frame_summary[
                 "goal_progress_regret_m_mean"
             ],
-            "footprint_collision_fraction": current_metrics[
-                "footprint_collision"
-            ].float().mean().item(),
+            "footprint_collision_fraction": current_metrics["footprint_collision"]
+            .float()
+            .mean()
+            .item(),
             "safety_margin_violation_fraction": current_metrics[
                 "safety_margin_violation"
-            ].float().mean().item(),
+            ]
+            .float()
+            .mean()
+            .item(),
             "path_change_from_full_history_m_mean": current_metrics[
                 "path_change_from_full_history_m"
-            ].mean().item(),
+            ]
+            .mean()
+            .item(),
             "current_only_collision_with_history_only_evidence_count": (
                 history_only_risk_count
             ),
@@ -673,69 +659,89 @@ def evaluate_measurements(measurements: PolicyMeasurements) -> dict[str, object]
         },
         "condition_causality_audit": {
             "interpretation": "paired intervention only; not a navigation score",
-            "depth_swap_path_change_m": depth_swap[
-                "path_change_from_policy_m"
-            ].mean().item(),
-            "depth_swap_footprint_collision_fraction": depth_swap[
-                "footprint_collision"
-            ].float().mean().item(),
+            "depth_swap_path_change_m": depth_swap["path_change_from_policy_m"]
+            .mean()
+            .item(),
+            "depth_swap_footprint_collision_fraction": depth_swap["footprint_collision"]
+            .float()
+            .mean()
+            .item(),
             "depth_swap_execution_prefix_1p0m_collision_fraction": depth_swap[
                 "execution_prefix_1p0m_collision"
-            ].float().mean().item(),
+            ]
+            .float()
+            .mean()
+            .item(),
             "point_goal_swap_path_change_m": point_goal_swap[
                 "path_change_from_policy_m"
-            ].mean().item(),
+            ]
+            .mean()
+            .item(),
             "point_goal_swap_footprint_collision_fraction": point_goal_swap[
                 "footprint_collision"
-            ].float().mean().item(),
+            ]
+            .float()
+            .mean()
+            .item(),
             "point_goal_swap_execution_prefix_1p0m_collision_fraction": (
-                point_goal_swap["execution_prefix_1p0m_collision"]
-                .float()
-                .mean()
-                .item()
+                point_goal_swap["execution_prefix_1p0m_collision"].float().mean().item()
             ),
         },
         "proposal_final_alignment": {
             "interpretation": (
                 "internal one-call clean proposal versus deployed final path"
             ),
-            "path_change_m_mean": metrics[
-                "proposal_to_final_path_change_m"
-            ].mean().item(),
+            "path_change_m_mean": metrics["proposal_to_final_path_change_m"]
+            .mean()
+            .item(),
             "proposal_footprint_collision_fraction": metrics[
                 "proposal_footprint_collision"
-            ].float().mean().item(),
+            ]
+            .float()
+            .mean()
+            .item(),
             "proposal_safe_final_collision_fraction": metrics[
                 "proposal_safe_final_collision"
-            ].float().mean().item(),
+            ]
+            .float()
+            .mean()
+            .item(),
             "proposal_collision_final_safe_fraction": metrics[
                 "proposal_collision_final_safe"
-            ].float().mean().item(),
+            ]
+            .float()
+            .mean()
+            .item(),
         },
         "raw_depth_path_support": {
             "interpretation": (
                 "strict four-corner observed support on the same 0.025m path grid"
             ),
-            "predicted_fraction_mean": metrics[
-                "depth_path_field_coverage_fraction"
-            ].mean().item(),
+            "predicted_fraction_mean": metrics["depth_path_field_coverage_fraction"]
+            .mean()
+            .item(),
             "reference_fraction_mean": metrics[
                 "reference_depth_path_field_coverage_fraction"
-            ].mean().item(),
+            ]
+            .mean()
+            .item(),
             "predicted_minus_reference_mean": (
                 metrics["depth_path_field_coverage_fraction"]
                 - metrics["reference_depth_path_field_coverage_fraction"]
-            ).mean().item(),
+            )
+            .mean()
+            .item(),
             "predicted_below_reference_fraction": (
                 metrics["depth_path_field_coverage_fraction"]
                 < metrics["reference_depth_path_field_coverage_fraction"] - 1e-6
-            ).float().mean().item(),
+            )
+            .float()
+            .mean()
+            .item(),
         },
         "raw_depth_collision_attribution": _collision_detection_summary(metrics),
         "batch32_latency_ms_mean": measurements.batch_latency_ms.mean().item(),
-        "base_policy_forward_observations_per_second": (
-            measurements.samples / seconds
-        ),
+        "base_policy_forward_observations_per_second": (measurements.samples / seconds),
         "full_evaluation_observations_per_second": (
             measurements.samples / measurements.wall_seconds
         ),
@@ -749,25 +755,6 @@ def evaluate_measurements(measurements: PolicyMeasurements) -> dict[str, object]
         "strata": summarize_strata(metrics),
         "goal_bearing_strata": summarize_goal_bearing_strata(metrics),
     }
-
-
-def evaluate_policy(
-    policy: CurveNavPolicy,
-    loader,
-    device: torch.device,
-    expected_samples: int,
-    source_query: SourceConfigurationSpaceQuery,
-    depth_projector,
-) -> dict[str, object]:
-    measurements = measure_policy(
-        policy, loader, device, source_query, depth_projector
-    )
-    if measurements.samples != expected_samples:
-        raise RuntimeError(
-            f"evaluated {measurements.samples} samples, expected {expected_samples}"
-        )
-    _validate_reference_source_safety(measurements.metrics)
-    return evaluate_measurements(measurements)
 
 
 def run_evaluation(

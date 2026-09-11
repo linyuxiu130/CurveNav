@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, default_convert
 
 from curvenav.config import DataConfig, TrajectoryConfig
 from curvenav.data.depth_bank import PackedDepthBankSpec
@@ -20,48 +20,36 @@ class PolicyLoaderBundle:
     samples: int
 
 
-def build_policy_loader(
+def build_policy_validation_loader(
     data: DataConfig,
     trajectory: TrajectoryConfig,
-    *,
-    split: str,
     batch_size: int,
     num_workers: int,
-    prefetch_factor: int,
-    samples: int | None = None,
-    seed: int = 0,
-    sample_offset: int = 0,
 ) -> PolicyLoaderBundle:
     """Load precomputed labels; workers move only small fixed-shape tensors."""
-    base = PreparedPolicyDataset(data.root, split, data, trajectory)
-    dataset = (
-        RepeatedPolicyDataset(base, samples, seed, sample_offset)
-        if samples is not None
-        else base
-    )
+    dataset = PreparedPolicyDataset(data.root, "validation", data, trajectory)
     arguments = {
         "dataset": dataset,
         "batch_size": batch_size,
         "shuffle": False,
         "num_workers": num_workers,
         "pin_memory": True,
-        "drop_last": samples is not None,
-        # Worker base seeds must not advance the model process RNG.  This also
-        # makes worker construction identical after an exact resume.
-        "generator": torch.Generator().manual_seed(seed),
+        "collate_fn": default_convert,
+        "drop_last": False,
+        # Worker construction must not advance the model process RNG.
+        "generator": torch.Generator().manual_seed(0),
     }
     if num_workers:
         arguments.update(
             persistent_workers=True,
-            prefetch_factor=prefetch_factor,
-            # The resume offset denotes a prefix of the deterministic sample
-            # stream, so yielded batches must preserve that order.
+            prefetch_factor=2,
+            # Evaluation follows the stored validation order.
             in_order=True,
         )
     loader = DataLoader(**arguments)
     return PolicyLoaderBundle(
         loader=loader,
-        depth_bank=base.depth_bank,
+        depth_bank=dataset.depth_bank,
         samples=len(dataset),
     )
 
@@ -96,6 +84,7 @@ def build_policy_training_loader(
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         pin_memory=True,
+        collate_fn=default_convert,
         persistent_workers=True,
         prefetch_factor=prefetch_factor,
         in_order=True,
@@ -104,23 +93,5 @@ def build_policy_training_loader(
     return PolicyLoaderBundle(
         loader=loader,
         depth_bank=base.depth_bank,
-        samples=samples,
-    )
-
-
-def build_policy_validation_loader(
-    data: DataConfig,
-    trajectory: TrajectoryConfig,
-    batch_size: int,
-    num_workers: int,
-    samples: int | None = None,
-) -> PolicyLoaderBundle:
-    return build_policy_loader(
-        data,
-        trajectory,
-        split="validation",
-        batch_size=batch_size,
-        num_workers=num_workers,
-        prefetch_factor=2,
         samples=samples,
     )

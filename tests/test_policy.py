@@ -1,6 +1,7 @@
 """Focused mathematical and architecture tests for the one CurveNav policy."""
 
-from dataclasses import replace
+from dataclasses import replace, fields
+from test_depth_memory import condition as depth_condition
 
 import pytest
 import torch
@@ -21,7 +22,6 @@ from curvenav.models.blocks import (
     ConditionalTrajectoryBlock,
     ReusableConditionCrossAttention,
 )
-from curvenav.precision import cuda_precision
 from curvenav.trajectory import local_terminal_goal, metric_horizon_reference
 from curvenav.training.optimizer import build_optimizer
 from curvenav.training.runtime import (
@@ -44,22 +44,11 @@ def tiny_config() -> CurveNavConfig:
     )
 
 
-def identity_transform(batch: int) -> torch.Tensor:
-    value = torch.zeros(batch, 4, 4)
-    value[..., 3] = 1
-    return value
-
-
 def make_condition(batch: int = 2) -> PolicyCondition:
-    return PolicyCondition(
-        depth=torch.rand(batch, 4, 1, 126, 224),
-        point_goal=torch.stack(
-            (torch.full((batch,), 3.0), torch.linspace(-1.0, 1.0, batch)),
-            dim=-1,
-        ),
-        observation_to_current=identity_transform(batch),
-        observation_valid=torch.ones(batch, 4, dtype=torch.bool),
-    )
+    value = depth_condition(batch)
+    value.depth = torch.rand_like(value.depth)
+    value.point_goal[:, 1] = torch.linspace(-1.0, 1.0, batch)
+    return value
 
 
 def test_cartesian_bspline_is_smooth_origin_anchored_and_differentiable() -> None:
@@ -74,13 +63,18 @@ def test_cartesian_bspline_is_smooth_origin_anchored_and_differentiable() -> Non
     assert coordinates.grad is not None and torch.isfinite(coordinates.grad).all()
 
 
-def test_expert_projection_recovers_a_curve_in_the_same_spline_family() -> None:
+def test_expert_projection_preserves_forward_tangent_and_terminal_goal() -> None:
     codec = build_policy(tiny_config()).curve_codec
-    values = codec.values_from_coordinates(torch.randn(4, 14))
-    path, _ = codec.decode_values(values)
-    recovered, recovered_path = codec.project_expert(path)
-    torch.testing.assert_close(recovered, values, atol=2e-5, rtol=2e-5)
-    torch.testing.assert_close(recovered_path, path, atol=2e-5, rtol=2e-5)
+    t = torch.linspace(0, 1, 64)
+    # A valid forward U-turn may finish behind the initial pose.
+    angle = t * 4.0
+    path = torch.stack((torch.sin(angle), 1 - torch.cos(angle)), dim=-1)[None]
+    values, recovered = codec.project_expert(path)
+    _, heading = codec.decode_values(values)
+    assert heading[0, 0] == 0
+    assert values[0, 0] > 0 and path[0, -1, 0] < 0
+    torch.testing.assert_close(recovered[:, -1], path[:, -1])
+    torch.testing.assert_close(recovered[:, 0], torch.zeros(1, 2))
 
 
 def test_control_increment_coordinates_are_exactly_invertible() -> None:
@@ -102,7 +96,10 @@ def test_metric_horizon_reference_is_target_independent_forward_slots() -> None:
     )
     path, _ = codec.decode_values(reference.flatten(1))
     endpoint = reference[:, -1]
-    expected = torch.linspace(0.0, 1.0, codec.num_path_points)[None, :, None] * endpoint[:, None]
+    expected = (
+        torch.linspace(0.0, 1.0, codec.num_path_points)[None, :, None]
+        * endpoint[:, None]
+    )
     torch.testing.assert_close(path, expected, atol=5e-6, rtol=5e-6)
 
 
@@ -123,7 +120,8 @@ def test_pointgoal_never_rewrites_scene_memory() -> None:
     torch.manual_seed(0)
     policy = build_policy(tiny_config()).eval()
     first = make_condition(1)
-    second = PolicyCondition(
+    second = replace(
+        first,
         depth=first.depth,
         point_goal=torch.tensor([[-2.0, 3.0]]),
         observation_to_current=first.observation_to_current,
@@ -132,7 +130,9 @@ def test_pointgoal_never_rewrites_scene_memory() -> None:
     first_encoded = policy.encode_condition(first)
     second_encoded = policy.encode_condition(second)
     torch.testing.assert_close(first_encoded.tokens, second_encoded.tokens)
-    torch.testing.assert_close(first_encoded.metric_reference, second_encoded.metric_reference)
+    torch.testing.assert_close(
+        first_encoded.metric_reference, second_encoded.metric_reference
+    )
     assert not torch.equal(first_encoded.terminal_goal, second_encoded.terminal_goal)
     assert first_encoded.tokens.shape[1] == 16 * 16 + 3
     torch.testing.assert_close(first_encoded.token_valid, second_encoded.token_valid)
@@ -141,9 +141,7 @@ def test_pointgoal_never_rewrites_scene_memory() -> None:
 def test_terminal_goal_is_metric_local_and_does_not_constrain_output() -> None:
     policy = build_policy(tiny_config()).eval()
     encoder = policy.condition_encoder
-    goals = torch.tensor(
-        [[1.0, 0.0], [1000.0, 0.0], [0.0, 1000.0], [0.0, 0.0]]
-    )
+    goals = torch.tensor([[1.0, 0.0], [1000.0, 0.0], [0.0, 1000.0], [0.0, 0.0]])
     terminal = local_terminal_goal(goals, 3.6)
 
     assert torch.isfinite(terminal).all()
@@ -157,22 +155,6 @@ def test_terminal_goal_is_metric_local_and_does_not_constrain_output() -> None:
     # The terminal intent is conditioning, not a codec constraint.
     decoded, _ = policy.curve_codec.decode(torch.full((4, 14), 10.0))
     assert torch.linalg.vector_norm(decoded[:, -1], dim=-1).max() > 3.6
-
-
-def test_trajectory_block_promotes_reusable_condition_to_query_dtype() -> None:
-    block = ConditionalTrajectoryBlock(32, 4, 0).eval()
-    trajectory = torch.randn(2, 7, 32)
-    encoded = build_policy(tiny_config()).encode_condition(make_condition(2))
-    projected = block.project_condition(encoded)
-    key, value, *geometry = projected
-    pair_geometry = torch.randn(2, 7, encoded.tokens.shape[1], 7)
-    output = block(
-        trajectory,
-        (key.bfloat16(), value.bfloat16(), *geometry),
-        pair_geometry,
-    )
-    assert output.dtype == trajectory.dtype
-    assert output.shape == trajectory.shape and torch.isfinite(output).all()
 
 
 def test_pointgoal_enters_decoder_only_as_terminal_intent() -> None:
@@ -206,9 +188,7 @@ def test_pointgoal_enters_decoder_only_as_terminal_intent() -> None:
         start,
         end,
         second_with_first_reference,
-        policy.trajectory_decoder.project_condition_memory(
-            second_with_first_reference
-        ),
+        policy.trajectory_decoder.project_condition_memory(second_with_first_reference),
     )[0]
     assert not torch.equal(first_velocity, second_velocity)
 
@@ -217,13 +197,15 @@ def test_depth_and_pointgoal_both_condition_the_trajectory() -> None:
     torch.manual_seed(1)
     policy = build_policy(tiny_config()).eval()
     baseline = make_condition(1)
-    changed_depth = PolicyCondition(
+    changed_depth = replace(
+        baseline,
         depth=torch.flip(baseline.depth, dims=(-1,)),
         point_goal=baseline.point_goal,
         observation_to_current=baseline.observation_to_current,
         observation_valid=baseline.observation_valid,
     )
-    changed_goal = PolicyCondition(
+    changed_goal = replace(
+        baseline,
         depth=baseline.depth,
         point_goal=torch.tensor([[2.0, -2.0]]),
         observation_to_current=baseline.observation_to_current,
@@ -242,7 +224,8 @@ def test_every_valid_history_frame_has_a_learned_visual_effect() -> None:
     for frame in range(4):
         depth = baseline.depth.clone()
         depth[:, frame] = torch.flip(depth[:, frame], dims=(-1,))
-        changed = PolicyCondition(
+        changed = replace(
+            baseline,
             depth=depth,
             point_goal=baseline.point_goal,
             observation_to_current=baseline.observation_to_current,
@@ -255,12 +238,8 @@ def test_max_range_depth_is_valid_free_space_evidence() -> None:
     policy = build_policy(tiny_config()).eval()
     inputs = make_condition(1)
     inputs.depth.fill_(1.0)
-    depth = policy.depth_encoder(
-        inputs.depth,
-        inputs.observation_to_current,
-        inputs.observation_valid,
-    )
-    assert depth.token_valid.all()
+    depth = policy.depth_encoder(inputs)
+    assert not depth.token_valid.any()
     assert depth.configuration_field[:, 3].any()
     encoded = policy.encode_condition(inputs)
     assert torch.isfinite(encoded.tokens).all()
@@ -281,7 +260,8 @@ def test_invalid_history_pixels_and_poses_cannot_enter_the_condition() -> None:
     transform = first.observation_to_current.clone()
     depth[:, :2] = torch.rand_like(depth[:, :2]) * 100
     transform[:, :2] = torch.rand_like(transform[:, :2]) * 100
-    second = PolicyCondition(
+    second = replace(
+        first,
         depth=depth,
         point_goal=first.point_goal,
         observation_to_current=transform,
@@ -301,9 +281,7 @@ def test_training_objective_trains_every_module() -> None:
     condition = make_condition(batch)
     losses = policy(
         condition,
-        TrajectoryTarget(
-            policy.curve_codec.values_from_coordinates(coordinates)
-        ),
+        TrajectoryTarget(policy.curve_codec.values_from_coordinates(coordinates)),
         torch.randn_like(coordinates),
         torch.arange(batch, dtype=torch.uint8).remainder(4),
     )
@@ -365,7 +343,9 @@ def test_visible_clearance_risk_has_no_uniform_shortening_gradient() -> None:
     field[:, 3] = 1.0
     observed_clearance_loss(scale * base, field, 3.6).sum().backward()
     assert scale.grad is not None
-    torch.testing.assert_close(scale.grad, torch.zeros_like(scale.grad), atol=2e-5, rtol=0)
+    torch.testing.assert_close(
+        scale.grad, torch.zeros_like(scale.grad), atol=2e-5, rtol=0
+    )
 
 
 def test_deployment_boundary_uses_the_exact_fixed_source() -> None:
@@ -420,8 +400,10 @@ def test_sampling_is_one_call_with_reference_and_proposal_geometry_queries() -> 
         geometry_inputs.append(arguments[0].detach().clone())
 
     handle = policy.trajectory_decoder.register_forward_pre_hook(record_call)
-    geometry_handle = policy.trajectory_decoder.path_geometry_embedding.register_forward_pre_hook(
-        record_geometry
+    geometry_handle = (
+        policy.trajectory_decoder.path_geometry_embedding.register_forward_pre_hook(
+            record_geometry
+        )
     )
     first = policy.sample(inputs).path
     handle.remove()
@@ -506,24 +488,6 @@ def test_reusable_cross_attention_excludes_invalid_history_tokens() -> None:
     torch.testing.assert_close(first, second)
 
 
-def test_reusable_cross_attention_promotes_cached_memory_to_query_dtype() -> None:
-    layer = ReusableConditionCrossAttention(32, 4, 0).eval()
-    query = torch.randn(2, 7, 32)
-    policy = build_policy(tiny_config())
-    encoded = policy.encode_condition(make_condition(2))
-    key, value, *geometry = layer.project_condition(encoded)
-    pair_geometry = policy.trajectory_decoder._path_relative_geometry(
-        encoded.metric_reference, encoded
-    )
-    output = layer(
-        query,
-        (key.bfloat16(), value.bfloat16(), *geometry),
-        pair_geometry,
-    )
-    assert output.dtype == query.dtype
-    assert output.shape == query.shape and torch.isfinite(output).all()
-
-
 def test_path_relative_attention_uses_physical_query_positions() -> None:
     torch.manual_seed(6)
     policy = build_policy(tiny_config())
@@ -553,9 +517,9 @@ def test_flow_field_reads_observed_geometry_along_its_candidate_curve() -> None:
     start = torch.zeros(1)
     end = torch.ones(1)
     projected = policy.trajectory_decoder.project_condition_memory(encoded)
-    baseline = policy._predict_stage_velocities(
-        state, start, end, encoded, projected
-    )[0]
+    baseline = policy._predict_stage_velocities(state, start, end, encoded, projected)[
+        0
+    ]
     changed_field = encoded.configuration_field.clone()
     changed_field[:, 0].fill_(-0.2)
     changed_field[:, 1].fill_(1.0)
@@ -598,39 +562,30 @@ def test_goal_does_not_relocate_candidate_relative_scene_queries() -> None:
     changed = replace(encoded, metric_reference=-encoded.metric_reference)
     torch.testing.assert_close(
         baseline,
-        policy.trajectory_decoder._path_relative_geometry(
-            candidate_controls, changed
-        ),
+        policy.trajectory_decoder._path_relative_geometry(candidate_controls, changed),
     )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_compiled_cuda_training_graph_and_deployment_sample_are_finite() -> None:
     device = torch.device("cuda")
-    precision = cuda_precision(device)
     configure_cuda_training_backend()
     policy = build_policy(tiny_config()).to(device).train()
     compile_static_training_functions(policy)
     optimizer = build_optimizer(policy, learning_rate=1e-4, weight_decay=1e-2)
     inputs = make_condition(4)
     inputs = PolicyCondition(
-        depth=inputs.depth.to(device),
-        point_goal=inputs.point_goal.to(device),
-        observation_to_current=inputs.observation_to_current.to(device),
-        observation_valid=inputs.observation_valid.to(device),
+        **{f.name: getattr(inputs, f.name).to(device) for f in fields(inputs)}
     )
     coordinates = torch.randn(4, 14, device=device) * 0.1
-    target = TrajectoryTarget(
-        policy.curve_codec.values_from_coordinates(coordinates)
-    )
+    target = TrajectoryTarget(policy.curve_codec.values_from_coordinates(coordinates))
     optimizer.zero_grad(set_to_none=True)
-    with torch.autocast(device_type="cuda", dtype=precision.autocast_dtype):
-        loss = policy(
-            inputs,
-            target,
-            torch.randn_like(coordinates),
-            torch.arange(4, device=device, dtype=torch.uint8),
-        ).loss
+    loss = policy(
+        inputs,
+        target,
+        torch.randn_like(coordinates),
+        torch.arange(4, device=device, dtype=torch.uint8),
+    ).loss
     loss.backward()
     optimizer.step()
     assert torch.isfinite(loss)
@@ -639,6 +594,5 @@ def test_compiled_cuda_training_graph_and_deployment_sample_are_finite() -> None
         for parameter in policy.parameters()
     )
     policy.eval()
-    with torch.autocast(device_type="cuda", dtype=precision.autocast_dtype):
-        path = policy.sample(inputs).path
+    path = policy.sample(inputs).path
     assert path.shape == (4, 64, 2) and torch.isfinite(path).all()

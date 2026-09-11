@@ -11,27 +11,31 @@ class PolicyCondition:
 
     depth: Tensor
     point_goal: Tensor
+    camera_intrinsics: Tensor
+    camera_to_body: Tensor
     observation_to_current: Tensor
+    observation_age_s: Tensor
     observation_valid: Tensor
 
     def validate(self) -> None:
         if self.depth.ndim != 5 or self.depth.shape[2] != 1:
-            raise ValueError("depth must have shape [B, F, 1, H, W]")
-        if self.point_goal.ndim != 2 or self.point_goal.shape[-1] != 2:
-            raise ValueError("point_goal must have shape [B, 2]")
-        if self.observation_to_current.shape != (*self.depth.shape[:2], 4):
-            raise ValueError("observation_to_current must have shape [B, F, 4]")
-        if self.observation_valid.shape != self.depth.shape[:2]:
-            raise ValueError("observation_valid must have shape [B, F]")
+            raise ValueError(
+                "depth must be [B,F,1,H,W], normalized optical Z; zero is invalid"
+            )
+        b, f, _, h, w = self.depth.shape
+        shapes = {
+            "point_goal": (b, 2),
+            "camera_intrinsics": (b, f, 3, 3),
+            "camera_to_body": (b, f, 4, 4),
+            "observation_to_current": (b, f, 4, 4),
+            "observation_age_s": (b, f),
+            "observation_valid": (b, f),
+        }
+        for name, shape in shapes.items():
+            if getattr(self, name).shape != shape:
+                raise ValueError(f"{name} must have shape {shape}")
         if self.observation_valid.dtype != torch.bool:
             raise TypeError("observation_valid must be boolean")
-        if not (
-            self.depth.shape[0]
-            == self.point_goal.shape[0]
-            == self.observation_to_current.shape[0]
-            == self.observation_valid.shape[0]
-        ):
-            raise ValueError("condition batch sizes must match")
 
 
 @dataclass

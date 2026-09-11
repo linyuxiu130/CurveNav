@@ -21,7 +21,6 @@ class PolicyConditionEncoder(nn.Module):
         configuration_encoder: nn.Module,
         *,
         observation_frames: int,
-        history_horizon_m: float,
         planning_horizon_m: float,
         control_tokens: int,
         model_dim: int,
@@ -33,7 +32,7 @@ class PolicyConditionEncoder(nn.Module):
             raise ValueError("goal reference must match seven B-spline controls")
         self.motion_encoder = HistoricalMotionEncoder(
             observation_frames=observation_frames,
-            history_horizon_m=history_horizon_m,
+            translation_scale_m=planning_horizon_m,
             model_dim=model_dim,
         )
         self.memory_norm = RMSNorm(model_dim)
@@ -53,6 +52,7 @@ class PolicyConditionEncoder(nn.Module):
         point_goal: Tensor,
         observation_valid: Tensor,
         observation_to_current: Tensor,
+        observation_age_s: Tensor,
     ) -> ConditionFeatures:
         batch = point_goal.shape[0]
         if observation.tokens.ndim != 3 or observation.tokens.shape[0] != batch:
@@ -65,7 +65,9 @@ class PolicyConditionEncoder(nn.Module):
             observation.metric_position,
             observation.token_valid,
         )
-        motion = self.motion_encoder(observation_to_current, observation_valid)
+        motion = self.motion_encoder(
+            observation_to_current, observation_valid, observation_age_s
+        )
         tokens = torch.cat((configuration.tokens, motion), dim=1)
         configuration_valid = torch.ones(
             batch,
@@ -74,19 +76,10 @@ class PolicyConditionEncoder(nn.Module):
             dtype=torch.bool,
         )
         token_valid = torch.cat((configuration_valid, observation_valid[:, :-1]), dim=1)
-        past_position = torch.cat(
-            (
-                observation_to_current[:, :-1, :2].float(),
-                torch.zeros(
-                    batch,
-                    observation_to_current.shape[1] - 1,
-                    1,
-                    device=point_goal.device,
-                ),
-            ),
-            dim=-1,
+        past_position = observation_to_current[:, :-1, :3, 3].float()
+        metric_position = torch.cat(
+            (configuration.metric_position, past_position), dim=1
         )
-        metric_position = torch.cat((configuration.metric_position, past_position), dim=1)
         surface_hit = torch.cat(
             (
                 configuration.observed_fraction > 0.0,
@@ -97,14 +90,7 @@ class PolicyConditionEncoder(nn.Module):
         frame_age = torch.cat(
             (
                 torch.zeros_like(configuration.observed_fraction),
-                torch.arange(
-                    observation_to_current.shape[1] - 1,
-                    0,
-                    -1,
-                    device=point_goal.device,
-                    dtype=torch.float32,
-                )[None].expand(batch, -1)
-                / (observation_to_current.shape[1] - 1),
+                observation_age_s[:, :-1],
             ),
             dim=1,
         )

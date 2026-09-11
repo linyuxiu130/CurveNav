@@ -11,7 +11,7 @@ def test_base_mapping_has_one_prepared_dataset_and_fixed_future_contract() -> No
         {
             "data": {
                 "root": "data/policy_dataset",
-                "frame_spacing_m": 0.45,
+                "observation_frames": 4,
                 "future_steps": 24,
             },
             "model": {
@@ -23,7 +23,7 @@ def test_base_mapping_has_one_prepared_dataset_and_fixed_future_contract() -> No
         }
     )
     assert config.data.root == "data/policy_dataset"
-    assert config.data.frame_spacing_m == 0.45
+    assert config.data.observation_frames == 4
     assert config.data.future_steps == 24
     assert config.trajectory.num_control_points == 8
     assert config.trajectory_decoder.transformer_layers == 4
@@ -73,26 +73,22 @@ def test_training_batch_contract_is_global_and_exact() -> None:
     config = config_from_mapping(
         {
             "training": {
-                "global_batch_size": 1024,
+                "gradient_accumulation_steps": 2,
                 "samples_per_epoch": 40960,
             }
         }
     )
-    assert config.training.global_batch_size == 1024
-    assert config.training.per_device_batch_size == 448
+    assert config.training.gradient_accumulation_steps == 2
+    assert config.training.per_device_batch_size == 416
     with pytest.raises(TypeError, match="micro_batch_size"):
         config_from_mapping({"training": {"micro_batch_size": 128}})
-    with pytest.raises(ValueError, match="samples_per_epoch"):
-        config_from_mapping({"training": {"samples_per_epoch": 40000}})
-    with pytest.raises(ValueError, match="cannot exceed"):
-        config_from_mapping(
-            {"training": {"global_batch_size": 32, "per_device_batch_size": 64}}
-        )
+    with pytest.raises(TypeError, match="global_batch_size"):
+        config_from_mapping({"training": {"global_batch_size": 1024}})
     with pytest.raises(ValueError, match="exact quarter"):
         config_from_mapping(
             {
                 "training": {
-                    "global_batch_size": 1022,
+                    "per_device_batch_size": 1022,
                     "samples_per_epoch": 40880,
                 }
             }

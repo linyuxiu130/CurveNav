@@ -25,19 +25,14 @@ def build_distributed_batch_layout(
         raise ValueError("world_size must be in [1, 8]")
     if per_device_batch_size < 1 or global_batch_size < world_size:
         raise ValueError("batch sizes must provide at least one sample per rank")
-    base, remainder = divmod(global_batch_size, world_size)
-    sizes = tuple(base + int(rank < remainder) for rank in range(world_size))
-    offsets = tuple(rank * base + min(rank, remainder) for rank in range(world_size))
-    micro_counts = tuple(
-        (size + per_device_batch_size - 1) // per_device_batch_size
-        for size in sizes
-    )
-    if len(set(micro_counts)) != 1:
-        raise ValueError("all ranks must execute the same number of micro-batches")
+    micro_count, remainder = divmod(global_batch_size, world_size * per_device_batch_size)
+    if remainder or micro_count < 1:
+        raise ValueError("global batch must contain complete fixed-size micro-batches")
+    rank_size = micro_count * per_device_batch_size
     return DistributedBatchLayout(
-        rank_batch_sizes=sizes,
-        rank_offsets=offsets,
-        micro_batches_per_step=micro_counts[0],
+        rank_batch_sizes=(rank_size,) * world_size,
+        rank_offsets=tuple(rank * rank_size for rank in range(world_size)),
+        micro_batches_per_step=micro_count,
     )
 
 
@@ -70,21 +65,15 @@ class DistributedStepBatchSampler(Sampler[list[int]]):
         return self.optimizer_steps * self.layout.micro_batches_per_step
 
     def __iter__(self) -> Iterator[list[int]]:
-        rank_size = self.layout.rank_batch_sizes[self.rank]
         rank_offset = self.layout.rank_offsets[self.rank]
         micro_count = self.layout.micro_batches_per_step
-        base_micro_size, larger_micro_batches = divmod(rank_size, micro_count)
         for step in range(self.optimizer_steps):
             step_offset = step * self.global_batch_size + rank_offset
-            micro_offset = 0
             for micro_index in range(micro_count):
-                micro_size = base_micro_size + int(
-                    micro_index < larger_micro_batches
-                )
+                micro_offset = micro_index * self.per_device_batch_size
                 yield list(
                     range(
                         step_offset + micro_offset,
-                        step_offset + micro_offset + micro_size,
+                        step_offset + micro_offset + self.per_device_batch_size,
                     )
                 )
-                micro_offset += micro_size

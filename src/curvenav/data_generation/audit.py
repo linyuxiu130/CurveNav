@@ -1,4 +1,4 @@
-"""Hard gates for the 500-route HSSD expert dataset."""
+"""Audit configured HSSD routes and their training-format depth."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import json
 import math
 from pathlib import Path
 from typing import Any
+
+from curvenav.data.history import validate_transform
 
 import numpy as np
 
@@ -66,9 +68,11 @@ def _dataset_sha(root: Path, audit_dir: Path) -> tuple[str, int]:
 def audit_dataset(root: Path) -> dict[str, Any]:
     root = root.resolve()
     manifest = _read_json(root / "dataset_manifest.json")
+    if manifest["schema"] != SCHEMA:
+        raise ValueError("expected forward policy-format depth route schema v4")
     records = _read_jsonl(root / "routes.jsonl")
-    camera = manifest["camera"]
-    expected_image_shape = (camera["image"]["height"], camera["image"]["width"])
+    observation = manifest["observation"]
+    expected_image_shape = (observation["image_height"], observation["image_width"])
     grids: dict[tuple[str, str], Grid] = {}
     metrics = []
     metadata_mismatches = []
@@ -82,7 +86,7 @@ def audit_dataset(root: Path) -> dict[str, Any]:
             metadata_mismatches.append(route_id)
         xy = np.load(directory / "traj_xy.npy")
         yaw = np.load(directory / "traj_yaw.npy")
-        depth_path = directory / "depth_m.npy"
+        depth_path = directory / "depth.npy"
         depth = np.load(depth_path, mmap_mode="r")
         reasons = []
         frames = len(xy)
@@ -94,10 +98,22 @@ def audit_dataset(root: Path) -> dict[str, Any]:
             or frames < 3
         ):
             reasons.append("trajectory_shape_or_dtype")
-        if depth.dtype != np.float32 or depth.shape != (frames, *expected_image_shape):
+        if depth.dtype != np.float16 or depth.shape != (frames, *expected_image_shape):
             reasons.append("depth_shape_or_dtype")
+        poses = np.load(directory / "body_to_world.npy")
+        times = np.load(directory / "timestamps.npy")
+        validate_transform(poses)
+        if (
+            poses.shape != (frames, 4, 4)
+            or times.shape != (frames,)
+            or not np.isfinite(times).all()
+            or np.any(np.diff(times) <= 0)
+        ):
+            reasons.append("pose_or_time_contract")
         depth_sha = sha256_file(depth_path)
-        invalid_fraction = float((~np.isfinite(depth) | (depth <= 0)).mean())
+        invalid_fraction = float((depth == 0).mean())
+        if not np.isfinite(depth).all() or np.any(depth < 0) or np.any(depth > 1):
+            reasons.append("normalized_depth_range")
         if (
             depth_sha != record["depth"]["sha256"]
             or not math.isclose(
@@ -118,12 +134,24 @@ def audit_dataset(root: Path) -> dict[str, Any]:
         if not grid.safe(xy):
             reasons.append("route_clearance")
         spacing = np.linalg.norm(np.diff(xy, axis=0), axis=1)
-        if (
-            np.any(spacing <= 0.02)
-            or np.any(spacing > 0.20)
-            or not 0.14 <= float(np.median(spacing)) <= 0.151
-        ):
+        period = manifest["route_contract"]["observation_period_s"]
+        maximum_step = (
+            period * manifest["route_contract"]["expert_speed_m_s"]
+        )
+        if np.any(spacing <= 0) or np.any(spacing > maximum_step + 1e-6):
             reasons.append("route_spacing")
+        controls = np.load(directory / "expert_controls.npy")
+        angular_limit = manifest["route_contract"]["expert_angular_speed_rad_s"]
+        if (controls.shape != (frames, 2) or not np.isfinite(controls).all()
+                or np.any(controls[:, 0] < 0)
+                or np.any(controls[:, 0] > manifest["route_contract"]["expert_speed_m_s"] + 1e-6)
+                or np.any(abs(controls[:, 1]) > angular_limit + 1e-6)):
+            reasons.append("forward_control_domain")
+        yaw_change = np.arctan2(np.sin(np.diff(yaw)), np.cos(np.diff(yaw)))
+        if np.any(abs(yaw_change) > period * angular_limit + 1e-6):
+            reasons.append("angular_clock")
+        if not np.allclose(np.diff(times), period, atol=1e-6, rtol=0):
+            reasons.append("sensor_clock")
         route_arc = path_length(xy)
         endpoint_distance = float(np.linalg.norm(xy[-1] - xy[0]))
         lower, upper = record["endpoint_distance_range_m"]
@@ -162,18 +190,21 @@ def audit_dataset(root: Path) -> dict[str, Any]:
     validation_scenes = {
         item["scene_id"] for item in records if item["split"] == "validation"
     }
+    quotas = manifest["route_contract"]["routes_per_scene_by_distance"]
+    expected_per_scene = sum(quotas.values())
+    expected_scenes = {(s["split"], s["scene_id"]) for s in manifest["scenes"]}
+    expected_splits = Counter(s["split"] for s in manifest["scenes"])
+    expected_routes = expected_per_scene * len(expected_scenes)
     failures = {
         "schema": manifest.get("schema") != SCHEMA,
         "navigation_geometry": manifest.get("route_contract", {}).get(
             "navigation_geometry"
         )
         != expert_navigation_geometry_contract(),
-        "route_count": len(records) != 500 or manifest.get("routes") != 500,
-        "split_counts": dict(split_counts) != {"train": 400, "validation": 100},
-        "scene_route_counts": any(count != 25 for count in scene_counts.values())
-        or len(scene_counts) != 20,
-        "distance_band_counts": dict(band_counts)
-        != {"near": 100, "middle": 200, "far": 200},
+        "route_count": len(records) != expected_routes or manifest.get("routes") != expected_routes,
+        "split_counts": dict(split_counts) != {k: v * expected_per_scene for k, v in expected_splits.items()},
+        "scene_route_counts": set(scene_counts) != expected_scenes or any(count != expected_per_scene for count in scene_counts.values()),
+        "distance_band_counts": dict(band_counts) != {k: v * len(expected_scenes) for k, v in quotas.items()},
         "duplicate_route_ids": len(records)
         - len({item["route_id"] for item in records}),
         "duplicate_routes": len(signatures) - len(set(signatures)),

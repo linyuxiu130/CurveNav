@@ -1,6 +1,6 @@
 """Tensor-only data-loader batches to typed CurveNav model inputs."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Mapping
 
 import torch
@@ -18,26 +18,8 @@ class PreparedPolicyBatch:
 
 def unpack_policy_batch(batch: Mapping[str, object]) -> PreparedPolicyBatch:
     """Rebuild typed model inputs from the worker-prepared tensor-only batch."""
-    required = (
-        "depth",
-        "point_goal",
-        "observation_to_current",
-        "observation_valid",
-        "curve_values",
-        "flow_interval_group",
-    )
-    missing = [key for key in required if key not in batch]
-    if missing:
-        raise KeyError(f"prepared policy batch is missing fields: {missing}")
-    values = [batch[key] for key in required]
-    if not all(isinstance(value, Tensor) for value in values):
-        raise TypeError("prepared policy batch fields must be tensors")
-    condition = PolicyCondition(
-        depth=batch["depth"],  # type: ignore[arg-type]
-        point_goal=batch["point_goal"],  # type: ignore[arg-type]
-        observation_to_current=batch["observation_to_current"],  # type: ignore[arg-type]
-        observation_valid=batch["observation_valid"],  # type: ignore[arg-type]
-    )
+    names = tuple(field.name for field in fields(PolicyCondition))
+    condition = PolicyCondition(**{name: batch[name] for name in names})
     target = TrajectoryTarget(
         curve_values=batch["curve_values"],  # type: ignore[arg-type]
     )

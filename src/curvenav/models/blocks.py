@@ -68,13 +68,6 @@ class ReusableConditionCrossAttention(nn.Module):
             -1, (self.num_heads, self.head_dim)
         ).transpose(1, 2)
         key, value, token_valid = projected_condition
-        # The trainable primal caches K/V under autocast, while the stopped
-        # MeanFlow JVP deliberately evaluates the same decoder in float32.
-        # Promote the reusable memory at the attention boundary so SDPA sees
-        # one numerical domain; under the primal this is an allocation-free
-        # no-op because query and memory already share the autocast dtype.
-        key = key.to(dtype=projected_query.dtype)
-        value = value.to(dtype=projected_query.dtype)
         expected = (*query.shape[:2], key.shape[-2], 7)
         if pair_geometry.shape != expected:
             raise ValueError("path-relative attention requires [B,Q,N,7] geometry")

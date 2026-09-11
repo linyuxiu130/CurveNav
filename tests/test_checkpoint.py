@@ -20,7 +20,7 @@ from curvenav.training.checkpoint import (
 from curvenav.training.ema import ExponentialMovingAverage
 
 
-BF16 = "bf16_neural_fp32_geometry_flow_jvp"
+BF16 = "bf16_neural_fp32_geometry_flow_accumulation"
 FP16 = "fp16_neural_fp32_geometry_flow_jvp"
 
 
@@ -33,7 +33,7 @@ def distributed_state(config: CurveNavConfig, precision: str = BF16):
     }
 
 
-def checkpoint(config: CurveNavConfig, precision: str = BF16, amp_state=None):
+def checkpoint(config: CurveNavConfig, precision: str = BF16):
     model = nn.Linear(2, 2)
     optimizer = AdamW(model.parameters())
     scheduler = LambdaLR(optimizer, lambda _: 1.0)
@@ -47,7 +47,6 @@ def checkpoint(config: CurveNavConfig, precision: str = BF16, amp_state=None):
         0,
         training_contract=contract,
         rng_states=rng,
-        amp_state=amp_state,
     )
     return value, model, optimizer, scheduler
 
@@ -120,7 +119,6 @@ def test_complete_optimizer_state_roundtrip() -> None:
         restored_scheduler,
         ExponentialMovingAverage(restored),
         config,
-        scaler=None,
     )
     assert step == 0
     for left, right in zip(model.parameters(), restored.parameters(), strict=True):
@@ -131,42 +129,24 @@ def test_complete_optimizer_state_roundtrip() -> None:
     )
 
 
-def test_fp16_requires_and_restores_scaler_state() -> None:
-    config = CurveNavConfig()
-    amp = {"scale": 1024.0}
-    value, _, _, _ = checkpoint(config, FP16, amp)
-    validate_training_resume(value, config, 2, FP16)
-
-    class Scaler:
-        def __init__(self):
-            self.state = None
-
-        def load_state_dict(self, state):
-            self.state = state
-
-    restored = nn.Linear(2, 2)
-    optimizer = AdamW(restored.parameters())
-    scheduler = LambdaLR(optimizer, lambda _: 1.0)
-    scaler = Scaler()
-    restore_training_state(
-        value,
-        restored,
-        optimizer,
-        scheduler,
-        ExponentialMovingAverage(restored),
-        config,
-        scaler,
-    )
-    assert scaler.state == amp
+def test_fp16_training_contract_is_rejected() -> None:
+    with pytest.raises(ValueError, match="unsupported CurveNav precision"):
+        build_training_contract(CurveNavConfig(), 2, FP16)
 
 
-def test_training_contract_preserves_global_batch_for_supported_world_sizes() -> None:
+def test_training_contract_derives_global_batch_from_devices_and_accumulation() -> None:
     config = CurveNavConfig()
     for world_size in range(1, 9):
         contract = build_training_contract(config, world_size, BF16)
-        assert contract["global_batch_size"] == 1792
-        assert contract["steps_per_epoch"] == 23
-        assert contract["total_steps"] == 4600
+        batch = config.training.per_device_batch_size * world_size
+        assert contract["global_batch_size"] == batch
+        assert contract["steps_per_epoch"] == config.training.samples_per_epoch // batch
+        assert contract["total_steps"] == config.training.epochs * contract["steps_per_epoch"]
+        assert contract["samples_per_epoch"] == contract["steps_per_epoch"] * batch
+    accumulated = replace(config, training=replace(config.training, gradient_accumulation_steps=2))
+    contract = build_training_contract(accumulated, 2, BF16)
+    assert contract["global_batch_size"] == config.training.per_device_batch_size * 4
+    assert contract["micro_batches_per_step"] == 2
 
 
 def test_resume_rejects_configuration_and_topology_changes() -> None:
