@@ -1,6 +1,6 @@
 # CurveNav
 
-CurveNav 是 PointGoal 条件的米制局部轨迹生成器。当前输入为已配准 深度、逐帧内外参、
+CurveNav 是 PointGoal 条件的米制局部轨迹生成器。当前输入为深度图、逐帧内外参、
 重力对齐的机体位姿和时间戳；共享视觉骨干与 SE(3) 几何对齐构建有界时序 BEV 记忆。
 生成器使用一步 improved MeanFlow 输出 B-spline，由固定测评 MPC 执行。
 传感器历史与异步推理分离；当前二维观测场不提供绝对无碰撞保证。
@@ -10,7 +10,32 @@ CurveNav 是 PointGoal 条件的米制局部轨迹生成器。当前输入为已
 重构原因见 [ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md)。源配置空间真值只用于
 标签安全证书与测评，不进入在线场景记忆。
 
-## 唯一工作流
+## 三条代码链路
+
+主分支为 `main`。三条链路按 Python 包目录组织，运行脚本集中在 `scripts/`：
+
+| 链路 | 实现目录 | 运行入口 | 产物 |
+| --- | --- | --- | --- |
+| 数据生成 | [data_generation](src/curvenav/data_generation/)；[data](src/curvenav/data/) 负责标签编译和读取 | [build_dataset.sh](scripts/build_dataset.sh)；资产下载用 [download_hssd_assets.sh](scripts/download_hssd_assets.sh) | 深度帧、专家路线、训练标签和拟合统计配置 |
+| 训练 | [training](src/curvenav/training/) | [train_policy.sh](scripts/train_policy.sh) | 模型、EMA、优化器和恢复状态 checkpoint |
+| 测评 | [evaluation](src/curvenav/evaluation/)；[deployment](src/curvenav/deployment/) 提供在线策略接口 | [evaluate_policy.sh](scripts/evaluate_policy.sh)；跨模型离线比较用 [compare_offline.sh](scripts/compare_offline.sh) | 离线指标、案例报告和比较结果 |
+
+运行顺序：生成数据并完成审计 → 使用生成目录中的 `config.yaml` 训练 → 使用同一配置和
+checkpoint 测评。三条链路共用 `encoders/`、`conditioning/`、`models/`、`trajectory/`
+中的模型与几何实现。详细定义见 [架构说明](ARCHITECTURE.md) 和 [测评说明](EVALUATION.md)。
+
+## GitHub 上传范围
+
+本仓库已上传上述三条链路的源码、配置、入口脚本、测试和中文文档。
+数据集、场景资产、模型权重、运行结果、Conda 环境和编译缓存保留在本地，由
+[.gitignore](.gitignore) 排除。
+
+SanD、NavDP、X-NavDP 的仿真执行器与服务代码位于独立本地目录
+`/shibo_huang/general-navigation-benchmark`，未包含在本次 CurveNav 仓库上传中。
+本机测评缓存位于 `/shibo_huang/.cache/navbench`。
+下文 `/shibo_huang/` 路径和 `outputs/` 验证记录均为本机位置，并非 GitHub 附件。
+
+## 运行流程
 
 重启后恢复：`bash /shibo_huang/curvenav-recovery/restore.sh`。
 备份目录、资产位置和兼容性约束见 `/shibo_huang/curvenav-recovery/README.md`。
