@@ -237,7 +237,6 @@ def run_training(
                     prepared.condition,
                     prepared.target,
                     flow_source,
-                    prepared.flow_interval_group,
                 )
                 accelerator.backward(losses.loss * batch_weight)
             current_losses += (

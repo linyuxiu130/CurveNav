@@ -67,6 +67,15 @@ def validate_route_pose(xy: np.ndarray, yaw: np.ndarray, poses: np.ndarray) -> N
         raise ValueError("depth poses and expert XY/yaw disagree")
 
 
+def validate_route_spacing(xy: np.ndarray, maximum_step: float) -> None:
+    """Check speed allowing only the rounding bounds of stored coordinates."""
+    spacing = np.linalg.norm(np.diff(xy.astype(np.float64), axis=0), axis=1)
+    # Each coordinate was rounded once on storage. Subtraction combines the
+    # two endpoint errors; the norm is 1-Lipschitz in that displacement.
+    half_ulp = np.spacing(np.abs(xy)).astype(np.float64) / 2
+    rounding_bound = np.linalg.norm(half_ulp[:-1] + half_ulp[1:], axis=1)
+    if np.any(spacing <= 0) or np.any(spacing > maximum_step + rounding_bound):
+        raise ValueError("route spacing exceeds the forward speed contract")
 
 
 def _dataset_sha(root: Path, audit_dir: Path) -> tuple[str, int]:
@@ -151,12 +160,13 @@ def audit_dataset(root: Path) -> dict[str, Any]:
         grid = grids[key]
         if not grid.safe(xy):
             reasons.append("route_clearance")
-        spacing = np.linalg.norm(np.diff(xy, axis=0), axis=1)
         period = manifest["route_contract"]["observation_period_s"]
         maximum_step = (
             period * manifest["route_contract"]["expert_speed_m_s"]
         )
-        if np.any(spacing <= 0) or np.any(spacing > maximum_step + 1e-6):
+        try:
+            validate_route_spacing(xy, maximum_step)
+        except ValueError:
             reasons.append("route_spacing")
         controls = np.load(directory / "expert_controls.npy")
         angular_limit = manifest["route_contract"]["expert_angular_speed_rad_s"]

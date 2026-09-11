@@ -16,7 +16,6 @@ from curvenav.config import (
     TrajectoryConfig,
 )
 from curvenav.models import TRAINING_LOSS_NAMES
-from curvenav.models.safety import observed_clearance_loss
 from curvenav.encoders.configuration import observed_configuration_features
 from curvenav.models.blocks import (
     ConditionalTrajectoryBlock,
@@ -157,40 +156,22 @@ def test_terminal_goal_is_metric_local_and_does_not_constrain_output() -> None:
     assert torch.linalg.vector_norm(decoded[:, -1], dim=-1).max() > 3.6
 
 
-def test_pointgoal_enters_decoder_only_as_terminal_intent() -> None:
+def test_pointgoal_enters_decoder_as_terminal_intent():
     policy = build_policy(tiny_config()).eval()
-    names = tuple(name for name, _ in policy.named_parameters())
-    assert not any(
-        word in name
-        for name in names
-        for word in ("intent", "goal_projection", "reference_embedding")
+    inputs = make_condition(1)
+    state, time = torch.randn(1, 14), torch.ones(1)
+
+    def velocity(c):
+        encoded = policy.encode_condition(c)
+        memory = policy.trajectory_decoder.project_condition_memory(
+            encoded, policy.curve_codec
+        )
+        return policy._predict_velocity(state, time, memory)
+
+    assert not torch.equal(
+        velocity(inputs),
+        velocity(replace(inputs, point_goal=torch.tensor([[-2.0, 3.0]]))),
     )
-    first = make_condition(1)
-    second = replace(first, point_goal=torch.tensor([[-2.0, 3.0]]))
-    first_encoded = policy.encode_condition(first)
-    second_encoded = policy.encode_condition(second)
-    second_with_first_reference = replace(
-        second_encoded,
-        metric_reference=first_encoded.metric_reference,
-    )
-    state = torch.randn(1, 14)
-    start = torch.zeros(1)
-    end = torch.ones(1)
-    first_velocity = policy._predict_stage_velocities(
-        state,
-        start,
-        end,
-        first_encoded,
-        policy.trajectory_decoder.project_condition_memory(first_encoded),
-    )[0]
-    second_velocity = policy._predict_stage_velocities(
-        state,
-        start,
-        end,
-        second_with_first_reference,
-        policy.trajectory_decoder.project_condition_memory(second_with_first_reference),
-    )[0]
-    assert not torch.equal(first_velocity, second_velocity)
 
 
 def test_depth_and_pointgoal_both_condition_the_trajectory() -> None:
@@ -283,83 +264,32 @@ def test_training_objective_trains_every_module() -> None:
         condition,
         TrajectoryTarget(policy.curve_codec.values_from_coordinates(coordinates)),
         torch.randn_like(coordinates),
-        torch.arange(batch, dtype=torch.uint8).remainder(4),
     )
-    assert TRAINING_LOSS_NAMES == (
-        "loss",
-        "mean_flow_loss",
-        "visible_clearance_loss",
-    )
-    assert len(losses.logging_values()) == 3
-    torch.testing.assert_close(
-        losses.loss,
-        losses.mean_flow_loss + losses.visible_clearance_loss,
-    )
-    assert losses.visible_clearance_loss >= 0
+    assert TRAINING_LOSS_NAMES == ("loss",)
+    assert len(losses.logging_values()) == 1
     assert losses.loss.ndim == 0 and torch.isfinite(losses.loss)
     losses.loss.backward()
     gradients = [p.grad for p in policy.parameters() if p.requires_grad]
     assert all(g is not None and torch.isfinite(g).all() for g in gradients)
 
 
-def test_visible_clearance_risk_uses_only_strict_observed_support() -> None:
-    x = torch.linspace(0.0, 1.0, 64)
-    path = torch.stack((x, torch.zeros_like(x)), dim=-1)[None]
-    field = torch.zeros(1, 5, 64, 64)
-    field[:, 0] = -0.05
-    field[:, 3] = 1.0
-    observed_risk = observed_clearance_loss(path, field, 3.6)
-    assert observed_risk.item() > 0
-    field[:, 3] = 0.0
-    torch.testing.assert_close(
-        observed_clearance_loss(path, field, 3.6),
-        torch.zeros(1),
-    )
+def test_flow_loss_matches_the_conditional_velocity_without_source_replacement(
+    monkeypatch,
+):
+    policy = build_policy(tiny_config())
+    clean, source = torch.randn(9, 14), torch.randn(9, 14)
+    target = TrajectoryTarget(policy.curve_codec.values_from_coordinates(clean))
+    clean = policy.curve_codec.coordinates_from_values(target.curve_values)
 
+    def oracle(state, time, memory):
+        torch.testing.assert_close(
+            state, (1 - time[:, None]) * clean + time[:, None] * source
+        )
+        assert ((time > 0) & (time < 1)).all()
+        return source - clean
 
-def test_visible_clearance_risk_pushes_a_curve_up_the_clearance_gradient() -> None:
-    x = torch.linspace(0.0, 1.0, 64)
-    path = torch.stack((x, torch.full_like(x, 0.02)), dim=-1)[None]
-    path.requires_grad_()
-    axis = torch.linspace(-3.6, 3.6, 64)
-    field = torch.zeros(1, 5, 64, 64)
-    field[:, 0] = axis[:, None]
-    field[:, 2] = 1.0
-    field[:, 3] = 1.0
-    loss = observed_clearance_loss(path, field, 3.6).sum()
-    loss.backward()
-    assert loss > 0
-    assert path.grad is not None
-    assert path.grad[..., 1].sum() < 0
-
-
-def test_visible_clearance_risk_has_no_uniform_shortening_gradient() -> None:
-    x = torch.linspace(0.0, 1.0, 64)
-    base = torch.stack((x, torch.full_like(x, 0.02)), dim=-1)[None]
-    scale = torch.ones((), requires_grad=True)
-    axis = torch.linspace(-3.6, 3.6, 64)
-    field = torch.zeros(1, 5, 64, 64)
-    field[:, 0] = axis[:, None]
-    field[:, 3] = 1.0
-    observed_clearance_loss(scale * base, field, 3.6).sum().backward()
-    assert scale.grad is not None
-    torch.testing.assert_close(
-        scale.grad, torch.zeros_like(scale.grad), atol=2e-5, rtol=0
-    )
-
-
-def test_deployment_boundary_uses_the_exact_fixed_source() -> None:
-    policy = build_policy(tiny_config()).eval()
-    clean = torch.randn(4, 14)
-    source = torch.randn_like(clean)
-    start, end, deployment = policy._training_intervals(
-        torch.arange(4, dtype=torch.uint8), clean
-    )
-    assert deployment.tolist() == [True, False, False, False]
-    assert start[0] == 0 and end[0] == 1
-    flow_source = source.clone()
-    flow_source[deployment] = policy.inference_source
-    torch.testing.assert_close(flow_source[0], policy.inference_source[0])
+    monkeypatch.setattr(policy, "_predict_velocity", oracle)
+    assert policy(make_condition(9), target, source).loss == 0
 
 
 def test_conditional_velocity_recovers_the_clean_flow_endpoint() -> None:
@@ -371,52 +301,66 @@ def test_conditional_velocity_recovers_the_clean_flow_endpoint() -> None:
     torch.testing.assert_close(state - end_time[:, None] * velocity, clean)
 
 
-def test_average_field_is_conditioned_on_interval_start() -> None:
-    torch.manual_seed(8)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA regression")
+def test_deterministic_cuda_flow_primal(monkeypatch) -> None:
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    previous = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        policy = build_policy(tiny_config()).cuda()
+        inputs = make_condition(8)
+        inputs = replace(
+            inputs,
+            **{
+                field.name: getattr(inputs, field.name).cuda()
+                for field in fields(inputs)
+            },
+        )
+        clean = torch.randn(8, 14, device="cuda")
+        loss = policy(
+            inputs,
+            TrajectoryTarget(policy.curve_codec.values_from_coordinates(clean)),
+            torch.randn_like(clean),
+        )
+        assert torch.isfinite(loss.loss)
+    finally:
+        torch.use_deterministic_algorithms(previous)
+
+
+def test_velocity_field_is_conditioned_on_flow_time():
     policy = build_policy(tiny_config()).eval()
-    condition = policy.encode_condition(make_condition(2))
-    projected = policy.trajectory_decoder.project_condition_memory(condition)
+    encoded = policy.encode_condition(make_condition(2))
+    memory = policy.trajectory_decoder.project_condition_memory(
+        encoded, policy.curve_codec
+    )
     state = torch.randn(2, 14)
-    end = torch.full((2,), 0.7)
-    first_average = policy._predict_stage_velocities(
-        state, torch.zeros(2), end, condition, projected
-    )[0]
-    second_average = policy._predict_stage_velocities(
-        state, torch.full((2,), 0.4), end, condition, projected
-    )[0]
-    assert not torch.equal(first_average, second_average)
+    assert not torch.equal(
+        policy._predict_velocity(state, torch.full((2,), 0.2), memory),
+        policy._predict_velocity(state, torch.full((2,), 0.7), memory),
+    )
 
 
-def test_sampling_is_one_call_with_reference_and_proposal_geometry_queries() -> None:
+def test_euler_sampling_reverses_time_and_prepares_geometry_once(monkeypatch):
     policy = build_policy(tiny_config()).eval()
     inputs = make_condition(2)
-    calls = []
-    geometry_inputs = []
+    times, geometry = [], []
 
-    def record_call(module, arguments):
-        calls.append((arguments[1].detach().clone(), arguments[2].detach().clone()))
+    def constant_velocity(state, time, memory):
+        times.append(time.clone())
+        return torch.ones_like(state)
 
-    def record_geometry(module, arguments):
-        geometry_inputs.append(arguments[0].detach().clone())
-
-    handle = policy.trajectory_decoder.register_forward_pre_hook(record_call)
-    geometry_handle = (
+    monkeypatch.setattr(policy, "_predict_velocity", constant_velocity)
+    handle = (
         policy.trajectory_decoder.path_geometry_embedding.register_forward_pre_hook(
-            record_geometry
+            lambda module, arguments: geometry.append(arguments[0])
         )
     )
-    first = policy.sample(inputs).path
+    prediction = policy.sample(inputs)
     handle.remove()
-    geometry_handle.remove()
-    torch.manual_seed(999)
-    second = policy.sample(inputs).path
-    assert torch.equal(first, second)
-    assert first.shape == (2, 64, 2)
-    assert len(calls) == 1
-    torch.testing.assert_close(calls[0][0], torch.zeros_like(calls[0][0]))
-    torch.testing.assert_close(calls[0][1], torch.ones_like(calls[0][1]))
-    assert len(geometry_inputs) == 2
-    assert all(value.shape == (2, 7, 7) for value in geometry_inputs)
+    expected, _ = policy.curve_codec.decode(policy.inference_source.expand(2, -1) - 1)
+    torch.testing.assert_close(prediction.path, expected)
+    torch.testing.assert_close(torch.stack(times)[:, 0], torch.tensor([1.0, 0.5]))
+    assert len(geometry) == 1
 
 
 def test_metric_reference_provides_distinct_target_independent_anchors() -> None:
@@ -509,45 +453,34 @@ def test_path_relative_attention_uses_physical_query_positions() -> None:
     assert not torch.equal(first, second)
 
 
-def test_flow_field_reads_observed_geometry_along_its_candidate_curve() -> None:
-    torch.manual_seed(7)
+def test_flow_field_reads_observed_reference_geometry():
     policy = build_policy(tiny_config()).eval()
     encoded = policy.encode_condition(make_condition(1))
-    state = torch.randn(1, 14)
-    start = torch.zeros(1)
-    end = torch.ones(1)
-    projected = policy.trajectory_decoder.project_condition_memory(encoded)
-    baseline = policy._predict_stage_velocities(state, start, end, encoded, projected)[
-        0
-    ]
-    changed_field = encoded.configuration_field.clone()
-    changed_field[:, 0].fill_(-0.2)
-    changed_field[:, 1].fill_(1.0)
-    changed_field[:, 2].zero_()
-    changed_field[:, 3:].fill_(1.0)
-    changed = replace(encoded, configuration_field=changed_field)
-    intervened = policy._predict_stage_velocities(
-        state, start, end, changed, projected
-    )[0]
-    assert not torch.equal(baseline, intervened)
-
-
-def test_deployment_sample_matches_the_final_path_from_proposal_diagnostics() -> None:
-    torch.manual_seed(19)
-    policy = build_policy(tiny_config()).eval()
-    condition = make_condition(2)
-    final_coordinates, proposal_coordinates = policy._deployment_transport(condition)
-    expected_path, _ = policy.curve_codec.decode(final_coordinates)
-    prediction = policy.sample(condition)
-    proposal, _ = policy.curve_codec.decode(prediction.proposal_coordinates)
-    assert prediction.path.shape == proposal.shape == (2, 64, 2)
-    torch.testing.assert_close(prediction.path, expected_path)
-    torch.testing.assert_close(
-        prediction.proposal_coordinates,
-        proposal_coordinates,
+    state, time = torch.randn(1, 14), torch.ones(1)
+    memory = policy.trajectory_decoder.project_condition_memory(
+        encoded, policy.curve_codec
     )
-    assert torch.isfinite(prediction.path).all()
-    assert torch.isfinite(proposal).all()
+    baseline = policy._predict_velocity(state, time, memory)
+    field = encoded.configuration_field.clone()
+    field[:, 0].fill_(-0.2)
+    field[:, 1].fill_(1)
+    field[:, 2].zero_()
+    field[:, 3:].fill_(1)
+    changed = replace(encoded, configuration_field=field)
+    memory = policy.trajectory_decoder.project_condition_memory(
+        changed, policy.curve_codec
+    )
+    assert not torch.equal(baseline, policy._predict_velocity(state, time, memory))
+
+
+def test_deployment_has_one_reproducible_path():
+    policy = build_policy(tiny_config()).eval()
+    inputs = make_condition(2)
+    first = policy.sample(inputs)
+    torch.manual_seed(999)
+    second = policy.sample(inputs)
+    assert [f.name for f in fields(first)] == ["path"]
+    torch.testing.assert_close(first.path, second.path, rtol=0, atol=0)
 
 
 def test_goal_does_not_relocate_candidate_relative_scene_queries() -> None:
@@ -584,7 +517,6 @@ def test_compiled_cuda_training_graph_and_deployment_sample_are_finite() -> None
         inputs,
         target,
         torch.randn_like(coordinates),
-        torch.arange(4, device=device, dtype=torch.uint8),
     ).loss
     loss.backward()
     optimizer.step()

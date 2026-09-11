@@ -36,7 +36,7 @@
 
 ## 固定验证协议
 
-每个 validation observation 只生成一条确定性的单步 MeanFlow B-spline。输出包括：
+每个 validation observation 只生成一条确定性的两步 Flow Matching B-spline。输出包括：
 
 - 固定 `2 m` 比较域的 ADE/FDE、弧长、PointGoal progress 和 regret；
 - 曲率、曲率变化、总 heading change、切线反向；
@@ -50,7 +50,6 @@
 - 只保留当前帧的历史消融，用于测量四帧时序证据的贡献；
 - 批内半周期配对的真实 depth-condition swap 与 PointGoal swap，只报告轨迹变化及原场景前缀碰撞变化，用于判断深度因果依赖和目标捷径；
 - base-policy batch-32 吞吐、包含全部诊断的端到端评估吞吐和 batch-1 延迟。
-- 单次调用内部的 clean proposal 与最终部署轨迹之间的平均路径差、两者各自 source-C-space 碰撞率，以及 `proposal-safe -> final-collision` / `proposal-collision -> final-safe` 翻转率。它只诊断单步架构是否真正把查询过的几何传递到最终输出，不是第二条候选或推理选择器。
 
 前缀指标比整条 `3.6 m` 路径更接近 receding-horizon 执行：机器人会先执行局部路径前段，再用新观测重规划。MPC 指标不是另一个可学习评价头，也不调用 Acados；它只复现固定控制器在求解前已经执行的确定性曲率/速度计算，因此计算量相对模型推理可忽略。
 

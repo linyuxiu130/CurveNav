@@ -133,7 +133,6 @@ def test_prepared_dataset_has_one_fixed_tensor_contract(tmp_path) -> None:
         "source_grid_index",
         "source_origin_xy",
         "source_yaw_rad",
-        "flow_interval_group",
     }
     assert sample["depth_indices"].dtype == torch.uint32
     assert sample["curve_values"].shape == (14,)
@@ -142,20 +141,16 @@ def test_prepared_dataset_has_one_fixed_tensor_contract(tmp_path) -> None:
     assert depth.shape == (1, 4, 1, 126, 224)
 
 
-def test_unpack_policy_batch_accepts_integer_global_interval_groups() -> None:
+def test_unpack_policy_batch_preserves_training_inputs() -> None:
     batch_size = 2
     c = depth_condition(batch_size)
     prepared = unpack_policy_batch(
         {
             **{f.name: getattr(c, f.name) for f in fields(c)},
             "curve_values": torch.zeros(batch_size, 14),
-            "flow_interval_group": torch.tensor([0, 3], dtype=torch.uint8),
         }
     )
-    torch.testing.assert_close(
-        prepared.flow_interval_group,
-        torch.tensor([0, 3], dtype=torch.uint8),
-    )
+    torch.testing.assert_close(prepared.target.curve_values, torch.zeros(batch_size, 14))
 
 
 def test_habitat_xz_routes_are_converted_to_x_forward_y_left() -> None:
@@ -276,21 +271,12 @@ def test_training_sampler_covers_each_cycle_once_and_resume_continues() -> None:
     batched = resumed.__getitems__(list(range(6)))
     for name, values in batched.items():
         assert torch.equal(values, torch.stack([resumed[i][name] for i in range(6)]))
-    assert [int(complete[index]["flow_interval_group"]) for index in range(8)] == [
-        0,
-        1,
-        2,
-        3,
-        0,
-        1,
-        2,
-        3,
-    ]
 
 
-def test_fixed_micro_batches_cover_global_stream_and_flow_strata() -> None:
+
+def test_fixed_micro_batches_cover_global_stream() -> None:
     for world_size in range(1, 9):
-        micro_batch = 320
+        micro_batch = 319
         accumulation = 2
         global_batch = micro_batch * world_size * accumulation
         layout = build_distributed_batch_layout(global_batch, micro_batch, world_size)
@@ -304,10 +290,6 @@ def test_fixed_micro_batches_cover_global_stream_and_flow_strata() -> None:
         assert all(len(batch) == micro_batch for batch in batches)
         covered = [index for batch in batches for index in batch]
         assert sorted(covered) == list(range(2 * global_batch))
-        groups = torch.tensor(covered) % 4
-        torch.testing.assert_close(
-            torch.bincount(groups, minlength=4), torch.full((4,), global_batch // 2)
-        )
     with pytest.raises(ValueError, match="complete fixed-size"):
         build_distributed_batch_layout(1000, 320, 2)
 

@@ -58,7 +58,7 @@ class SandPlannerAgent:
         originals = []
         for env_id, frame in enumerate(depth[:, :, :, 0]):
             cache = self.depth_caches[env_id]
-            cache.add_frame_to_cache(frame, should_save=True)
+            cache.add_frame_to_cache(frame)
             self.frame_counters[env_id] += 1
             sequences.append(cache.get_sequence_from_cache()[0])
             originals.append(
@@ -76,9 +76,6 @@ class SandPlannerAgent:
             engine._prev_control_points,
             engine._warm_start_counter,
             engine._prev_initial_turn,
-            engine._prev_best_trajectory,
-            engine._prev_best_control_points,
-            engine._executed_distance,
         ) = state
 
     def _save_temporal_state(self, env_id: int) -> None:
@@ -87,9 +84,6 @@ class SandPlannerAgent:
             engine._prev_control_points,
             engine._warm_start_counter,
             engine._prev_initial_turn,
-            engine._prev_best_trajectory,
-            engine._prev_best_control_points,
-            engine._executed_distance,
         )
 
     def step_pointgoal(

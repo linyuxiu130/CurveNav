@@ -7,7 +7,7 @@ from curvenav.encoders import (
     DepthObservationEncoder,
     MetricDepthProjector,
 )
-from curvenav.models import ConditionalCurveMeanFlowDecoder, CurveNavPolicy
+from curvenav.models import ConditionalCurveFlowDecoder, CurveNavPolicy
 from curvenav.trajectory import IncrementalBSplineTrajectory
 
 
@@ -49,7 +49,7 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         control_increment_mean_xy_m=trajectory.control_increment_mean_xy_m,
         control_increment_std_xy_m=trajectory.control_increment_std_xy_m,
     )
-    trajectory_decoder = ConditionalCurveMeanFlowDecoder(
+    trajectory_decoder = ConditionalCurveFlowDecoder(
         control_tokens=curve_codec.num_control_tokens,
         coordinate_dim=curve_codec.coordinate_dim,
         model_dim=decoder.model_dim,
@@ -63,6 +63,7 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         depth_encoder=depth_encoder,
         condition_encoder=condition_encoder,
         trajectory_decoder=trajectory_decoder,
+        integration_steps=decoder.integration_steps,
         curve_codec=curve_codec,
         planning_horizon_m=planning_horizon_m,
     )

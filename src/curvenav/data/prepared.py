@@ -294,11 +294,6 @@ class PreparedPolicyDataset(Dataset):
             name: torch.from_numpy(array[indices])
             for name, array in self.arrays.items()
         }
-        # This runtime-only group is assigned before any distributed shuffling.
-        # Four equal global strata cover the exact deployed boundary, one
-        # random interior stratum and two diagonal MeanFlow strata.  It is
-        # neither a stored expert label nor a policy condition.
-        sample["flow_interval_group"] = torch.from_numpy((indices % 4).astype(np.uint8))
         return sample
 
 
@@ -341,8 +336,4 @@ class RepeatedPolicyDataset(Dataset):
                 stride += 2
             mask = cycles == cycle
             mapped[mask] = (offset + stride * positions[mask]) % size
-        sample = self.dataset.__getitems__(mapped)
-        sample["flow_interval_group"] = torch.from_numpy(
-            (absolute_index % 4).astype(np.uint8)
-        )
-        return sample
+        return self.dataset.__getitems__(mapped)

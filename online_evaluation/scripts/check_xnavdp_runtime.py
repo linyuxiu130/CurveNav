@@ -32,10 +32,6 @@ PINNED = {
         "3e4a298f0e650738aee79a287db42a321522d7a55c4660849d7e858ed387cf2a",
     "eval/scripts/evaluate_pointgoal.py":
         "38c942ecfd2fe5c7c397ca8c71c03e6655d764fc3752a6a3eff7d87a24561bb4",
-    "eval/src/policy_agent.py":
-        "fff695f8e4d7060c9fefffbe9f1eb4d789a72ad1c9d229ab8798127247481bd3",
-    "eval/src/policy_server.py":
-        "06a721c0d2beef34969d9c6e0bd11f82683c24196d2c722358956081f03b8094",
     "src/environment/robots/dingo_config.py":
         "3b7da016006eb6c4f536387e1b020825fafcdca3dd7c45fbcdf21cf11359bf27",
     "src/environment/tasks/event_utils.py":
@@ -51,7 +47,7 @@ PINNED = {
     "src/environment/wheeled_tasks.py":
         "ced3f3bbb196277cef12fddc3f4216a15abcd2909e42fef601849c4d9df937f6",
     "src/utils/mpc_tracking.py":
-        "02976909b0afa586ecc285910c70cca7facc7787dd34c4bdb1187139af2903a4",
+        "741b445899c24d632e9b14bdfc08bc04af90dd83db4004eed8b14cc57c2b1e5b",
 }
 
 
@@ -80,10 +76,11 @@ def main() -> None:
         path = runtime / relative
         if not path.is_file() or digest(path) != expected:
             raise SystemExit(f"upstream runtime file differs: {path}")
-    bridge = runtime / "eval/src/client_utils.py"
-    expected_bridge = ROOT / "baselines/x-navdp/eval/src/client_utils.py"
-    if not bridge.is_file() or bridge.read_bytes() != expected_bridge.read_bytes():
-        raise SystemExit("runtime raw-depth transport bridge differs")
+    for name in ("client_utils.py", "policy_agent.py", "policy_server.py", "policy_backbone.py", "policy_network_embodiment.py"):
+        bridge = runtime / "eval/src" / name
+        expected = ROOT / "baselines/x-navdp/eval/src" / name
+        if not bridge.is_file() or bridge.read_bytes() != expected.read_bytes():
+            raise SystemExit(f"runtime policy bridge differs: {name}")
     cuda_tag = VERSIONS["PYTORCH_CUDA_TAG"]
     cuda_version = f"{cuda_tag[2:-1]}.{cuda_tag[-1]}"
     dependency_code = (

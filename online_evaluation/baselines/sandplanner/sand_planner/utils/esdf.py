@@ -14,16 +14,6 @@ import cv2
 from scipy.ndimage import distance_transform_edt
 import time
 
-# 尝试导入 CuPy 用于 GPU 加速 / Try importing CuPy for GPU acceleration
-try:
-    import cupy as cp
-    from cupyx.scipy.ndimage import distance_transform_edt as cp_edt
-    CUPY_AVAILABLE = True
-    print("[ESDF] ✅ CuPy 可用,支持 GPU 加速 EDT")
-except ImportError:
-    CUPY_AVAILABLE = False
-    print("[ESDF] ⚠️ CuPy 不可用,将使用 CPU SciPy EDT")
-
 def quick_depth_to_esdf(depth_image, camera_intrinsics,
                        voxel_size=0.05, grid_size=(80, 80, 40),
                        grid_origin=(0.0, -2.0, -1.0),
@@ -165,7 +155,10 @@ def compute_esdf_from_pointcloud(points, voxel_size, grid_size, grid_origin, sur
         esdf: ESDF 数组 (nx, ny, nz) / ESDF array (nx, ny, nz).
     """
     # 决定使用 GPU 还是 CPU / Decide whether to use GPU or CPU
-    use_gpu_actual = use_gpu and CUPY_AVAILABLE
+    use_gpu_actual = use_gpu
+    if use_gpu:
+        import cupy as cp
+        from cupyx.scipy.ndimage import distance_transform_edt as cp_edt
     backend = "GPU (CuPy)" if use_gpu_actual else "CPU (NumPy/SciPy)"
     if verbose: print(f"  使用 [{backend}] 生成占用网格...")
     start_time = time.time()
@@ -265,7 +258,10 @@ def compute_esdf_from_pointcloud(points, voxel_size, grid_size, grid_origin, sur
     if verbose: print(f"  占用网格生成完成 [{backend}]，耗时: {grid_time:.3f}秒")
 
     # 决定使用 GPU 还是 CPU 计算 ESDF / Decide whether to compute the ESDF on GPU or CPU
-    use_gpu_actual = use_gpu and CUPY_AVAILABLE
+    use_gpu_actual = use_gpu
+    if use_gpu:
+        import cupy as cp
+        from cupyx.scipy.ndimage import distance_transform_edt as cp_edt
     backend = "GPU (CuPy)" if use_gpu_actual else "CPU (SciPy)"
     if verbose: print(f"  计算ESDF距离场 [{backend}]...")
     start_time = time.time()

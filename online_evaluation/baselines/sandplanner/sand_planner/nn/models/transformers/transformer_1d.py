@@ -7,18 +7,18 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from diffusers.configuration_utils import LegacyConfigMixin, register_to_config
+from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.utils import deprecate, is_torch_version, logging
 from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.embeddings import ImagePositionalEmbeddings, PatchEmbed, PixArtAlphaTextProjection
 from ..modeling_outputs import Transformer1DModelOutput
-from diffusers.models.modeling_utils import LegacyModelMixin
+from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import AdaLayerNormSingle
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
-class Transformer1DModel(LegacyModelMixin, LegacyConfigMixin):
+class Transformer1DModel(ModelMixin, ConfigMixin):
     """
     用于序列数据的 1D Transformer 模型 / A 1D Transformer model for seq data.
 

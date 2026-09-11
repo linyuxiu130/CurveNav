@@ -2,7 +2,7 @@
 
 CurveNav 是 PointGoal 条件的米制局部轨迹生成器。当前输入为深度图、逐帧内外参、
 重力对齐的机体位姿和时间戳；共享视觉骨干与 SE(3) 几何对齐构建有界时序 BEV 记忆。
-生成器使用一步 improved MeanFlow 输出 B-spline，由固定测评 MPC 执行。
+生成器使用两步条件 Flow Matching 输出 B-spline，由固定测评 MPC 执行。
 传感器历史与异步推理分离；当前二维观测场不提供绝对无碰撞保证。
 
 唯一新观测契约拒绝旧深度数据、旧请求与旧 checkpoint，没有兼容或旧输入替代分支。
@@ -32,7 +32,8 @@ checkpoint 测评。三条链路共用 `encoders/`、`conditioning/`、`models/`
 
 在线仿真测评的调度器、模型适配器、固定题目与运行时准备脚本也已纳入
 [online_evaluation/](online_evaluation/README.md)，支持 SanD、NavDP、X-NavDP 和
-CurveNav 接入，继续使用 `python -m navbench` 入口。
+CurveNav 接入，继续使用 `python -m navbench` 入口。各模型的启动适配器独立位于
+`online_evaluation/navbench/adapters/`；NavDP 与 XNavDP 共用 `navbench/vision/` 视觉骨干。
 本机测评缓存位于 `/shibo_huang/.cache/navbench`。
 下文 `/shibo_huang/` 路径和 `outputs/` 验证记录均为本机位置，并非 GitHub 附件。
 
@@ -102,7 +103,7 @@ DDP loss 按全局均值缩放。`samples_per_epoch` 是每个逻辑 epoch 的�
 默认样本预算下，实际每 epoch 处理 40,768 个样本；单卡 98 次更新，双卡 49 次更新。
 训练批次、卡数和累积次数是 checkpoint 的恢复契约，恢复时必须保持一致。
 训练和测评的神经算子统一 BF16，要求 GPU 原生支持 BF16。标定几何、Flow 状态、
-JVP 输出及其组合、B-spline 解码和损失使用 FP32。
+Flow 积分、B-spline 解码和损失使用 FP32。
 数据、训练与离线测评入口共用当前 Conda 环境；训练直接使用 `scripts/train_policy.sh`。
 本地训练停止时应向 torchrun 主进程发送 SIGINT 并等待各 rank 退出；不要强杀 tmux
 来代替正常停止。
@@ -121,7 +122,7 @@ src/curvenav/data/         深度、source C-space query、编译与 loader
 src/curvenav/data_generation/ HSSD 资产、几何、生成与审计
 src/curvenav/encoders/     共享 深度、时序几何与 metric BEV
 src/curvenav/conditioning/目标无关场景记忆、PointGoal 度量查询与历史状态
-src/curvenav/models/       MeanFlow trajectory Transformer
+src/curvenav/models/       Flow Matching trajectory Transformer
 src/curvenav/trajectory/   专家/推理共用的 B-spline 坐标与重采样
 src/curvenav/training/     DDP、AMP、EMA 与 checkpoint
 src/curvenav/evaluation/   source-consistent 离线与跨模型评测

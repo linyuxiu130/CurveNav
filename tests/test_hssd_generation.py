@@ -12,6 +12,7 @@ import pytest
 
 from curvenav.data_generation import assets
 from curvenav.data_generation import generate as generation
+from curvenav.data_generation.audit import validate_route_spacing
 from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data_generation.assets import selected_asset_paths
 from curvenav.data_generation.generate import (
@@ -39,6 +40,15 @@ from curvenav.physical import (
     ROBOT_BASE_HEIGHT_ABOVE_GROUND_M,
     ROBOT_FOOTPRINT_RADIUS_M,
 )
+
+
+def test_route_speed_accounts_for_storage_rounding_without_allowing_overspeed():
+    for origin in (0., 30., -30., 1000.):
+        xy = np.array([[origin, origin], [origin + .03, origin]], np.float32)
+        validate_route_spacing(xy, .03)
+        xy[1, 0] += .001
+        with pytest.raises(ValueError, match="speed"):
+            validate_route_spacing(xy, .03)
 
 
 def test_depth_stream_matches_policy_numpy_files(tmp_path, monkeypatch):

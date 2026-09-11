@@ -86,4 +86,3 @@ class TrajectoryTarget:
 @dataclass
 class TrajectoryPrediction:
     path: Tensor
-    proposal_coordinates: Tensor

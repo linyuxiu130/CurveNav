@@ -13,13 +13,6 @@ from navbench.protocol import inference_context, policy_response, read_depth, re
 import numpy as np
 import json
 
-# 设置 matplotlib 使用非交互式后端，避免 GUI 相关的错误
-# Configure matplotlib to use a non-interactive backend to avoid GUI-related errors.
-import matplotlib
-# 使用 Anti-Grain Geometry 后端，无需 X11 或其他 GUI
-# Use the Anti-Grain Geometry backend, which requires neither X11 nor any other GUI.
-matplotlib.use('Agg')
-
 import argparse
 
 parser = argparse.ArgumentParser()
@@ -49,8 +42,6 @@ def navigator_reset():
         print("🚀 创建SanD-planner Agent...")
         config_kwargs = dict(
             device=args.device,
-            save_visualizations=False,
-            save_data=False,
             show_verbose=False,
         )
         if args.checkpoint is not None:

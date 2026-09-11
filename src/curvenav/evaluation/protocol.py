@@ -56,12 +56,6 @@ def summarize_strata(metrics: dict[str, Tensor]) -> dict[str, dict[str, float | 
                     .mean()
                     .item()
                 ),
-                proposal_footprint_collision_fraction=(
-                    metrics["proposal_footprint_collision"][selected]
-                    .float()
-                    .mean()
-                    .item()
-                ),
                 first_collision_current_visible_fraction=(
                     metrics["first_collision_current_depth_visible"][selected]
                     .float()

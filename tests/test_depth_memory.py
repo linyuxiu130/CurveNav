@@ -324,7 +324,7 @@ def test_depth_flow_backward_and_strict_state_roundtrip(tmp_path):
     p = build_policy(cfg)
     c = condition(4)
     target = TrajectoryTarget(p.curve_codec.values_from_coordinates(torch.randn(4, 14)))
-    loss = p(c, target, torch.randn(4, 14), torch.arange(4, dtype=torch.uint8)).loss
+    loss = p(c, target, torch.randn(4, 14)).loss
     assert torch.isfinite(loss)
     loss.backward()
     assert p.depth_encoder.backbone[0].weight.grad[:, :3].abs().sum() > 0

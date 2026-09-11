@@ -24,11 +24,11 @@ from curvenav.precision import PRECISION_NAME
 from curvenav.trajectory import INCREMENTAL_CONTROL_PARAMETERIZATION_TYPE
 from curvenav.models.policy import (
     INFERENCE_SOURCE_SEED,
-    MEAN_FLOW_TIME_SAMPLING,
+    FLOW_TIME_SAMPLING,
 )
 
 
-CHECKPOINT_TYPE = "curvenav_metric_curve_mean_flow_policy"
+CHECKPOINT_TYPE = "curvenav_metric_curve_flow_policy"
 PRODUCTION_WORLD_SIZES = tuple(range(1, 9))
 
 
@@ -65,7 +65,6 @@ def build_training_contract(
         "micro_batches_per_step": layout.micro_batches_per_step,
         "global_batch_size": global_batch_size,
         "samples_per_epoch": steps_per_epoch * global_batch_size,
-        "flow_interval_assignment": "global_sample_stream_index_mod_four",
         "steps_per_epoch": steps_per_epoch,
         "total_steps": config.training.epochs * steps_per_epoch,
     }
@@ -101,6 +100,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             ],
             "depth_dropout": depth.dropout,
             "trajectory_decoder_layers": decoder.transformer_layers,
+            "flow_integration_steps": decoder.integration_steps,
             "trajectory_decoder_heads": decoder.transformer_heads,
             "trajectory_decoder_dropout": decoder.dropout,
         },
@@ -114,24 +114,19 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             "source_cspace_gated_fixed_future_expert_planar_bspline_imitation"
         ),
         "expert_curve_projection": "equal_arc_bspline_forward_tangent_endpoint_fit",
-        "trajectory_endpoint_policy": "one_step_improved_mean_flow_curve",
+        "trajectory_endpoint_policy": "conditional_flow_curve",
         "curve_boundary_conditions": "fixed_robot_origin",
         "trajectory_decoder_type": TRAJECTORY_DECODER_TYPE,
-        "flow_source": (
-            "standard_gaussian_flow_training_plus_exact_fixed_typical_"
-            "deployment_boundary"
-        ),
+        "flow_source": "standard_gaussian_training_fixed_typical_inference_draw",
         "inference_source_seed": INFERENCE_SOURCE_SEED,
         "flow_path": "data_anchored_linear_stochastic_interpolant",
-        "flow_solver": "none_direct_average_velocity",
-        "flow_time_embedding": "end_time_and_interval_width_mlp",
-        "flow_time_sampling": MEAN_FLOW_TIME_SAMPLING,
-        "mean_flow_identity": "instantaneous_proposal_plus_average_velocity_jvp_target",
+        "flow_solver": "explicit_euler_noise_to_data",
+        "flow_time_embedding": "flow_time_mlp",
+        "flow_time_sampling": FLOW_TIME_SAMPLING,
         "training_objective": (
-            "standardized_euclidean_mean_flow_plus_deployed_"
-            "strict_observed_clearance_risk"
+            "standardized_euclidean_conditional_flow_matching"
         ),
-        "trajectory_prediction": ("one_step_improved_mean_flow_planar_cubic_bspline"),
+        "trajectory_prediction": ("conditional_flow_planar_cubic_bspline"),
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
         "visual_context": (
             "goal_independent_temporal_visual_observed_configuration_bev"
@@ -144,10 +139,10 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "visual_compression": "metric_splat_and_observed_cspace_16x16_bev",
         "condition_context": "target_independent_metric_bev_plus_motion_tokens",
         "trajectory_condition_interaction": (
-            "metric_horizon_geometry_then_clean_estimate_query_observed_cspace_and_bev"
+            "cached_metric_reference_geometry_and_bev_cross_attention"
         ),
         "path_relative_geometry": (
-            "metric_horizon_then_learned_clean_control_to_bev_metric_attention_bias"
+            "metric_reference_to_bev_attention_bias"
         ),
         "goal_conditioning": (
             "terminal_local_goal_vector_without_straight_template_matching"
@@ -163,9 +158,9 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "condition_token_count": (
             condition.bev_grid_size**2 + data.observation_frames - 1
         ),
-        "decoder_flow_fields": 2,
+        "decoder_flow_fields": 1,
         "decoder_stage_supervision": (
-            "instantaneous_clean_proposal_and_interval_average_velocity"
+            "single_conditional_velocity_field"
         ),
         "source_configuration_space_truth": (
             "native_navigation_grid_endpoint_inclusive_dense_0.025m_"
@@ -173,15 +168,14 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         ),
         "source_configuration_space_role": "dataset_certificate_and_evaluation_only",
         "depth_configuration_space_role": (
-            "target_independent_observed_bev_plus_flow_candidate_curve_query_"
-            "plus_deployed_curve_training_risk"
+            "target_independent_observed_bev_plus_metric_reference_query"
         ),
         "num_curve_tokens": trajectory.num_control_points - 1,
         "curve_coordinate_dim": 2 * (trajectory.num_control_points - 1),
         "num_control_points": trajectory.num_control_points,
         "spline_degree": trajectory.spline_degree,
         "num_path_points": trajectory.num_path_points,
-        "path_sampling": "fixed_uniform_arc_progress",
+        "path_sampling": "fixed_uniform_bspline_parameter",
         "curve_coordinates": INCREMENTAL_CONTROL_PARAMETERIZATION_TYPE,
         "visual_planning_scale_m": (data.future_steps * data.expert_waypoint_spacing_m),
         "curve_value_semantics": ("seven_planar_cubic_bspline_control_points_xy_m"),

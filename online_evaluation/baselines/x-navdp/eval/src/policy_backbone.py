@@ -5,20 +5,10 @@ This module provides the RGB-D encoder used by point-goal evaluation.
 """
 
 import math
-import os
-import sys
 import torch
 import torch.nn as nn
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_THIRD_PARTY_ROOT = os.path.join(_REPO_ROOT, "third_party")
-_DEPTH_ANYTHING_ROOT = os.path.join(_REPO_ROOT, "third_party", "depth_anything")
-if _THIRD_PARTY_ROOT not in sys.path:
-    sys.path.insert(0, _THIRD_PARTY_ROOT)
-if _DEPTH_ANYTHING_ROOT not in sys.path:
-    sys.path.insert(0, _DEPTH_ANYTHING_ROOT)
-
-from depth_anything.depth_anything_v2.dpt import DepthAnythingV2
+from navbench.vision.depth_anything_v2.dpt import DepthAnythingV2
 
 
 class SinusoidalPosEmb(nn.Module):

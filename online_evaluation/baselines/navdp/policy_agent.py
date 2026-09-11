@@ -42,7 +42,10 @@ class NavDP_Agent:
             token_dim, device=device, cache_rgb_tokens=cache_rgb_tokens,
         )
         state_dict = torch.load(navi_model, map_location=self.device, weights_only=True)
-        self.navi_former.load_state_dict(state_dict, strict=False)
+        # Released weights also contain these unused pre-training heads.
+        unused_heads = ('image_aux_head', 'image_encoder', 'pixel_aux_head', 'pixel_encoder')
+        state_dict = {k: v for k, v in state_dict.items() if k.split('.')[0] not in unused_heads}
+        self.navi_former.load_state_dict(state_dict, strict=True)
         self.navi_former.to(self.device)
         self.navi_former.eval()
 

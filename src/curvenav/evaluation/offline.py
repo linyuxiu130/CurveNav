@@ -319,9 +319,6 @@ def measure_policy(
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         prepared, prediction = _sample(policy, batch)
-        proposal_path, _ = policy.curve_codec.decode(
-            prediction.proposal_coordinates.float()
-        )
         end.record()
         end.synchronize()
         batch_latency.append(start.elapsed_time(end))
@@ -365,13 +362,6 @@ def measure_policy(
             source_yaw_rad,
             policy.planning_horizon_m,
         )
-        source_proposal = source_query.query(
-            proposal_path.float(),
-            source_grid_index,
-            source_origin_xy,
-            source_yaw_rad,
-            policy.planning_horizon_m,
-        )
         metrics = trajectory_metrics(
             prediction.path.float(),
             reference_path,
@@ -407,19 +397,6 @@ def measure_policy(
             )
         )
         metrics.update(source_execution_prefix_metrics(source_prediction))
-        proposal_safety = source_query.safety_metrics_from_query(
-            proposal_path.float(), source_proposal, policy.planning_horizon_m
-        )
-        proposal_collision = proposal_safety["footprint_collision"].bool()
-        final_collision = metrics["footprint_collision"].bool()
-        metrics.update(
-            proposal_to_final_path_change_m=paired_path_change_m(
-                proposal_path.float(), prediction.path.float()
-            ),
-            proposal_footprint_collision=proposal_collision,
-            proposal_safe_final_collision=(~proposal_collision & final_collision),
-            proposal_collision_final_safe=(proposal_collision & ~final_collision),
-        )
         metrics.update(controller_tracking_metrics(prediction.path.float()))
         visibility = collision_visibility_attribution(
             source_prediction,
@@ -526,7 +503,6 @@ def measure_policy(
             point_goal_swap_values.setdefault(name, []).append(value.cpu())
         for name, value in {
             "predicted_path": prediction.path.float(),
-            "proposal_path": proposal_path.float(),
             "current_frame_predicted_path": current_prediction.path.float(),
             "reference_path": reference_path,
             "point_goal": prepared.condition.point_goal.float(),
@@ -686,32 +662,6 @@ def evaluate_measurements(measurements: PolicyMeasurements) -> dict[str, object]
             "point_goal_swap_execution_prefix_1p0m_collision_fraction": (
                 point_goal_swap["execution_prefix_1p0m_collision"].float().mean().item()
             ),
-        },
-        "proposal_final_alignment": {
-            "interpretation": (
-                "internal one-call clean proposal versus deployed final path"
-            ),
-            "path_change_m_mean": metrics["proposal_to_final_path_change_m"]
-            .mean()
-            .item(),
-            "proposal_footprint_collision_fraction": metrics[
-                "proposal_footprint_collision"
-            ]
-            .float()
-            .mean()
-            .item(),
-            "proposal_safe_final_collision_fraction": metrics[
-                "proposal_safe_final_collision"
-            ]
-            .float()
-            .mean()
-            .item(),
-            "proposal_collision_final_safe_fraction": metrics[
-                "proposal_collision_final_safe"
-            ]
-            .float()
-            .mean()
-            .item(),
         },
         "raw_depth_path_support": {
             "interpretation": (

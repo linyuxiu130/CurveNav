@@ -1,13 +1,11 @@
-"""PointGoal-conditioned one-step improved MeanFlow trajectory generation."""
+"""PointGoal-conditioned Flow Matching in physical curve coordinates."""
 
 import math
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from curvenav.precision import GEOMETRY_DTYPE
 from curvenav.trajectory import IncrementalBSplineTrajectory
 from curvenav.types import (
     ConditionFeatures,
@@ -16,38 +14,24 @@ from curvenav.types import (
     TrajectoryTarget,
 )
 
-from .blocks import ProjectedCondition
-from .safety import observed_clearance_loss
 
-TRAINING_LOSS_NAMES = (
-    "loss",
-    "mean_flow_loss",
-    "visible_clearance_loss",
-)
+TRAINING_LOSS_NAMES = ("loss",)
 INFERENCE_SOURCE_SEED = 20_260_828
-MEAN_FLOW_TIME_SAMPLING = (
-    "half_diagonal_quarter_logit_normal_interval_quarter_deployment_boundary"
-)
-MEAN_FLOW_LOGIT_NORMAL_MEAN = -0.4
-MEAN_FLOW_LOGIT_NORMAL_STD = 1.0
+FLOW_TIME_SAMPLING = "single_draw_logit_normal"
+FLOW_LOGIT_NORMAL_MEAN = -0.4
+FLOW_LOGIT_NORMAL_STD = 1.0
 
 
 @dataclass
 class CurveNavLoss:
     loss: Tensor
-    mean_flow_loss: Tensor
-    visible_clearance_loss: Tensor
 
     def logging_values(self) -> tuple[Tensor, ...]:
-        return (
-            self.loss,
-            self.mean_flow_loss,
-            self.visible_clearance_loss,
-        )
+        return (self.loss,)
 
 
 class CurveNavPolicy(nn.Module):
-    """Learn a deterministic conditional transport to one executable curve."""
+    """Learn conditional curve transport; deploy one reproducible source sample."""
 
     def __init__(
         self,
@@ -56,6 +40,7 @@ class CurveNavPolicy(nn.Module):
         trajectory_decoder: nn.Module,
         curve_codec: IncrementalBSplineTrajectory,
         planning_horizon_m: float,
+        integration_steps: int,
     ) -> None:
         super().__init__()
         self.depth_encoder = depth_encoder
@@ -63,6 +48,7 @@ class CurveNavPolicy(nn.Module):
         self.trajectory_decoder = trajectory_decoder
         self.curve_codec = curve_codec
         self._planning_horizon_m = float(planning_horizon_m)
+        self.integration_steps = integration_steps
         if (
             trajectory_decoder.control_tokens != curve_codec.num_control_tokens
             or trajectory_decoder.coordinate_dim != curve_codec.coordinate_dim
@@ -98,254 +84,57 @@ class CurveNavPolicy(nn.Module):
             condition.observation_age_s,
         )
 
-    def _predict_stage_velocities(
-        self,
-        state: Tensor,
-        start_time: Tensor,
-        end_time: Tensor,
-        condition: ConditionFeatures,
-        projected_condition: tuple[ProjectedCondition, ...],
-    ) -> tuple[Tensor, Tensor]:
-        return self.trajectory_decoder(
-            state,
-            start_time,
-            end_time,
-            condition,
-            projected_condition,
-            self.curve_codec,
-        )
-
-    def _trainable_velocity_primal(
-        self,
-        state: Tensor,
-        start_time: Tensor,
-        end_time: Tensor,
-        condition: ConditionFeatures,
-        projected_condition: tuple[ProjectedCondition, ...],
-    ) -> tuple[Tensor, Tensor]:
-        """Expose the same decoder as one separately compiled reverse-mode graph."""
-        return self._predict_stage_velocities(
-            state,
-            start_time,
-            end_time,
-            condition,
-            projected_condition,
-        )
-
-    def _mean_flow_total_time_derivative(
-        self,
-        state: Tensor,
-        start_time: Tensor,
-        end_time: Tensor,
-        instantaneous_velocity: Tensor,
-        condition: ConditionFeatures,
-        projected_condition: tuple[ProjectedCondition, ...],
-    ) -> Tensor:
-        """Differentiate the same neural function; return a float32 Flow derivative."""
-
-        def average_velocity(
-            flow_state: Tensor,
-            start_time: Tensor,
-            end_time: Tensor,
-        ) -> Tensor:
-            return self._predict_stage_velocities(
-                flow_state,
-                start_time,
-                end_time,
-                condition,
-                projected_condition,
-            )[0].float()
-
-        return torch.func.jvp(
-            average_velocity,
-            (state, start_time, end_time),
-            (
-                instantaneous_velocity,
-                torch.zeros_like(start_time),
-                torch.ones_like(end_time),
-            ),
-        )[1]
-
-    @staticmethod
-    def _training_intervals(
-        flow_interval_group: Tensor,
-        reference: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Sample the iMF diagonal/interior law plus the exact deployed boundary."""
-        if (
-            flow_interval_group.shape != reference.shape[:1]
-            or flow_interval_group.device != reference.device
-        ):
-            raise ValueError(
-                "flow_interval_group must have shape [B] on the flow device"
-            )
-        batch_size = reference.shape[0]
-        group = flow_interval_group.long()
-        deployment = group == 0
-        diagonal = group >= 2
-        sampled = torch.sigmoid(
-            torch.randn(batch_size, 2, device=reference.device, dtype=reference.dtype)
-            * MEAN_FLOW_LOGIT_NORMAL_STD
-            + MEAN_FLOW_LOGIT_NORMAL_MEAN
-        )
-        start_time = sampled.min(dim=1).values
-        end_time = sampled.max(dim=1).values
-        start_time = torch.where(diagonal, end_time, start_time)
-        start_time = torch.where(deployment, torch.zeros_like(start_time), start_time)
-        end_time = torch.where(deployment, torch.ones_like(end_time), end_time)
-        return start_time, end_time, deployment
+    def _predict_velocity(self, state: Tensor, time: Tensor, memory) -> Tensor:
+        return self.trajectory_decoder(state, time, memory).float()
 
     def training_loss(
         self,
         condition: PolicyCondition,
         target: TrajectoryTarget,
         source: Tensor,
-        flow_interval_group: Tensor,
     ) -> CurveNavLoss:
         target.validate()
-        encoded = self.encode_condition(condition)
-        clean = self.curve_codec.coordinates_from_values(
-            target.curve_values.float(),
-        )
-        if clean.shape[1] != self.curve_codec.coordinate_dim:
-            raise ValueError("target curve values do not match the production codec")
+        clean = self.curve_codec.coordinates_from_values(target.curve_values.float())
         if source.shape != clean.shape:
             raise ValueError(
                 "flow source must match the standardized curve coordinates"
             )
         source = source.float()
-        start_time, end_time, deployment = self._training_intervals(
-            flow_interval_group, clean
-        )
-        flow_source = source.clone()
-        flow_source[deployment] = self.inference_source.to(flow_source)
-        state = (1.0 - end_time[:, None]) * clean + end_time[:, None] * flow_source
-        conditional_velocity = flow_source - clean
-        projected_condition = self.trajectory_decoder.project_condition_memory(encoded)
-
-        def stage_velocities(
-            flow_state: Tensor,
-            start_time: Tensor,
-            end_time: Tensor,
-        ) -> tuple[Tensor, Tensor]:
-            return self._trainable_velocity_primal(
-                flow_state,
-                start_time,
-                end_time,
-                encoded,
-                projected_condition,
-            )
-
-        average_velocities, instantaneous_velocities = stage_velocities(
-            state, start_time, end_time
-        )
-        # The MeanFlow material derivative is multiplied by (t-r), hence it is
-        # identically absent on the diagonal half of the training law.  Evaluate
-        # its stopped JVP only for positive-width rows; this is algebraically
-        # identical to a full-batch JVP followed by the zero interval product.
-        # Resolve the subset once; repeated boolean indexing synchronizes CUDA
-        # separately for every condition tensor to discover its output size.
-        positive_indices = torch.nonzero(flow_interval_group < 2, as_tuple=True)[0]
-        positive_condition = ConditionFeatures(
-            tokens=encoded.tokens[positive_indices],
-            token_valid=encoded.token_valid[positive_indices],
-            metric_position=encoded.metric_position[positive_indices],
-            surface_hit=encoded.surface_hit[positive_indices],
-            frame_age=encoded.frame_age[positive_indices],
-            motion_token=encoded.motion_token[positive_indices],
-            metric_reference=encoded.metric_reference[positive_indices],
-            terminal_goal=encoded.terminal_goal[positive_indices],
-            configuration_field=encoded.configuration_field[positive_indices],
-        )
-        positive_projected_condition = tuple(
-            tuple(value[positive_indices] for value in projected)
-            for projected in projected_condition
-        )
-        # The auxiliary marginal-velocity readout is structurally independent
-        # of r. The same primal therefore supplies iMF's stopped predicted-v
-        # JVP tangent without a second decoder evaluation.
-        jvp_tangent = instantaneous_velocities[positive_indices, -1].float()
-        with torch.no_grad():
-            with sdpa_kernel([SDPBackend.MATH]):
-                total_time_derivatives = self._mean_flow_total_time_derivative(
-                    state[positive_indices],
-                    start_time[positive_indices],
-                    end_time[positive_indices],
-                    jvp_tangent.detach(),
-                    positive_condition,
-                    positive_projected_condition,
-                )
-        # The material derivative is a geometric/Flow quantity.  Keep its
-        # interval integration in float32 instead of quantizing it back into
-        # the neural autocast dtype before forming the MeanFlow target.
-        interval_correction = torch.zeros_like(average_velocities, dtype=GEOMETRY_DTYPE)
-        interval_correction[positive_indices] = (end_time - start_time)[
-            positive_indices, None, None
-        ] * total_time_derivatives.detach()
-        reparameterized_velocities = average_velocities.float() + interval_correction
-        stage_target = conditional_velocity[:, None]
-        instantaneous_error = instantaneous_velocities.float() - stage_target
-        average_error = reparameterized_velocities.float() - stage_target
-        instantaneous_squared_error = instantaneous_error.square()
-        average_squared_error = average_error.square()
-        mean_flow_loss = 0.5 * (
-            instantaneous_squared_error.mean() + average_squared_error.mean()
-        )
-        deployment_coordinates = (
-            flow_source[deployment] - average_velocities[deployment, -1].float()
-        )
-        deployment_path, _ = self.curve_codec.decode(deployment_coordinates)
-        visible_clearance_loss = (
-            observed_clearance_loss(
-                deployment_path,
-                encoded.configuration_field[deployment],
-                self.planning_horizon_m,
-            )
-            .sum()
-            .mul(4.0 / clean.shape[0])
-        )
-        return CurveNavLoss(
-            loss=mean_flow_loss + visible_clearance_loss,
-            mean_flow_loss=mean_flow_loss,
-            visible_clearance_loss=visible_clearance_loss,
-        )
-
-    @torch.no_grad()
-    def _deployment_transport(
-        self, condition: PolicyCondition
-    ) -> tuple[Tensor, Tensor]:
-        """Return final and internal clean-proposal coordinates from one call."""
         encoded = self.encode_condition(condition)
-        state = self.inference_source.expand(condition.point_goal.shape[0], -1).clone()
-        start_time = torch.zeros(state.shape[0], device=state.device)
-        end_time = torch.ones_like(start_time)
-        average_velocities, instantaneous_velocities = self._predict_stage_velocities(
-            state,
-            start_time,
-            end_time,
-            encoded,
-            self.trajectory_decoder.project_condition_memory(encoded),
+        memory = self.trajectory_decoder.project_condition_memory(
+            encoded, self.curve_codec
         )
-        final = state - average_velocities[:, -1].float()
-        proposal = state - instantaneous_velocities[:, -1].float()
-        return final, proposal
+        time = torch.sigmoid(
+            torch.randn(len(clean), device=clean.device) * FLOW_LOGIT_NORMAL_STD
+            + FLOW_LOGIT_NORMAL_MEAN
+        )
+        state = (1 - time[:, None]) * clean + time[:, None] * source
+        velocity = self._predict_velocity(state, time, memory)
+        return CurveNavLoss((velocity - (source - clean)).square().mean())
 
     @torch.no_grad()
     def sample(self, condition: PolicyCondition) -> TrajectoryPrediction:
-        final, proposal = self._deployment_transport(condition)
-        path, _ = self.curve_codec.decode(final)
-        return TrajectoryPrediction(path=path, proposal_coordinates=proposal)
+        encoded = self.encode_condition(condition)
+        memory = self.trajectory_decoder.project_condition_memory(
+            encoded, self.curve_codec
+        )
+        state = self.inference_source.expand(len(condition.point_goal), -1)
+        # Reverse the data-to-noise interpolant, reusing the same scene memory.
+        for index in range(self.integration_steps):
+            time = torch.full(
+                (len(state),), 1 - index / self.integration_steps, device=state.device
+            )
+            state = (
+                state
+                - self._predict_velocity(state, time, memory) / self.integration_steps
+            )
+        path, _ = self.curve_codec.decode(state)
+        return TrajectoryPrediction(path=path)
 
     def forward(
         self,
         condition: PolicyCondition,
         target: TrajectoryTarget,
         source: Tensor,
-        flow_interval_group: Tensor,
     ) -> CurveNavLoss:
-        return self.training_loss(
-            condition,
-            target,
-            source,
-            flow_interval_group,
-        )
+        return self.training_loss(condition, target, source)

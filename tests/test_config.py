@@ -84,20 +84,12 @@ def test_training_batch_contract_is_global_and_exact() -> None:
         config_from_mapping({"training": {"micro_batch_size": 128}})
     with pytest.raises(TypeError, match="global_batch_size"):
         config_from_mapping({"training": {"global_batch_size": 1024}})
-    with pytest.raises(ValueError, match="exact quarter"):
-        config_from_mapping(
-            {
-                "training": {
-                    "per_device_batch_size": 1022,
-                    "samples_per_epoch": 40880,
-                }
-            }
-        )
+    config_from_mapping({"training": {"per_device_batch_size": 1022}}).validate()
 
 
-def test_meanflow_dropout_is_structurally_disabled() -> None:
-    with pytest.raises(ValueError, match="dropout must be zero"):
-        config_from_mapping({"model": {"depth_encoder": {"dropout": 0.1}}})
+def test_dropout_probability_is_validated() -> None:
+    with pytest.raises(ValueError, match="dropout must be in"):
+        config_from_mapping({"model": {"depth_encoder": {"dropout": 1.1}}})
 
 
 def test_rejects_invalid_trajectory_contract() -> None:
@@ -120,7 +112,7 @@ def test_rejects_invalid_trajectory_contract() -> None:
         config_from_mapping(
             {"model": {"trajectory_decoder": {"flow_steps": 7}}}
         )
-    with pytest.raises(ValueError, match="split evenly"):
+    with pytest.raises(ValueError, match="must be positive"):
         config_from_mapping(
             {"model": {"trajectory_decoder": {"transformer_layers": 0}}}
         )

@@ -33,12 +33,14 @@ bridge_files=(
     baselines/x-navdp/eval/src/client_utils.py
     baselines/x-navdp/eval/src/policy_agent.py
     baselines/x-navdp/eval/src/policy_server.py
+    baselines/x-navdp/eval/src/policy_backbone.py
+    baselines/x-navdp/eval/src/policy_network_embodiment.py
 )
 git -C "$CHECKOUT" checkout -- "${patch_files[@]}" "${bridge_files[@]}"
 git -C "$CHECKOUT" apply --unidiff-zero "$RUNTIME_PATCH"
 
 # The simulator and every policy server share the sole raw float32/NPZ bridge.
-for runtime_file in client_utils.py policy_agent.py policy_server.py; do
+for runtime_file in client_utils.py policy_agent.py policy_server.py policy_backbone.py policy_network_embodiment.py; do
     install -m 0644         "${ROOT_DIR}/baselines/x-navdp/eval/src/${runtime_file}"         "${RUNTIME_ROOT}/eval/src/${runtime_file}"
 done
 

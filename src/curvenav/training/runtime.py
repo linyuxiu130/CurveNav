@@ -7,9 +7,6 @@ from torch import nn
 def configure_cuda_training_backend() -> None:
     """Select the static-shape Tensor Core route without unbounded workspaces."""
     torch.set_float32_matmul_precision("highest")
-    # CurveNav compiles only internal static functions.  DDPOptimizer is for
-    # compiling an enclosing DDP model and cannot split a torch.func JVP graph.
-    torch._dynamo.config.optimize_ddp = False
     # All training shapes are fixed.  With the NCHW activation route, limiting
     # cuDNN's search to ten plans improves the complete ResNet step without the
     # transient workspace exhaustion seen on the discarded NHWC route.
@@ -18,12 +15,11 @@ def configure_cuda_training_backend() -> None:
 
 
 def compile_static_training_functions(policy: nn.Module) -> None:
-    """Fuse perception, conditioning, shared K/V, primal, and stopped JVP."""
+    """Fuse perception, scene preparation, and the single velocity field."""
     for module, name in (
         (policy.depth_encoder, "forward"),
         (policy.condition_encoder, "forward"),
         (policy.trajectory_decoder, "project_condition_memory"),
-        (policy, "_trainable_velocity_primal"),
-        (policy, "_mean_flow_total_time_derivative"),
+        (policy, "_predict_velocity"),
     ):
         setattr(module, name, torch.compile(getattr(module, name), fullgraph=True, dynamic=False))

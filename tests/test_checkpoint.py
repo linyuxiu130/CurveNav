@@ -55,13 +55,12 @@ def test_checkpoint_records_the_clean_depth_grounded_flow_contract() -> None:
     config = CurveNavConfig()
     value, _, _, _ = checkpoint(config)
     contract = value["policy_contract"]
-    assert value["checkpoint_type"] == "curvenav_metric_curve_mean_flow_policy"
+    assert value["checkpoint_type"] == "curvenav_metric_curve_flow_policy"
     assert contract["trajectory_decoder_type"] == (
-        "single_call_metric_horizon_anchored_proposal_terminal_goal_cspace_improved_mean_flow"
+        "metric_reference_conditioned_curve_flow_transformer"
     )
     assert contract["training_objective"] == (
-        "standardized_euclidean_mean_flow_plus_deployed_"
-        "strict_observed_clearance_risk"
+        "standardized_euclidean_conditional_flow_matching"
     )
     assert contract["curve_coordinates"] == (
         "standardized_physical_bspline_control_increments"
@@ -74,21 +73,19 @@ def test_checkpoint_records_the_clean_depth_grounded_flow_contract() -> None:
         "dataset_certificate_and_evaluation_only"
     )
     assert contract["depth_configuration_space_role"] == (
-        "target_independent_observed_bev_plus_flow_candidate_curve_query_"
-        "plus_deployed_curve_training_risk"
+        "target_independent_observed_bev_plus_metric_reference_query"
     )
     assert contract["trajectory_condition_interaction"] == (
-        "metric_horizon_geometry_then_clean_estimate_query_observed_cspace_and_bev"
+        "cached_metric_reference_geometry_and_bev_cross_attention"
     )
     assert contract["path_relative_geometry"] == (
-        "metric_horizon_then_learned_clean_control_to_bev_metric_attention_bias"
+        "metric_reference_to_bev_attention_bias"
     )
     assert contract["goal_conditioning"] == (
         "terminal_local_goal_vector_without_straight_template_matching"
     )
-    assert contract["decoder_flow_fields"] == 2
-    assert contract["flow_solver"] == "none_direct_average_velocity"
-    assert "clearance_risk" in contract["training_objective"]
+    assert contract["decoder_flow_fields"] == 1
+    assert contract["flow_solver"] == "explicit_euler_noise_to_data"
     assert len(contract["control_increment_mean_xy_m"]) == 14
     assert len(contract["control_increment_std_xy_m"]) == 14
 
@@ -96,7 +93,7 @@ def test_checkpoint_records_the_clean_depth_grounded_flow_contract() -> None:
 def test_policy_contract_catches_geometry_mismatch() -> None:
     config = CurveNavConfig()
     value = {
-        "checkpoint_type": "curvenav_metric_curve_mean_flow_policy",
+        "checkpoint_type": "curvenav_metric_curve_flow_policy",
         "policy_contract": build_policy_contract(config),
     }
     validate_policy_contract(value, config)

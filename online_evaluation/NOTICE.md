@@ -18,4 +18,6 @@ distributed through Git.
 SanD-Planner attribution and license are retained in `baselines/sandplanner/`.
 X-NavDP attribution, MIT license, citation, and third-party notices are retained
 in `baselines/x-navdp/`. Depth Anything V2's license is retained alongside its
-vendored inference source.
+shared inference source in `navbench/vision/`. NavDP and X-NavDP use this
+single Depth Anything / DINOv2 implementation; their policy networks and temporal
+preprocessing remain separate.

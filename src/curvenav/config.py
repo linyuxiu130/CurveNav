@@ -58,36 +58,36 @@ class TrajectoryConfig:
     spline_degree: int = 3
     num_path_points: int = 64
     control_increment_mean_xy_m: tuple[float, ...] = (
-        0.19575905874489494,
-        0.000013560529621743297,
-        0.3902212095715023,
-        0.002008237219028404,
-        0.558451868792498,
-        0.007029782353195491,
-        0.5213567234781906,
-        0.009539148157356049,
-        0.4803115149944964,
-        0.009542148952045124,
-        0.29207692008915925,
-        0.005783167418347843,
-        0.13902845983512357,
-        0.003241675585678419,
+        0.19642330136755862,
+        0.0,
+        0.3915094997185144,
+        0.00021861691377818637,
+        0.5476898505751266,
+        -0.0014516595218387449,
+        0.5035989823812841,
+        -0.006019467515492705,
+        0.4582797710610274,
+        -0.01078719027836341,
+        0.27792310350004706,
+        -0.010353431965547815,
+        0.13242820373850755,
+        -0.005304436046028459,
     )
     control_increment_std_xy_m: tuple[float, ...] = (
-        0.06963118493486234,
-        0.009753948216963312,
-        0.1396785939096103,
-        0.06463728684735078,
-        0.20765432388349703,
-        0.1990670224631178,
-        0.22015131716511072,
-        0.27216707621942426,
-        0.24343845568601458,
-        0.32393372700831924,
-        0.18216146996698057,
-        0.24085929622333027,
-        0.09459704496084137,
-        0.12324686272239309,
+        0.050220991216198226,
+        0.050220991216198226,
+        0.11429249515751656,
+        0.11429249515751656,
+        0.2282398416282557,
+        0.2282398416282557,
+        0.27447920007578686,
+        0.27447920007578686,
+        0.31187694698071,
+        0.31187694698071,
+        0.22779275189818496,
+        0.22779275189818496,
+        0.1147950114801321,
+        0.1147950114801321,
     )
 
     def validate(self) -> None:
@@ -130,14 +130,13 @@ class ConditionEncoderConfig:
 class TrajectoryDecoderConfig:
     model_dim: int = 384
     transformer_layers: int = 12
+    integration_steps: int = 2
     transformer_heads: int = 8
     dropout: float = 0.0
 
     def validate(self) -> None:
-        if self.transformer_layers < 2 or self.transformer_layers % 2:
-            raise ValueError(
-                "trajectory decoder layers must split evenly into proposal and average phases"
-            )
+        if self.transformer_layers < 1 or self.integration_steps < 1:
+            raise ValueError("decoder layers and integration steps must be positive")
 
 
 @dataclass(frozen=True)
@@ -210,20 +209,13 @@ class CurveNavConfig:
             raise ValueError(
                 "model_dim must be divisible by trajectory_decoder.transformer_heads"
             )
-        if (
-            self.trajectory_decoder.transformer_layers < 2
-            or self.trajectory_decoder.transformer_layers % 2
-        ):
-            raise ValueError(
-                "trajectory_decoder.transformer_layers must be positive and even"
-            )
         for name, dropout in (
             ("depth_encoder", self.depth_encoder.dropout),
             ("trajectory_decoder", self.trajectory_decoder.dropout),
         ):
-            if dropout != 0:
+            if not 0 <= dropout < 1:
                 raise ValueError(
-                    f"{name}.dropout must be zero for deterministic MeanFlow"
+                    f"{name}.dropout must be in [0, 1)"
                 )
         if not 0 <= self.training.seed < 2**32:
             raise ValueError("training.seed must be in [0, 2**32)")
@@ -240,10 +232,6 @@ class CurveNavConfig:
         invalid = [name for name, value in positive_integers.items() if value < 1]
         if invalid:
             raise ValueError(f"training values must be positive: {invalid}")
-        if self.training.per_device_batch_size % 4:
-            raise ValueError(
-                "per_device_batch_size must contain an exact quarter of deployment intervals"
-            )
         if not 0 <= self.training.warmup_epochs < self.training.epochs:
             raise ValueError("training.warmup_epochs must be in [0, epochs)")
         if not 0 < self.training.min_learning_rate_factor <= 1:

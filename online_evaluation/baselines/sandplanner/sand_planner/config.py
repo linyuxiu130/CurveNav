@@ -23,21 +23,14 @@ class InferenceConfig:
 
     # 路径配置（使用相对路径） / Path configuration (relative paths)
     checkpoint_path: str = "checkpoints/NoMax.pth"
-    stats_path: str = "data/outputs/trajectory_stats_mg2_mg50_2d.json"
-    input_depth_dir: str = "data/real_test/draw"
-    consecutive_depth_dir: str = "data/real_test/real_lab_converted/depth"
-    output_dir: str = "outputs/inference_results"
+    stats_path: str = "trajectory_stats.json"
 
     # 模型配置 / Model configuration
     sequence_length: int = 4
     fusion_strategy: str = 'concat'  # 可选值/options: 'concat', 'average', 'attention'
-    use_consecutive_frames: bool = True
     trajectory_interpolation: str = 'bspline'  # 可选值/options: 'bspline' 或/or 'cubic_spline'
     prediction_mode: str = 'control_points'  # 可选值/options: 'control_points' 或/or 'waypoints'
     num_control_points: int = 8  # B-spline 控制点数量（必须与训练时一致） / Number of B-spline control points (must match training)
-    # 严格模式：与 checkpoint 不符或 checkpoint 未记录时直接报错
-    # Strict mode: raise an error if the value mismatches the checkpoint or is not recorded in it
-    strict_num_control_points: bool = False
     num_transformer_layers: int = 2
     num_heads: int = 4
 
@@ -49,10 +42,6 @@ class InferenceConfig:
     enable_warm_start: bool = True
     warm_start_resume_step: int = 5  # 选择重新加噪对应的 scheduler 步编号 / Scheduler timestep index at which to re-inject noise
 
-    # Best Plan Candidate Backtracking 配置 / Best plan candidate backtracking configuration
-    enable_plan_backtracking: bool = False  # 启用最优计划回溯 / Enable best-plan backtracking
-    backtracking_bonus: float = 0.01  # 给旧轨迹的奖励系数 / Bonus weight given to the previous trajectory
-    execution_distance_per_frame: float = 0.1  # 每帧执行的距离（米） / Distance executed per frame (meters)
 
     # 图像处理配置 / Image processing configuration
     image_height: int = 168
@@ -79,9 +68,6 @@ class InferenceConfig:
     esdf_surface_threshold: float = 0.2  # 障碍物膨胀半径（≈机器人半径），用作安全距离 / Obstacle inflation radius (≈robot radius), used as clearance
     clearance_height: Optional[float] = 0.36  # 查询离地约 0.5m 的 2D 平面（机器人胸部高度） / 2D query plane ~0.5m above ground (robot chest height)
 
-    # 可视化配置 / Visualization configuration
-    save_visualizations: bool = True
-    save_data: bool = True
     show_verbose: bool = False
 
     # Agent 参数（此前在 SandPlannerAgent 中硬编码）
@@ -103,12 +89,7 @@ class InferenceConfig:
         # 将相对路径转换为绝对路径 / Resolve relative paths into absolute paths
         self.checkpoint_path = os.path.join(self.base_dir, self.checkpoint_path)
         self.stats_path = os.path.join(self.base_dir, self.stats_path)
-        self.input_depth_dir = os.path.join(self.base_dir, self.input_depth_dir)
-        self.consecutive_depth_dir = os.path.join(self.base_dir, self.consecutive_depth_dir)
-        self.output_dir = os.path.join(self.base_dir, self.output_dir)
 
-        # 创建输出目录 / Create the output directory
-        os.makedirs(self.output_dir, exist_ok=True)
 
     @property
     def camera_intrinsics(self) -> Dict[str, float]:

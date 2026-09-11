@@ -48,25 +48,14 @@ class TrajectoryInference:
         self._prev_control_points: Optional[torch.Tensor] = None  # (3, 8)
         self._latest_latent_control_points: Optional[torch.Tensor] = None
         self._warm_start_counter: int = 0
-        self._warm_start_enabled = getattr(self.config, 'enable_warm_start', False)
-        self._warm_start_resume_step = max(0, getattr(self.config, 'warm_start_resume_step', 0))
+        self._warm_start_enabled = self.config.enable_warm_start
+        self._warm_start_resume_step = max(0, self.config.warm_start_resume_step)
 
-        # Best Plan Candidate Backtracking 相关缓存 / Best plan candidate backtracking caches
-        self._prev_best_trajectory: Optional[np.ndarray] = None  # 上一帧的最优轨迹 / previous frame's best trajectory (N, 3)
+        self._prev_initial_turn: Optional[float] = None
 
-        # Initial Turn 相关缓存（用于时序连贯性）/ Initial-turn caches (for temporal coherence)
-        self._prev_initial_turn: Optional[float] = None  # 上一帧的初始转弯值（归一化后的 Y 分量）/ previous frame's initial turn value (normalized Y component)
-        self._prev_best_control_points: Optional[np.ndarray] = None  # 上一帧的最优控制点 / previous frame's best control points (8, 3)
-        self._executed_distance: float = 0.0  # 已执行的距离（用于轨迹剪裁）/ distance already executed (for trajectory trimming)
-        self._enable_plan_backtracking = getattr(self.config, 'enable_plan_backtracking', False)
-        self._backtracking_bonus = getattr(self.config, 'backtracking_bonus', 0.05)  # 给旧轨迹的奖励分数 / bonus score awarded to the previous trajectory
-
-    def _get_resume_timestep(self, scheduler: DPMSolverMultistepScheduler) -> torch.Tensor:
-        resume_idx = min(self._warm_start_resume_step, len(scheduler.timesteps) - 1)
-        return scheduler.timesteps[resume_idx]
 
     def _initialize_control_points(self, batch_size: int, scheduler: DPMSolverMultistepScheduler, dtype: torch.dtype) -> Tuple[torch.Tensor, int]:
-        num_cp = getattr(self.model, 'num_control_points', getattr(self.config, 'num_control_points', 8))
+        num_cp = self.model.num_control_points
         shape = (batch_size, 3, num_cp)
         device = self.config.device
 
@@ -74,29 +63,8 @@ class TrajectoryInference:
             self._warm_start_counter = 0
             return torch.randn(shape, device=device, dtype=dtype), 0
 
-        # 复用上一帧的完整 batch（保留多样性）
-        # Reuse the previous frame's full batch (preserving diversity)
         prev = self._prev_control_points.to(device=device, dtype=dtype)
-
-        # 处理维度：如果是单条轨迹 (3, 8)，扩展为 batch
-        # Handle dimensionality: if it is a single trajectory (3, 8), expand it to a batch
-        if prev.ndim == 2:
-            prev = prev.unsqueeze(0)
-
-        # 处理 batch size 不匹配的情况 / Handle batch-size mismatch
-        if prev.shape[0] != batch_size:
-            if prev.shape[0] == 1:
-                # 上一帧只有 1 条，复制到整个 batch（退化为原逻辑）
-                # Previous frame has only 1 trajectory; replicate it across the whole batch (degenerates to the original logic)
-                prev = prev.repeat(batch_size, 1, 1)
-            elif prev.shape[0] > batch_size:
-                # 上一帧更多，随机抽样 / Previous frame has more; sample randomly
-                indices = torch.randperm(prev.shape[0])[:batch_size]
-                prev = prev[indices]
-            else:
-                # 上一帧更少，循环复用 / Previous frame has fewer; reuse cyclically
-                repeat_count = (batch_size + prev.shape[0] - 1) // prev.shape[0]
-                prev = prev.repeat(repeat_count, 1, 1)[:batch_size]
+        prev = prev.unsqueeze(0).repeat(batch_size, 1, 1)
 
         # 为每个样本独立生成噪声（保持 batch 内差异）
         # Generate noise independently per sample (to keep intra-batch differences)
@@ -118,30 +86,12 @@ class TrajectoryInference:
         self._warm_start_counter += 1
         return resumed, resume_idx
 
-    def update_warm_start_cache(self, best_index: Optional[int] = None):
-        """保存最优轨迹的控制点用于下次 warm start / Save the best trajectory's control points for the next warm start.
-
-        Args:
-            best_index: 最优轨迹在 batch 中的索引；如果为 None，则保存整个 batch（兼容模式）。 / Index of the best trajectory within the batch; if None, save the entire batch (compatibility mode).
-        """
-        if not self._warm_start_enabled:
-            return
-        if self._latest_latent_control_points is None:
-            return
-
-        # 如果指定了 best_index，只保存该条轨迹；否则保存整个 batch
-        # If best_index is given, save only that trajectory; otherwise save the entire batch
-        if best_index is not None:
-            # 只保存被选中的最优轨迹 / Save only the selected best trajectory (3, 8)
-            if best_index < self._latest_latent_control_points.shape[0]:
-                self._prev_control_points = self._latest_latent_control_points[best_index].detach().clone().to(device='cpu')
-            else:
-                # best_index 超出范围（可能是回溯的旧轨迹），不更新
-                # best_index is out of range (possibly the backtracked previous trajectory); skip the update
-                pass
-        else:
-            # 兼容模式：保存整个 batch / Compatibility mode: save the entire batch
-            self._prev_control_points = self._latest_latent_control_points.detach().clone().to(device='cpu')
+    def update_warm_start_cache(self, best_index: int):
+        """Save the selected candidate for the next observation's warm start."""
+        if self._warm_start_enabled:
+            self._prev_control_points = (
+                self._latest_latent_control_points[best_index].detach().clone().cpu()
+            )
 
     def reset_warm_start_cache(self):
         """重置 warm start 缓存（用于新 episode 开始）/ Reset the warm-start cache (used when a new episode begins)."""
@@ -176,10 +126,7 @@ class TrajectoryInference:
         end_relative_pose_batch = end_relative_pose.repeat(self.config.batch_size, 1)
         depth_images_batch = depth_images.repeat(self.config.batch_size, 1, 1, 1, 1)
 
-        # 使用 AMP（自动混合精度）推理 / Run inference with AMP (automatic mixed precision)
-        amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-
-        with torch.no_grad(), torch.autocast(device_type='cuda' if self.config.device=='cuda' else 'cpu', enabled=(self.config.device=='cuda'), dtype=amp_dtype):
+        with torch.no_grad():
             batch_size = depth_images_batch.shape[0]
 
             # 条件编码 / Condition encoding
@@ -194,7 +141,7 @@ class TrajectoryInference:
             # Prepare the initial-turn condition (the mean Y of CP1 and CP2 from the previous frame)
             initial_turn = None
             has_initial_turn = None
-            if hasattr(self.model.condition_encoder, 'use_initial_turn') and self.model.condition_encoder.use_initial_turn:
+            if self.model.condition_encoder.use_initial_turn:
                 if self._prev_initial_turn is not None:
                     # 有历史转弯信息 / Historical turn information is available
                     initial_turn = torch.full((batch_size,), self._prev_initial_turn,

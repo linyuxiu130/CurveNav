@@ -7,6 +7,8 @@
 
 | 目录 | 内容 |
 | --- | --- |
+| `navbench/adapters/` | 每个模型独立的启动适配器，共享启动契约与注册表 |
+| `navbench/vision/` | NavDP / XNavDP 共用的 Depth Anything / DINOv2，含许可证 |
 | `navbench/` | 场景调度、常驻仿真进程、原始观测传输、指标汇总和轨迹记录 |
 | `baselines/` | 模型服务和适配器；CurveNav 仅保留协议接入，共享主仓库模型 |
 | `suites/pointgoal-v2.json` | 40 场景、每场景 100 回合及固定输入的 SHA-256 |
@@ -50,7 +52,8 @@ NAVBENCH_NUM_ENVS=16
 `OMNI_KIT_ACCEPT_EULA=YES`。
 
 新主机使用 `scripts/setup_evaluator_env.sh` 准备锁定的 Isaac Sim/Lab、acados 和
-X-NavDP 运行时。完整统一环境脚本 `scripts/setup_unified_env.sh` 还需要预先将
+X-NavDP 运行时；已有运行时在更新代码后执行 `scripts/prepare_xnavdp_runtime.sh <checkout>`
+同步策略接入，再运行 `scripts/check_xnavdp_runtime.py <checkout>/baselines/x-navdp` 检查。完整统一环境脚本 `scripts/setup_unified_env.sh` 还需要预先将
 Python 3.11 的 Magnum、Habitat-Sim wheel 和 `SHA256SUMS` 放到 `.runtime/wheels/`；
 这些本地构建产物不包含在仓库中。通用 Python 包可设置
 `PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`，NVIDIA 与 PyTorch
@@ -95,7 +98,17 @@ python -m navbench --model navdp --gpus 1 --num-envs 16 \
 
 CurveNav 在线服务已包含在 `baselines/curvenav/`。其 `--model-config` 使用显式模型
 bundle 的 `configs/config.yaml`，对应源码在该 bundle 的 `src/curvenav/`，
-不能直接把任意数据目录中的配置当作模型 bundle。当前三基线批量命令不运行 CurveNav。
+不能直接把任意数据目录中的配置当作模型 bundle。当前三基线批量命令不运行 CurveNav。当前仓库本身可作为模型 bundle：
+
+```bash
+python -m navbench --model curvenav --gpus 1 --num-envs 16 \
+  --checkpoint ../outputs/train_policy-depth-flow-20260911/checkpoint.pt \
+  --model-config ../configs/base.yaml
+```
+
+配置必须与 checkpoint 完全一致；使用其他训练配置时，将该配置放入模型 bundle 的
+`configs/`，并让 bundle 的 `src/curvenav` 指向对应源码。
+SanD 固定权重所需的归一化统计已随源码保存，不需要从旧机器补拷贝。
 
 ## 结果与验证边界
 
