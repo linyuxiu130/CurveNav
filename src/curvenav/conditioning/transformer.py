@@ -66,7 +66,7 @@ class PolicyConditionEncoder(nn.Module):
             observation.token_valid,
         )
         motion = self.motion_encoder(
-            observation_to_current, observation_valid, observation_age_s
+            observation_to_current, observation_age_s
         )
         tokens = torch.cat((configuration.tokens, motion), dim=1)
         configuration_valid = torch.ones(
@@ -104,7 +104,7 @@ class PolicyConditionEncoder(nn.Module):
         metric_reference = self._metric_reference(batch, point_goal.device)
         terminal_goal = local_terminal_goal(point_goal, self.planning_horizon_m)
         return ConditionFeatures(
-            tokens=self.memory_norm(tokens),
+            tokens=self.memory_norm(tokens) * token_valid[..., None],
             token_valid=token_valid,
             metric_position=metric_position,
             surface_hit=surface_hit,

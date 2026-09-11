@@ -11,7 +11,7 @@ from curvenav.types import DepthFeatures
 from .geometry import MetricDepthProjector
 
 
-DEPTH_ENCODER_TYPE = "depth_pixel_lift_se3_memory_v2"
+DEPTH_ENCODER_TYPE = "depth_pixel_lift_se3_memory_v3"
 
 
 def _channel_group_norm(channels: int) -> nn.GroupNorm:

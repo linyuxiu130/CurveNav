@@ -9,10 +9,9 @@ import math
 from pathlib import Path
 from typing import Any
 
-from curvenav.data.history import validate_transform
-
 import numpy as np
 
+from curvenav.data.history import validate_transform
 from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data_generation.geometry import (
     Grid,
@@ -49,6 +48,25 @@ def _distribution(values: list[float]) -> dict[str, float]:
         "p95": float(np.percentile(array, 95)),
         "max": float(array.max()),
     }
+
+
+def validate_route_pose(xy: np.ndarray, yaw: np.ndarray, poses: np.ndarray) -> None:
+    """Check that label XZ coordinates and depth SE(3) describe the same body."""
+    if not np.isfinite(xy).all() or not np.isfinite(yaw).all():
+        raise ValueError("route positions and headings must be finite")
+    validate_transform(poses)
+    expected_rotation = np.zeros((len(yaw), 3, 3))
+    c, s = np.cos(yaw), np.sin(yaw)
+    expected_rotation[:, 0, 0] = expected_rotation[:, 1, 1] = c
+    expected_rotation[:, 0, 1], expected_rotation[:, 1, 0] = s, -s
+    expected_rotation[:, 2, 2] = 1
+    if (
+        not np.allclose(poses[:, :2, 3], xy * [1, -1], atol=1e-6, rtol=0)
+        or not np.allclose(poses[:, :3, :3], expected_rotation, atol=1e-6, rtol=0)
+    ):
+        raise ValueError("depth poses and expert XY/yaw disagree")
+
+
 
 
 def _dataset_sha(root: Path, audit_dir: Path) -> tuple[str, int]:
@@ -102,7 +120,7 @@ def audit_dataset(root: Path) -> dict[str, Any]:
             reasons.append("depth_shape_or_dtype")
         poses = np.load(directory / "body_to_world.npy")
         times = np.load(directory / "timestamps.npy")
-        validate_transform(poses)
+        validate_route_pose(xy, yaw, poses)
         if (
             poses.shape != (frames, 4, 4)
             or times.shape != (frames,)

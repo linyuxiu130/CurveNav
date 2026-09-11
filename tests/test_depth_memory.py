@@ -472,3 +472,16 @@ def test_neural_regions_leave_metric_outputs_and_master_parameters_float32():
     prediction = policy.sample(c)
     assert prediction.path.dtype == torch.float32
     assert all(p.dtype == torch.float32 for p in policy.parameters())
+
+
+def test_obstacle_outside_bev_still_inflates_into_boundary():
+    projector = build_evaluation_projector(config())
+    point = torch.tensor([3.65, 0., .06])
+    field = projector._configuration_field(
+        point.reshape(1, 1, 1, 1, 3), torch.ones(1, 1, 1, 1, dtype=torch.bool),
+        point.reshape(1, 1, 1, 3), torch.ones(1, 1, 1, dtype=torch.bool),
+        torch.eye(4).reshape(1, 1, 4, 4), torch.ones(1, 1, dtype=torch.bool),
+    )
+    assert field.shape == (1, 5, 64, 64)
+    assert field[0, 0, 31:33, -1].max() < 0
+    assert field[0, 3:, 31:33, -1].all()

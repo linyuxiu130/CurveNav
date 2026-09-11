@@ -55,29 +55,36 @@ class MetricDepthProjector(nn.Module):
             -planning_horizon_m, planning_horizon_m, CONFIGURATION_GRID_SIZE
         )
         self.register_buffer("configuration_axis_m", axis)
-        index = torch.arange(CONFIGURATION_GRID_SIZE, dtype=torch.float32)
+        self.obstacle_padding = math.ceil(
+            (ROBOT_FOOTPRINT_RADIUS_M + EXTRA_CLEARANCE_M)
+            / self.configuration_resolution_m
+        ) + 1
+        index = torch.arange(
+            CONFIGURATION_GRID_SIZE + 2 * self.obstacle_padding, dtype=torch.float32
+        )
         self.register_buffer(
             "axis_squared_distance",
             (index[:, None] - index[None]).square(),
             persistent=False,
         )
 
-    def _rasterize(self, points: Tensor, valid: Tensor) -> Tensor:
+    def _rasterize(self, points: Tensor, valid: Tensor, padding: int = 0) -> Tensor:
         """Rasterize aligned planar samples into the fixed robot-centric grid."""
         if points.shape[:-1] != valid.shape or points.shape[-1] != 2:
             raise ValueError("raster points and validity must match")
         batch = points.shape[0]
-        size = self.configuration_grid_size
+        size = self.configuration_grid_size + 2 * padding
         coordinate = (
             (
                 (points + self.planning_horizon_m)
                 / (2.0 * self.planning_horizon_m)
-                * (size - 1)
+                * (self.configuration_grid_size - 1)
             )
             .round()
-            .long()
+            .long() + padding
         )
-        inside = valid & (points.abs() <= self.planning_horizon_m).all(dim=-1)
+        extent = self.planning_horizon_m + padding * self.configuration_resolution_m
+        inside = valid & (points.abs() <= extent).all(dim=-1)
         x = coordinate[..., 0].clamp(0, size - 1)
         y = coordinate[..., 1].clamp(0, size - 1)
         batch_index = torch.arange(batch, device=points.device).view(
@@ -98,18 +105,15 @@ class MetricDepthProjector(nn.Module):
 
     def _euclidean_distance_transform(self, mask: Tensor) -> Tensor:
         """Exact separable squared-Euclidean transform on the fixed grid."""
-        if mask.ndim != 4 or mask.shape[1:] != (
-            1,
-            self.configuration_grid_size,
-            self.configuration_grid_size,
-        ):
+        size = mask.shape[-1]
+        if mask.ndim != 4 or mask.shape[1:3] != (1, size):
             raise ValueError("distance mask does not match the configuration grid")
         occupied_cost = torch.where(
             mask[:, 0],
             torch.zeros((), device=mask.device),
             torch.full((), torch.inf, device=mask.device),
         )
-        squared = self.axis_squared_distance.to(mask.device)
+        squared = self.axis_squared_distance[:size, :size]
         horizontal = (occupied_cost[:, :, None, :] + squared[None, None]).amin(dim=-1)
         distance_squared = (horizontal[:, None, :, :] + squared[None, :, :, None]).amin(
             dim=2
@@ -130,9 +134,13 @@ class MetricDepthProjector(nn.Module):
         occupancy = self._rasterize(
             aligned_body_points[..., :2],
             body_pixel & observation_valid[..., None, None],
+            padding=self.obstacle_padding,
         )
+        # Inflate before cropping: obstacles just outside the BEV still collide
+        # with robot footprints whose centres are inside its boundary.
+        pad = self.obstacle_padding
         signed_clearance = (
-            self._euclidean_distance_transform(occupancy)
+            self._euclidean_distance_transform(occupancy)[:, pad:-pad, pad:-pad]
             - ROBOT_FOOTPRINT_RADIUS_M
             # Nearest-node rasterization moves a measured point by at most
             # sqrt(2)*resolution/2. Triangle inequality makes this a lower

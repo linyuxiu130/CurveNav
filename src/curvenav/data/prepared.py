@@ -74,6 +74,7 @@ def policy_dataset_contract(
             data.expert_waypoint_spacing_m * MAXIMUM_EXPERT_PROJECTION_ADE_RATIO
         ),
         "production_curve_minimum_source_clearance_m": EXTRA_CLEARANCE_M,
+        "production_curve_source_audit_extent": "full_decoded_path",
         "trajectory_geometry_coupling": (
             "source_safe_expert_physical_increment_imitation"
         ),

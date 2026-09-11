@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 import hashlib
 import heapq
 import math
@@ -10,9 +11,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.interpolate import BSpline
+from scipy.interpolate import BSpline, RectBivariateSpline
 from scipy.integrate import solve_ivp
-from scipy.optimize import brentq
+from scipy.optimize import brentq, minimize
+from scipy.ndimage import distance_transform_edt
 
 from curvenav.physical import EXTRA_CLEARANCE_M, ROBOT_FOOTPRINT_RADIUS_M
 
@@ -95,6 +97,27 @@ class Grid:
         positions, inside = positions[navigable], inside[navigable]
         values[positions] = self.clearance_m[inside[:, 0], inside[:, 1]]
         return values
+
+    @cached_property
+    def clearance_spline(self):
+        # Smooth optimization surrogate. Acceptance still uses native grid cells.
+        signed = np.where(
+            self.free, self.clearance_m,
+            (1 - distance_transform_edt(~self.free)) * self.cell_size_m,
+        )
+        axes = [
+            self.origin_xy[k] + (np.arange(n) + 0.5) * self.cell_size_m
+            for k, n in enumerate(self.free.shape)
+        ]
+        return RectBivariateSpline(*axes, signed)
+
+    def clearance_gradient(self, xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Continuous surrogate value and its exact spline derivative."""
+        x, y = xy.T
+        field = self.clearance_spline
+        return field.ev(x, y), np.column_stack(
+            (field.ev(x, y, dx=1), field.ev(x, y, dy=1))
+        )
 
     def safe(self, path: np.ndarray, minimum_m: float = MIN_CLEARANCE_M) -> bool:
         dense = resample(path, SAFETY_STEP_M)
@@ -207,9 +230,7 @@ def _astar(grid: Grid, start: np.ndarray, goal: np.ndarray) -> np.ndarray:
             if dx and dy and (not allowed[x + dx, y] or not allowed[x, y + dy]):
                 continue
             clear = 0.5 * (grid.clearance_m[x, y] + grid.clearance_m[nx, ny])
-            trial = current + step * grid.cell_size_m * (
-                1 + math.exp(-clear / ROBOT_FOOTPRINT_RADIUS_M)
-            )
+            trial = current + step * grid.cell_size_m * clearance_density(clear)
             if trial + 1e-12 >= cost[nx, ny]:
                 continue
             cost[nx, ny], parent[nx, ny] = trial, (x, y)
@@ -225,12 +246,7 @@ def _path_cost(grid: Grid, path: np.ndarray) -> float:
     if not np.isfinite(clearance).all():
         return math.inf
     segment_clearance = 0.5 * (clearance[:-1] + clearance[1:])
-    return float(
-        np.sum(
-            segment_length
-            * (1.0 + np.exp(-segment_clearance / ROBOT_FOOTPRINT_RADIUS_M))
-        )
-    )
+    return float(np.sum(segment_length * clearance_density(segment_clearance)))
 
 
 def _simplify_route(grid: Grid, path: np.ndarray) -> np.ndarray:
@@ -249,20 +265,86 @@ def _simplify_route(grid: Grid, path: np.ndarray) -> np.ndarray:
     return np.asarray(output)
 
 
-def _smooth(grid: Grid, path: np.ndarray, spacing_m: float) -> tuple[BSpline, np.ndarray]:
-    """One convex-hull B-spline approximation; no interpolant endpoint overshoot."""
-    controls = resample(path, spacing_m)
+def clearance_density(clearance):
+    """Dimensionless travel cost; extra clearance is scaled by body radius."""
+    return 1.0 + np.exp(1.0 - clearance / ROBOT_FOOTPRINT_RADIUS_M)
+
+
+def _curve_objective(controls, basis, first, second, weights, grid, reference_length):
+    """Integral rho(d)|p'| du + r_body^2/L_ref^3 integral |p''|^2 du.
+
+    The second term regularizes bending and parameter spacing. Its units are
+    metres, like the first term; it is not a hard curvature/radius constraint.
+    """
+    points, tangent, acceleration = basis @ controls, first @ controls, second @ controls
+    speed = np.linalg.norm(tangent, axis=1)
+    if np.any(speed <= np.finfo(float).eps):
+        raise PlanningError("curve optimization encountered a stationary tangent")
+    distance, distance_gradient = grid.clearance_gradient(points)
+    density = clearance_density(distance)
+    radius = ROBOT_FOOTPRINT_RADIUS_M
+    bending = radius**2 / reference_length**3
+    energy = density * speed + bending * (acceleration**2).sum(axis=1)
+    dp = -(density - 1)[:, None] / radius * distance_gradient * speed[:, None]
+    dv = density[:, None] * tangent / speed[:, None]
+    da = 2 * bending * acceleration
+    gradient = (
+        basis.T @ (weights[:, None] * dp)
+        + first.T @ (weights[:, None] * dv)
+        + second.T @ (weights[:, None] * da)
+    )
+    return float(weights @ energy), gradient
+
+
+def _smooth(grid: Grid, path: np.ndarray) -> tuple[BSpline, np.ndarray]:
+    """Optimize one continuous curve for length, clearance and turning effort."""
+    length = path_length(path)
+    controls = resample(path, 2 * ROBOT_FOOTPRINT_RADIUS_M)
     degree = min(3, len(controls) - 1)
-    knots = np.r_[np.zeros(degree), np.linspace(0, 1, len(controls) - degree + 1),
-                  np.ones(degree)]
-    curve = BSpline(knots, controls, degree)
-    # Derivative control hull bounds the distance travelled per parameter step.
-    derivative = curve.derivative()
-    bound = np.linalg.norm(derivative.c, axis=1).max()
-    parameter = np.linspace(0, 1, max(2, math.ceil(bound / spacing_m) + 1))
-    sampled = curve(parameter)
+    knots = np.r_[
+        np.zeros(degree), np.linspace(0, 1, len(controls) - degree + 1), np.ones(degree)
+    ]
+    parameter = np.linspace(0, 1, max(2, math.ceil(length / SAFETY_STEP_M) + 1))
+    identity = BSpline(knots, np.eye(len(controls)), degree)
+    basis, first = identity(parameter), identity.derivative()(parameter)
+    second = identity.derivative(2)(parameter) if degree >= 2 else np.zeros_like(basis)
+    weights = np.ones(len(parameter)) / (len(parameter) - 1)
+    weights[[0, -1]] *= 0.5
+
+    def assemble(values):
+        return np.vstack((controls[0], values.reshape(-1, 2), controls[-1]))
+
+    def objective(values):
+        cost, gradient = _curve_objective(
+            assemble(values), basis, first, second, weights, grid, length
+        )
+        return cost, gradient[1:-1].ravel()
+
+    def clearance(values):
+        distance, gradient = grid.clearance_gradient(basis @ assemble(values))
+        jacobian = (basis[:, 1:-1, None] * gradient[:, None, :]).reshape(len(parameter), -1)
+        return distance - MIN_CLEARANCE_M, jacobian
+
+    lower = grid.origin_xy + grid.cell_size_m * 0.5
+    upper = grid.origin_xy + (np.array(grid.free.shape) - 0.5) * grid.cell_size_m
+    result = minimize(
+        objective, controls[1:-1].ravel(), jac=True, method="SLSQP",
+        bounds=list(zip(lower, upper)) * (len(controls) - 2),
+        constraints={
+            "type": "ineq",
+            "fun": lambda x: clearance(x)[0],
+            "jac": lambda x: clearance(x)[1],
+        },
+        options={"maxiter": 300, "ftol": 1e-6},
+    )
+    if not result.success:
+        raise PlanningError(f"clearance curve optimization failed: {result.message}")
+    curve = BSpline(knots, assemble(result.x), degree)
+    # Derivative control hull bounds arc distance between certification samples.
+    bound = np.linalg.norm(curve.derivative().c, axis=1).max()
+    sampled = curve(np.linspace(0, 1, max(2, math.ceil(bound / SAFETY_STEP_M) + 1)))
     if not grid.safe(sampled):
-        raise PlanningError("smooth route leaves the source configuration space")
+        raise PlanningError("optimized curve leaves the source configuration space")
     return curve, sampled
 
 
@@ -313,7 +395,6 @@ def plan_route(
     grid: Grid,
     start_xy: np.ndarray,
     goal_xy: np.ndarray,
-    spacing_m: float = 0.05,
 ) -> Plan:
     start, goal = grid.snap(start_xy), grid.snap(goal_xy)
     cells = _astar(grid, start, goal)
@@ -321,7 +402,6 @@ def plan_route(
     curve_spline, path = _smooth(
         grid,
         _simplify_route(grid, discrete_path),
-        spacing_m,
     )
     length = path_length(path)
     clear, curve = grid.clearance(path), curvature(path)
@@ -336,7 +416,7 @@ def plan_route(
         "minimum_clearance_m": float(clear.min()),
         "clearance_p05_m": float(np.percentile(clear, 5)),
         "risk_density": float(
-            np.mean(np.exp(-clear / ROBOT_FOOTPRINT_RADIUS_M))
+            np.mean(clearance_density(clear) - 1)
         ),
         "curvature_p95": float(np.percentile(curve, 95)),
         "maximum_curvature": float(curve.max()),
@@ -354,7 +434,7 @@ def plan_route(
 
 
 def source_route(grid: Grid, start_xy: np.ndarray, goal_xy: np.ndarray) -> Plan:
-    plan = plan_route(grid, start_xy, goal_xy, grid.cell_size_m)
+    plan = plan_route(grid, start_xy, goal_xy)
     if not grid.safe(plan.path_xy):
         raise PlanningError("source route violates continuous clearance")
     return plan

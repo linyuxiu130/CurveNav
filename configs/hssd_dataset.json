@@ -1,6 +1,6 @@
 {
   "asset_root": "data/scene_assets/hssd-hab",
-  "output_root": "outputs/hssd_policy_depth_500_forward",
+  "output_root": "outputs/hssd_policy_depth_500_clearance",
   "seed": 20260822,
   "workers": 4,
   "gpu_device": 1,

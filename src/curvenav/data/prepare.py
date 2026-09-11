@@ -28,9 +28,9 @@ from curvenav.data.depth import (
 from curvenav.data.history import (
     OBSERVATION_PERIOD_S,
     ObservationHistory,
-    validate_transform,
 )
 from curvenav.data_generation.geometry import points_at_arc
+from curvenav.data_generation.audit import validate_route_pose
 from curvenav.data.prepared import (
     policy_dataset_contract,
 )
@@ -45,6 +45,7 @@ from curvenav.data.trajectory import (
     collate_metric_paths,
 )
 from curvenav.trajectory import IncrementalBSplineTrajectory
+from curvenav.trajectory.resampling import path_arc_length
 from curvenav.physical import EXTRA_CLEARANCE_M
 
 
@@ -162,7 +163,7 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
         yaw = np.load(route_root / "traj_yaw.npy").astype(np.float32)
         poses = np.load(route_root / "body_to_world.npy")
         times = np.load(route_root / "timestamps.npy")
-        validate_transform(poses)
+        validate_route_pose(xy, yaw, poses)
         if poses.shape != (len(xy), 4, 4) or times.shape != (len(xy),):
             raise ValueError("depth route poses/timestamps do not match frames")
         if (
@@ -272,7 +273,7 @@ def _source_minimum_clearance(
                 torch.from_numpy(source.grid_index[start:end]),
                 torch.from_numpy(source.origin_xy[start:end]),
                 torch.from_numpy(source.yaw_rad[start:end]),
-                planning_horizon_m,
+                max(planning_horizon_m, float(path_arc_length(path[start:end]).max())),
             ).minimum_clearance_m.numpy()
         )
     return np.concatenate(values)
@@ -351,7 +352,8 @@ def _audit_serialized_source_contract(
             )
         )
         expert_query = query.query(
-            expert_path, indices, origins, yaws, planning_horizon_m
+            expert_path, indices, origins, yaws,
+            max(planning_horizon_m, float(path_arc_length(expert_path).max())),
         )
         expert_minimum.append(expert_query.minimum_clearance_m.numpy())
         expert_oob_count += int(

@@ -191,3 +191,21 @@ def test_route_failure_after_planning_is_not_retried_or_erased(tmp_path, monkeyp
             0., 42, CurveNavConfig().data,
         )
     assert (tmp_path / "run_0001/traj_xy.npy").is_file()
+
+
+def test_label_safety_checks_fitted_tail_beyond_nominal_horizon(tmp_path):
+    import torch
+    from curvenav.data.prepare import _SourceMetadata, _source_minimum_clearance
+    from curvenav.data.privileged import SourceConfigurationSpaceQuery
+    p = tmp_path / 'navigation_grid.npz'
+    free = np.ones((50, 5), dtype=bool)
+    free[37:] = False
+    clearance = np.where(free, 1., 0.).astype(np.float32)
+    np.savez(p, free=free, clearance_m=clearance,
+             origin_xy=np.array([0., -.25]), cell_size_m=np.array(.1))
+    source = _SourceMetadata((p,), np.array([0]), np.zeros((1, 2),np.float32),
+                             np.zeros(1,np.float32), SourceConfigurationSpaceQuery.from_paths((p,)))
+    path = torch.tensor([[[0., 0.], [3.8, 0.]]])
+    prefix = source.query.query(path, torch.tensor([0]), torch.zeros(1,2), torch.zeros(1), 3.6)
+    assert prefix.minimum_clearance_m.item() > .1
+    assert _source_minimum_clearance(path, source, 3.6)[0] < .1

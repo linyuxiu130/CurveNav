@@ -62,7 +62,7 @@ condition swap 只在真实 held-out 条件之间做确定性配对，不生成�
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 scripts/evaluate_policy.sh \
-  data/policy_dataset-depth-forward/config.yaml outputs/train_policy-depth-forward/checkpoint.pt \
+  data/policy_dataset-depth-clearance/config.yaml outputs/train_policy-depth-clearance/checkpoint.pt \
   --artifact-dir outputs/offline-evaluation
 ```
 

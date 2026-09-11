@@ -311,7 +311,7 @@ def generate_route(
         config["candidate_limit"],
     )
     directory = scene_dir / route_name
-    for start, goal in pairs:
+    for candidate_index, (start, goal) in enumerate(pairs):
         try:
             plan = source_route(
                 grid,

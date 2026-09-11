@@ -1,5 +1,5 @@
 data:
-  root: data/policy_dataset-depth-forward
+  root: data/policy_dataset-depth-clearance
   observation_frames: 4
   expert_waypoint_spacing_m: 0.15
   future_steps: 24
@@ -68,7 +68,7 @@ training:
   min_learning_rate_factor: 0.01
   log_every_steps: 20
   checkpoint_every_epochs: 20
-  output_dir: outputs/train_policy-depth-forward
+  output_dir: outputs/train_policy-depth-clearance
   learning_rate: 0.0002
   weight_decay: 0.01
   grad_clip_norm: 1.0

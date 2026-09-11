@@ -356,3 +356,51 @@ def test_curve_clock_preserves_forward_turning_and_sensor_rate():
     velocity = (xy[2:] - xy[:-2]) / .2
     lateral = -np.sin(yaw[1:-1])*velocity[:, 0] + np.cos(yaw[1:-1])*velocity[:, 1]
     assert np.max(abs(lateral)) < 1e-4
+
+
+def test_clearance_curve_energy_gradient_matches_finite_difference():
+    from scipy.interpolate import BSpline
+    from scipy.ndimage import distance_transform_edt
+    from scipy.optimize._numdiff import approx_derivative
+    from curvenav.data_generation.geometry import _curve_objective
+    free = np.ones((80,80),bool)
+    free[30:40,30:40] = False
+    distance = distance_transform_edt(np.pad(free,1))[1:-1,1:-1]*.05
+    grid = Grid(free,distance,np.zeros(2),.05)
+    controls = np.array([[.617,.793],[1.037,.719],[1.843,1.017],[2.413,.613]])
+    u = np.linspace(0,1,37)
+    identity = BSpline([0,0,0,0,1,1,1,1],np.eye(4),3)
+    args = (identity(u),identity.derivative()(u),identity.derivative(2)(u),np.ones(37)/37,grid,2.)
+    value, gradient = _curve_objective(controls,*args)
+    numerical = approx_derivative(lambda x:_curve_objective(x.reshape(4,2),*args)[0],controls.ravel(),method='3-point',abs_step=1e-6)
+    assert np.isfinite(value)
+    np.testing.assert_allclose(gradient.ravel(),numerical.ravel(),rtol=2e-4,atol=2e-5)
+
+
+def test_clearance_optimization_keeps_a_narrow_feasible_corridor():
+    from scipy.ndimage import distance_transform_edt
+    free = np.zeros((80,80),bool)
+    free[:,28:34] = True
+    distance = distance_transform_edt(np.pad(free,1))[1:-1,1:-1]*.05
+    grid = Grid(free,distance,np.zeros(2),.05)
+    plan = plan_route(grid,np.array([.5,1.55]),np.array([3.5,1.55]))
+    assert grid.safe(plan.path_xy)
+    assert grid.clearance(plan.path_xy).min() <= .15+1e-6
+
+
+def test_route_audit_rejects_valid_but_misaligned_depth_pose():
+    from curvenav.data_generation.audit import validate_route_pose
+    xy = np.array([[1., 2.], [1.1, 2.1]], dtype=np.float32)
+    yaw = np.array([.3, .4], dtype=np.float32)
+    poses = np.broadcast_to(np.eye(4), (2, 4, 4)).copy()
+    poses[:, :2, 3] = xy * [1, -1]
+    c, s = np.cos(yaw), np.sin(yaw)
+    poses[:, 0, 0] = poses[:, 1, 1] = c
+    poses[:, 0, 1], poses[:, 1, 0] = s, -s
+    validate_route_pose(xy, yaw, poses)
+    poses[1, 0, 3] += .1
+    with pytest.raises(ValueError, match='disagree'):
+        validate_route_pose(xy, yaw, poses)
+    poses[1, 0, 3] -= .1
+    with pytest.raises(ValueError, match='disagree'):
+        validate_route_pose(xy, yaw + .1, poses)

@@ -13,8 +13,7 @@ class HistoricalMotionEncoder(nn.Module):
 
     The final observation is the current frame and therefore has an identity
     transform.  Each preceding transform contributes one fixed-slot token.
-    Missing history uses a learned null value so batching remains dense without
-    pretending that padding is a stationary observation.
+    Missing history is excluded by the condition memory attention mask.
     """
 
     def __init__(
@@ -37,14 +36,11 @@ class HistoricalMotionEncoder(nn.Module):
             nn.Linear(model_dim, model_dim),
         )
         self.slot_embedding = nn.Parameter(torch.zeros(1, self.state_tokens, model_dim))
-        self.null_token = nn.Parameter(torch.zeros(1, 1, model_dim))
         nn.init.trunc_normal_(self.slot_embedding, std=0.02)
-        nn.init.trunc_normal_(self.null_token, std=0.02)
 
     def forward(
         self,
         observation_to_current: Tensor,
-        observation_valid: Tensor,
         observation_age_s: Tensor,
     ) -> Tensor:
         past = observation_to_current[:, :-1].float()
@@ -58,5 +54,4 @@ class HistoricalMotionEncoder(nn.Module):
         )
         with torch.autocast(device_type=features.device.type, dtype=NEURAL_DTYPE):
             encoded = self.projection(features)
-        encoded = torch.where(observation_valid[:, :-1, None], encoded, self.null_token)
         return encoded + self.slot_embedding

@@ -82,17 +82,7 @@ class DepthContextBuffer:
             )
             for k in camera_intrinsics
         ]
-        collected = {
-            name: []
-            for name in (
-                        "depth",
-                "camera_intrinsics",
-                "camera_to_body",
-                "observation_to_current",
-                "observation_age_s",
-                "observation_valid",
-            )
-        }
+        collected = {name: [] for name in DEPTH_CONTEXT_FIELDS}
         for env in range(batch):
             depth, intrinsic = preprocess_depth(
                 depth_m[env, ..., 0],
