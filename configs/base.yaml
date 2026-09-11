@@ -1,13 +1,13 @@
 data:
-  root: data/policy_dataset-depth-clearance
+  root: data/policy_dataset-depth-memory
   observation_frames: 4
   expert_waypoint_spacing_m: 0.15
   future_steps: 24
   image_height: 126
   image_width: 224
   max_depth_m: 5.0
-  camera_forward_offset_m: 0.28618
-  camera_height_m: 0.62532
+  camera_forward_offset_m: 0.14309
+  camera_height_m: 0.31266
   camera_downward_pitch_degrees: 10.0
 model:
   trajectory:
@@ -69,7 +69,7 @@ training:
   min_learning_rate_factor: 0.01
   log_every_steps: 20
   checkpoint_every_epochs: 20
-  output_dir: outputs/train_policy-depth-clearance
+  output_dir: outputs/train_policy-depth-memory
   learning_rate: 0.0002
   weight_decay: 0.01
   grad_clip_norm: 1.0

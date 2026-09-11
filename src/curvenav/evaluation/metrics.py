@@ -5,8 +5,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import torch
-import torch.nn.functional as functional
 from torch import Tensor
 
 from curvenav.evaluation.configuration import (
@@ -30,8 +30,7 @@ MPC_REFERENCE_LENGTH_M = 2.0
 MPC_REFERENCE_SPEED_MPS = 0.5
 MPC_MAX_LINEAR_SPEED_MPS = 0.5
 MPC_MAX_ANGULAR_SPEED_RADPS = 0.5
-MPC_MIN_DESIRED_SPEED_MPS = 0.05
-MPC_CURVATURE_LOOKAHEAD_POINTS = 12
+MPC_CURVATURE_LOOKAHEAD_M = MPC_MAX_LINEAR_SPEED_MPS * 30 * 0.1
 TERMINAL_COLLISION_WINDOW_M = 0.25
 
 
@@ -400,46 +399,53 @@ def source_execution_prefix_metrics(
     return result
 
 
-def _point_gradient(value: Tensor) -> Tensor:
-    """Vectorized equivalent of numpy.gradient(..., edge_order=1)."""
-    gradient = torch.empty_like(value)
-    gradient[:, 0] = value[:, 1] - value[:, 0]
-    gradient[:, -1] = value[:, -1] - value[:, -2]
-    gradient[:, 1:-1] = 0.5 * (value[:, 2:] - value[:, :-2])
-    return gradient
-
-
 def controller_tracking_metrics(path: Tensor) -> dict[str, Tensor]:
-    """Reproduce the benchmark MPC's path-dependent speed calculation exactly."""
+    """Measure the benchmark's remaining-polyline curvature and desired speed.
+
+    Diagnostic only: float64 CPU geometry follows the online MPC reset, including
+    repeated endpoints and projection of the current origin onto an old plan.
+    """
     _validate_path(path, "path")
-    dx = _point_gradient(path[..., 0])
-    dy = _point_gradient(path[..., 1])
-    dy[:, 0] = 0.0
-    ddx = _point_gradient(dx)
-    ddy = _point_gradient(dy)
-    denominator = (dx.square() + dy.square()).pow(1.5).clamp_min(1e-6)
-    curvature = (dx * ddy - dy * ddx).abs() / denominator
-    curvature = functional.avg_pool1d(
-        curvature[:, None], kernel_size=3, stride=1, padding=1,
-        count_include_pad=True,
-    )[:, 0]
-    lookahead = min(MPC_CURVATURE_LOOKAHEAD_POINTS, path.shape[1])
-    maximum = curvature[:, :lookahead].amax(dim=-1)
-    length = path_arc_length(path)
-    length_speed = (
-        MPC_REFERENCE_SPEED_MPS
-        * (length / MPC_REFERENCE_LENGTH_M).clamp(max=1.0)
-    ).clamp(MPC_MIN_DESIRED_SPEED_MPS, MPC_MAX_LINEAR_SPEED_MPS)
-    curvature_speed = (
-        MPC_MAX_ANGULAR_SPEED_RADPS / maximum.clamp_min(1e-6)
-    ).clamp(MPC_MIN_DESIRED_SPEED_MPS, MPC_MAX_LINEAR_SPEED_MPS)
-    desired_speed = torch.minimum(length_speed, curvature_speed)
+    rows = []
+    for points in path.detach().cpu().double().numpy():
+        points = points[np.r_[True, np.any(np.diff(points, axis=0) != 0, axis=1)]]
+        segments = np.diff(points, axis=0)
+        lengths = np.linalg.norm(segments, axis=1)
+        arc = np.r_[0.0, np.cumsum(lengths)]
+        start = 0.0
+        if len(segments):
+            fraction = np.clip(-np.sum(points[:-1] * segments, axis=1) / lengths**2, 0, 1)
+            projected = points[:-1] + fraction[:, None] * segments
+            nearest = np.argmin(np.linalg.norm(projected, axis=1))
+            start = arc[nearest] + fraction[nearest] * lengths[nearest]
+        origin = np.array([np.interp(start, arc, points[:, axis]) for axis in range(2)])
+        points = np.vstack((origin, points[arc > start]))
+        segments = np.diff(points, axis=0)
+        lengths = np.linalg.norm(segments, axis=1)
+        arc = np.r_[0.0, np.cumsum(lengths)]
+        maximum = 0.0
+        if len(segments) >= 2:
+            before, after = segments[:-1], segments[1:]
+            turn = np.abs(np.arctan2(
+                before[:, 0] * after[:, 1] - before[:, 1] * after[:, 0],
+                np.sum(before * after, axis=1),
+            ))
+            curvature = turn / (0.5 * (lengths[:-1] + lengths[1:]))
+            curvature = np.r_[curvature[0], curvature, curvature[-1]]
+            end = np.searchsorted(arc, MPC_CURVATURE_LOOKAHEAD_M, side="right") + 1
+            maximum = float(curvature[:end].max())
+        length_speed = min(MPC_MAX_LINEAR_SPEED_MPS,
+                           MPC_REFERENCE_SPEED_MPS * min(arc[-1] / MPC_REFERENCE_LENGTH_M, 1.0))
+        curvature_speed = min(MPC_MAX_LINEAR_SPEED_MPS,
+                              MPC_MAX_ANGULAR_SPEED_RADPS / max(maximum, 1e-6))
+        rows.append((maximum, length_speed, curvature_speed))
+    maximum, length_speed, curvature_speed = path.new_tensor(rows).unbind(dim=1)
     initial = path[:, 1] - path[:, 0]
     return {
-        "mpc_max_curvature_first12_inv_m": maximum,
+        "mpc_max_curvature_lookahead_inv_m": maximum,
         "mpc_length_limited_speed_mps": length_speed,
         "mpc_curvature_limited_speed_mps": curvature_speed,
-        "mpc_desired_speed_mps": desired_speed,
+        "mpc_desired_speed_mps": torch.minimum(length_speed, curvature_speed),
         "mpc_curvature_is_active": curvature_speed < length_speed,
         "initial_tangent_heading_error_rad": torch.atan2(
             initial[:, 1], initial[:, 0]
@@ -623,8 +629,8 @@ def summarize_configuration_safety(metrics: dict[str, Tensor]) -> dict[str, floa
         .float()
         .mean()
         .item(),
-        mpc_max_curvature_first12_inv_m_p95=torch.quantile(
-            metrics["mpc_max_curvature_first12_inv_m"], 0.95
+        mpc_max_curvature_lookahead_inv_m_p95=torch.quantile(
+            metrics["mpc_max_curvature_lookahead_inv_m"], 0.95
         ).item(),
         initial_tangent_heading_error_rad_p95=torch.quantile(
             metrics["initial_tangent_heading_error_rad"], 0.95

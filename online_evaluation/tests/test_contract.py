@@ -61,7 +61,6 @@ from navbench.cli import (
     build_checkpoint_target,
     evaluator_command,
     evaluator_environment,
-    materialize_scene_overlay,
     prepare_upstream_inputs,
     queued_artifact,
 )
@@ -71,6 +70,7 @@ from navbench.metrics import success_weighted_path_length
 from navbench.policy_pool import PolicyPool
 from navbench.protocol import policy_response, read_depth
 from navbench.scene_evaluator import (
+    Planner,
     TRACE_SAMPLE_INTERVAL_STEPS,
     trace_sample_env_ids,
     write_metrics,
@@ -88,6 +88,79 @@ SCENE_ROOT = Path(os.environ.get(
 
 
 class PaperContractTests(unittest.TestCase):
+    def test_mpc_geometry_is_invariant_to_sampling_and_uses_metric_progress(self):
+        import importlib.util
+        source = ROOT / ".runtime/x-navdp-878740a20118/baselines/x-navdp/src/utils/mpc_tracking.py"
+        spec = importlib.util.spec_from_file_location("mpc_geometry", source)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        controller = module.MPC_Controller_Fast.__new__(module.MPC_Controller_Fast)
+        for count in (16, 64, 256):
+            angle = np.linspace(0, np.pi/2, count)
+            circle = .2 * np.stack((np.sin(angle), 1-np.cos(angle)), axis=1)
+            np.testing.assert_allclose(controller.calculate_curvature(circle), 5., rtol=1e-3)
+        # Compare the offline diagnostic directly with the deployed reset,
+        # including an executed prefix, duplicate endpoint and stationary plan.
+        import torch
+        from curvenav.evaluation.metrics import controller_tracking_metrics
+
+        controller.N, controller.T, controller.ref_gap = 30, 0.1, 1
+        controller.v_max = controller.w_max = controller.ref_desired_v = 0.5
+        controller.ref_traj_length_m = 2.0
+        rng = np.random.default_rng(7)
+        paths = rng.normal(size=(8, 64, 2)).cumsum(1) * 0.1
+        paths[:, -3:] = paths[:, -4:-3]
+        paths[0] = 0
+        metrics = controller_tracking_metrics(torch.from_numpy(paths))
+        for index, path in enumerate(paths):
+            maximum = controller.reset(path)
+            np.testing.assert_allclose(metrics["mpc_max_curvature_lookahead_inv_m"][index], maximum)
+            np.testing.assert_allclose(metrics["mpc_desired_speed_mps"][index], controller.desired_v)
+
+        reversal = np.array([[0.,0.], [1.,0.], [.5,0.]])
+        self.assertGreater(controller.calculate_curvature(reversal)[1], 4.)
+        controller.desired_v, controller.ref_gap, controller.T, controller.ref_traj_len = 1., 1, .1, 3
+        line = np.stack(([0., .01, .02, .5, .51, .52, 1.], np.zeros(7)), axis=1)
+        ref = controller.find_reference_traj(np.array([.03, .02, 0.]), line)
+        np.testing.assert_allclose(ref[:,0], [.03,.13,.23])
+        np.testing.assert_array_equal(ref[:,1], 0.)
+
+    def test_planner_tracks_current_pose_and_rejects_stale_episodes(self):
+        paths = np.ones((2, 3, 3), dtype=np.float32)
+        paths[1] = np.nan
+
+        def step(observation):
+            planner.stop_event.set()
+            return paths
+
+        def solve(active_paths):
+            self.assertEqual(active_paths.shape, (1, 4, 3))
+            self.assertTrue(np.isfinite(active_paths).all())
+            np.testing.assert_allclose(active_paths[0, 0], [-0.1, 0, 0])
+            return np.ones((1, 2, 2)), np.ones((1, 3, 3)), np.ones(1), np.ones(1)
+
+        planner = Planner(SimpleNamespace(step=step), SimpleNamespace(solve=solve), 2)
+        planner.reset_env(1, active=False)
+        observation = {
+            "pointgoal": np.zeros((2, 2)),
+            "robot_pos": np.zeros((2, 3)),
+            "robot_quat": np.tile([0, 0, 0, 1], (2, 1)),
+            "body_to_world": np.tile(np.eye(4), (2, 1, 1)),
+        }
+        planner.submit(observation)
+        planner._run()
+        self.assertIsNone(planner.error)
+        current = dict(observation)
+        current["body_to_world"] = observation["body_to_world"].copy()
+        current["body_to_world"][:, 0, 3] = 0.1
+        action, version, index = planner.pop_action(current)
+        np.testing.assert_array_equal(action[0], 1)
+        np.testing.assert_array_equal(action[1], 0)
+        self.assertEqual((version, index), (1, 0))
+        self.assertEqual([record.env_id for record in planner.drain_plan_records()], [0])
+        planner.reset_env(0, active=True)
+        self.assertIsNone(planner.pop_action(current))
+
     def test_policy_gpu_pool_enforces_weighted_memory_capacity(self):
         pool = PolicyGpuPool([5, 6], slots_per_gpu=2)
         with pool.reserve([5], slots_per_server=2):
@@ -138,14 +211,20 @@ class PaperContractTests(unittest.TestCase):
         self.assertIn(
             "--/plugins/carb.tasking.plugin/threadCount=8", command,
         )
+        self.assertIn("--/plugins/omni.tbb.globalcontrol/maxThreadCount=8", command)
         portable_index = command.index("--portable-root")
         self.assertTrue(command[portable_index + 1].endswith("/kit/gpu_3"))
+        self.assertTrue(any(arg.startswith(
+            "--/rtx-transient/resourcemanager/localTextureCachePath="
+        ) and arg.endswith("/textures") for arg in command))
 
         args.xnavdp_root = Path("/runtime/xnavdp")
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {
             "ACADOS_SOURCE_DIR": tmp, "CUDA_VISIBLE_DEVICES": "0,1,2,3",
         }), patch("navbench.cli.cache_root", return_value=Path(tmp)):
             env = evaluator_environment(args, 3, Path(tmp) / "optix")
+            self.assertEqual(env["CUDA_CACHE_PATH"], str(Path(tmp) / "cuda"))
+            self.assertTrue(Path(env["CUDA_CACHE_PATH"]).is_dir())
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "3")
 
     def test_ready_bundle_binds_checkpoint_config_and_source(self):
@@ -370,33 +449,6 @@ class PaperContractTests(unittest.TestCase):
         self.assertIn("DINGO_CameraCfg = TiledCameraCfg(", runtime_patch)
         self.assertNotIn("omni.isaac.lab", runtime_patch)
 
-    def test_scene_overlay_closes_relative_mdl_imports_without_asset_edits(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "source"
-            material = source / "room/material"
-            material.mkdir(parents=True)
-            (material / "chair.mdl").write_text("import .::OmniUe4Base;\n")
-            (material / "OmniUe4Base.mdl").write_text("stale scene copy\n")
-            (source / "room/mesh.usd").write_text("#usda 1.0\n")
-            modules = root / "modules"
-            modules.mkdir()
-            for name in ("OmniUe4Base", "OmniUe4Function", "OmniUe4Translucent"):
-                (modules / f"{name}.mdl").write_text(f"mdl 1.6; // {name}\n")
-            (source / "models").mkdir()
-            (source / "models/geometry.usd").write_text("#usda 1.0\n")
-            target = root / "overlay"
-            linked = materialize_scene_overlay(source, target, modules)
-            self.assertTrue((target / "models").is_symlink())
-            self.assertEqual((target / "models").resolve(), source / "models")
-            self.assertEqual(linked, 1)
-            self.assertFalse((target / "room/mesh.usd").is_symlink())
-            self.assertFalse((target / "room/material/chair.mdl").is_symlink())
-            self.assertEqual((target / "room/material/chair.mdl").read_text(),
-                             (material / "chair.mdl").read_text())
-            self.assertTrue((target / "room/material/OmniUe4Base.mdl").is_symlink())
-            self.assertTrue((material / "OmniUe4Base.mdl").is_file())
-
     def test_single_split_input_cache_does_not_require_other_domains(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -409,18 +461,6 @@ class PaperContractTests(unittest.TestCase):
             (scenes / "navigation_metadata/internscenes_home/esdf").mkdir(
                 parents=True
             )
-            eval_python = root / "env/bin/python"
-            eval_python.parent.mkdir(parents=True)
-            eval_python.touch()
-            modules = (
-                root / "env/lib/python3.10/site-packages/omni/mdl/core/Ue4"
-            )
-            modules.mkdir(parents=True)
-            (root / "env/lib/python3.1").symlink_to(
-                "python3.10", target_is_directory=True
-            )
-            for name in ("OmniUe4Base", "OmniUe4Function", "OmniUe4Translucent"):
-                (modules / f"{name}.mdl").write_text("mdl 1.6;\n")
             run_root = root / "run"
             run_root.mkdir()
             repo = root / "repo"
@@ -436,7 +476,6 @@ class PaperContractTests(unittest.TestCase):
                 suite={"splits": {"home": {"scenes": ["episode-scene"]}, "commercial": {}}},
                 jobs=[SimpleNamespace(split="home")],
                 scene_root=scenes,
-                eval_python=str(eval_python),
             )
             with (
                 patch("navbench.cli.ROOT", repo),
@@ -444,7 +483,17 @@ class PaperContractTests(unittest.TestCase):
                 patch("navbench.cli.cache_root", return_value=root / "cache"),
             ):
                 inputs = prepare_upstream_inputs(args, run_root)
+                next_run = root / "next-run"
+                next_run.mkdir()
+                self.assertEqual(prepare_upstream_inputs(args, next_run), inputs)
             self.assertTrue((inputs / "internscenes_home").is_dir())
+            self.assertTrue((inputs / "internscenes_home").is_symlink())
+            # A repaired source asset must be visible through an already-built cache.
+            (material / "chair.mdl").write_text("repaired material\n")
+            self.assertEqual(
+                (inputs / "internscenes_home/scene/material/chair.mdl").read_text(),
+                "repaired material\n",
+            )
             self.assertFalse((inputs / "internscenes_commercial").exists())
             pairs = inputs / "navigation_metadata/internscenes_home/pointgoal_start_pair"
             self.assertEqual(sorted(p.name for p in pairs.iterdir()), ["episode-scene"])
@@ -460,7 +509,9 @@ class PaperContractTests(unittest.TestCase):
             suite["simulator_contract"]["robot_asset_sha256"],
         )
         camera = suite["simulator_contract"]["camera"]
-        self.assertEqual(camera["offset_xyz_m"], [0.28618, 0.0, 0.62532])
+        self.assertEqual(camera["offset_xyz_m"], [0.14309, 0.0, 0.31266])
+        self.assertEqual(camera["authored_offset_xyz"], [0.28618, 0.0, 0.62532])
+        self.assertEqual(camera["update_period_s"], 0.1)
         self.assertEqual((camera["focal_length"], camera["offset_convention"]), (1.93, "usd"))
         split = json.loads((ROOT / "assets/scenes/scene_split.json").read_text())
         for domain in ("home", "commercial"):

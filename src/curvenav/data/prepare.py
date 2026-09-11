@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 from dataclasses import asdict, dataclass, replace
 import json
 import math
@@ -47,6 +49,7 @@ from curvenav.data.trajectory import (
 from curvenav.trajectory import IncrementalBSplineTrajectory
 from curvenav.trajectory.resampling import path_arc_length
 from curvenav.physical import EXTRA_CLEARANCE_M
+from curvenav.data.obstacle_memory import ObstacleMemory
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,7 @@ class _Example:
     metric_path: np.ndarray
     scene: str
     reached_goal: bool
+    obstacle_memory: np.ndarray
 
 
 def _arc_length(path: np.ndarray) -> float:
@@ -152,70 +156,86 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
         for line in (root / "routes.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     output: dict[str, list[_Example]] = {"train": [], "validation": []}
-    for record in records:
-        split = str(record["split"])
-        if split not in output:
-            raise ValueError(f"invalid HSSD split: {split}")
-        route_id = str(record["route_id"])
-        route_root = root / str(record["route_directory"])
-        source_grid_path = (route_root.parent / "navigation_grid.npz").resolve()
-        xy = np.load(route_root / "traj_xy.npy").astype(np.float32)
-        yaw = np.load(route_root / "traj_yaw.npy").astype(np.float32)
-        poses = np.load(route_root / "body_to_world.npy")
-        times = np.load(route_root / "timestamps.npy")
-        validate_route_pose(xy, yaw, poses)
-        if poses.shape != (len(xy), 4, 4) or times.shape != (len(xy),):
-            raise ValueError("depth route poses/timestamps do not match frames")
-        if (
-            int(record["frames"]) != len(xy) or len(xy) != len(yaw)
-        ):
-            raise ValueError(f"HSSD route frame count mismatch: {route_id}")
-        if not np.allclose(np.diff(times), OBSERVATION_PERIOD_S, atol=1e-6, rtol=0):
-            raise ValueError(
-                f"HSSD observations must follow the 10 Hz sensor clock: {route_id}"
-            )
-        depth = _DepthRun(
-            source=route_root / "depth.npy",
-            frames=len(xy),
-            name=f"hssd/{route_id}",
-        )
-        history = ObservationHistory()
-        for anchor in range(len(xy) - 1):
-            frame_indices, relative, age, valid = history.update(
-                anchor, poses[anchor], float(times[anchor])
-            )
-            transform: Callable[[np.ndarray], np.ndarray] = (
-                lambda points, anchor=anchor: _planar_local(
-                    points, xy[anchor], float(yaw[anchor])
-                )
-            )
-            full_local = transform(xy[anchor:])
-            local_path, reached_goal = _fixed_future(
-                full_local, data.future_steps, data.expert_waypoint_spacing_m
-            )
-            output[split].append(
-                _Example(
-                    depth_run=depth,
-                    depth_indices=frame_indices,
-                    point_goal=full_local[-1],
-                    observation_to_current=relative,
-                    observation_valid=valid,
-                    observation_age_s=age,
-                    camera_intrinsics=np.broadcast_to(
-                        intrinsic, (data.observation_frames, 3, 3)
-                    ),
-                    camera_to_body=np.broadcast_to(
-                        body_from_camera, (data.observation_frames, 4, 4)
-                    ),
-                    source_grid_path=source_grid_path,
-                    source_origin_xy=xy[anchor].copy(),
-                    source_yaw_rad=float(yaw[anchor]),
-                    metric_path=local_path,
-                    scene=f"hssd/{record['scene_id']}",
-                    reached_goal=reached_goal,
-                )
-            )
+    with ProcessPoolExecutor(
+        max_workers=8, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        tasks = ((record, root, data, intrinsic, body_from_camera) for record in records)
+        for index, (split, examples) in enumerate(pool.map(_hssd_route, tasks), 1):
+            output[split].extend(examples)
+            if index % 25 == 0:
+                print(f"Prepared causal geometry: {index}/{len(records)} routes", flush=True)
     return output
+
+
+def _hssd_route(arguments):
+    record, root, data, intrinsic, body_from_camera = arguments
+    examples = []
+    split = str(record["split"])
+    if split not in ("train", "validation"):
+        raise ValueError(f"invalid HSSD split: {split}")
+    route_id = str(record["route_id"])
+    route_root = root / str(record["route_directory"])
+    source_grid_path = (route_root.parent / "navigation_grid.npz").resolve()
+    xy = np.load(route_root / "traj_xy.npy").astype(np.float32)
+    yaw = np.load(route_root / "traj_yaw.npy").astype(np.float32)
+    poses = np.load(route_root / "body_to_world.npy")
+    times = np.load(route_root / "timestamps.npy")
+    validate_route_pose(xy, yaw, poses)
+    if poses.shape != (len(xy), 4, 4) or times.shape != (len(xy),):
+        raise ValueError("depth route poses/timestamps do not match frames")
+    if (
+        int(record["frames"]) != len(xy) or len(xy) != len(yaw)
+    ):
+        raise ValueError(f"HSSD route frame count mismatch: {route_id}")
+    if not np.allclose(np.diff(times), OBSERVATION_PERIOD_S, atol=1e-6, rtol=0):
+        raise ValueError(
+            f"HSSD observations must follow the 10 Hz sensor clock: {route_id}"
+        )
+    depth = _DepthRun(
+        source=route_root / "depth.npy",
+        frames=len(xy),
+        name=f"hssd/{route_id}",
+    )
+    history = ObservationHistory()
+    memory = ObstacleMemory(data.future_steps * data.expert_waypoint_spacing_m, data.max_depth_m)
+    depth_frames = np.load(depth.source, mmap_mode="r")
+    for anchor in range(len(xy) - 1):
+        frame_indices, relative, age, valid = history.update(
+            anchor, poses[anchor], float(times[anchor])
+        )
+        transform: Callable[[np.ndarray], np.ndarray] = (
+            lambda points, anchor=anchor: _planar_local(
+                points, xy[anchor], float(yaw[anchor])
+            )
+        )
+        full_local = transform(xy[anchor:])
+        local_path, reached_goal = _fixed_future(
+            full_local, data.future_steps, data.expert_waypoint_spacing_m
+        )
+        examples.append(
+            _Example(
+                obstacle_memory=memory.update(depth_frames[anchor], intrinsic, body_from_camera, poses[anchor]),
+                depth_run=depth,
+                depth_indices=frame_indices,
+                point_goal=full_local[-1],
+                observation_to_current=relative,
+                observation_valid=valid,
+                observation_age_s=age,
+                camera_intrinsics=np.broadcast_to(
+                    intrinsic, (data.observation_frames, 3, 3)
+                ),
+                camera_to_body=np.broadcast_to(
+                    body_from_camera, (data.observation_frames, 4, 4)
+                ),
+                source_grid_path=source_grid_path,
+                source_origin_xy=xy[anchor].copy(),
+                source_yaw_rad=float(yaw[anchor]),
+                metric_path=local_path,
+                scene=f"hssd/{record['scene_id']}",
+                reached_goal=reached_goal,
+            )
+        )
+    return split, examples
 
 
 def _save_array(split_root: Path, name: str, value: np.ndarray) -> dict[str, object]:
@@ -513,6 +533,9 @@ def _compile_split(
     )
 
     arrays = {
+        "obstacle_memory": _save_array(
+            split_root, "obstacle_memory", np.stack([e.obstacle_memory for e in examples])
+        ),
         "depth_indices": _save_array(split_root, "depth_indices", depth_indices),
         "point_goal": _save_array(split_root, "point_goal", point_goal),
         "observation_to_current": _save_array(

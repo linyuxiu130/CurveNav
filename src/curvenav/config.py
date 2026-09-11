@@ -12,7 +12,7 @@ from curvenav.physical import (
 
 @dataclass(frozen=True)
 class DataConfig:
-    root: str = "data/policy_dataset-depth-clearance"
+    root: str = "data/policy_dataset-depth-memory"
     observation_frames: int = 4
     expert_waypoint_spacing_m: float = 0.15
     future_steps: int = 24
@@ -152,7 +152,7 @@ class TrainingConfig:
     min_learning_rate_factor: float = 0.01
     log_every_steps: int = 20
     checkpoint_every_epochs: int = 20
-    output_dir: str = "outputs/train_policy-depth-clearance"
+    output_dir: str = "outputs/train_policy-depth-memory"
     learning_rate: float = 2e-4
     weight_decay: float = 1e-2
     grad_clip_norm: float = 1.0

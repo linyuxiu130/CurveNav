@@ -399,8 +399,8 @@ def write_case_report(
                 "mpc_desired_speed_mps": float(
                     metrics["mpc_desired_speed_mps"][index]
                 ),
-                "mpc_max_curvature_first12_inv_m": float(
-                    metrics["mpc_max_curvature_first12_inv_m"][index]
+                "mpc_max_curvature_lookahead_inv_m": float(
+                    metrics["mpc_max_curvature_lookahead_inv_m"][index]
                 ),
                 "configuration_extent_m": extent,
                 "point_goal": goal.tolist(),

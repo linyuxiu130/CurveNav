@@ -1,7 +1,8 @@
 # CurveNav
 
 CurveNav 是 PointGoal 条件的米制局部轨迹生成器。当前输入为深度图、逐帧内外参、
-重力对齐的机体位姿和时间戳；共享视觉骨干与 SE(3) 几何对齐构建有界时序 BEV 记忆。
+重力对齐的机体位姿和时间戳；四帧共享视觉骨干与 SE(3) 几何对齐构建 BEV，
+局部世界坐标体素记忆保留已观测障碍。
 生成器使用两步条件 Flow Matching 输出 B-spline，由固定测评 MPC 执行。
 传感器历史与异步推理分离；当前二维观测场不提供绝对无碰撞保证。
 
@@ -71,7 +72,9 @@ Conda 提供，系统需有 GCC。PyTorch 安装版本参见
 [官方历史版本说明](https://pytorch.org/get-started/previous-versions/#v260)。
 
 当前环境验证、离线测评和在线测评日志保留在
-`outputs/evaluation-flow-20260911/`；在线测评是否完成以实际生成的结果为准。
+`outputs/train_policy-depth-memory-flow-20260911-2gpu/`：200 epoch 双卡训练完成，
+31,082 个离线验证样本 ADE 3.11 cm、整轨迹碰撞率 7.47%；单场景 10 回合在线
+成功 9 个、SPL 0.825。该结果不是全场景成绩，后方目标与障碍端部净空仍有不足。
 数据生成以输出目录的 `audit/summary.json` 通过为完成标志，
 准备目录使用实际拟合的 `config.yaml`。
 
@@ -88,8 +91,8 @@ scripts/build_dataset.sh
 需要小批生产时，给 `scripts/build_dataset.sh` 传入配置，显式选择场景和路线配额；
 保留训练/验证场景隔离。生成完成后审核全部帧、轨迹与训练标签。
 
-训练读取 `data/policy_dataset-depth-clearance`，保存深度帧索引、专家曲线、逐样本内外参、
-SE(3) 相对位姿、观测年龄和 source provenance。写盘后必须通过 source re-query certificate；
+训练读取 `data/policy_dataset-depth-memory`，保存深度帧索引、专家曲线、逐样本内外参、
+SE(3) 相对位姿、观测年龄、因果障碍记忆和 source provenance。写盘后必须通过 source re-query certificate；
 Flow 坐标统计只从训练集拟合，写入准备目录的 `config.yaml`。所有入口使用当前 Conda 环境，不再引用旧虚拟环境路径。
 
 深度 的内参必须对应交付图像分辨率；缩放保持视场并更新 K。每帧实际相机外参参与几何计算，
@@ -101,9 +104,9 @@ Flow 坐标统计只从训练集拟合，写入准备目录的 `config.yaml`。�
 source scripts/common_env.sh
 PYTHONDONTWRITEBYTECODE=1 "${CURVENAV_PYTHON}" \
   -m pytest -q -p no:cacheprovider
-CUDA_VISIBLE_DEVICES=1 scripts/train_policy.sh data/policy_dataset-depth-clearance/config.yaml
+CUDA_VISIBLE_DEVICES=1 scripts/train_policy.sh data/policy_dataset-depth-memory/config.yaml
 CUDA_VISIBLE_DEVICES=1 scripts/evaluate_policy.sh \
-  data/policy_dataset-depth-clearance/config.yaml outputs/train_policy-depth-clearance/checkpoint.pt
+  data/policy_dataset-depth-memory/config.yaml outputs/train_policy-depth-memory/checkpoint.pt
 ```
 
 训练配置直接指定 `per_device_batch_size` 和 `gradient_accumulation_steps`，全局 batch
@@ -129,7 +132,7 @@ peer-DMA，可只通过 NCCL transport 环境变量选择 SHM，不改变模型�
 
 ```text
 configs/base.yaml          数据准备的模型与训练模板
-data/policy_dataset-depth-clearance/config.yaml  含训练集拟合统计的实际训练配置
+data/policy_dataset-depth-memory/config.yaml  含训练集拟合统计的实际训练配置
 scripts/build_dataset.sh   唯一数据构建入口
 src/curvenav/data/         深度、source C-space query、编译与 loader
 src/curvenav/data_generation/ HSSD 资产、几何、生成与审计

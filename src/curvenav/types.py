@@ -16,6 +16,7 @@ class PolicyCondition:
     observation_to_current: Tensor
     observation_age_s: Tensor
     observation_valid: Tensor
+    obstacle_memory: Tensor
 
     def validate(self) -> None:
         if self.depth.ndim != 5 or self.depth.shape[2] != 1:
@@ -36,6 +37,13 @@ class PolicyCondition:
                 raise ValueError(f"{name} must have shape {shape}")
         if self.observation_valid.dtype != torch.bool:
             raise TypeError("observation_valid must be boolean")
+        if (
+            self.obstacle_memory.ndim != 3
+            or self.obstacle_memory.shape[0] != b
+            or self.obstacle_memory.shape[1] != self.obstacle_memory.shape[2]
+            or self.obstacle_memory.dtype != torch.bool
+        ):
+            raise ValueError("obstacle_memory must be boolean [B,G,G]")
 
 
 @dataclass
@@ -67,7 +75,6 @@ class ConditionFeatures:
     surface_hit: Tensor
     frame_age: Tensor
     motion_token: Tensor
-    metric_reference: Tensor
     terminal_goal: Tensor
     configuration_field: Tensor
 

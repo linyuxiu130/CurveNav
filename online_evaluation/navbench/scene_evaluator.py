@@ -52,7 +52,7 @@ def parse_observations(observation, obs_mapping) -> dict[str, np.ndarray]:
     return parsed
 
 
-def add_robot_state(observation, env, math_utils):
+def add_robot_state(observation, env, math_utils, camera_mount):
     observation = dict(observation)
     robot = env.unwrapped.scene["robot"]
     robot_rotation = math_utils.matrix_from_quat(robot.data.root_quat_w)
@@ -71,12 +71,13 @@ def add_robot_state(observation, env, math_utils):
     c, sn = yaw.cos(), yaw.sin()
     pose[:, 0, 0], pose[:, 0, 1], pose[:, 1, 0], pose[:, 1, 1] = c, -sn, sn, c
     pose[:, :3, 3] = robot.data.root_pos_w
-    camera_world = math_utils.matrix_from_quat(sensor.quat_w_ros)
+    # Camera child XForm poses can remain at their authored USD location while
+    # PhysX/Fabric moves the parent. Compose the measured rigid mount with the
+    # live root-link attitude, including roll/pitch, instead of reading that cache.
+    root_to_planning = pose[:, :3, :3].transpose(1, 2) @ robot_rotation
     extrinsic = torch.eye(4, device=pose.device).repeat(batch, 1, 1)
-    extrinsic[:, :3, :3] = pose[:, :3, :3].transpose(1, 2) @ camera_world
-    extrinsic[:, :3, 3] = (
-        pose[:, :3, :3].transpose(1, 2) @ (sensor.pos_w - pose[:, :3, 3]).unsqueeze(-1)
-    ).squeeze(-1)
+    extrinsic[:, :3, :3] = root_to_planning @ camera_mount[:3, :3]
+    extrinsic[:, :3, 3] = root_to_planning @ camera_mount[:3, 3]
     observation["body_to_world"] = pose
     observation["camera_to_body"] = extrinsic
     observation["camera_intrinsics"] = sensor.intrinsic_matrices
@@ -110,7 +111,7 @@ def trace_sample_env_ids(
 
 
 class Planner:
-    """Asynchronous policy and MPC worker with per-environment generations."""
+    """Infer asynchronously; track the latest path at the current control pose."""
 
     def __init__(self, policy_pool: PolicyPool, mpc_controller, num_envs: int) -> None:
         self.policy_pool = policy_pool
@@ -118,19 +119,14 @@ class Planner:
         self.input_lock = threading.Lock()
         self.output_lock = threading.Lock()
         self.stop_event = threading.Event()
-        self.input_observation: dict[str, np.ndarray] | None = None
-        self.output_action: np.ndarray | None = None
-        self.output_action_index = 0
+        self.input_observation = None
+        self.output_plan = None
         self.output_version = 0
         self.episode_generation = np.zeros(num_envs, dtype=np.int64)
         self.active_envs = np.ones(num_envs, dtype=bool)
         self.error: BaseException | None = None
         self.plan_records: list[PlanRecord] = []
-        self.thread = threading.Thread(
-            target=self._run,
-            name="pointgoal-planner",
-            daemon=True,
-        )
+        self.thread = threading.Thread(target=self._run, name="pointgoal-planner", daemon=True)
 
     def start(self) -> None:
         self.thread.start()
@@ -138,63 +134,21 @@ class Planner:
     def _run(self) -> None:
         try:
             while not self.stop_event.is_set():
-                observation = None
                 with self.input_lock:
-                    if self.input_observation is not None:
-                        observation = self.input_observation
-                        generation = self.episode_generation.copy()
-                        self.input_observation = None
+                    observation = self.input_observation
+                    generation = self.episode_generation.copy()
+                    self.input_observation = None
                 if observation is not None:
-                    policy_started = time.perf_counter()
+                    started = time.perf_counter()
                     trajectory = self.policy_pool.step(observation)
-                    policy_seconds = time.perf_counter() - policy_started
                     trajectory = np.concatenate(
                         (np.zeros_like(trajectory[:, :1]), trajectory), axis=1
                     )
-                    mpc_started = time.perf_counter()
-                    controls, states, desired_speed, maximum_curvature = (
-                        self.mpc_controller.solve(trajectory)
-                    )
-                    mpc_seconds = time.perf_counter() - mpc_started
-                    with self.input_lock:
-                        stale = (
-                            generation != self.episode_generation
-                        ) | ~self.active_envs
-                        with self.output_lock:
-                            controls[stale] = 0.0
-                            self.output_action = controls
-                            self.output_action_index = 0
-                            self.output_version += 1
-                            for env_id in range(trajectory.shape[0]):
-                                if stale[env_id]:
-                                    continue
-                                self.plan_records.append(
-                                    PlanRecord(
-                                        env_id=env_id,
-                                        version=self.output_version,
-                                        generation=int(generation[env_id]),
-                                        point_goal=observation["pointgoal"][
-                                            env_id
-                                        ].copy(),
-                                        robot_position=(
-                                            observation["robot_pos"][env_id].copy()
-                                        ),
-                                        robot_quaternion=(
-                                            observation["robot_quat"][env_id].copy()
-                                        ),
-                                        trajectory=trajectory[env_id].copy(),
-                                        controls=controls[env_id].copy(),
-                                        predicted_states=states[env_id].copy(),
-                                        desired_speed=np.asarray(
-                                            desired_speed[env_id]
-                                        ).copy(),
-                                        maximum_curvature=np.asarray(
-                                            maximum_curvature[env_id]
-                                        ).copy(),
-                                        policy_seconds=policy_seconds,
-                                        mpc_seconds=mpc_seconds,
-                                    )
-                                )
+                    with self.output_lock:
+                        self.output_plan = (
+                            trajectory, observation["body_to_world"], generation,
+                            time.perf_counter() - started,
+                        )
                 self.stop_event.wait(0.01)
         except BaseException as exc:
             self.error = exc
@@ -204,39 +158,65 @@ class Planner:
         with self.input_lock:
             self.input_observation = observation
 
-    def pop_action(self) -> tuple[np.ndarray, int, int] | None:
+    def pop_action(
+        self, observation: dict[str, np.ndarray]
+    ) -> tuple[np.ndarray, int, int] | None:
         if self.error is not None:
-            raise RuntimeError("policy/MPC planning failed") from self.error
+            raise RuntimeError("policy planning failed") from self.error
         with self.output_lock:
-            if self.output_action is None or self.output_action.shape[1] == 0:
-                return None
-            action = self.output_action[:, 0].copy()
-            self.output_action = self.output_action[:, 1:]
-            action_index = self.output_action_index
-            self.output_action_index += 1
-            return action, self.output_version, action_index
+            plan = self.output_plan
+        if plan is None:
+            return None
+        trajectory, source_pose, generation, policy_seconds = plan
+        active_ids = np.flatnonzero((generation == self.episode_generation) & self.active_envs)
+        if not len(active_ids):
+            return None
+        current = observation["body_to_world"][active_ids]
+        source = source_pose[active_ids]
+        # Both poses use gravity-aligned planning axes. Apply T_current^-1 T_capture.
+        world = (
+            np.einsum("bij,bpj->bpi", source[:, :3, :3], trajectory[active_ids])
+            + source[:, None, :3, 3]
+        )
+        local = np.einsum(
+            "bji,bpj->bpi", current[:, :3, :3], world - current[:, None, :3, 3]
+        )
+        started = time.perf_counter()
+        controls, states, desired_speed, maximum_curvature = self.mpc_controller.solve(local)
+        mpc_seconds = time.perf_counter() - started
+        action = np.zeros((len(generation), 2), dtype=controls.dtype)
+        action[active_ids] = controls[:, 0]
+        self.output_version += 1
+        for row, env_id in enumerate(active_ids):
+            self.plan_records.append(PlanRecord(
+                env_id=int(env_id), version=self.output_version, generation=int(generation[env_id]),
+                point_goal=observation["pointgoal"][env_id].copy(),
+                robot_position=observation["robot_pos"][env_id].copy(),
+                robot_quaternion=observation["robot_quat"][env_id].copy(),
+                trajectory=local[row].copy(), controls=controls[row].copy(),
+                predicted_states=states[row].copy(), desired_speed=np.asarray(desired_speed[row]).copy(),
+                maximum_curvature=np.asarray(maximum_curvature[row]).copy(),
+                policy_seconds=policy_seconds, mpc_seconds=mpc_seconds,
+            ))
+        return action, self.output_version, 0
 
     def drain_plan_records(self) -> list[PlanRecord]:
-        with self.output_lock:
-            records = self.plan_records
-            self.plan_records = []
-            return records
+        records = self.plan_records
+        self.plan_records = []
+        return records
 
     def reset_env(self, env_id: int, active: bool) -> int:
         with self.input_lock:
             self.input_observation = None
             self.episode_generation[env_id] += 1
             self.active_envs[env_id] = active
-            with self.output_lock:
-                if self.output_action is not None:
-                    self.output_action[env_id] = 0.0
             return int(self.episode_generation[env_id])
 
     def close(self) -> None:
         self.stop_event.set()
         self.thread.join()
         if self.error is not None:
-            raise RuntimeError("policy/MPC planning failed") from self.error
+            raise RuntimeError("policy planning failed") from self.error
 
 
 class SceneSession:
@@ -244,12 +224,23 @@ class SceneSession:
 
     def __init__(self, env, controller, cfg, house_id: str, math_utils) -> None:
         from eval.environment import BatchMPCNEWController, namespace_to_dict
+        from pxr import UsdGeom
 
         self.env = env
         self.controller = controller
         self.cfg = cfg
         self.house_id = house_id
         self.math_utils = math_utils
+        camera = env.unwrapped.scene.sensors["camera_sensor"]
+        prim = camera._sensor_prims[0].GetPrim()
+        transforms = UsdGeom.XformCache()
+        # Keep the ancestor-scaled metric translation, but remove scale from
+        # both world frames before forming the rigid camera-to-root transform.
+        camera_world = transforms.GetLocalToWorldTransform(prim).RemoveScaleShear()
+        root_world = transforms.GetLocalToWorldTransform(prim.GetParent()).RemoveScaleShear()
+        mount = np.asarray(camera_world * root_world.GetInverse()).T.copy()
+        mount[:3, 1:3] *= -1  # OpenGL optical axes -> ROS optical axes.
+        self.camera_mount = torch.as_tensor(mount, dtype=torch.float32, device=env.device)
         self.mpc_controller = BatchMPCNEWController(
             batch=cfg.environment.num_envs,
             **namespace_to_dict(cfg.mpc),
@@ -265,7 +256,7 @@ class SceneSession:
     def run(self, server_ports: list[int], episodes: int, metric_path: Path) -> int:
         self.env.unwrapped._next_sample_idx = 0
         observations = self._observations(self.env.reset())
-        observations = add_robot_state(observations, self.env, self.math_utils)
+        observations = add_robot_state(observations, self.env, self.math_utils, self.camera_mount)
 
         intrinsic = self.env.unwrapped.scene.sensors[
             "camera_sensor"
@@ -312,7 +303,8 @@ class SceneSession:
             [sample is not None for sample in current_episode]
         )
         planner.start()
-        planner.submit(capture(observations))
+        parsed_observation = capture(observations)
+        planner.submit(parsed_observation)
 
         goal_distance = torch.linalg.vector_norm(
             observations["goal_pose"][:, :2], dim=-1
@@ -343,7 +335,7 @@ class SceneSession:
 
         try:
             while len(completed) < total:
-                planned_action = planner.pop_action()
+                planned_action = planner.pop_action(parsed_observation)
                 if planned_action is None:
                     action = np.zeros((self.env.num_envs, 2))
                     plan_version = -1
@@ -418,7 +410,7 @@ class SceneSession:
                 else:
                     raw_observations, _, dones, infos = step_outputs
                     observations = infos.get("observations", raw_observations)
-                observations = add_robot_state(observations, self.env, self.math_utils)
+                observations = add_robot_state(observations, self.env, self.math_utils, self.camera_mount)
                 record_completed_plans()
 
                 done_env_ids = torch.nonzero(dones, as_tuple=False).flatten()
@@ -490,7 +482,8 @@ class SceneSession:
                         traces.start_episode(env_id, next_sample, goal_distance[env_id])
 
                 if len(completed) < total:
-                    planner.submit(capture(observations))
+                    parsed_observation = capture(observations)
+                    planner.submit(parsed_observation)
         finally:
             try:
                 planner.close()
@@ -520,6 +513,10 @@ def main() -> None:
     startup_started = time.monotonic()
     args = parse_args()
     control_path = Path(os.environ.pop("NAVBENCH_CONTROL_SOCKET"))
+    # Use the unified environment's pinned Warp before Kit registers its bundled
+    # 1.7.1 module, whose cuDeviceGetUuid query uses the invalid version 110400.
+    import warp
+    warp.init()
     from isaaclab.app import AppLauncher
 
     launcher = AppLauncher(
@@ -545,6 +542,7 @@ def main() -> None:
         "ready",
         scene=house_id,
         num_envs=env.num_envs,
+        camera_mount_ros=session.camera_mount.cpu().tolist(),
         startup_seconds=time.monotonic() - startup_started,
     )
     try:

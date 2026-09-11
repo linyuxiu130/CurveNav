@@ -9,12 +9,12 @@ from pathlib import Path
 import numpy as np
 
 
-TRACE_SCHEMA_VERSION = 3
+TRACE_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
 class PlanRecord:
-    """One policy request and the MPC solution produced from it."""
+    """One control-tick MPC solution in its execution-time planning frame."""
 
     env_id: int
     version: int

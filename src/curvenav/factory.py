@@ -39,7 +39,6 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         configuration_encoder,
         observation_frames=config.data.observation_frames,
         planning_horizon_m=planning_horizon_m,
-        control_tokens=trajectory.num_control_points - 1,
         model_dim=condition.model_dim,
     )
     curve_codec = IncrementalBSplineTrajectory(
@@ -57,7 +56,7 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         heads=decoder.transformer_heads,
         dropout=decoder.dropout,
         planning_horizon_m=planning_horizon_m,
-        path_to_control_weight=curve_codec.basis[:, 1:].transpose(0, 1),
+        path_to_increment_weight=curve_codec.increment_basis.transpose(0, 1),
     )
     return CurveNavPolicy(
         depth_encoder=depth_encoder,

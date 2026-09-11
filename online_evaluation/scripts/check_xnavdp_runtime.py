@@ -43,11 +43,13 @@ PINNED = {
     "src/environment/tasks/terminal_utils.py":
         "c6ab4f4cc392e339b83eceb8efbe631a6a4b32228557d7f8c14782ddda896044",
     "src/environment/env_wrapper.py":
-        "7d14e9c164f547b87443f98cb3f9caf1c32cc74e20c253f7707b0412e0ae2839",
+        "903666368ccbf3c3fa4b5f972df5ea7d084262188a6d3535a7f34cf76c462f50",
+    "src/environment/scenes/default_scene.py":
+        "1fe53196df705bc996d5ff087c03d61159ab58bcf54b7897008298969b8d1cf6",
     "src/environment/wheeled_tasks.py":
         "ced3f3bbb196277cef12fddc3f4216a15abcd2909e42fef601849c4d9df937f6",
     "src/utils/mpc_tracking.py":
-        "741b445899c24d632e9b14bdfc08bc04af90dd83db4004eed8b14cc57c2b1e5b",
+        "de010b5ba856473a1fb5156500e718537600569231a283185f2fbb399a78fd44",
 }
 
 
@@ -93,6 +95,7 @@ def main() -> None:
         f"'isaaclab-rl':'{VERSIONS['ISAACLAB_RL_VERSION']}',"
         f"'rsl-rl-lib':'{VERSIONS['RSL_RL_VERSION']}',"
         f"'tensordict':'{VERSIONS['TENSORDICT_VERSION']}',"
+        f"'warp-lang':'{VERSIONS['WARP_VERSION']}',"
         f"'acados-template':'{VERSIONS['ACADOS_TEMPLATE_VERSION']}',"
         f"'torch':'{VERSIONS['TORCH_VERSION']}',"
         f"'torchvision':'{VERSIONS['TORCHVISION_VERSION']}'}}; "

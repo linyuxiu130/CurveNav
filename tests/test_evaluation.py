@@ -253,36 +253,19 @@ def test_controller_metrics_match_the_fixed_benchmark_speed_law() -> None:
 
     metrics = controller_tracking_metrics(torch.stack((straight, sharp)))
 
-    expected_curvature = []
-    expected_speed = []
-    for path in (straight.numpy(), sharp.numpy()):
-        dx = np.gradient(path[:, 0])
-        dy = np.gradient(path[:, 1])
-        dy[0] = 0.0
-        ddx = np.gradient(dx)
-        ddy = np.gradient(dy)
-        denominator = (dx**2 + dy**2) ** 1.5
-        denominator[denominator < 1e-6] = 1e-6
-        curvature = np.convolve(
-            np.abs(dx * ddy - dy * ddx) / denominator,
-            np.ones(3) / 3,
-            mode="same",
-        )
-        maximum = curvature[:12].max()
-        length = np.linalg.norm(np.diff(path, axis=0), axis=1).sum()
-        length_speed = np.clip(0.5 * min(length / 2.0, 1.0), 0.05, 0.5)
-        curvature_speed = np.clip(0.5 / max(maximum, 1e-6), 0.05, 0.5)
-        expected_curvature.append(maximum)
-        expected_speed.append(min(length_speed, curvature_speed))
-
-    np.testing.assert_allclose(
-        metrics["mpc_max_curvature_first12_inv_m"].numpy(),
-        expected_curvature,
-        rtol=1e-5,
+    torch.testing.assert_close(
+        metrics["mpc_max_curvature_lookahead_inv_m"], torch.tensor([0.0, 4.0]),
+        atol=0.001, rtol=0.001,
     )
-    np.testing.assert_allclose(
-        metrics["mpc_desired_speed_mps"].numpy(), expected_speed, rtol=1e-5
+    torch.testing.assert_close(
+        metrics["mpc_curvature_limited_speed_mps"], torch.tensor([0.5, 0.125]),
+        atol=0.0001, rtol=0.001,
     )
+    # This short quarter circle slows down for its remaining length first.
+    expected_speed = 0.5 * torch.linalg.vector_norm(sharp.diff(dim=0), dim=-1).sum() / 2
+    torch.testing.assert_close(metrics["mpc_desired_speed_mps"][1], expected_speed)
+    stopped = controller_tracking_metrics(torch.zeros(1, 64, 2))
+    assert stopped["mpc_desired_speed_mps"].item() == 0
 
 
 def test_collision_detection_separates_perception_from_generation() -> None:

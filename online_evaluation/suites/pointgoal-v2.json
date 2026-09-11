@@ -46,8 +46,9 @@
     "camera": {
       "width": 640,
       "height": 360,
-      "update_period_s": 0.05,
-      "offset_xyz_m": [0.28618, 0.0, 0.62532],
+      "update_period_s": 0.1,
+      "offset_xyz_m": [0.14309, 0.0, 0.31266],
+      "authored_offset_xyz": [0.28618, 0.0, 0.62532],
       "offset_quaternion_wxyz": [-0.54168, -0.45452, 0.45452, 0.54168],
       "offset_convention": "usd",
       "focal_length": 1.93,

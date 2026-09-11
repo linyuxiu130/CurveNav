@@ -42,7 +42,7 @@ def test_rgbd_server_preserves_sensor_snapshot_over_raw_transport():
         np.testing.assert_array_equal(runtime.context[name], value)
 
 
-def test_sensor_optical_pose_is_composed_with_gravity_aligned_planning_frame():
+def test_rigid_camera_mount_uses_live_root_pose_instead_of_stale_sensor_pose():
     class Scene(dict):
         pass
 
@@ -57,6 +57,9 @@ def test_sensor_optical_pose_is_composed_with_gravity_aligned_planning_frame():
 
     root = Rotation.from_euler("xyz", [0.1, 0.2, 0.6])
     camera = Rotation.from_euler("xyz", [1.2, -0.3, 0.8])
+    mount = torch.eye(4)
+    mount[:3, :3] = torch.tensor(camera.as_matrix(), dtype=torch.float32)
+    mount[:3, 3] = torch.tensor([0.14309, 0.0, 0.31266])
     robot = SimpleNamespace(
         data=SimpleNamespace(
             root_quat_w=quaternion(root), root_pos_w=torch.tensor([[1.0, 2.0, 0.1]])
@@ -75,10 +78,11 @@ def test_sensor_optical_pose_is_composed_with_gravity_aligned_planning_frame():
     }
     goal = torch.tensor([[4.0, 3.0, 0.1]])
     env = SimpleNamespace(unwrapped=SimpleNamespace(scene=scene, _goal_pos_w=goal))
-    obs = add_robot_state({}, env, SimpleNamespace(matrix_from_quat=matrix_from_quat))
+    obs = add_robot_state({}, env, SimpleNamespace(matrix_from_quat=matrix_from_quat), mount)
     combined = obs["body_to_world"] @ obs["camera_to_body"]
-    torch.testing.assert_close(combined[:, :3, :3], matrix_from_quat(sensor.quat_w_ros))
-    torch.testing.assert_close(combined[:, :3, 3], sensor.pos_w)
+    root_rotation = matrix_from_quat(robot.data.root_quat_w)
+    torch.testing.assert_close(combined[:, :3, :3], root_rotation @ mount[:3, :3])
+    torch.testing.assert_close(combined[:, :3, 3], robot.data.root_pos_w + root_rotation @ mount[:3, 3])
     torch.testing.assert_close(
         obs["body_to_world"][:, :3, 2], torch.tensor([[0.0, 0.0, 1.0]])
     )

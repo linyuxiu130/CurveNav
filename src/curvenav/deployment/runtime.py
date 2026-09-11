@@ -55,7 +55,7 @@ class CurveNavRuntime:
             )
         if context["depth"].dtype != np.float16:
             raise TypeError("snapshot depth must be float16")
-        for name in DEPTH_CONTEXT_FIELDS - {"depth", "observation_valid"}:
+        for name in DEPTH_CONTEXT_FIELDS - {"depth", "observation_valid", "obstacle_memory"}:
             if context[name].dtype != np.float32 or not np.isfinite(context[name]).all():
                 raise ValueError(f"snapshot {name} must be finite float32")
         depth = context["depth"]

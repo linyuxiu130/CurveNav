@@ -23,13 +23,14 @@ def _read_request(payload: bytes) -> dict[str, np.ndarray]:
                 f"CurveNav request fields must be {sorted(REQUEST_FIELDS)}, got {sorted(fields)}"
             )
         request = {name: np.array(archive[name], copy=True) for name in archive.files}
-    for name in REQUEST_FIELDS - {"observation_valid", "depth"}:
+    for name in REQUEST_FIELDS - {"observation_valid", "depth", "obstacle_memory"}:
         if request[name].dtype != np.float32:
             raise TypeError(f"{name} must be float32")
     if request["depth"].dtype != np.float16:
         raise TypeError("normalized depth must be float16")
-    if request["observation_valid"].dtype != np.bool_:
-        raise TypeError("observation_valid must be bool")
+    for name in ("observation_valid", "obstacle_memory"):
+        if request[name].dtype != np.bool_:
+            raise TypeError(f"{name} must be bool")
     return request
 
 

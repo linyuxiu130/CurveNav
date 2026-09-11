@@ -327,6 +327,7 @@ def measure_policy(
         current_frame_valid = torch.zeros_like(batch["observation_valid"])
         current_frame_valid[:, -1] = True
         current_frame_batch["observation_valid"] = current_frame_valid
+        current_frame_batch["obstacle_memory"] = torch.zeros_like(batch["obstacle_memory"])
         current_prepared, current_prediction = _sample(
             policy, current_frame_batch
         )
@@ -341,6 +342,7 @@ def measure_policy(
                     "observation_to_current",
                     "observation_age_s",
                     "observation_valid",
+                    "obstacle_memory",
                 ),
             ),
         )

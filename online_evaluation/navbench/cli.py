@@ -9,6 +9,7 @@ import contextlib
 import csv
 from dataclasses import dataclass
 import hashlib
+from importlib.metadata import version
 import json
 import os
 from pathlib import Path
@@ -42,12 +43,7 @@ PAPER_SEED = 1234
 STOP = threading.Event()
 ACTIVE: set[subprocess.Popen] = set()
 ACTIVE_LOCK = threading.Lock()
-INPUT_LAYOUT_VERSION = "mdl-overlay-v2"
-UE4_MDL_MODULES = (
-    "OmniUe4Base",
-    "OmniUe4Function",
-    "OmniUe4Translucent",
-)
+INPUT_LAYOUT_VERSION = "linked-assets-v3"
 
 
 @dataclass(frozen=True)
@@ -658,7 +654,13 @@ def evaluator_command(
             "--/plugins/carb.tasking.plugin/threadCount="
             f"{args.cpu_threads_per_worker}"
         ),
+        (
+            "--/plugins/omni.tbb.globalcontrol/maxThreadCount="
+            f"{args.cpu_threads_per_worker}"
+        ),
         "--portable-root", str(portable_root),
+        "--/rtx-transient/resourcemanager/localTextureCachePath="
+        + str(cache_root() / "textures"),
     ]
     command.extend(shlex.split(os.environ.get("NAVBENCH_EVAL_KIT_ARGS", "")))
     return command
@@ -676,7 +678,7 @@ def write_upstream_config(
         "run_root_dir: outputs/evaluation":
             f"run_root_dir: {json.dumps(str(scene_root / 'upstream-output'))}",
         "  scene_dir: data/scenes":
-            f"  scene_dir: {json.dumps(str(input_root))}",
+            f"  scene_dir: {json.dumps(str(args.scene_root.resolve()))}",
         f"  dataset_dir: data/scenes/navigation_metadata/internscenes_{job.split}":
             "  dataset_dir: " + json.dumps(str(
                 input_root / "navigation_metadata" / f"internscenes_{job.split}"
@@ -701,75 +703,6 @@ def cache_root() -> Path:
     return Path(
         os.environ.get("NAVBENCH_CACHE_ROOT", Path.home() / ".cache" / "navbench")
     ).expanduser()
-
-
-def isaac_ue4_mdl_root(eval_python: str) -> Path:
-    """Locate the three Isaac modules referenced relatively by scene MDLs."""
-    env_root = Path(eval_python).expanduser().resolve().parents[1]
-    candidates = sorted(
-        env_root.glob("lib/python*/site-packages/omni/mdl/core/Ue4")
-    )
-    valid = sorted({
-        path.resolve() for path in candidates
-        if all((path / f"{name}.mdl").is_file() for name in UE4_MDL_MODULES)
-    })
-    if len(valid) != 1:
-        raise RuntimeError(
-            f"expected one Isaac UE4 MDL directory under {env_root}, found {valid}"
-        )
-    return valid[0]
-
-
-def _materialize_asset(source: str, target: str) -> str:
-    # USD/MDL resolve relative dependencies from their file location. Keep those
-    # documents in the overlay where the canonical MDL imports are installed.
-    if Path(source).suffix.lower() in {".usd", ".usda", ".usdc", ".mdl"}:
-        return shutil.copy2(source, target)
-    Path(target).symlink_to(Path(source).absolute())
-    return target
-
-
-def _ignore_isaac_mdl_dependencies(_directory: str, names: list[str]) -> set[str]:
-    """Keep the runtime's canonical UE4 MDL modules out of scene overlays."""
-    return {f"{name}.mdl" for name in UE4_MDL_MODULES}.intersection(names)
-
-
-def materialize_scene_overlay(
-    source: Path, target: Path, mdl_root: Path,
-) -> int:
-    """Keep scene documents local, link bulk assets and close relative MDL imports."""
-    def ignore(directory: str, names: list[str]) -> set[str]:
-        excluded = _ignore_isaac_mdl_dependencies(directory, names)
-        if Path(directory) == source:
-            excluded.add("models")
-        return excluded
-
-    shutil.copytree(
-        source,
-        target,
-        symlinks=True,
-        copy_function=_materialize_asset,
-        ignore=ignore,
-    )
-    if (source / "models").is_dir():
-        (target / "models").symlink_to((source / "models").absolute(), target_is_directory=True)
-    linked = 0
-    mdl_directories = sorted({path.parent for path in target.rglob("*.mdl")})
-    for directory in mdl_directories:
-        text = "\n".join(
-            path.read_text(errors="ignore") for path in directory.glob("*.mdl")
-        )
-        for name in UE4_MDL_MODULES:
-            if f".::{name}" not in text:
-                continue
-            destination = directory / f"{name}.mdl"
-            if destination.exists() or destination.is_symlink():
-                raise RuntimeError(
-                    f"scene asset shadows Isaac MDL dependency: {destination}"
-                )
-            destination.symlink_to(mdl_root / f"{name}.mdl")
-            linked += 1
-    return linked
 
 
 def prepare_upstream_inputs(args: argparse.Namespace, run_root: Path) -> Path:
@@ -803,17 +736,13 @@ def prepare_upstream_inputs(args: argparse.Namespace, run_root: Path) -> Path:
     robot_root = incoming / "data/robots"
     robot_root.mkdir()
     shutil.copy2(ROOT / "assets/robots/dingo.usd", robot_root / "dingo.usd")
-    mdl_root = isaac_ue4_mdl_root(args.eval_python)
-    mdl_links: dict[str, int] = {}
     for name in ("Materials", "SkyTexture"):
         (target / name).symlink_to(args.scene_root / name, target_is_directory=True)
     shutil.copy2(ROOT / "assets/scenes/scene_split.json", target / "scene_split.json")
     for split in selected_splits:
         source_domain = args.scene_root / f"internscenes_{split}"
         domain_name = f"internscenes_{split}"
-        mdl_links[domain_name] = materialize_scene_overlay(
-            source_domain, target / domain_name, mdl_root,
-        )
+        (target / domain_name).symlink_to(source_domain.resolve(), target_is_directory=True)
         metadata = target / "navigation_metadata" / f"internscenes_{split}"
         metadata.mkdir(parents=True)
         (metadata / "esdf").symlink_to(
@@ -825,11 +754,6 @@ def prepare_upstream_inputs(args: argparse.Namespace, run_root: Path) -> Path:
                 ROOT / "assets/scenes" / f"internscenes_{split}" / scene,
                 metadata / "pointgoal_start_pair" / scene,
             )
-    (incoming / "data/mdl-closure.json").write_text(json.dumps({
-        "layout": INPUT_LAYOUT_VERSION,
-        "modules": list(UE4_MDL_MODULES),
-        "links_by_domain": mdl_links,
-    }, indent=2) + "\n")
     try:
         incoming.rename(suite_root)
     except FileExistsError:
@@ -1094,6 +1018,8 @@ def server_environment(
     server_gpu: int,
     cuda_library_path: str | None,
 ) -> dict[str, str]:
+    cuda_cache = cache_root() / "cuda"
+    cuda_cache.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env.update(spec.env)
     python_paths = []
@@ -1105,6 +1031,7 @@ def server_environment(
     env["PYTHONPATH"] = os.pathsep.join(python_paths)
     env.update({
         "CUDA_VISIBLE_DEVICES": str(server_gpu),
+        "CUDA_CACHE_PATH": str(cuda_cache),
         "OMP_NUM_THREADS": str(args.cpu_threads_per_worker),
         "MKL_NUM_THREADS": str(args.cpu_threads_per_worker),
         "OPENBLAS_NUM_THREADS": str(args.cpu_threads_per_worker),
@@ -1133,6 +1060,9 @@ def evaluator_environment(
     optix_cache: Path,
 ) -> dict[str, str]:
     """Build the single Isaac evaluator environment for one resident scene."""
+    cuda_cache = cache_root() / "cuda"
+    cuda_cache.mkdir(parents=True, exist_ok=True)
+    (cache_root() / "textures").mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     # CUDA uses the one visible device (ordinal 0); Vulkan retains the physical
     # ordinal supplied separately in evaluator_command. Do not initialize other GPUs.
@@ -1141,6 +1071,8 @@ def evaluator_environment(
     env.update({
         "PYTHONUNBUFFERED": "1",
         "OPTIX_CACHE_PATH": str(optix_cache),
+        "CUDA_CACHE_PATH": str(cuda_cache),
+        "WARP_CACHE_PATH": str(cache_root() / "warp" / version("warp-lang")),
         "PYTHONPATH": os.pathsep.join(filter(None, (
             str(args.xnavdp_root), str(ROOT), os.environ.get("PYTHONPATH"),
         ))),

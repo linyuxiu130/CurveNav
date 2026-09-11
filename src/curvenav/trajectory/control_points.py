@@ -13,19 +13,6 @@ INCREMENTAL_CONTROL_PARAMETERIZATION_TYPE = (
 )
 BSPLINE_CONTROL_POINTS = 8
 BSPLINE_DEGREE = 3
-# Greville abscissae of the seven non-origin controls for the clamped cubic
-# knot vector [0,0,0,0,.2,.4,.6,.8,1,1,1,1]. A control polygon placed at
-# these fractions reproduces a linear metric horizon exactly.
-METRIC_REFERENCE_PROGRESS = (
-    1.0 / 15.0,
-    1.0 / 5.0,
-    2.0 / 5.0,
-    3.0 / 5.0,
-    4.0 / 5.0,
-    14.0 / 15.0,
-    1.0,
-)
-
 
 def local_terminal_goal(point_goal: Tensor, planning_horizon_m: float) -> Tensor:
     """Clip PointGoal to the local terminal position without changing its direction."""
@@ -38,37 +25,6 @@ def local_terminal_goal(point_goal: Tensor, planning_horizon_m: float) -> Tensor
     direction = point_goal / distance.clamp_min(torch.finfo(point_goal.dtype).eps)
     endpoint = direction * distance.clamp_max(planning_horizon_m)
     return endpoint
-
-
-def metric_horizon_reference(
-    batch_size: int,
-    planning_horizon_m: float,
-    *,
-    device: torch.device,
-    dtype: torch.dtype = GEOMETRY_DTYPE,
-) -> Tensor:
-    """Return target-independent forward metric slots for scene retrieval.
-
-    These seven controls are spatial query anchors only.  They cover the
-    nominal receding-horizon distance from the robot origin and are never
-    decoded as a policy output or used as a goal template.
-    """
-    if batch_size < 1 or planning_horizon_m <= 0:
-        raise ValueError("batch size and planning horizon must be positive")
-    progress = torch.tensor(
-        METRIC_REFERENCE_PROGRESS,
-        device=device,
-        dtype=dtype,
-    )
-    reference = torch.zeros(
-        batch_size,
-        len(METRIC_REFERENCE_PROGRESS),
-        2,
-        device=device,
-        dtype=dtype,
-    )
-    reference[..., 0] = progress * float(planning_horizon_m)
-    return reference
 
 
 class IncrementalBSplineTrajectory(nn.Module):
@@ -110,6 +66,10 @@ class IncrementalBSplineTrajectory(nn.Module):
             learned_basis.T,
         )
         self.register_buffer("basis", basis, persistent=True)
+        # dp(s)/d(delta P_i) = sum_{j>=i} B_j(s). The fixed origin has no token.
+        self.register_buffer(
+            "increment_basis", basis[:, 1:].flip(1).cumsum(1).flip(1), persistent=True
+        )
         self.register_buffer("first_basis", first_basis, persistent=True)
         self.register_buffer("fit_inverse", fit_inverse, persistent=True)
         self.register_buffer(

@@ -8,8 +8,9 @@ DINGO_USD_SHA256 = (
 )
 DINGO_WHEEL_RADIUS_M = 0.06125
 DINGO_WHEEL_BASE_M = 0.22616
-DINGO_CAMERA_FORWARD_OFFSET_M = 0.28618
-DINGO_CAMERA_HEIGHT_M = 0.62532
+# The camera offsets authored under dingo/base_link inherit the USD's 0.5 scale.
+DINGO_CAMERA_FORWARD_OFFSET_M = 0.14309
+DINGO_CAMERA_HEIGHT_M = 0.31266
 DINGO_CAMERA_DOWNWARD_PITCH_DEGREES = 10.0
 
 # Exact circular configuration-space envelope of all moving collision shapes.

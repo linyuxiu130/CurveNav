@@ -278,7 +278,7 @@ typing_extensions==4.12.2
 typing-inspection==0.4.2
 urllib3==2.7.0
 uvicorn==0.29.0
-warp-lang==1.17.0
+warp-lang==1.8.1
 watchdog==4.0.0
 wcwidth==0.8.3
 webbot==0.34

@@ -52,6 +52,7 @@ def _write_dataset(root, count: int = 4) -> None:
             cell_size_m=np.asarray(0.25),
         )
         arrays = {
+            "obstacle_memory": depth_condition(count).obstacle_memory.numpy(),
             "depth_indices": np.tile(np.arange(4, dtype=np.uint32), (count, 1)),
             "point_goal": np.ones((count, 2), np.float32),
             "observation_to_current": np.broadcast_to(
@@ -122,6 +123,7 @@ def test_prepared_dataset_has_one_fixed_tensor_contract(tmp_path) -> None:
 
     sample = dataset[0]
     assert set(sample) == {
+        "obstacle_memory",
         "depth_indices",
         "camera_intrinsics",
         "camera_to_body",

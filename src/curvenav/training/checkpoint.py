@@ -10,6 +10,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from curvenav.data.history import history_contract
+from curvenav.data.obstacle_memory import MEMORY_CONTRACT
 from curvenav.config import CurveNavConfig
 from curvenav.conditioning import (
     CONDITION_ENCODER_TYPE,
@@ -139,14 +140,15 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "visual_compression": "metric_splat_and_observed_cspace_16x16_bev",
         "condition_context": "target_independent_metric_bev_plus_motion_tokens",
         "trajectory_condition_interaction": (
-            "cached_metric_reference_geometry_and_bev_cross_attention"
+            "cached_bev_kv_state_dependent_curve_geometry_attention"
         ),
         "path_relative_geometry": (
-            "metric_reference_to_bev_attention_bias"
+            "increment_effect_weighted_current_curve_to_bev_attention_bias"
         ),
         "goal_conditioning": (
             "terminal_local_goal_vector_without_straight_template_matching"
         ),
+        "obstacle_memory": MEMORY_CONTRACT,
         "temporal_modeling": (
             "depth_pixel_sample_stride16_se3_all_newer_consistency"
         ),
@@ -168,7 +170,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         ),
         "source_configuration_space_role": "dataset_certificate_and_evaluation_only",
         "depth_configuration_space_role": (
-            "target_independent_observed_bev_plus_metric_reference_query"
+            "target_independent_observed_bev_plus_current_curve_query"
         ),
         "num_curve_tokens": trajectory.num_control_points - 1,
         "curve_coordinate_dim": 2 * (trajectory.num_control_points - 1),

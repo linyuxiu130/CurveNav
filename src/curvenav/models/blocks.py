@@ -142,7 +142,6 @@ class ConditionalTrajectoryBlock(nn.Module):
                 surface_hit=condition.surface_hit,
                 frame_age=condition.frame_age,
                 motion_token=condition.motion_token,
-                metric_reference=condition.metric_reference,
                 terminal_goal=condition.terminal_goal,
                 configuration_field=condition.configuration_field,
             )

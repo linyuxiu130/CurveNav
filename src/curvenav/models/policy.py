@@ -84,8 +84,11 @@ class CurveNavPolicy(nn.Module):
             condition.observation_age_s,
         )
 
-    def _predict_velocity(self, state: Tensor, time: Tensor, memory) -> Tensor:
-        return self.trajectory_decoder(state, time, memory).float()
+    def _predict_velocity(
+        self, state: Tensor, time: Tensor, condition: ConditionFeatures, memory
+    ) -> Tensor:
+        path, _ = self.curve_codec.decode(state)
+        return self.trajectory_decoder(state, time, path, condition, memory).float()
 
     def training_loss(
         self,
@@ -101,23 +104,19 @@ class CurveNavPolicy(nn.Module):
             )
         source = source.float()
         encoded = self.encode_condition(condition)
-        memory = self.trajectory_decoder.project_condition_memory(
-            encoded, self.curve_codec
-        )
+        memory = self.trajectory_decoder.project_condition_memory(encoded)
         time = torch.sigmoid(
             torch.randn(len(clean), device=clean.device) * FLOW_LOGIT_NORMAL_STD
             + FLOW_LOGIT_NORMAL_MEAN
         )
         state = (1 - time[:, None]) * clean + time[:, None] * source
-        velocity = self._predict_velocity(state, time, memory)
+        velocity = self._predict_velocity(state, time, encoded, memory)
         return CurveNavLoss((velocity - (source - clean)).square().mean())
 
     @torch.no_grad()
     def sample(self, condition: PolicyCondition) -> TrajectoryPrediction:
         encoded = self.encode_condition(condition)
-        memory = self.trajectory_decoder.project_condition_memory(
-            encoded, self.curve_codec
-        )
+        memory = self.trajectory_decoder.project_condition_memory(encoded)
         state = self.inference_source.expand(len(condition.point_goal), -1)
         # Reverse the data-to-noise interpolant, reusing the same scene memory.
         for index in range(self.integration_steps):
@@ -126,7 +125,8 @@ class CurveNavPolicy(nn.Module):
             )
             state = (
                 state
-                - self._predict_velocity(state, time, memory) / self.integration_steps
+                - self._predict_velocity(state, time, encoded, memory)
+                / self.integration_steps
             )
         path, _ = self.curve_codec.decode(state)
         return TrajectoryPrediction(path=path)

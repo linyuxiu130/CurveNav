@@ -2,6 +2,7 @@
 
 import numpy as np
 from curvenav.config import DataConfig
+from curvenav.data.obstacle_memory import ObstacleMemory
 from curvenav.data.depth import PinholeIntrinsics, preprocess_depth
 from curvenav.data.history import (
     OBSERVATION_PERIOD_S,
@@ -17,6 +18,7 @@ DEPTH_CONTEXT_FIELDS = frozenset(
         "observation_to_current",
         "observation_age_s",
         "observation_valid",
+        "obstacle_memory",
     }
 )
 
@@ -33,11 +35,19 @@ class DepthContextBuffer:
             raise ValueError("batch_size must be positive")
         self.histories = [ObservationHistory() for _ in range(batch_size)]
         self.frames = [{} for _ in range(batch_size)]
+        horizon_m = self.data.future_steps * self.data.expert_waypoint_spacing_m
+        self.obstacle_memories = [
+            ObstacleMemory(horizon_m, self.data.max_depth_m) for _ in range(batch_size)
+        ]
         self.sequence = 0
 
     def reset_env(self, env_id: int):
         self.histories[env_id] = ObservationHistory()
         self.frames[env_id].clear()
+        self.obstacle_memories[env_id] = ObstacleMemory(
+            self.data.future_steps * self.data.expert_waypoint_spacing_m,
+            self.data.max_depth_m,
+        )
 
     def update(
         self, depth_m, body_to_world, camera_intrinsics, camera_to_body, timestamps
@@ -109,6 +119,9 @@ class DepthContextBuffer:
             collected["observation_to_current"].append(transform.astype(np.float32))
             collected["observation_age_s"].append(age)
             collected["observation_valid"].append(valid)
+            collected["obstacle_memory"].append(self.obstacle_memories[env].update(
+                depth.astype(np.float16), intrinsic, camera_to_body[env], body_to_world[env],
+            ))
             retained = {x[0] for x in self.histories[env].frames}
             self.frames[env] = {
                 index: value

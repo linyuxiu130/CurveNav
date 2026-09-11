@@ -15,6 +15,7 @@ from curvenav.data.history import ObservationHistory, inverse_rigid, validate_tr
 from curvenav.data.observation import DepthContextBuffer
 from curvenav.factory import build_policy, build_evaluation_projector
 from curvenav.types import PolicyCondition, TrajectoryTarget
+from curvenav.data.obstacle_memory import memory_grid_shape
 
 
 def config():
@@ -36,6 +37,7 @@ def condition(batch=1, height=126, width=224):
     )
     return PolicyCondition(
         depth=torch.full((batch, 4, 1, height, width), 0.4),
+        obstacle_memory=torch.zeros(batch, memory_grid_shape(3.6), memory_grid_shape(3.6), dtype=torch.bool),
         point_goal=torch.tensor([[3.0, 0.0]]).expand(batch, -1).clone(),
         camera_intrinsics=k.expand(batch, 4, 3, 3).clone(),
         camera_to_body=extrinsic.expand(batch, 4, 4, 4).clone(),
@@ -67,6 +69,26 @@ def test_resize_preserves_rays_and_missing_depth():
             ],
             atol=1e-7,
         )
+
+
+def test_obstacle_memory_preserves_blind_obstacles_and_clears_observed_free_space():
+    from curvenav.data.obstacle_memory import ObstacleMemory
+
+    memory = ObstacleMemory(3.6, 5.0)
+    k = np.array([[20., 0, 4.5], [0, 20., 4.5], [0, 0, 1.]])
+    camera = np.array([[0.,0,1,0], [-1.,0,0,0], [0,-1.,0,.06], [0,0,0,1.]])
+    depth = np.zeros((9,9), dtype=np.float16)
+    depth[4,4] = .2
+    pose = np.eye(4)
+    assert memory.update(depth, k, camera, pose).any()
+    moved = pose.copy()
+    moved[0,3] = 1.5
+    for _ in range(20):
+        assert memory.update(np.zeros_like(depth), k, camera, moved).any()
+    incomplete = np.ones_like(depth)
+    incomplete[4,4] = 0
+    assert memory.update(incomplete, k, camera, pose).any()
+    assert not memory.update(np.ones_like(depth), k, camera, pose).any()
 
 
 def test_fp16_depth_encoding_preserves_unknown_hits_and_range_limits():
@@ -162,6 +184,7 @@ def test_raster_clearance_is_a_lower_bound_on_continuous_point_clearance():
         torch.ones(1, 1, 1, dtype=torch.bool),
         torch.eye(4).reshape(1, 1, 4, 4),
         torch.ones(1, 1, dtype=torch.bool),
+        torch.zeros(1, memory_grid_shape(3.6), memory_grid_shape(3.6), dtype=torch.bool),
     )
     axis = torch.linspace(-3.6, 3.6, 64)
     y, x = torch.meshgrid(axis, axis, indexing="ij")
@@ -405,6 +428,30 @@ def test_continuous_clearance_is_a_lipschitz_lower_bound():
     assert torch.isfinite(points.grad).all()
 
 
+def test_query_unknown_corners_cannot_change_observed_geometry():
+    from curvenav.configuration_space import query_configuration_field
+
+    field = torch.zeros(1, 5, 2, 2)
+    field[:, 0] = -0.2
+    field[:, 3, 0, 0] = 1
+    points = torch.tensor([[[0.0, 0.0], [-1.0, -1.0], [2.0, 0.0]]])
+    expected = query_configuration_field(field, points, 1.0)
+    changed = field.clone()
+    unknown = changed[:, 3] == 0
+    for channel in (0, 1, 2, 4):
+        changed[:, channel][unknown] = 100
+    actual = query_configuration_field(changed, points, 1.0)
+    torch.testing.assert_close(actual.observed_features, expected.observed_features)
+    assert actual.observed_features[0, 0, 0] < 0
+    assert actual.observed_features[0, 2].count_nonzero() == 0
+    changed[:, 3].zero_()
+    points.requires_grad_()
+    empty = query_configuration_field(changed, points, 1.0)
+    assert empty.observed_features.count_nonzero() == 0
+    empty.observed_features.sum().backward()
+    assert torch.isfinite(points.grad).all()
+
+
 def test_horizontal_platform_in_robot_body_band_remains_an_obstacle():
     c = condition(height=16, width=24)
     c.observation_valid[:, :-1] = False
@@ -481,6 +528,7 @@ def test_obstacle_outside_bev_still_inflates_into_boundary():
         point.reshape(1, 1, 1, 1, 3), torch.ones(1, 1, 1, 1, dtype=torch.bool),
         point.reshape(1, 1, 1, 3), torch.ones(1, 1, 1, dtype=torch.bool),
         torch.eye(4).reshape(1, 1, 4, 4), torch.ones(1, 1, dtype=torch.bool),
+        torch.zeros(1, memory_grid_shape(3.6), memory_grid_shape(3.6), dtype=torch.bool),
     )
     assert field.shape == (1, 5, 64, 64)
     assert field[0, 0, 31:33, -1].max() < 0

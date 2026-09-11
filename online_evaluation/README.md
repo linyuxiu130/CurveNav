@@ -96,6 +96,17 @@ python -m navbench --model navdp --gpus 1 --num-envs 16 \
 多个场景由现有任务队列调度；Kit/OptiX 缓存按 GPU 隔离，输入缓存使用稳定路径。
 中断恢复使用 `--resume-root`，持续接收模型产物使用 `--checkpoint-queue`。
 
+`NAVBENCH_CACHE_ROOT` 应位于重启后保留的磁盘；本机为 `/shibo_huang/.cache/navbench`。
+其中 `official-inputs/` 按测评协议、资产根目录和目录版本复用输入映射，
+场景目录直接链接完整原始资产，修复资产后不会继续读取旧的 USD/MDL 副本。
+`kit/`、`optix/`、`textures/`、`cuda/`、`warp/` 保留对应运行时的原生缓存，
+具体缓存条目的有效性由对应运行时管理。模型权重和输出目录不参与场景输入缓存键。
+磁盘缓存不能保存已加载的物理场景：连续比较模型时，使用上面的多模型入口，
+或给单场景命令增加 `--checkpoint-queue cache/checkpoint-queue`，保持仿真器常驻。
+新的完整模型目录以 `.ready` 结尾发布到队列；每个模型仍独立重置机器人和历史帧。
+测评入口先导入统一环境锁定的 Warp 1.8.1，避免 Isaac 内置 Warp 1.7.1 的 CUDA UUID 查询错误，
+并保留当前 Isaac 所需的数组接口。
+
 CurveNav 在线服务已包含在 `baselines/curvenav/`。其 `--model-config` 使用显式模型
 bundle 的 `configs/config.yaml`，对应源码在该 bundle 的 `src/curvenav/`，
 不能直接把任意数据目录中的配置当作模型 bundle。当前三基线批量命令不运行 CurveNav。当前仓库本身可作为模型 bundle：

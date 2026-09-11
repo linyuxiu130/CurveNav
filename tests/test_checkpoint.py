@@ -57,7 +57,7 @@ def test_checkpoint_records_the_clean_depth_grounded_flow_contract() -> None:
     contract = value["policy_contract"]
     assert value["checkpoint_type"] == "curvenav_metric_curve_flow_policy"
     assert contract["trajectory_decoder_type"] == (
-        "metric_reference_conditioned_curve_flow_transformer"
+        "state_geometry_increment_curve_flow_transformer"
     )
     assert contract["training_objective"] == (
         "standardized_euclidean_conditional_flow_matching"
@@ -73,13 +73,13 @@ def test_checkpoint_records_the_clean_depth_grounded_flow_contract() -> None:
         "dataset_certificate_and_evaluation_only"
     )
     assert contract["depth_configuration_space_role"] == (
-        "target_independent_observed_bev_plus_metric_reference_query"
+        "target_independent_observed_bev_plus_current_curve_query"
     )
     assert contract["trajectory_condition_interaction"] == (
-        "cached_metric_reference_geometry_and_bev_cross_attention"
+        "cached_bev_kv_state_dependent_curve_geometry_attention"
     )
     assert contract["path_relative_geometry"] == (
-        "metric_reference_to_bev_attention_bias"
+        "increment_effect_weighted_current_curve_to_bev_attention_bias"
     )
     assert contract["goal_conditioning"] == (
         "terminal_local_goal_vector_without_straight_template_matching"

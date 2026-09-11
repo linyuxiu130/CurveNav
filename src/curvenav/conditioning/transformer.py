@@ -1,16 +1,16 @@
-"""Target-independent fused metric memory and a PointGoal reference."""
+"""Target-independent fused metric memory and terminal PointGoal intent."""
 
 import torch
 from torch import Tensor, nn
 
 from curvenav.layers import RMSNorm
-from curvenav.trajectory import local_terminal_goal, metric_horizon_reference
+from curvenav.trajectory import local_terminal_goal
 from curvenav.types import ConditionFeatures, DepthFeatures
 
 from .motion import HistoricalMotionEncoder
 
 
-CONDITION_ENCODER_TYPE = "observed_cspace_visual_bev_motion_plus_metric_horizon_slots"
+CONDITION_ENCODER_TYPE = "observed_cspace_visual_bev_motion_terminal_intent"
 
 
 class PolicyConditionEncoder(nn.Module):
@@ -22,29 +22,17 @@ class PolicyConditionEncoder(nn.Module):
         *,
         observation_frames: int,
         planning_horizon_m: float,
-        control_tokens: int,
         model_dim: int,
     ) -> None:
         super().__init__()
         self.configuration_encoder = configuration_encoder
         self.planning_horizon_m = float(planning_horizon_m)
-        if control_tokens != 7:
-            raise ValueError("goal reference must match seven B-spline controls")
         self.motion_encoder = HistoricalMotionEncoder(
             observation_frames=observation_frames,
             translation_scale_m=planning_horizon_m,
             model_dim=model_dim,
         )
         self.memory_norm = RMSNorm(model_dim)
-
-    def _metric_reference(self, batch_size: int, device: torch.device) -> Tensor:
-        """Return target-independent forward slots for metric scene retrieval."""
-        return metric_horizon_reference(
-            batch_size,
-            self.planning_horizon_m,
-            device=device,
-            dtype=torch.float32,
-        )
 
     def forward(
         self,
@@ -101,7 +89,6 @@ class PolicyConditionEncoder(nn.Module):
             ),
             dim=1,
         )
-        metric_reference = self._metric_reference(batch, point_goal.device)
         terminal_goal = local_terminal_goal(point_goal, self.planning_horizon_m)
         return ConditionFeatures(
             tokens=self.memory_norm(tokens) * token_valid[..., None],
@@ -110,7 +97,6 @@ class PolicyConditionEncoder(nn.Module):
             surface_hit=surface_hit,
             frame_age=frame_age,
             motion_token=motion_token,
-            metric_reference=metric_reference,
             terminal_goal=terminal_goal,
             configuration_field=observation.configuration_field,
         )

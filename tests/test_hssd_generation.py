@@ -342,8 +342,8 @@ def base_config() -> dict:
             "image_height": 360,
             "focal_x_px": 326.398559570312,
             "focal_y_px": 326.398559570312,
-            "forward_offset_m": 0.28618,
-            "height_m": 0.62532,
+            "forward_offset_m": 0.14309,
+            "height_m": 0.31266,
             "downward_pitch_degrees": 10.0,
         },
     }

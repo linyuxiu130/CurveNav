@@ -57,7 +57,8 @@ clone_at_revision "$ISAACLAB_REPOSITORY" "$ISAACLAB_REVISION" "$ISAACLAB_ROOT"
     -e "${ISAACLAB_ROOT}/source/isaaclab_tasks" \
     -e "${ISAACLAB_ROOT}/source/isaaclab_rl" \
     "rsl-rl-lib==${RSL_RL_VERSION}" \
-    "tensordict==${TENSORDICT_VERSION}"
+    "tensordict==${TENSORDICT_VERSION}" \
+    "warp-lang==${WARP_VERSION}"
 
 if [[ -f "${ACADOS_ROOT}/interfaces/acados_template/setup.py" ]]; then
     if git -C "$ACADOS_ROOT" apply --reverse --check "$ROOT_DIR/config/acados-template-version.patch" 2>/dev/null; then

@@ -9,7 +9,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_NCCL_HIGH_PRIORITY=1
 
-CONFIG_PATH="${1:-data/policy_dataset-depth-clearance/config.yaml}"
+CONFIG_PATH="${1:-data/policy_dataset-depth-memory/config.yaml}"
 if (( $# )); then
     shift
 fi

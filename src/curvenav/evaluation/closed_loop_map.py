@@ -315,8 +315,8 @@ def _closed_loop_plan_diagnostics(
             bool(value)
             for value in controller_values.get("mpc_curvature_is_active", [])
         ]),
-        "mpc_max_curvature_first12_inv_m_p95": float(np.quantile(
-            controller_values.get("mpc_max_curvature_first12_inv_m", [0.0]), 0.95
+        "mpc_max_curvature_lookahead_inv_m_p95": float(np.quantile(
+            controller_values.get("mpc_max_curvature_lookahead_inv_m", [0.0]), 0.95
         )),
         "adjacent_plan_first1m_world_disagreement_m_mean": (
             float(np.mean(disagreement)) if disagreement else 0.0

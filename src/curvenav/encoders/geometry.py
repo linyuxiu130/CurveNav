@@ -130,12 +130,14 @@ class MetricDepthProjector(nn.Module):
         surface_valid: Tensor,
         camera_to_current: Tensor,
         observation_valid: Tensor,
+        obstacle_memory: Tensor,
     ) -> Tensor:
         occupancy = self._rasterize(
             aligned_body_points[..., :2],
             body_pixel & observation_valid[..., None, None],
             padding=self.obstacle_padding,
         )
+        occupancy = occupancy | obstacle_memory[:, None]
         # Inflate before cropping: obstacles just outside the BEV still collide
         # with robot footprints whose centres are inside its boundary.
         pad = self.obstacle_padding
@@ -310,6 +312,7 @@ class MetricDepthProjector(nn.Module):
             surface_valid,
             camera_to_current,
             condition.observation_valid,
+            condition.obstacle_memory,
         )
         return MetricDepthProjection(
             points=torch.where(obstacle_valid[..., None], obstacle, surface),

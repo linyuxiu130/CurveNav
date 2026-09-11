@@ -24,9 +24,11 @@ from curvenav.data.privileged import (
     SOURCE_CONFIGURATION_QUERY_TYPE,
 )
 from curvenav.physical import EXTRA_CLEARANCE_M
+from curvenav.data.obstacle_memory import MEMORY_CONTRACT, memory_grid_shape
 
 
 POLICY_ARRAYS = {
+    "obstacle_memory": ("bool", 3),
     "depth_indices": ("uint32", 2),
     "point_goal": ("float32", 2),
     "observation_to_current": ("float32", 4),
@@ -57,6 +59,7 @@ def policy_dataset_contract(
     return {
         "observation_schema": "depth_zero_invalid_se3_v2",
         "history": history_contract(),
+        "obstacle_memory": MEMORY_CONTRACT,
         "expert_navigation_geometry": expert_navigation_geometry_contract(),
         "observation_frames": data.observation_frames,
         "expert_waypoint_spacing_m": data.expert_waypoint_spacing_m,
@@ -138,7 +141,9 @@ class PreparedPolicyDataset(Dataset):
             if list(array.shape) != metadata.get("shape"):
                 raise ValueError(f"prepared array manifest mismatch: {name}")
             self.arrays[name] = array
+        memory_size = memory_grid_shape(data.future_steps * data.expert_waypoint_spacing_m)
         expected_shapes = {
+            "obstacle_memory": (self.count, memory_size, memory_size),
             "depth_indices": (self.count, data.observation_frames),
             "point_goal": (self.count, 2),
             "observation_to_current": (self.count, data.observation_frames, 4, 4),

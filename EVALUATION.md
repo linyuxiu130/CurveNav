@@ -23,7 +23,7 @@
 
 ## raw depth C-space 的正确用途
 
-策略和评估器用同一确定性投影从四帧深度构造 `64×64` observed C-space，网格间距约 `0.114 m`。它是策略的目标无关输入表示，也是判断 source-truth 碰撞是否被传感器观测到的诊断场；它不是物理真值、训练目标或 learned completion，不能替代 native `0.05 m` source grid。连续路径位置只有所有非零插值权重的支撑格都 observed 时才可报告净空下界；部分 observed stencil 不作为安全证据。
+策略和评估器用同一确定性投影从四帧深度与因果局部障碍记忆构造 `64×64` observed C-space，网格间距约 `0.114 m`。它是策略的目标无关输入表示，也是判断 source-truth 碰撞是否被传感器观测到的诊断场；它不是物理真值、训练目标或 learned completion，不能替代 native `0.05 m` source grid。连续路径位置只有所有非零插值权重的支撑格都 observed 时才可报告净空下界；部分 observed stencil 不作为安全证据。
 
 离线报告仍会把 source-truth 碰撞点与 raw field 的同一点查询对齐，输出：
 
@@ -45,15 +45,15 @@
   `1.0 m` 的首次碰撞进一步严格分为当前帧可见、仅历史帧可见和四帧均未识别，
   避免把长轨迹末端的可见碰撞误判成下一次重规划前会执行的近端碰撞；
 - 轨迹物理终点、末端 `0.25 m` 是否碰撞，以及碰撞是否完全局限于末端 `0.25 m`；
-- 严格复现固定 benchmark MPC 曲率计算与限速律的首 12 点最大曲率、期望速度和曲率限速比例；
+- 严格复现固定 benchmark MPC 曲率计算与限速律的1.5 m 米制前视内（含下一顶点）的最大曲率、期望速度和曲率限速比例；
 - 真实 held-out 数据中的 `forward_direct`、`forward_detour`、`rear_goal` 和 `expert_moves_away_from_goal` strata；
-- 只保留当前帧的历史消融，用于测量四帧时序证据的贡献；
+- 只保留当前帧并清空障碍记忆的推理干预；同时移除了体素离散化，不能视为单独记忆模块的重训练消融；
 - 批内半周期配对的真实 depth-condition swap 与 PointGoal swap，只报告轨迹变化及原场景前缀碰撞变化，用于判断深度因果依赖和目标捷径；
 - base-policy batch-32 吞吐、包含全部诊断的端到端评估吞吐和 batch-1 延迟。
 
 前缀指标比整条 `3.6 m` 路径更接近 receding-horizon 执行：机器人会先执行局部路径前段，再用新观测重规划。MPC 指标不是另一个可学习评价头，也不调用 Acados；它只复现固定控制器在求解前已经执行的确定性曲率/速度计算，因此计算量相对模型推理可忽略。
 
-condition swap 只在真实 held-out 条件之间做确定性配对，不生成目标，也不改变主验证集。交换 depth 时将四帧、相对位姿和有效掩码作为一个完整条件一起交换；交换 PointGoal 时保持原深度不变。它们是因果敏感性审计，不是物理可达任务，因此不计入 checkpoint 的导航成绩或 strata。
+condition swap 只在真实 held-out 条件之间做确定性配对，不生成目标，也不改变主验证集。交换 depth 时将四帧、内外参、相对位姿、年龄、有效掩码和障碍记忆作为一个完整条件一起交换；交换 PointGoal 时保持原深度不变。它们是因果敏感性审计，不是物理可达任务，因此不计入 checkpoint 的导航成绩或 strata。
 
 `forward_detour` 由 source-safe expert 与 straight chord 的 source C-space 关系定义，不使用人工合成目标或阈值。目标在身后和专家暂时远离最终 PointGoal 都是原始 held-out route 的自然样本，而不是故意制造的异常测试。
 
@@ -61,7 +61,7 @@ condition swap 只在真实 held-out 条件之间做确定性配对，不生成�
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 scripts/evaluate_policy.sh \
-  data/policy_dataset-depth-clearance/config.yaml outputs/train_policy-depth-clearance/checkpoint.pt \
+  data/policy_dataset-depth-memory/config.yaml outputs/train_policy-depth-memory/checkpoint.pt \
   --artifact-dir outputs/offline-evaluation
 ```
 
@@ -88,7 +88,7 @@ Omniverse EULA 后，唯一 launcher 环境必须显式包含
 得到 EOF。该项只允许写入主机 runtime 配置，不能硬编码到模型或用交互
 fallback 绕过。
 
-闭环 SR、SPL、success threshold、timeout 和控制器/MPC 均不在本文件或模型中改动。在线 trace 把每个局部 plan 用冻结 benchmark robot-center PLY 重投影。PLY 点按原生 `0.05 m` 格心构造 robot-center 栅格，禁止用点坐标作为像素边界而产生半格偏移。局部 plan 以 `0.025 m` 稠密查询；当前机器人原点与未来轨迹点分开计数，避免机器人一旦离开 proxy free map 后把所有后续 plan 自动判为碰撞。报告同时包含全体 plan 和“原点仍 free”条件下的前 `0.5/1.0 m` 未来碰撞率。
+闭环 SR、SPL、success threshold 和 timeout 由固定测评协议定义；控制器改动见文末的本地前进控制协议。在线 trace 把每个局部 plan 用冻结 benchmark robot-center PLY 重投影。PLY 点按原生 `0.05 m` 格心构造 robot-center 栅格，禁止用点坐标作为像素边界而产生半格偏移。局部 plan 以 `0.025 m` 稠密查询；当前机器人原点与未来轨迹点分开计数，避免机器人一旦离开 proxy free map 后把所有后续 plan 自动判为碰撞。报告同时包含全体 plan 和“原点仍 free”条件下的前 `0.5/1.0 m` 未来碰撞率。
 
 该 PLY 栅格是冻结 benchmark 几何的高效在线诊断 proxy，不是 Isaac contact 真值，也不替代官方 SR/SPL。每回合还报告实际位姿 free fraction，以及相邻真实重规划在 world frame 前 `1 m` 的路径不一致度。这样可区分：
 
@@ -113,3 +113,5 @@ fallback 绕过。
 急弯与近目标减速不设置额外最低速度，求解失败直接报错。
 该协议修改已保存在 benchmark 的运行时维护补丁中；与此前允许倒车的成绩比较时，
 必须先统一执行器协议，不能将两者作为同协议的模型改进结果。
+
+当前 MPC 使用转角/双边弧长曲率、连续弧长投影和米制前视，没有最低期望速度。离线 `mpc_max_curvature_lookahead_inv_m` 与在线 reset 做直接数值比对；此前保存的 `first12` 诊断属于旧公式，不能用于解释当前控制器。该更正不改变已保存的 ADE、碰撞率或在线 SR/SPL。

@@ -70,10 +70,11 @@ def query_configuration_field(
         ),
         dim=-1,
     )
-    lower_bound = (
+    corner_lower_bound = (
         corners[..., 0]
         - torch.linalg.vector_norm(path.float()[..., None, :] - nodes, dim=-1)
-    ).amax(dim=-1)
+    )
+    lower_bound = corner_lower_bound.amax(dim=-1)
     inside = (normalized.abs() <= 1).all(dim=-1)
     observed = corners[..., 3].clamp(0, 1)
     support_observed = inside & torch.where(
@@ -85,8 +86,17 @@ def query_configuration_field(
         corners[..., :3] * observed[..., None] * weights[..., None]
     ).sum(dim=-2)
     coverage = (observed * weights).sum(dim=-1, keepdim=True)
+    # Learned geometry uses only measured support, just like the BEV encoder.
+    # The all-node bound above remains available for geometric evaluation.
+    observed_lower_bound = corner_lower_bound.masked_fill(
+        observed == 0, -torch.inf
+    ).amax(dim=-1)
+    observed_lower_bound = torch.where(
+        (observed > 0).any(dim=-1), observed_lower_bound, 0.0
+    )
     observed_geometry = torch.cat(
-        (lower_bound[..., None] * coverage, observed_geometry[..., 1:]), dim=-1
+        (observed_lower_bound[..., None] * coverage, observed_geometry[..., 1:]),
+        dim=-1,
     )
     forbidden = (corners[..., 4:5] * observed[..., None] * weights[..., None]).sum(
         dim=-2
