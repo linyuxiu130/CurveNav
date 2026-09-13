@@ -30,4 +30,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["online_evaluation"]
 addopts = "-ra"

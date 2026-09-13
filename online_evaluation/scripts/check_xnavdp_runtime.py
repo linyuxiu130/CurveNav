@@ -49,7 +49,7 @@ PINNED = {
     "src/environment/wheeled_tasks.py":
         "ced3f3bbb196277cef12fddc3f4216a15abcd2909e42fef601849c4d9df937f6",
     "src/utils/mpc_tracking.py":
-        "de010b5ba856473a1fb5156500e718537600569231a283185f2fbb399a78fd44",
+        "1c99cb781efc2241f6d8df5c66d4ae070927236b29d20c00340bb890171c33f1",
 }
 
 

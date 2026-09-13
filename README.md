@@ -71,10 +71,8 @@ python -m pip check
 Conda 提供，系统需有 GCC。PyTorch 安装版本参见
 [官方历史版本说明](https://pytorch.org/get-started/previous-versions/#v260)。
 
-当前环境验证、离线测评和在线测评日志保留在
-`outputs/train_policy-depth-memory-flow-20260911-2gpu/`：200 epoch 双卡训练完成，
-31,082 个离线验证样本 ADE 3.11 cm、整轨迹碰撞率 7.47%；单场景 10 回合在线
-成功 9 个、SPL 0.825。该结果不是全场景成绩，后方目标与障碍端部净空仍有不足。
+实验结果保存在本地 `outputs/`，按模型、场景和运行批次分别统计；
+旧批次、未完成批次和当前正式批次不能合并。在线成绩应同时记录权重和跟踪器版本。
 数据生成以输出目录的 `audit/summary.json` 通过为完成标志，
 准备目录使用实际拟合的 `config.yaml`。
 

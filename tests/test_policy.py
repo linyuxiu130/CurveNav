@@ -164,6 +164,30 @@ def test_current_curve_geometry_has_gradients_to_flow_state_and_field():
         assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0
 
 
+def test_pointwise_geometry_retains_contrasts_lost_by_raw_increment_means():
+    decoder = build_policy(tiny_config()).trajectory_decoder.eval()
+    weight = decoder.path_to_increment_weight.double()
+    # Seven raw means cannot distinguish this signed local contrast from zero.
+    _, _, vectors = torch.linalg.svd(weight, full_matrices=True)
+    contrast = vectors[-1] / vectors[-1].abs().max()
+    torch.testing.assert_close(weight @ contrast, torch.zeros(7, dtype=torch.float64))
+    geometry = torch.zeros(2, 64, 7)
+    geometry[1, :, 2] = contrast.float()
+    goal = torch.zeros(2, 64, 5)
+    # A representable pointwise nonlinearity must distinguish the distributions.
+    with torch.no_grad():
+        first, _, last = decoder.path_geometry_embedding
+        first.weight.zero_()
+        first.bias.zero_()
+        last.weight.zero_()
+        last.bias.zero_()
+        first.weight[0, 2] = 1
+        last.weight[0, 0] = 1
+    encoded, _ = decoder._embed_trajectory_geometry(geometry, goal)
+    assert encoded.dtype == torch.float32
+    assert (encoded[1] - encoded[0]).abs().max() > 0.01
+
+
 def test_clamped_bspline_tangent_is_the_control_increment_operator() -> None:
     codec = build_policy(tiny_config()).curve_codec
     values = codec.values_from_coordinates(torch.randn(4, 14))

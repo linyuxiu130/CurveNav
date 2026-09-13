@@ -326,7 +326,7 @@ index f2da754..b2f8331 100644
 @@ -40,0 +41 @@ class DingoEvalPointNavCfg(ManagerBasedRLEnvCfg):
 +        self.rerender_on_reset = True
 diff --git a/baselines/x-navdp/src/utils/mpc_tracking.py b/baselines/x-navdp/src/utils/mpc_tracking.py
-index 4de20e0..a9dfa80 100644
+index 4de20e0..b86e41b 100644
 --- a/baselines/x-navdp/src/utils/mpc_tracking.py
 +++ b/baselines/x-navdp/src/utils/mpc_tracking.py
 @@ -3,0 +4,2 @@ import casadi as ca
@@ -359,34 +359,40 @@ index 4de20e0..a9dfa80 100644
 -        self.min_desired_v = min_desired_v
 @@ -70 +58 @@ class MPC_Controller_Fast:
 -        model.name = f'mobile_platform_N{N}'  # Unique name for each horizon
-+        model.name = f'mobile_platform_forward_N{N}'  # Distinct forward-only solver cache
-@@ -107 +95 @@ class MPC_Controller_Fast:
--        ocp.constraints.lbu = np.array([-v_max, -w_max])
-+        ocp.constraints.lbu = np.array([0.0, -w_max])
-@@ -125,0 +114,6 @@ class MPC_Controller_Fast:
++        model.name = f'mobile_platform_N{N}'
+@@ -106,0 +95 @@ class MPC_Controller_Fast:
++        # Preserve the baseline unicycle contract: reversing is allowed.
+@@ -125,0 +115,13 @@ class MPC_Controller_Fast:
++        # Keep the strict KKT tolerance while allowing difficult turn-first
++        # references enough SQP iterations to converge.
++        ocp.solver_options.nlp_solver_max_iter = 500
++        # Globalize nonlinear SQP steps when the reference requires turning first.
++        ocp.solver_options.globalization = 'MERIT_BACKTRACKING'
++        # Dampen the SQP Hessian, not the objective or feasibility tolerance.
++        ocp.solver_options.levenberg_marquardt = 0.01
 +        # Inner QPs must be more accurate than the outer KKT stopping test.
 +        for residual in ('stat', 'eq', 'ineq', 'comp'):
 +            setattr(
 +                ocp.solver_options, f'qp_solver_tol_{residual}',
 +                getattr(ocp.solver_options, f'nlp_solver_tol_{residual}') / 100,
 +            )
-@@ -131 +125 @@ class MPC_Controller_Fast:
+@@ -131 +131 @@ class MPC_Controller_Fast:
 -            # Only set acados_lib_path through code_gen_opts if the path exists
 +            # Only set acados_lib_path if the path exists
-@@ -137 +131 @@ class MPC_Controller_Fast:
+@@ -137 +137 @@ class MPC_Controller_Fast:
 -                ocp.code_gen_opts.acados_lib_path = acados_lib_path
 +                ocp.acados_lib_path = acados_lib_path
-@@ -148 +142,5 @@ class MPC_Controller_Fast:
+@@ -148 +148,5 @@ class MPC_Controller_Fast:
 -        code_gen_dir = os.path.join(codegen_root, f"rank_{rank}")
 +        definition = json.dumps(
 +            ocp.to_dict(), sort_keys=True, default=make_object_json_dumpable,
 +        ).encode()
 +        cache_key = hashlib.sha256(definition).hexdigest()[:16]
 +        code_gen_dir = os.path.join(codegen_root, f"rank_{rank}", cache_key)
-@@ -152 +150 @@ class MPC_Controller_Fast:
+@@ -152 +156 @@ class MPC_Controller_Fast:
 -        ocp.code_gen_opts.code_export_directory = code_gen_dir
 +        ocp.code_export_directory = code_gen_dir
-@@ -164,13 +161,0 @@ class MPC_Controller_Fast:
+@@ -164,13 +167,0 @@ class MPC_Controller_Fast:
 -        self.last_opt_x_states = None
 -        self.last_opt_u_controls = None
 -
@@ -400,7 +406,7 @@ index 4de20e0..a9dfa80 100644
 -        uniform_y = interp_func_y(new_x)
 -        ref_traj = np.stack((uniform_x, uniform_y), axis=1)
 -        return ref_traj
-@@ -184,16 +169,10 @@ class MPC_Controller_Fast:
+@@ -184,16 +175,10 @@ class MPC_Controller_Fast:
 -        # Warm start using previous solution (shift by one step)
 -        if self.last_opt_x_states is not None and self.last_opt_u_controls is not None:
 -            # Shift previous solution and use as initial guess
@@ -427,18 +433,18 @@ index 4de20e0..a9dfa80 100644
 +            self.solver.set(i, 'x', x00 + i * self.T * self.desired_v * direction)
 +            if i < self.N:
 +                self.solver.set(i, 'u', seed_control)
-@@ -230 +209,5 @@ class MPC_Controller_Fast:
+@@ -230 +215,5 @@ class MPC_Controller_Fast:
 -            print(f"WARNING: Acados solver returned status {status}")
 +            raise RuntimeError(
 +                f"Acados failed with status {status}; no executable command; "
 +                f"residuals={self.solver.get_residuals().tolist()}; "
 +                f"reference={self.input_ref_traj.tolist()}"
 +            )
-@@ -236,3 +218,0 @@ class MPC_Controller_Fast:
+@@ -236,3 +224,0 @@ class MPC_Controller_Fast:
 -        self.last_opt_x_states = x_opt
 -        self.last_opt_u_controls = u_opt
 -
-@@ -243,3 +223,8 @@ class MPC_Controller_Fast:
+@@ -243,3 +229,8 @@ class MPC_Controller_Fast:
 -        self.last_opt_x_states = None
 -        self.last_opt_u_controls = None
 -        self.ref_traj = self.make_ref_denser(global_ref_traj)
@@ -450,17 +456,17 @@ index 4de20e0..a9dfa80 100644
 +        arc, start = self._path_progress(np.zeros(3), self.ref_traj)
 +        projected = np.array([np.interp(start, arc, self.ref_traj[:, axis]) for axis in range(2)])
 +        self.ref_traj = np.vstack((projected, self.ref_traj[arc > start]))
-@@ -248 +233 @@ class MPC_Controller_Fast:
+@@ -248 +239 @@ class MPC_Controller_Fast:
 -        traj_length_m = self.compute_trajectory_length(global_ref_traj)
 +        traj_length_m = self.compute_trajectory_length(self.ref_traj)
-@@ -251,2 +236,4 @@ class MPC_Controller_Fast:
+@@ -251,2 +242,4 @@ class MPC_Controller_Fast:
 -        traj_curvature = self.calculate_curvature(global_ref_traj)
 -        max_curvature = np.max(traj_curvature[:12])
 +        traj_curvature = self.calculate_curvature(self.ref_traj)
 +        arc = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(self.ref_traj, axis=0), axis=1))]
-+        end = np.searchsorted(arc, self.v_max * self.N * self.T, side='right') + 1
++        end = np.searchsorted(arc, desired_v_length * self.N * self.T, side='right') + 1
 +        max_curvature = np.max(traj_curvature[:end])
-@@ -260,17 +247,10 @@ class MPC_Controller_Fast:
+@@ -260,17 +253,10 @@ class MPC_Controller_Fast:
 -        """Estimate smoothed planar curvature along a reference trajectory."""
 -
 -        dx = np.gradient(traj[:, 0])
@@ -488,12 +494,12 @@ index 4de20e0..a9dfa80 100644
 +        dot = np.sum(before * after, axis=1)
 +        curvature = np.abs(np.arctan2(cross, dot)) / length
 +        return np.r_[curvature[0], curvature, curvature[-1]]
-@@ -284 +263,0 @@ class MPC_Controller_Fast:
+@@ -284 +269,0 @@ class MPC_Controller_Fast:
 -        desired_v = max(self.min_desired_v, desired_v)
-@@ -298 +277 @@ class MPC_Controller_Fast:
+@@ -298 +283 @@ class MPC_Controller_Fast:
 -        length_m = max(float(length_m), 1e-6)
 +        length_m = float(length_m)
-@@ -301,30 +280,26 @@ class MPC_Controller_Fast:
+@@ -301,30 +286,26 @@ class MPC_Controller_Fast:
 -        return max(self.min_desired_v, min(self.v_max, v))
 -
 -    def find_reference_traj(self, x0, global_planed_traj, lookahead_points=10):
@@ -550,8 +556,8 @@ index 4de20e0..a9dfa80 100644
 +        nearest = np.argmin(np.linalg.norm(projected - x0[:2], axis=1))
 +        start = arc[nearest] + fraction[nearest] * length[nearest]
 +        return arc, start
-@@ -335 +310 @@ class BatchMPCController:
+@@ -335 +316 @@ class BatchMPCController:
 -                 ref_traj_length_m=2.0, ref_desired_v=0.5, min_desired_v=0.05, **_deprecated):
 +                 ref_traj_length_m=2.0, ref_desired_v=0.5, **_deprecated):
-@@ -346 +320,0 @@ class BatchMPCController:
+@@ -346 +326,0 @@ class BatchMPCController:
 -            min_desired_v=min_desired_v,

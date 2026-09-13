@@ -57,7 +57,7 @@ def test_checkpoint_records_the_clean_depth_grounded_flow_contract() -> None:
     contract = value["policy_contract"]
     assert value["checkpoint_type"] == "curvenav_metric_curve_flow_policy"
     assert contract["trajectory_decoder_type"] == (
-        "state_geometry_increment_curve_flow_transformer"
+        "pointwise_geometry_increment_curve_flow_transformer"
     )
     assert contract["training_objective"] == (
         "standardized_euclidean_conditional_flow_matching"

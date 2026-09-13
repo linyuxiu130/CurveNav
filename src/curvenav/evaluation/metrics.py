@@ -30,7 +30,7 @@ MPC_REFERENCE_LENGTH_M = 2.0
 MPC_REFERENCE_SPEED_MPS = 0.5
 MPC_MAX_LINEAR_SPEED_MPS = 0.5
 MPC_MAX_ANGULAR_SPEED_RADPS = 0.5
-MPC_CURVATURE_LOOKAHEAD_M = MPC_MAX_LINEAR_SPEED_MPS * 30 * 0.1
+MPC_HORIZON_S = 30 * 0.1
 TERMINAL_COLLISION_WINDOW_M = 0.25
 
 
@@ -424,6 +424,8 @@ def controller_tracking_metrics(path: Tensor) -> dict[str, Tensor]:
         lengths = np.linalg.norm(segments, axis=1)
         arc = np.r_[0.0, np.cumsum(lengths)]
         maximum = 0.0
+        length_speed = min(MPC_MAX_LINEAR_SPEED_MPS,
+                           MPC_REFERENCE_SPEED_MPS * min(arc[-1] / MPC_REFERENCE_LENGTH_M, 1.0))
         if len(segments) >= 2:
             before, after = segments[:-1], segments[1:]
             turn = np.abs(np.arctan2(
@@ -432,10 +434,8 @@ def controller_tracking_metrics(path: Tensor) -> dict[str, Tensor]:
             ))
             curvature = turn / (0.5 * (lengths[:-1] + lengths[1:]))
             curvature = np.r_[curvature[0], curvature, curvature[-1]]
-            end = np.searchsorted(arc, MPC_CURVATURE_LOOKAHEAD_M, side="right") + 1
+            end = np.searchsorted(arc, length_speed * MPC_HORIZON_S, side="right") + 1
             maximum = float(curvature[:end].max())
-        length_speed = min(MPC_MAX_LINEAR_SPEED_MPS,
-                           MPC_REFERENCE_SPEED_MPS * min(arc[-1] / MPC_REFERENCE_LENGTH_M, 1.0))
         curvature_speed = min(MPC_MAX_LINEAR_SPEED_MPS,
                               MPC_MAX_ANGULAR_SPEED_RADPS / max(maximum, 1e-6))
         rows.append((maximum, length_speed, curvature_speed))

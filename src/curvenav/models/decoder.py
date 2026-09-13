@@ -10,7 +10,7 @@ from curvenav.models.blocks import ConditionalTrajectoryBlock, ProjectedConditio
 from curvenav.types import ConditionFeatures
 
 
-TRAJECTORY_DECODER_TYPE = "state_geometry_increment_curve_flow_transformer"
+TRAJECTORY_DECODER_TYPE = "pointwise_geometry_increment_curve_flow_transformer"
 
 
 class FlowTimeEmbedding(nn.Module):
@@ -114,15 +114,19 @@ class ConditionalCurveFlowDecoder(nn.Module):
             ),
             dim=-1,
         )
-        increment_path_features = torch.einsum(
-            "cp,bpf->bcf",
-            self.path_to_increment_weight,
-            path_features,
-        )
-        return increment_path_features, torch.einsum(
-            "cp,bpf->bcf",
-            self.path_to_increment_weight,
-            self._goal_geometry(candidate_path, condition),
+        return path_features, self._goal_geometry(candidate_path, condition)
+
+    def _embed_trajectory_geometry(
+        self, path_geometry: Tensor, goal_geometry: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        # Encode each position and its evidence together before reducing the
+        # curve. A nonlinear encoder of raw means loses local distributions.
+        with torch.autocast(device_type=path_geometry.device.type, dtype=NEURAL_DTYPE):
+            path = self.path_geometry_embedding(path_geometry).float()
+            goal = self.goal_geometry_embedding(goal_geometry).float()
+        return (
+            torch.einsum("cp,bpd->bcd", self.path_to_increment_weight, path),
+            torch.einsum("cp,bpd->bcd", self.path_to_increment_weight, goal),
         )
 
     def _goal_geometry(
@@ -208,6 +212,9 @@ class ConditionalCurveFlowDecoder(nn.Module):
         path_geometry, goal_geometry = self._trajectory_geometry(
             candidate_path, condition
         )
+        path_embedding, goal_embedding = self._embed_trajectory_geometry(
+            path_geometry, goal_geometry
+        )
         pair_geometry = self._path_relative_geometry(candidate_path, condition)
         with torch.autocast(device_type=state.device.type, dtype=NEURAL_DTYPE):
             tokens = self.state_embedding(state.reshape(-1, self.control_tokens, 2))
@@ -215,8 +222,8 @@ class ConditionalCurveFlowDecoder(nn.Module):
                 tokens
                 + self.position_embedding.to(tokens.dtype)
                 + self.time_embedding(time)[:, None]
-                + self.path_geometry_embedding(path_geometry)
-                + self.goal_geometry_embedding(goal_geometry)
+                + path_embedding.to(tokens.dtype)
+                + goal_embedding.to(tokens.dtype)
             )
             for block, projected in zip(self.blocks, memory, strict=True):
                 tokens = block(tokens, projected, pair_geometry)

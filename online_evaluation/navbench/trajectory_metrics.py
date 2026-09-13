@@ -297,6 +297,8 @@ def analyze_roots(roots: list[Path]) -> tuple[list[dict[str, object]], list[dict
         if not metadata_path.is_file():
             raise ValueError(f"run has no metadata: {root}")
         metadata = json.loads(metadata_path.read_text())
+        if metadata.get("validity", {}).get("status") == "invalid":
+            raise ValueError(f"Cannot compare invalid evaluation: {metadata_path}")
         model = str(metadata["model"])
         run = root.name
         if run in run_models:

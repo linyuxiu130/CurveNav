@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import contextlib
 import csv
+import fcntl
 from dataclasses import dataclass
 import hashlib
 from importlib.metadata import version
@@ -846,6 +847,8 @@ def validate_resume_root(
         metadata = json.loads(metadata_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"Invalid resume metadata: {metadata_path}") from exc
+    if metadata.get("validity", {}).get("status") == "invalid":
+        raise SystemExit(f"Cannot resume invalid evaluation: {metadata_path}")
     expected = {
         "suite_definition_sha256": suite_definition_sha256(args.suite),
         "suite": args.suite["name"],
@@ -882,6 +885,8 @@ def validate_resume_root(
 
 def common_asset_errors(args: argparse.Namespace) -> list[str]:
     errors: list[str] = []
+    if (args.scene_root / ".installing").exists():
+        errors.append("Scene installation is incomplete; finish prepare_scenes.sh download")
     for path in (args.scene_root / "Materials", args.scene_root / "SkyTexture"):
         if not path.is_dir():
             errors.append(str(path))
@@ -1781,6 +1786,15 @@ def checkpoint_run_metadata(
 def main() -> None:
     args = parse_args()
     resolve_paths(args)
+    if args.dry_run:
+        dry_run_plan(args)
+        return
+    # Hold the shared lock for the entire resident scene lifetime.
+    asset_lock = (args.scene_root / ".installation.lock").open("a")
+    try:
+        fcntl.flock(asset_lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit("Scene installation is running; evaluation cannot use mutable assets")
     if args.check_assets:
         missing = missing_assets(args.jobs)
         invalid = [
@@ -1797,9 +1811,6 @@ def main() -> None:
             f"[ok] {len(args.jobs)} scenes and "
             f"{sum(job.episodes for job in args.jobs)} episodes"
         )
-        return
-    if args.dry_run:
-        dry_run_plan(args)
         return
     if args.suite.get("status") != "frozen":
         raise SystemExit(

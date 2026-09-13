@@ -93,6 +93,13 @@ python -m navbench --model navdp --gpus 1 --num-envs 16 \
 ```
 
 每个场景内顺序启动模型服务，模型之间重置环境和策略历史，结果分别保存。
+正式 40 场景比较使用同一入口；将上述两个 `--artifact-bundle` 按
+X-NavDP、SanD 的顺序传入，并设置 `--gpus 0,1 --episodes-per-scene 100`，
+即可在两张卡上调度不同场景，每个场景依次执行 NavDP、X-NavDP、SanD。
+跨进程分片使用 `--shard-index 0/1 --shard-count 2`，每个进程指定自己的 GPU。
+统计只选择同一轮两个分片的运行目录，不递归累计输出根目录中的旧批次。
+运行时维护补丁包含项目 MPC 的参考重采样、限速和求解设置；
+因此结果是官方权重在统一项目跟踪器上的比较，不是原样官方复现。
 多个场景由现有任务队列调度；Kit/OptiX 缓存按 GPU 隔离，输入缓存使用稳定路径。
 中断恢复使用 `--resume-root`，持续接收模型产物使用 `--checkpoint-queue`。
 

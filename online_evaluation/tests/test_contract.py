@@ -75,7 +75,7 @@ from navbench.scene_evaluator import (
     trace_sample_env_ids,
     write_metrics,
 )
-from navbench.suite import invalid_episode_assets, invalid_navigation_assets, load_suite
+from navbench.suite import invalid_episode_assets, invalid_navigation_assets, load_suite, missing_assets
 from navbench.trajectory_trace import PlanRecord, TrajectoryTraceWriter
 from scripts.check_xnavdp_runtime import REVISION, VERSIONS
 
@@ -87,7 +87,67 @@ SCENE_ROOT = Path(os.environ.get(
 ))
 
 
+def test_scene_rejects_tar_link_placeholders(tmp_path):
+    scene = tmp_path / "scene"
+    scene.mkdir()
+    (scene / "scene.usda").write_text("#usda 1.0\n")
+    for name in ("models", "Materials", "navigation.ply", "episodes.npy"):
+        (scene / name).touch()
+    job = SimpleNamespace(scene_dir=scene, navigation_file=scene / "navigation.ply",
+                          episode_file=scene / "episodes.npy")
+    assert missing_assets([job]) == [scene / "models", scene / "Materials"]
+    for name in ("models", "Materials"):
+        (tmp_path / name).mkdir()
+        (scene / name).unlink()
+        (scene / name).symlink_to(tmp_path / name, target_is_directory=True)
+    assert missing_assets([job]) == []
+
+
 class PaperContractTests(unittest.TestCase):
+    def test_mpc_converges_when_reference_requires_turning_before_translation(self):
+        import importlib.util
+        source = ROOT / ".runtime/x-navdp-878740a20118/baselines/x-navdp/src/utils/mpc_tracking.py"
+        spec = importlib.util.spec_from_file_location("mpc_turn_regression", source)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        controller = module.MPC_Controller_Fast(N=30, T=0.1)
+        # Actual reference that exhausted fixed-step SQP after 100 iterations.
+        reference = np.array([
+            [-0.017624961212277412, -0.00011021457612514496],
+            [-0.018528388813138008, -0.016304902732372284],
+            [-0.02762456238269806, -0.04076113551855087],
+            [-0.043778471648693085, -0.07085032016038895],
+            [-0.06585341691970825, -0.10394297540187836],
+            [-0.09271524101495743, -0.1374109387397766],
+            [-0.12322807312011719, -0.16862523555755615],
+            [-0.1562560796737671, -0.19495676457881927],
+            [-0.1907149702310562, -0.21396207809448242],
+            [-0.22606132924556732, -0.2251838743686676],
+            [-0.2620832026004791, -0.2293734848499298],
+            [-0.2985718846321106, -0.22729875147342682],
+            [-0.3353191912174225, -0.21972763538360596],
+            [-0.372117280960083, -0.20742835104465485],
+            [-0.40875786542892456, -0.19116896390914917],
+            [-0.44503238797187805, -0.17171719670295715],
+            [-0.48073291778564453, -0.14984124898910522],
+            [-0.5156513452529907, -0.12630915641784668],
+            [-0.5495792627334595, -0.10188892483711243],
+            [-0.5823089480400085, -0.07734878361225128],
+            [-0.6136317253112793, -0.05345648527145386],
+            [-0.6433398723602295, -0.030980214476585388],
+            [-0.6712245941162109, -0.01068788766860962],
+            [-0.6970781087875366, 0.00665244460105896],
+            [-0.7206921577453613, 0.020272672176361084],
+        ])
+        controller.reset(reference)
+        controls, states = controller.solve()
+        self.assertTrue(np.isfinite(states).all())
+        self.assertTrue(np.isfinite(controls).all())
+        self.assertGreaterEqual(controls[:, 0].min(), -0.5 - 1e-6)
+        self.assertLessEqual(controls[:, 0].max(), 0.5 + 1e-6)
+        self.assertLessEqual(np.abs(controls[:, 1]).max(), 0.5 + 1e-6)
+        self.assertLess(np.max(controller.solver.get_residuals()), 1e-6)
+
     def test_mpc_geometry_is_invariant_to_sampling_and_uses_metric_progress(self):
         import importlib.util
         source = ROOT / ".runtime/x-navdp-878740a20118/baselines/x-navdp/src/utils/mpc_tracking.py"
@@ -107,6 +167,12 @@ class PaperContractTests(unittest.TestCase):
         controller.N, controller.T, controller.ref_gap = 30, 0.1, 1
         controller.v_max = controller.w_max = controller.ref_desired_v = 0.5
         controller.ref_traj_length_m = 2.0
+        # Terminal sampling jitter lies outside the time horizon at the
+        # length-limited speed and must not stop the straight approach.
+        approach = np.column_stack((np.linspace(0, 1.4, 13), np.zeros(13)))
+        approach = np.vstack((approach, [1.401, .001], [1.4, 0], [1.402, -.001]))
+        controller.reset(approach)
+        self.assertGreater(controller.desired_v, .3)
         rng = np.random.default_rng(7)
         paths = rng.normal(size=(8, 64, 2)).cumsum(1) * 0.1
         paths[:, -3:] = paths[:, -4:-3]

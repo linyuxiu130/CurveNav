@@ -534,6 +534,20 @@ def main() -> None:
     env, controller, house_id = create_environment(
         cfg, scene_index=args.scene_index, device=args.device
     )
+    import omni.usd
+    from pxr import Usd
+    stage = omni.usd.get_context().get_stage()
+    composition_errors = {
+        str(error)
+        for root in (stage.GetPseudoRoot(), *stage.GetPrototypes())
+        for prim in Usd.PrimRange(root)
+        for error in prim.GetPrimIndex().localErrors
+    }
+    if composition_errors:
+        raise RuntimeError(
+            "Incomplete USD scene composition; refusing evaluation:\n"
+            + "\n".join(sorted(composition_errors))
+        )
     session = SceneSession(env, controller, cfg, house_id, math_utils)
     control_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     control_server.bind(str(control_path))

@@ -34,10 +34,9 @@ fi
 
 download_archive() {
     local remote="$1" expected_size="$2" destination="$3"
-    local filename archive partial
+    local filename archive
     filename="$(basename "$remote")"
     archive="${ARCHIVE_ROOT}/${remote}"
-    partial="${archive}.part"
     mkdir -p "$(dirname "$archive")" "$destination"
     if [[ -f "$archive" && "$(stat -c %s "$archive")" == "$expected_size" ]]; then
         echo "[cached] $filename"
@@ -47,16 +46,9 @@ download_archive() {
             exit 1
         }
         echo "[download] $remote"
-        # Read the authorization header from stdin so the token is not exposed
-        # in the curl process arguments or written to the download log.
-        printf 'header = "Authorization: Bearer %s"\n' "$HF_TOKEN" | \
-            curl -fL --retry 8 --retry-delay 3 -C - \
-                --config - -o "$partial" "${BASE_URL}/${remote}?download=true"
-        [[ "$(stat -c %s "$partial")" == "$expected_size" ]] || {
-            echo "Size mismatch: $partial" >&2
-            exit 1
-        }
-        mv "$partial" "$archive"
+        HF_TOKEN="$HF_TOKEN" "${NAVBENCH_EVAL_PYTHON:-python}" \
+            "$ROOT_DIR/scripts/download_hf_archive.py" \
+            "${BASE_URL}/${remote}?download=true" "$archive" "$expected_size"
     fi
     echo "[extract] $filename -> $destination"
     tar -xzf "$archive" -C "$destination"
@@ -64,6 +56,9 @@ download_archive() {
 
 download_all() {
     mkdir -p "$ASSET_ROOT" "$ARCHIVE_ROOT"
+    exec 9>"$ASSET_ROOT/.installation.lock"
+    flock -n -x 9 || { echo "Scene assets are in use or being installed" >&2; exit 1; }
+    touch "$ASSET_ROOT/.installing"
 
     if [[ ! -d "$ASSET_ROOT/Materials/Carpet" ]]; then
         download_archive "n1_eval_scenes/Materials.tar.gz" 863251449 "$ASSET_ROOT"
@@ -96,6 +91,7 @@ download_all() {
     fi
     python "$ROOT_DIR/scripts/download_xnavdp_eval_metadata.py" \
         --staging-root "$ASSET_ROOT/.incoming" --install-root "$ASSET_ROOT"
+    unlink "$ASSET_ROOT/.installing"
 }
 
 check_frozen() {

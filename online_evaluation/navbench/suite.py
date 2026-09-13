@@ -129,6 +129,9 @@ def missing_assets(jobs: list[SceneJob]) -> list[Path]:
         if not job.scene_dir.is_dir():
             missing.append(job.scene_dir)
         else:
+            for name in ("models", "Materials"):
+                if not (job.scene_dir / name).is_dir():
+                    missing.append(job.scene_dir / name)
             try:
                 find_canonical_scene_usd(job.scene_dir)
             except (FileNotFoundError, RuntimeError):
