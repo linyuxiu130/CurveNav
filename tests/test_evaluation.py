@@ -22,7 +22,7 @@ from curvenav.evaluation.metrics import (
 from curvenav.data.privileged import SourcePathQuery
 from curvenav.evaluation.offline import (
     _collision_detection_summary,
-    _condition_intervention,
+    _cached_interventions,
 )
 from curvenav.evaluation.report import _write_case_visualization, select_cases
 from curvenav.evaluation.protocol import evaluation_strata
@@ -40,22 +40,26 @@ def test_cross_model_set_requires_explicit_axis_and_source_geometry(
         load_common_protocol(common)
 
 
-def test_condition_intervention_pairs_real_samples_without_changing_other_fields() -> (
-    None
-):
-    batch = {
-        "point_goal": torch.arange(8, dtype=torch.float32).reshape(4, 2),
-        "depth": torch.arange(4, dtype=torch.float32)[:, None],
-        "observation_valid": torch.ones(4, 1, dtype=torch.bool),
-    }
+@pytest.mark.parametrize("batch", [1, 3, 4])
+@torch.no_grad()
+def test_cached_interventions_match_raw_input_permutations(batch):
+    from dataclasses import fields, replace
+    from test_policy import tiny_config, make_condition
+    from curvenav.factory import build_policy
 
-    intervened = _condition_intervention(batch, ("depth",))
-
-    torch.testing.assert_close(
-        intervened["depth"], torch.tensor([[2.0], [3.0], [0.0], [1.0]])
-    )
-    assert intervened["point_goal"] is batch["point_goal"]
-    assert intervened["observation_valid"] is batch["observation_valid"]
+    policy = build_policy(tiny_config()).eval()
+    condition = make_condition(batch)
+    permutation = torch.arange(batch).roll(batch // 2)
+    depth_swapped = replace(condition, **{
+        f.name: getattr(condition, f.name)[permutation]
+        for f in fields(condition) if f.name != "point_goal"
+    })
+    goal_swapped = replace(condition, point_goal=condition.point_goal[permutation])
+    actual = _cached_interventions(policy, policy.encode_condition(condition), condition.point_goal)
+    for prediction, raw in zip(actual, (depth_swapped, goal_swapped)):
+        expected = policy.sample(raw)
+        for f in fields(expected):
+            torch.testing.assert_close(getattr(prediction, f.name), getattr(expected, f.name))
 
 
 def test_cross_model_safety_queries_frozen_source_grid(tmp_path: Path) -> None:

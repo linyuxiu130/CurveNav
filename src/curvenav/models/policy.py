@@ -158,9 +158,14 @@ class CurveNavPolicy(nn.Module):
     @torch.no_grad()
     def sample(self, condition: PolicyCondition) -> TrajectoryPrediction:
         encoded = self.encode_condition(condition)
+        return self.sample_encoded(encoded, condition.point_goal)
+
+    @torch.no_grad()
+    def sample_encoded(self, encoded: ConditionFeatures, point_goal: Tensor) -> TrajectoryPrediction:
+        """Decode cached scene features with their corresponding goal intent."""
         memory = self.trajectory_decoder.project_condition_memory(encoded)
         critic_memory = self.trajectory_evaluator.project_condition_memory(encoded)
-        batch = len(condition.point_goal)
+        batch = len(point_goal)
         repeated = repeat_condition(encoded, INFERENCE_CANDIDATES)
         state = self._generate_coordinates(
             repeated, repeat_memory(memory, INFERENCE_CANDIDATES),
@@ -168,7 +173,7 @@ class CurveNavPolicy(nn.Module):
         )
         path, _ = self.curve_codec.decode(state)
         scores = self.trajectory_evaluator(
-            path, condition.point_goal.repeat_interleave(INFERENCE_CANDIDATES, dim=0),
+            path, point_goal.repeat_interleave(INFERENCE_CANDIDATES, dim=0),
             repeated, repeat_memory(critic_memory, INFERENCE_CANDIDATES),
         ).unflatten(0, (batch, INFERENCE_CANDIDATES))
         candidates = path.unflatten(0, (batch, INFERENCE_CANDIDATES))

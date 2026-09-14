@@ -1,7 +1,7 @@
 """Held-out source-truth evaluation for CurveNav's single local policy."""
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import json
 from pathlib import Path
 import time
@@ -36,6 +36,8 @@ from curvenav.training.critic import RouteUtilityTeacher
 from curvenav.training.checkpoint import validate_policy_contract
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.prefetch import CudaPrefetchLoader
+from curvenav.trajectory import local_terminal_goal
+from curvenav.types import ConditionFeatures, TrajectoryPrediction
 
 
 VALIDATION_BATCH_SIZE = 32
@@ -49,6 +51,7 @@ class PolicyMeasurements:
     depth_swap_metrics: dict[str, Tensor]
     point_goal_swap_metrics: dict[str, Tensor]
     batch_latency_ms: Tensor
+    all_passes_latency_ms: Tensor
     model_latency_ms: Tensor
     wall_seconds: float
     samples: int
@@ -64,18 +67,36 @@ def _sample(
     return prepared, prediction
 
 
-def _condition_intervention(
-    batch: dict[str, Tensor],
-    fields: tuple[str, ...],
-) -> dict[str, Tensor]:
-    """Cyclically pair real held-out conditions within one deterministic batch."""
-    permutation = torch.arange(
-        len(batch["point_goal"]), device=batch["point_goal"].device
-    ).roll(len(batch["point_goal"]) // 2)
-    intervened = dict(batch)
-    for name in fields:
-        intervened[name] = batch[name][permutation]
-    return intervened
+def _cached_interventions(
+    policy: CurveNavPolicy, encoded: ConditionFeatures, point_goal: Tensor,
+) -> tuple[TrajectoryPrediction, TrajectoryPrediction]:
+    """Decode each unique (scene, goal) pair once, including odd-sized tails."""
+    batch = len(point_goal)
+    index = torch.arange(batch, device=point_goal.device)
+    permutation = index.roll(batch // 2)
+    # For even B, p(p(i)) = i: (p(i), i) and (i, p(i)) are the same
+    # scene/goal pairs in a different order. Odd tails retain both sets.
+    pairs, inverse = torch.unique(
+        torch.cat((permutation * batch + index, index * batch + permutation)),
+        sorted=True, return_inverse=True,
+    )
+    predictions = []
+    for pair in pairs.split(batch):
+        scene_index, goal_index = pair // batch, pair % batch
+        scene = ConditionFeatures(**{
+            field.name: getattr(encoded, field.name)[scene_index]
+            for field in fields(encoded)
+        })
+        goal = point_goal[goal_index]
+        scene.terminal_goal = local_terminal_goal(goal, policy.planning_horizon_m)
+        predictions.append(policy.sample_encoded(scene, goal))
+    values = {
+        field.name: torch.cat([getattr(p, field.name) for p in predictions])[inverse]
+        for field in fields(TrajectoryPrediction)
+    }
+    depth_swap = TrajectoryPrediction(**{name: value[:batch] for name, value in values.items()})
+    goal_swap = TrajectoryPrediction(**{name: value[batch:] for name, value in values.items()})
+    return depth_swap, goal_swap
 
 
 def _intervention_metrics(
@@ -315,13 +336,16 @@ def measure_policy(
     point_goal_swap_values: dict[str, list[Tensor]] = {}
     sample_data: dict[str, list[Tensor]] = {}
     batch_latency = []
+    all_passes_latency = []
     samples = 0
     evaluation_started = time.perf_counter()
-    for batch in loader:
+    for batch_index, batch in enumerate(loader):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        prepared, prediction = _sample(policy, batch)
+        prepared = unpack_policy_batch(batch)
+        encoded = policy.encode_condition(prepared.condition)
+        prediction = policy.sample_encoded(encoded, prepared.condition.point_goal)
         end.record()
         end.synchronize()
         batch_latency.append(start.elapsed_time(end))
@@ -334,25 +358,11 @@ def measure_policy(
         current_prepared, current_prediction = _sample(
             policy, current_frame_batch
         )
-        _, depth_swap_prediction = _sample(
-            policy,
-            _condition_intervention(
-                batch,
-                (
-                    "depth",
-                    "camera_intrinsics",
-                    "camera_to_body",
-                    "observation_to_current",
-                    "observation_age_s",
-                    "observation_valid",
-                    "obstacle_memory",
-                ),
-            ),
+        depth_swap_prediction, point_goal_swap_prediction = _cached_interventions(
+            policy, encoded, prepared.condition.point_goal
         )
-        _, point_goal_swap_prediction = _sample(
-            policy,
-            _condition_intervention(batch, ("point_goal",)),
-        )
+        inference_end = torch.cuda.Event(enable_timing=True)
+        inference_end.record()
 
         reference_path, _ = policy.curve_codec.decode_values(
             prepared.target.curve_values.float()
@@ -556,6 +566,12 @@ def measure_policy(
         }.items():
             sample_data.setdefault(name, []).append(value.cpu())
         samples += len(prediction.path)
+        all_passes_latency.append(start.elapsed_time(inference_end))
+        if batch_index % 100 == 0:
+            elapsed = time.perf_counter() - evaluation_started
+            print(json.dumps({"event": "evaluation_progress", "samples": samples,
+                              "elapsed_seconds": elapsed,
+                              "samples_per_second": samples / elapsed}), flush=True)
 
     wall_seconds = time.perf_counter() - evaluation_started
     return PolicyMeasurements(
@@ -570,6 +586,7 @@ def measure_policy(
             name: torch.cat(parts) for name, parts in point_goal_swap_values.items()
         },
         batch_latency_ms=torch.tensor(batch_latency, dtype=torch.float64),
+        all_passes_latency_ms=torch.tensor(all_passes_latency, dtype=torch.float64),
         model_latency_ms=(
             _time_model(policy, warmup, model_latency_repeats)
             if model_latency_repeats
@@ -732,6 +749,7 @@ def evaluate_measurements(measurements: PolicyMeasurements) -> dict[str, object]
             measurements.samples / measurements.wall_seconds
         ),
         "full_evaluation_wall_seconds": measurements.wall_seconds,
+        "all_policy_passes_cuda_seconds": measurements.all_passes_latency_ms.sum().item() / 1000.0,
         "model_latency_batch1_ms_p50": torch.quantile(
             measurements.model_latency_ms, 0.50
         ).item(),
@@ -748,6 +766,7 @@ def run_evaluation(
     checkpoint_path: Path,
     artifact_dir: Path | None = None,
 ) -> dict[str, object]:
+    started = time.perf_counter()
     if not torch.cuda.is_available():
         raise RuntimeError("CurveNav evaluation requires CUDA")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -757,6 +776,7 @@ def run_evaluation(
     ema = ExponentialMovingAverage(policy, decay=config.training.ema_decay)
     ema.load_state_dict(checkpoint["ema"])
     ema.copy_to(policy)
+    policy.eval()
     bundle = build_policy_validation_loader(
         config.data,
         config.trajectory,
@@ -769,6 +789,8 @@ def run_evaluation(
         "validation",
     )
     depth_projector = build_evaluation_projector(config)
+    print(json.dumps({"event": "evaluation_start", "checkpoint_step": int(checkpoint["step"]),
+                      "samples": bundle.samples, "candidates": INFERENCE_CANDIDATES}), flush=True)
     measurements = measure_policy(
         policy,
         loader,
@@ -786,6 +808,7 @@ def run_evaluation(
         checkpoint=str(checkpoint_path.resolve()),
         checkpoint_step=int(checkpoint["step"]),
         weights="ema",
+        evaluation_wall_seconds_including_setup=time.perf_counter() - started,
     )
     if artifact_dir is not None:
         artifact_dir = artifact_dir.expanduser().resolve()
