@@ -354,8 +354,8 @@ def test_training_objective_trains_every_module() -> None:
     )
     assert not losses.candidate_paths.requires_grad
     losses = criterion_loss(losses)
-    assert TRAINING_LOSS_NAMES == ("loss", "flow_loss", "critic_loss", "ranking_loss")
-    assert len(losses.logging_values()) == 4
+    assert TRAINING_LOSS_NAMES == ("loss", "flow_loss", "critic_loss")
+    assert len(losses.logging_values()) == 3
     assert losses.loss.ndim == 0 and torch.isfinite(losses.loss)
     losses.loss.backward()
     gradients = [p.grad for p in policy.parameters() if p.requires_grad]

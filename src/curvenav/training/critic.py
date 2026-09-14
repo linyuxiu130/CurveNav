@@ -10,11 +10,11 @@ from torch.nn import functional as F
 from curvenav.data.goal_distance import GoalDistanceQuery
 from curvenav.data.privileged import SourceConfigurationSpaceQuery, SourcePathQuery
 from curvenav.models.policy import CurveNavTrainingOutput
-from curvenav.physical import ROBOT_FOOTPRINT_RADIUS_M
+from curvenav.physical import EXTRA_CLEARANCE_M, ROBOT_FOOTPRINT_RADIUS_M
 from curvenav.trajectory import path_arc_length
 
 
-CRITIC_TARGET = "shared_cell_segment_prefix_geodesic_progress_minus_half_length_and_contact"
+CRITIC_TARGET = "geodesic_progress_minus_half_length_contact_and_clearance_margin"
 
 
 @torch.no_grad()
@@ -81,7 +81,9 @@ class RouteUtilityTeacher:
         score = (
             (progress - 0.5 * length) / self.horizon
             - contact
-            - torch.asinh(F.relu(-minimum) / ROBOT_FOOTPRINT_RADIUS_M)
+            - torch.asinh(
+                F.relu(EXTRA_CLEARANCE_M - minimum) / ROBOT_FOOTPRINT_RADIUS_M
+            )
         )
         return CandidateUtility(score, minimum, progress)
 
@@ -91,10 +93,9 @@ class CurveNavLoss:
     loss: Tensor
     flow_loss: Tensor
     critic_loss: Tensor
-    ranking_loss: Tensor
 
     def logging_values(self) -> tuple[Tensor, ...]:
-        return self.loss, self.flow_loss, self.critic_loss, self.ranking_loss
+        return self.loss, self.flow_loss, self.critic_loss
 
 
 class CurveNavCriterion:
@@ -105,10 +106,6 @@ class CurveNavCriterion:
         target = self.teacher(output.candidate_paths, batch).score
         scores = output.candidate_scores
         regression = F.smooth_l1_loss(scores, target)
-        pairs = torch.triu_indices(scores.shape[1], scores.shape[1], offset=1, device=scores.device)
-        difference = scores[:, pairs[0]] - scores[:, pairs[1]]
-        preference = (target[:, pairs[0]] - target[:, pairs[1]]).sigmoid()
-        ranking = F.binary_cross_entropy_with_logits(difference, preference)
         return CurveNavLoss(
-            output.flow_loss + regression + ranking, output.flow_loss, regression, ranking
+            output.flow_loss + regression, output.flow_loss, regression
         )

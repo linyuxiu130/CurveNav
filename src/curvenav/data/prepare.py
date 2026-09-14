@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
@@ -50,6 +51,25 @@ from curvenav.trajectory import IncrementalBSplineTrajectory
 from curvenav.trajectory.resampling import path_arc_length
 from curvenav.physical import EXTRA_CLEARANCE_M
 from curvenav.data.obstacle_memory import ObstacleMemory
+
+
+def _route_memory_path(route_root: Path, data: DataConfig, intrinsic, extrinsic) -> Path:
+    """Invalidate local derived memory when its inputs or implementation change."""
+    digest = hashlib.sha256()
+    digest.update(str(route_root.resolve()).encode())
+    for name in ("depth.npy", "body_to_world.npy"):
+        path = route_root / name
+        stat = path.stat()
+        digest.update(str((name, stat.st_size, stat.st_mtime_ns)).encode())
+    for path in (Path(__file__).with_name("obstacle_memory.py"),
+                 Path(__file__).parents[1] / "physical.py"):
+        digest.update(path.read_bytes())
+    digest.update(str((data.future_steps * data.expert_waypoint_spacing_m,
+                       data.max_depth_m)).encode())
+    digest.update(np.asarray(intrinsic, dtype=np.float64).tobytes())
+    digest.update(np.asarray(extrinsic, dtype=np.float64).tobytes())
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache_root / "curvenav/route_memory" / (digest.hexdigest() + ".npy")
 
 
 @dataclass(frozen=True)
@@ -212,6 +232,13 @@ def _route_examples_worker(arguments):
     history = ObservationHistory()
     memory = ObstacleMemory(data.future_steps * data.expert_waypoint_spacing_m, data.max_depth_m)
     depth_frames = np.load(depth.source, mmap_mode="r")
+    memory_path = _route_memory_path(route_root, data, intrinsic, body_from_camera)
+    cached_memory = np.load(memory_path, mmap_mode="r") if memory_path.exists() else None
+    if cached_memory is not None and (
+        cached_memory.shape != (len(xy) - 1, memory.size, memory.size)
+        or cached_memory.dtype != np.bool_
+    ):
+        raise ValueError(f"invalid route memory cache: {memory_path}")
     for anchor in range(len(xy) - 1):
         frame_indices, relative, age, valid = history.update(
             anchor, poses[anchor], float(times[anchor])
@@ -227,7 +254,8 @@ def _route_examples_worker(arguments):
         )
         examples.append(
             _Example(
-                obstacle_memory=memory.update(depth_frames[anchor], intrinsic, body_from_camera, poses[anchor]),
+                obstacle_memory=(cached_memory[anchor] if cached_memory is not None else
+                                 memory.update(depth_frames[anchor], intrinsic, body_from_camera, poses[anchor])),
                 depth_run=depth,
                 depth_indices=frame_indices,
                 point_goal=full_local[-1],
@@ -248,6 +276,13 @@ def _route_examples_worker(arguments):
                 reached_goal=reached_goal,
             )
         )
+    if cached_memory is None:
+        memory_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = memory_path.with_suffix(f".{os.getpid()}.tmp")
+        with temporary.open("wb") as stream:
+            np.save(stream, np.stack([example.obstacle_memory for example in examples]),
+                    allow_pickle=False)
+        os.replace(temporary, memory_path)
     return split, examples
 
 

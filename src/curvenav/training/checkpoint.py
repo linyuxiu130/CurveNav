@@ -134,7 +134,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "flow_time_embedding": "flow_time_mlp",
         "flow_time_sampling": FLOW_TIME_SAMPLING,
         "training_objective": (
-            "conditional_flow_matching_plus_route_utility_regression_and_pairwise_ranking"
+            "conditional_flow_matching_plus_calibrated_route_utility_regression"
         ),
         "trajectory_prediction": ("conditional_flow_planar_cubic_bspline"),
         "condition_encoder_type": CONDITION_ENCODER_TYPE,

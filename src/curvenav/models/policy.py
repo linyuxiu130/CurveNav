@@ -15,7 +15,7 @@ from curvenav.types import (
 )
 
 
-TRAINING_LOSS_NAMES = ("loss", "flow_loss", "critic_loss", "ranking_loss")
+TRAINING_LOSS_NAMES = ("loss", "flow_loss", "critic_loss")
 INFERENCE_SOURCE_SEED = 20_260_828
 INFERENCE_CANDIDATES = 32
 FLOW_TIME_SAMPLING = "single_draw_logit_normal"

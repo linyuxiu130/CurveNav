@@ -12,6 +12,7 @@ from curvenav.data.prepare import _route_examples
 
 
 def test_packed_routes_and_local_slicing_share_training_frames(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     config = CurveNavConfig()
     data = config.data
     pitch = math.radians(data.camera_downward_pitch_degrees)
