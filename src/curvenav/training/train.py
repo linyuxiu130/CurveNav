@@ -276,6 +276,31 @@ def run_training(
         )
     )
 
+    def validate_epoch(step: int, best_loss: float) -> float:
+        accelerator.print(json.dumps({"event": "validation_start", "step": step}), flush=True)
+        validation = _validate(
+            accelerator, policy, ema, validation_loader,
+            validation_criterion, config.training.seed,
+        )
+        improved = validation["loss"] < best_loss
+        best_loss = min(best_loss, validation["loss"])
+        accelerator.print(json.dumps({
+            "event": "validation", "epoch": step // steps_per_epoch, "step": step,
+            **{f"validation_{name}": value for name, value in validation.items()},
+            "best_validation_loss": best_loss,
+        }), flush=True)
+        if improved:
+            _save_checkpoint(
+                accelerator, policy, optimizer, scheduler, ema, config,
+                step=step, best_validation_loss=best_loss,
+                training_contract=training_contract, filenames=("best.pt",),
+            )
+        return best_loss
+
+    # A saved epoch boundary precedes validation; complete it before resuming updates.
+    if start_step and start_step % steps_per_epoch == 0:
+        best_validation_loss = validate_epoch(start_step, best_validation_loss)
+
     policy.train()
     step = start_step
     window_losses = torch.zeros(len(TRAINING_LOSS_NAMES), device=accelerator.device)
@@ -349,44 +374,19 @@ def run_training(
             window_steps = 0
             window_start = time.perf_counter()
 
-        if step % steps_per_epoch == 0:
-            validation = _validate(
-                accelerator,
-                policy,
-                ema,
-                validation_loader,
-                validation_criterion,
-                config.training.seed,
-            )
-            improved = validation["loss"] < best_validation_loss
-            best_validation_loss = min(best_validation_loss, validation["loss"])
-            accelerator.print(json.dumps({
-                "event": "validation",
-                "epoch": epoch,
-                "step": step,
-                **{f"validation_{name}": value for name, value in validation.items()},
-                "best_validation_loss": best_validation_loss,
-            }), flush=True)
-        else:
-            improved = False
-
-        filenames = (
-            (("checkpoint.pt",) if step % checkpoint_interval == 0 else ())
-            + (("best.pt",) if improved else ())
-        )
-        if filenames:
+        if step % checkpoint_interval == 0:
             _save_checkpoint(
-                accelerator,
-                policy,
-                optimizer,
-                scheduler,
-                ema,
-                config,
-                step=step,
-                best_validation_loss=best_validation_loss,
-                training_contract=training_contract,
-                filenames=filenames,
+                accelerator, policy, optimizer, scheduler, ema, config,
+                step=step, best_validation_loss=best_validation_loss,
+                training_contract=training_contract, filenames=("checkpoint.pt",),
             )
+
+        if step % steps_per_epoch == 0:
+            best_validation_loss = validate_epoch(step, best_validation_loss)
+            # Validation and disk writes are not optimizer throughput.
+            window_losses.zero_()
+            window_steps = 0
+            window_start = time.perf_counter()
 
     if step % checkpoint_interval != 0:
         _save_checkpoint(
