@@ -259,9 +259,14 @@ def validate_training_resume(
     expected_config = asdict(config)
     # Moving artifacts does not change the optimizer, samples or random stream.
     expected_config["training"]["output_dir"] = checkpoint["config"]["training"]["output_dir"]
+    saved_epochs = checkpoint["config"]["training"]["epochs"]
+    if config.training.epochs < saved_epochs:
+        raise ValueError("resume cannot shorten the training schedule")
+    expected_config["training"]["epochs"] = saved_epochs
     if checkpoint["config"] != expected_config:
         raise ValueError("resume checkpoint configuration does not exactly match")
     expected = build_training_contract(config, world_size, mixed_precision)
+    expected["total_steps"] = saved_epochs * expected["steps_per_epoch"]
     if checkpoint.get("training_contract") != expected:
         raise ValueError("resume checkpoint training topology does not exactly match")
     rng_states = checkpoint.get("rng_states")

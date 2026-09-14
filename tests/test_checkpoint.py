@@ -177,6 +177,11 @@ def test_resume_allows_moving_artifacts_without_changing_training():
     value, _, _, _ = checkpoint(config)
     moved = replace(config, training=replace(config.training, output_dir="outputs/resumed"))
     validate_training_resume(value, moved, 2, BF16)
+    extended = replace(config, training=replace(config.training, epochs=config.training.epochs * 2))
+    validate_training_resume(value, extended, 2, BF16)
+    shortened = replace(config, training=replace(config.training, epochs=config.training.epochs - 1))
+    with pytest.raises(ValueError, match="shorten"):
+        validate_training_resume(value, shortened, 2, BF16)
     changed = replace(moved, training=replace(moved.training, learning_rate=1e-4))
     with pytest.raises(ValueError, match="configuration"):
         validate_training_resume(value, changed, 2, BF16)
