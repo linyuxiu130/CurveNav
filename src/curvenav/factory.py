@@ -8,6 +8,7 @@ from curvenav.encoders import (
     MetricDepthProjector,
 )
 from curvenav.models import ConditionalCurveFlowDecoder, CurveNavPolicy
+from curvenav.models.evaluator import TrajectoryEvaluator
 from curvenav.trajectory import IncrementalBSplineTrajectory
 
 
@@ -62,6 +63,7 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         depth_encoder=depth_encoder,
         condition_encoder=condition_encoder,
         trajectory_decoder=trajectory_decoder,
+        trajectory_evaluator=TrajectoryEvaluator(decoder.model_dim, decoder.transformer_heads, planning_horizon_m),
         integration_steps=decoder.integration_steps,
         curve_codec=curve_codec,
         planning_horizon_m=planning_horizon_m,

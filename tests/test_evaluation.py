@@ -222,6 +222,7 @@ def test_source_safety_reports_the_executed_prefix_without_another_query() -> No
     )
     query = SourcePathQuery(
         local_path=local,
+        grid_cells=torch.zeros_like(local, dtype=torch.long),
         clearance_m=torch.tensor(
             [[0.2, 0.2, -0.01, -0.02, -0.02], [0.2, 0.2, 0.2, 0.05, 0.2]]
         ),
@@ -378,6 +379,7 @@ def test_collision_attribution_separates_current_history_and_unseen_points() -> 
     current[1, 0] = obstacle_distance
     source_query = SourcePathQuery(
         local_path=local_path,
+        grid_cells=torch.zeros_like(local_path, dtype=torch.long),
         clearance_m=torch.tensor([[1.0, -1.0, 1.0], [1.0, -1.0, -1.0]]),
         in_world_bounds=torch.ones(2, 3, dtype=torch.bool),
         active=torch.ones(2, 3, dtype=torch.bool),

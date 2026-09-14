@@ -16,6 +16,8 @@ from curvenav.config import (
     TrajectoryConfig,
 )
 from curvenav.models import TRAINING_LOSS_NAMES
+from curvenav.models.policy import repeat_condition
+from test_critic import criterion_loss
 from curvenav.encoders.configuration import observed_configuration_features
 from curvenav.models.blocks import (
     ConditionalTrajectoryBlock,
@@ -133,11 +135,13 @@ def test_euler_sampling_refreshes_curve_geometry_but_caches_scene_kv(monkeypatch
     geometry_hook.remove()
     scene_hook.remove()
     torch.testing.assert_close(torch.stack(times)[:, 0], torch.tensor([1.0, 0.5]))
-    expected, _ = policy.curve_codec.decode(policy.inference_source.expand(2, -1) - 1)
-    torch.testing.assert_close(prediction.path, expected)
+    expected, _ = policy.curve_codec.decode(policy.inference_source.repeat(2, 1) - 1)
+    torch.testing.assert_close(prediction.candidates, expected.unflatten(0, (2, 32)))
+    torch.testing.assert_close(prediction.path, prediction.candidates[torch.arange(2), prediction.scores.argmax(1)])
     assert len(scene) == 1 and len(geometry) == 2
     assert not torch.equal(geometry[0], geometry[1])
     encoded = policy.encode_condition(inputs)
+    encoded = repeat_condition(encoded, 32)
     for state, actual in zip(states, geometry):
         path, _ = policy.curve_codec.decode(state)
         expected, _ = policy.trajectory_decoder._trajectory_geometry(path, encoded)
@@ -348,8 +352,10 @@ def test_training_objective_trains_every_module() -> None:
         TrajectoryTarget(policy.curve_codec.values_from_coordinates(coordinates)),
         torch.randn_like(coordinates),
     )
-    assert TRAINING_LOSS_NAMES == ("loss",)
-    assert len(losses.logging_values()) == 1
+    assert not losses.candidate_paths.requires_grad
+    losses = criterion_loss(losses)
+    assert TRAINING_LOSS_NAMES == ("loss", "flow_loss", "critic_loss", "ranking_loss")
+    assert len(losses.logging_values()) == 4
     assert losses.loss.ndim == 0 and torch.isfinite(losses.loss)
     losses.loss.backward()
     gradients = [p.grad for p in policy.parameters() if p.requires_grad]
@@ -365,6 +371,8 @@ def test_flow_loss_matches_the_conditional_velocity_without_source_replacement(
     clean = policy.curve_codec.coordinates_from_values(target.curve_values)
 
     def oracle(state, time, encoded, memory):
+        if len(state) != len(clean):
+            return torch.zeros_like(state)
         torch.testing.assert_close(
             state, (1 - time[:, None]) * clean + time[:, None] * source
         )
@@ -372,7 +380,7 @@ def test_flow_loss_matches_the_conditional_velocity_without_source_replacement(
         return source - clean
 
     monkeypatch.setattr(policy, "_predict_velocity", oracle)
-    assert policy(make_condition(9), target, source).loss == 0
+    assert policy(make_condition(9), target, source).flow_loss == 0
 
 
 def test_conditional_velocity_recovers_the_clean_flow_endpoint() -> None:
@@ -405,7 +413,7 @@ def test_deterministic_cuda_flow_primal(monkeypatch) -> None:
             TrajectoryTarget(policy.curve_codec.values_from_coordinates(clean)),
             torch.randn_like(clean),
         )
-        assert torch.isfinite(loss.loss)
+        assert torch.isfinite(loss.flow_loss)
     finally:
         torch.use_deterministic_algorithms(previous)
 
@@ -522,7 +530,7 @@ def test_deployment_has_one_reproducible_path():
     first = policy.sample(inputs)
     torch.manual_seed(999)
     second = policy.sample(inputs)
-    assert [f.name for f in fields(first)] == ["path"]
+    assert [f.name for f in fields(first)] == ["path", "candidates", "scores", "selected_index"]
     torch.testing.assert_close(first.path, second.path, rtol=0, atol=0)
 
 
@@ -558,7 +566,8 @@ def test_compiled_cuda_training_graph_and_deployment_sample_are_finite() -> None
         inputs,
         target,
         torch.randn_like(coordinates),
-    ).loss
+    )
+    loss = criterion_loss(loss).loss
     loss.backward()
     optimizer.step()
     assert torch.isfinite(loss)

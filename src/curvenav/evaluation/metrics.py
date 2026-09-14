@@ -354,7 +354,7 @@ def source_execution_prefix_metrics(
 ) -> dict[str, Tensor]:
     """Measure the source-truth portion that a receding-horizon policy executes.
 
-    The source query is already endpoint-inclusive at 2.5 cm spacing, so these
+    The source query visits crossed cells and endpoints with at most 2.5 cm spacing, so these
     metrics add no map queries and use exactly the same physical truth as the
     full-path collision report.
     """

@@ -60,7 +60,7 @@ def test_checkpoint_records_the_clean_depth_grounded_flow_contract() -> None:
         "pointwise_geometry_increment_curve_flow_transformer"
     )
     assert contract["training_objective"] == (
-        "standardized_euclidean_conditional_flow_matching"
+        "conditional_flow_matching_plus_route_utility_regression_and_pairwise_ranking"
     )
     assert contract["curve_coordinates"] == (
         "standardized_physical_bspline_control_increments"
@@ -70,7 +70,7 @@ def test_checkpoint_records_the_clean_depth_grounded_flow_contract() -> None:
     assert contract["num_control_points"] == 8
     assert contract["condition_token_count"] == 259
     assert contract["source_configuration_space_role"] == (
-        "dataset_certificate_and_evaluation_only"
+        "dataset_certificate_critic_supervision_and_evaluation"
     )
     assert contract["depth_configuration_space_role"] == (
         "target_independent_observed_bev_plus_current_curve_query"
@@ -169,3 +169,13 @@ def test_checkpoint_type_is_strict() -> None:
             },
             config,
         )
+
+
+def test_resume_allows_moving_artifacts_without_changing_training():
+    config = CurveNavConfig()
+    value, _, _, _ = checkpoint(config)
+    moved = replace(config, training=replace(config.training, output_dir="outputs/resumed"))
+    validate_training_resume(value, moved, 2, BF16)
+    changed = replace(moved, training=replace(moved.training, learning_rate=1e-4))
+    with pytest.raises(ValueError, match="configuration"):
+        validate_training_resume(value, changed, 2, BF16)

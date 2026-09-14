@@ -109,7 +109,7 @@ def _planar_local(points: np.ndarray, origin: np.ndarray, yaw: float) -> np.ndar
     ).astype(np.float32, copy=False)
 
 
-def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Example]]:
+def _route_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Example]]:
     data = config.data
     source_manifest = json.loads(
         (root / "dataset_manifest.json").read_text(encoding="utf-8")
@@ -119,7 +119,7 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
         != expert_navigation_geometry_contract()
     ):
         raise ValueError(
-            "HSSD experts must be planned against the stage and static objects"
+            "Expert routes must be planned against the stage and static objects"
         )
     pitch = math.radians(data.camera_downward_pitch_degrees)
     sine, cosine = math.sin(pitch), math.cos(pitch)
@@ -144,13 +144,13 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
         or not np.allclose(intrinsic, expected_intrinsic, atol=1e-6)
         or not np.allclose(body_from_camera, expected_camera_transform, atol=1e-6)
     ):
-        raise ValueError("HSSD camera calibration does not match CurveNav")
+        raise ValueError("Expert camera calibration does not match CurveNav")
     intrinsic = CANONICAL_INTRINSICS.matrix()
     if (
-        source_manifest.get("schema") != "curvenav_hssd_policy_depth_routes_v4"
+        source_manifest.get("schema") != "curvenav_policy_depth_routes_v5"
         or source_manifest.get("observation") != depth_camera_contract(data)
     ):
-        raise ValueError("HSSD must contain the exact policy depth storage contract")
+        raise ValueError("Expert routes must contain the exact policy depth storage contract")
     records = [
         json.loads(line)
         for line in (root / "routes.jsonl").read_text(encoding="utf-8").splitlines()
@@ -160,19 +160,19 @@ def _hssd_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Exampl
         max_workers=8, mp_context=multiprocessing.get_context("spawn")
     ) as pool:
         tasks = ((record, root, data, intrinsic, body_from_camera) for record in records)
-        for index, (split, examples) in enumerate(pool.map(_hssd_route, tasks), 1):
+        for index, (split, examples) in enumerate(pool.map(_route_examples_worker, tasks), 1):
             output[split].extend(examples)
             if index % 25 == 0:
                 print(f"Prepared causal geometry: {index}/{len(records)} routes", flush=True)
     return output
 
 
-def _hssd_route(arguments):
+def _route_examples_worker(arguments):
     record, root, data, intrinsic, body_from_camera = arguments
     examples = []
     split = str(record["split"])
     if split not in ("train", "validation"):
-        raise ValueError(f"invalid HSSD split: {split}")
+        raise ValueError(f"invalid expert split: {split}")
     route_id = str(record["route_id"])
     route_root = root / str(record["route_directory"])
     source_grid_path = (route_root.parent / "navigation_grid.npz").resolve()
@@ -186,15 +186,15 @@ def _hssd_route(arguments):
     if (
         int(record["frames"]) != len(xy) or len(xy) != len(yaw)
     ):
-        raise ValueError(f"HSSD route frame count mismatch: {route_id}")
+        raise ValueError(f"Expert route frame count mismatch: {route_id}")
     if not np.allclose(np.diff(times), OBSERVATION_PERIOD_S, atol=1e-6, rtol=0):
         raise ValueError(
-            f"HSSD observations must follow the 10 Hz sensor clock: {route_id}"
+            f"Expert observations must follow the 10 Hz sensor clock: {route_id}"
         )
     depth = _DepthRun(
         source=route_root / "depth.npy",
         frames=len(xy),
-        name=f"hssd/{route_id}",
+        name=f"{record['source']}/{route_id}",
     )
     history = ObservationHistory()
     memory = ObstacleMemory(data.future_steps * data.expert_waypoint_spacing_m, data.max_depth_m)
@@ -231,7 +231,7 @@ def _hssd_route(arguments):
                 source_origin_xy=xy[anchor].copy(),
                 source_yaw_rad=float(yaw[anchor]),
                 metric_path=local_path,
-                scene=f"hssd/{record['scene_id']}",
+                scene=f"{record['source']}/{record['scene_id']}",
                 reached_goal=reached_goal,
             )
         )
@@ -672,12 +672,12 @@ def _compile_split(
 
 
 def compile_policy_dataset(
-    hssd_root: Path,
+    route_root: Path,
     output_root: Path,
     config: CurveNavConfig,
 ) -> None:
     config.validate()
-    hssd = _hssd_examples(hssd_root.expanduser().resolve(), config)
+    routes = _route_examples(route_root.expanduser().resolve(), config)
     output_root = output_root.expanduser().resolve()
     building_root = output_root.with_name(output_root.name + ".building")
     replaced_root = output_root.with_name(output_root.name + ".replaced")
@@ -689,7 +689,7 @@ def compile_policy_dataset(
     try:
         split_manifests = {}
         for index, split in enumerate(("train", "validation")):
-            examples = hssd[split]
+            examples = routes[split]
             if not examples:
                 raise ValueError(f"compiled split has no examples: {split}")
             split_manifests[split] = _compile_split(
@@ -793,11 +793,11 @@ def compile_policy_dataset(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compile the CurveNav policy dataset")
-    parser.add_argument("--hssd-root", type=Path, required=True)
+    parser.add_argument("--route-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
-    compile_policy_dataset(args.hssd_root, args.output, load_config(args.config))
+    compile_policy_dataset(args.route_root, args.output, load_config(args.config))
 
 
 if __name__ == "__main__":

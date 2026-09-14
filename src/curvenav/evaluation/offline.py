@@ -31,6 +31,8 @@ from curvenav.evaluation.protocol import (
 from curvenav.evaluation.report import write_case_report
 from curvenav.factory import build_evaluation_projector, build_policy
 from curvenav.models import CurveNavPolicy
+from curvenav.models.policy import INFERENCE_CANDIDATES
+from curvenav.training.critic import RouteUtilityTeacher
 from curvenav.training.checkpoint import validate_policy_contract
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.prefetch import CudaPrefetchLoader
@@ -301,6 +303,7 @@ def measure_policy(
 ) -> PolicyMeasurements:
     """Collect one deterministic path and one history ablation per observation."""
     policy.to(device).eval()
+    teacher = RouteUtilityTeacher(source_query, policy.planning_horizon_m)
     depth_projector.to(device).eval()
     warmup = next(iter(loader))
     _sample(policy, warmup)
@@ -369,6 +372,20 @@ def measure_policy(
             reference_path,
             prepared.condition.point_goal.float(),
         )
+        candidate_labels = teacher(prediction.candidates, batch)
+        candidate_truth = candidate_labels.clearance_m
+        teacher_scores = candidate_labels.score
+        rows = torch.arange(len(candidate_truth), device=candidate_truth.device)
+        selected_truth = candidate_truth[rows, prediction.selected_index]
+        safe_available = (candidate_truth >= 0).any(dim=1)
+        metrics.update({
+            "candidate_safe_available": safe_available,
+            "candidate_collision_fraction": (candidate_truth < 0).float().mean(1),
+            "selected_whole_curve_collision": selected_truth < 0,
+            "selection_missed_safe_candidate": safe_available & (selected_truth < 0),
+            "selection_score_regret": teacher_scores.max(1).values - teacher_scores[rows, prediction.selected_index],
+            "critic_score_mae": (prediction.scores - teacher_scores).abs().mean(1),
+        })
         metrics["valid_observation_frames"] = prepared.condition.observation_valid.sum(
             dim=-1
         )
@@ -505,6 +522,11 @@ def measure_policy(
             point_goal_swap_values.setdefault(name, []).append(value.cpu())
         for name, value in {
             "predicted_path": prediction.path.float(),
+            "candidate_scores": prediction.scores,
+            "candidate_clearance_m": candidate_truth,
+            "candidate_teacher_score": teacher_scores,
+            "candidate_geodesic_progress_m": candidate_labels.progress_m,
+            "selected_candidate_index": prediction.selected_index,
             "current_frame_predicted_path": current_prediction.path.float(),
             "reference_path": reference_path,
             "point_goal": prepared.condition.point_goal.float(),
@@ -555,7 +577,12 @@ def measure_policy(
         ),
         wall_seconds=wall_seconds,
         samples=samples,
-        sample_data={name: torch.cat(parts) for name, parts in sample_data.items()},
+        sample_data={
+            name: (torch.nn.utils.rnn.pad_sequence(
+                [row for part in parts for row in part], batch_first=True,
+            ) if name.startswith("source_collision_") else torch.cat(parts))
+            for name, parts in sample_data.items()
+        },
     )
 
 
@@ -582,8 +609,15 @@ def evaluate_measurements(measurements: PolicyMeasurements) -> dict[str, object]
     return {
         "protocol": "curvenav_metric_local_validation_source_cspace",
         "samples": measurements.samples,
-        "trajectories_per_observation": 1,
+        "trajectories_per_observation": INFERENCE_CANDIDATES,
+        "selected_trajectories_per_observation": 1,
         **policy_summary,
+        "candidate_selection": {
+            name: metrics[name].float().mean().item()
+            for name in ("candidate_safe_available", "candidate_collision_fraction",
+                         "selected_whole_curve_collision", "selection_missed_safe_candidate",
+                         "selection_score_regret", "critic_score_mae")
+        },
         **summarize_configuration_safety(metrics),
         "current_frame_ablation": {
             "fixed_horizon_ade_m_mean": current_frame_summary[

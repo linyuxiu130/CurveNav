@@ -1,4 +1,4 @@
-"""One source configuration-space oracle for data preparation and evaluation."""
+"""One source configuration-space oracle for supervision and evaluation."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from scipy.ndimage import distance_transform_edt
 from torch import Tensor
 
 from curvenav.physical import EXTRA_CLEARANCE_M, PATH_CONFIGURATION_QUERY_SPACING_M
-from curvenav.trajectory import path_arc_length, resample_path_to_horizon
+from curvenav.trajectory import path_arc_length
 
 
 SOURCE_CONFIGURATION_QUERY_SPACING_M = PATH_CONFIGURATION_QUERY_SPACING_M
@@ -74,6 +74,7 @@ class SourcePathQuery:
     clearance_m: Tensor
     in_world_bounds: Tensor
     active: Tensor
+    grid_cells: Tensor
 
     @property
     def minimum_clearance_m(self) -> Tensor:
@@ -89,7 +90,7 @@ class SourcePathQuery:
 class SourceConfigurationSpaceQuery:
     """Query immutable source C-space at one spacing with one OOB definition.
 
-    The oracle is training-only provenance: it validates expert B-splines and
+    The oracle validates expert B-splines, supervises candidate scores, and
     independently evaluates trajectories.  It is never part of the deployed
     depth/PointGoal policy input.
     """
@@ -98,9 +99,7 @@ class SourceConfigurationSpaceQuery:
         if not grids:
             raise ValueError("source configuration query requires at least one grid")
         self.grids = grids
-        self._grid_tensors: dict[
-            tuple[int, str, int | None], tuple[Tensor, Tensor]
-        ] = {}
+        self._atlases: dict[torch.device, tuple[Tensor, ...]] = {}
 
     @classmethod
     def from_paths(cls, paths: tuple[Path, ...]) -> "SourceConfigurationSpaceQuery":
@@ -132,87 +131,112 @@ class SourceConfigurationSpaceQuery:
             raise ValueError("prepared source configuration grid is missing")
         return cls.from_paths(paths)
 
-    def _grid_tensors_for(
-        self,
-        grid_index: int,
-        device: torch.device,
-    ) -> tuple[Tensor, Tensor]:
-        cache_key = (grid_index, device.type, device.index)
-        cached = self._grid_tensors.get(cache_key)
-        if cached is not None:
-            return cached
-        grid = self.grids[grid_index]
-        values = torch.from_numpy(grid.signed_clearance_m).to(device=device)
-        origin = torch.as_tensor(grid.origin_xy, dtype=torch.float32, device=device)
-        self._grid_tensors[cache_key] = (values, origin)
-        return values, origin
+    def _atlas(self, device: torch.device) -> tuple[Tensor, ...]:
+        """Pack immutable maps once; all scenes share one batched lookup."""
+        if device not in self._atlases:
+            sizes = np.array([grid.signed_clearance_m.shape for grid in self.grids], dtype=np.int64)
+            offsets = np.r_[0, np.prod(sizes, axis=1).cumsum()[:-1]]
+            self._atlases[device] = tuple(torch.as_tensor(value, device=device) for value in (
+                np.concatenate([grid.signed_clearance_m.ravel() for grid in self.grids]),
+                np.stack([grid.origin_xy for grid in self.grids]),
+                np.array([grid.cell_size_m for grid in self.grids], dtype=np.float64),
+                sizes, offsets,
+            ))
+        return self._atlases[device]
+
+    def grid_coordinates(
+        self, local: Tensor, indices: Tensor, origin: Tensor, yaw: Tensor,
+    ) -> Tensor:
+        """One FP64 robot-to-native-grid transform, outside neural autocast."""
+        _, grid_origins, cell_sizes, _, _ = self._atlas(local.device)
+        local, origin, yaw = local.double(), origin.double(), yaw.double()
+        cosine, sine = yaw.cos()[:, None], yaw.sin()[:, None]
+        world = torch.stack((
+            origin[:, None, 0] + cosine * local[..., 0] + sine * local[..., 1],
+            origin[:, None, 1] + sine * local[..., 0] - cosine * local[..., 1],
+        ), -1)
+        return (world - grid_origins[indices, None]) / cell_sizes[indices, None, None]
+
+    def point_cells(self, local: Tensor, indices: Tensor, origin: Tensor, yaw: Tensor) -> Tensor:
+        return self.grid_coordinates(local, indices, origin, yaw).floor().long()
+
+    @staticmethod
+    def _trace_segments(path: Tensor, grid_path: Tensor, horizon: float) -> tuple[Tensor, Tensor, Tensor]:
+        """Visit every crossed half-open grid cell, preserving polyline vertices.
+
+        Grid-boundary crossings partition each original segment into intervals
+        lying in a single cell. Their midpoints cannot miss a short corner cut.
+        Metric subdivisions also bound the spacing of visibility diagnostics.
+        """
+        delta = path[:, 1:].double() - path[:, :-1].double()
+        length = delta.norm(dim=-1)
+        start_arc = length.cumsum(-1) - length
+        fraction = ((horizon - start_arc).clamp_min(0) / length.clamp_min(1e-30)).clamp_max(1)
+        end = path[:, :-1].double() + fraction[..., None] * delta
+        grid_start = grid_path[:, :-1]
+        grid_end = grid_start + fraction[..., None] * (grid_path[:, 1:] - grid_start)
+        grid_delta = grid_end - grid_start
+        used_length = length * fraction
+        events = [torch.zeros_like(length[..., None]), torch.ones_like(length[..., None])]
+        for axis in range(2):
+            low = torch.minimum(grid_start[..., axis], grid_end[..., axis]).floor()
+            high = torch.maximum(grid_start[..., axis], grid_end[..., axis]).floor()
+            count = int((high - low).max().item())
+            boundaries = low[..., None] + torch.arange(1, count + 1, device=path.device)
+            direction = grid_delta[..., axis, None]
+            t = (boundaries - grid_start[..., axis, None]) / torch.where(direction != 0, direction, 1)
+            events.append(torch.where((direction != 0) & (t > 0) & (t < 1), t, 1))
+        spacing = SOURCE_CONFIGURATION_QUERY_SPACING_M
+        count = int(torch.ceil(used_length.max() / spacing).item())
+        distances = torch.arange(max(0, count - 1), device=path.device).add(1) * spacing
+        events.append((distances / used_length[..., None].clamp_min(1e-30)).clamp_max(1))
+        cuts = torch.cat(events, -1).sort(-1).values
+        left, right = cuts[..., :-1], cuts[..., 1:]
+        # Midpoint covers each crossed cell; the right endpoint also checks
+        # isolated contacts at grid corners and retains every original vertex.
+        t = torch.stack(((left + right) * 0.5, right), -1).flatten(-2)
+        local = (path[:, :-1, None].double()
+                 + t[..., None] * (end - path[:, :-1])[..., None, :]).flatten(1, 2)
+        cells = (grid_start[..., None, :] + t[..., None] * grid_delta[..., None, :]).floor().long().flatten(1, 2)
+        valid = ((right > left) & (used_length[..., None] > 0)).repeat_interleave(2, -1).flatten(1, 2)
+        local = torch.cat((path[:, :1].double(), local), 1)
+        cells = torch.cat((grid_path[:, :1].floor().long(), cells), 1)
+        valid = torch.cat((torch.ones_like(valid[:, :1]), valid), 1)
+        # Stable compaction keeps active samples contiguous and in execution order.
+        size = int(valid.sum(-1).max().item())
+        order = (~valid).to(torch.int32).argsort(dim=-1, stable=True)[:, :size]
+        active = valid.gather(1, order)
+        local = local.gather(1, order[..., None].expand(-1, -1, 2))
+        cells = cells.gather(1, order[..., None].expand(-1, -1, 2))
+        last = (active.sum(-1) - 1)[:, None, None].expand(-1, 1, 2)
+        local = torch.where(active[..., None], local, local.gather(1, last))
+        cells = torch.where(active[..., None], cells, cells.gather(1, last))
+        return local.float(), cells, active
 
     def query(
-        self,
-        path: Tensor,
-        grid_index: Tensor,
-        world_origin_xy: Tensor,
-        world_yaw_rad: Tensor,
-        planning_horizon_m: float,
+        self, path: Tensor, grid_index: Tensor, world_origin_xy: Tensor,
+        world_yaw_rad: Tensor, planning_horizon_m: float,
     ) -> SourcePathQuery:
-        """Return native-grid clearance; any source-grid OOB point is unsafe."""
-        if path.ndim != 3 or path.shape[-1] != 2:
-            raise ValueError("path must have shape [B,P,2]")
+        """Trace the original polyline, then reuse its exact integer cells."""
+        if path.ndim != 3 or path.shape[-1] != 2 or path.shape[1] < 2:
+            raise ValueError("path must have shape [B,P,2], P >= 2")
         batch = path.shape[0]
-        if grid_index.shape != (batch,):
-            raise ValueError("grid_index must have shape [B]")
-        if world_origin_xy.shape != (batch, 2):
-            raise ValueError("world_origin_xy must have shape [B,2]")
-        if world_yaw_rad.shape != (batch,):
-            raise ValueError("world_yaw_rad must have shape [B]")
+        if grid_index.shape != (batch,) or world_origin_xy.shape != (batch, 2) or world_yaw_rad.shape != (batch,):
+            raise ValueError("source grid poses must match the path batch")
+        if planning_horizon_m <= 0:
+            raise ValueError("planning horizon must be positive")
         indices = grid_index.long()
         if (indices < 0).any() or (indices >= len(self.grids)).any():
             raise ValueError("source grid index is outside the prepared grid table")
-        local, active = resample_path_to_horizon(
-            path.float(),
-            planning_horizon_m,
-            SOURCE_CONFIGURATION_QUERY_SPACING_M,
-        )
-        origin = world_origin_xy.float()
-        yaw = world_yaw_rad.float()
-        cosine, sine = yaw.cos(), yaw.sin()
-        world = torch.stack(
-            (
-                origin[:, None, 0]
-                + cosine[:, None] * local[..., 0]
-                + sine[:, None] * local[..., 1],
-                origin[:, None, 1]
-                + sine[:, None] * local[..., 0]
-                - cosine[:, None] * local[..., 1],
-            ),
-            dim=-1,
-        )
-        clearance = torch.full(
-            world.shape[:2],
-            -float(planning_horizon_m),
-            device=world.device,
-            dtype=torch.float32,
-        )
-        in_bounds = torch.zeros_like(clearance, dtype=torch.bool)
-        for index in indices.unique(sorted=True).tolist():
-            selected = indices == index
-            values, grid_origin = self._grid_tensors_for(int(index), world.device)
-            cells = torch.floor(
-                (world[selected] - grid_origin) / self.grids[int(index)].cell_size_m
-            ).long()
-            inside = (
-                (cells[..., 0] >= 0)
-                & (cells[..., 0] < values.shape[0])
-                & (cells[..., 1] >= 0)
-                & (cells[..., 1] < values.shape[1])
-            )
-            selected_clearance = torch.full_like(cells[..., 0], -float(planning_horizon_m), dtype=torch.float32)
-            selected_clearance[inside] = values[
-                cells[..., 0][inside], cells[..., 1][inside]
-            ]
-            clearance[selected] = selected_clearance
-            in_bounds[selected] = inside
-        return SourcePathQuery(local, clearance, in_bounds, active)
+        coordinates = self.grid_coordinates(path, indices, world_origin_xy, world_yaw_rad)
+        local, cells, active = self._trace_segments(path, coordinates, planning_horizon_m)
+        values, _, _, sizes, offsets = self._atlas(path.device)
+        shape = sizes[indices, None]
+        inside = (cells >= 0).all(-1) & (cells < shape).all(-1)
+        address = offsets[indices, None] + cells[..., 0] * shape[..., 1] + cells[..., 1]
+        # Select a valid address before the gather; out-of-map values remain unsafe.
+        clearance = values[torch.where(inside, address, 0)].masked_fill(~inside, -planning_horizon_m)
+        return SourcePathQuery(local, clearance, inside, active, cells)
 
     def safety_metrics(
         self,

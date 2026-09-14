@@ -60,9 +60,9 @@ model:
 training:
   seed: 42
   gradient_accumulation_steps: 1
-  per_device_batch_size: 416
+  per_device_batch_size: 128
   samples_per_epoch: 40960
-  epochs: 200
+  epochs: 50
   num_workers: 2
   prefetch_factor: 2
   warmup_epochs: 5

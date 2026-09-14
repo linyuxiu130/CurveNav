@@ -8,7 +8,7 @@ from curvenav.config import CurveNavConfig
 from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data.depth import BENCHMARK_INTRINSICS, depth_camera_contract
 from curvenav.data_generation.generate import render_depth
-from curvenav.data.prepare import _hssd_examples
+from curvenav.data.prepare import _route_examples
 
 
 def test_packed_routes_and_local_slicing_share_training_frames(tmp_path, monkeypatch) -> None:
@@ -41,13 +41,14 @@ def test_packed_routes_and_local_slicing_share_training_frames(tmp_path, monkeyp
         "route_directory": route_id,
         "split": "train",
         "scene_id": "scene",
+        "source": "hssd",
         "frames": 5,
     }
     (tmp_path / "routes.jsonl").write_text(json.dumps(record) + "\n")
     (tmp_path / "dataset_manifest.json").write_text(
         json.dumps(
             {
-                "schema": "curvenav_hssd_policy_depth_routes_v4",
+                "schema": "curvenav_policy_depth_routes_v5",
                 "observation": depth_camera_contract(data),
                 "routes": 1,
                 "route_contract": {
@@ -90,7 +91,7 @@ def test_packed_routes_and_local_slicing_share_training_frames(tmp_path, monkeyp
         cell_size_m=np.array(0.1, dtype=np.float64),
     )
 
-    examples = _hssd_examples(tmp_path, config)
+    examples = _route_examples(tmp_path, config)
     assert len(examples["train"]) == 4
     np.testing.assert_array_equal(examples["train"][0].depth_indices, [0] * 4)
     np.testing.assert_array_equal(
@@ -190,7 +191,7 @@ def test_route_failure_after_planning_is_not_retried_or_erased(tmp_path, monkeyp
              "expert_speed_m_s": .3, "expert_angular_speed_rad_s": .5},
             0., 42, CurveNavConfig().data,
         )
-    assert (tmp_path / "run_0001/traj_xy.npy").is_file()
+    assert (tmp_path / "near_0001.partial/traj_xy.npy").is_file()
 
 
 def test_label_safety_checks_fitted_tail_beyond_nominal_horizon(tmp_path):

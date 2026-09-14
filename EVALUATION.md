@@ -32,11 +32,13 @@
 - source 碰撞点是否在 raw depth 严格四支撑覆盖内，以及覆盖后是否被 raw signed clearance 判为碰撞；
 - raw depth 的 false-collision 点数。
 
-这些是传感器可观测性诊断，不是物理安全分数，也不参与 checkpoint 排名。没有 learned completion IoU、completion 碰撞率、训练净空损失或 `p−` 反事实指标。
+这些是传感器可观测性诊断，不是物理安全分数，也不参与 checkpoint 排名。评分头的源真值净空监督单独记录，不能与这些传感器诊断混淆。
 
 ## 固定验证协议
 
-每个 validation observation 只生成一条确定性的两步 Flow Matching B-spline。输出包括：
+每个 validation observation 从固定高斯候选库并行生成 32 条两步 Flow Matching B-spline，
+按学习路线效用取最高分的一条。所有主指标均测该选中轨迹；另报告安全候选覆盖率、
+错过安全候选率、教师路线效用 regret 和评分误差，以区分生成问题与选择问题。输出包括：
 
 - 固定 `2 m` 比较域的 ADE/FDE、弧长、PointGoal progress 和 regret；
 - 曲率、曲率变化、总 heading change、切线反向；

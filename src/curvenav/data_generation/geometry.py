@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.interpolate import BSpline, RectBivariateSpline
-from scipy.integrate import solve_ivp
+from scipy.interpolate import BSpline, PPoly, RectBivariateSpline
+from scipy.integrate import quad_vec, solve_ivp
 from scipy.optimize import brentq, minimize
 from scipy.ndimage import distance_transform_edt
 
@@ -21,7 +21,6 @@ from curvenav.physical import EXTRA_CLEARANCE_M, ROBOT_FOOTPRINT_RADIUS_M
 
 SAFETY_STEP_M = 0.025
 MIN_CLEARANCE_M = EXTRA_CLEARANCE_M
-ENDPOINT_CLEARANCE_M = 0.30
 
 
 class PlanningError(RuntimeError):
@@ -34,10 +33,6 @@ def sha256_file(path: Path) -> str:
         while chunk := stream.read(8 * 1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def source_family(scene_id: str) -> str:
-    return scene_id.split("_", 1)[0][:6]
 
 
 @dataclass(frozen=True)
@@ -270,66 +265,142 @@ def clearance_density(clearance):
     return 1.0 + np.exp(1.0 - clearance / ROBOT_FOOTPRINT_RADIUS_M)
 
 
-def _curve_objective(controls, basis, first, second, weights, grid, reference_length):
-    """Integral rho(d)|p'| du + r_body^2/L_ref^3 integral |p''|^2 du.
-
-    The second term regularizes bending and parameter spacing. Its units are
-    metres, like the first term; it is not a hard curvature/radius constraint.
-    """
-    points, tangent, acceleration = basis @ controls, first @ controls, second @ controls
+def _travel_objective(controls, basis, first, weights, grid):
+    """Integral rho(clearance) ds and its control-point gradient."""
+    points, tangent = basis @ controls, first @ controls
     speed = np.linalg.norm(tangent, axis=1)
     if np.any(speed <= np.finfo(float).eps):
         raise PlanningError("curve optimization encountered a stationary tangent")
     distance, distance_gradient = grid.clearance_gradient(points)
     density = clearance_density(distance)
-    radius = ROBOT_FOOTPRINT_RADIUS_M
-    bending = radius**2 / reference_length**3
-    energy = density * speed + bending * (acceleration**2).sum(axis=1)
-    dp = -(density - 1)[:, None] / radius * distance_gradient * speed[:, None]
+    dp = -(density - 1)[:, None] / ROBOT_FOOTPRINT_RADIUS_M * distance_gradient * speed[:, None]
     dv = density[:, None] * tangent / speed[:, None]
-    da = 2 * bending * acceleration
-    gradient = (
-        basis.T @ (weights[:, None] * dp)
-        + first.T @ (weights[:, None] * dv)
-        + second.T @ (weights[:, None] * da)
+    return float(weights @ (density * speed)), (
+        basis.T @ (weights[:, None] * dp) + first.T @ (weights[:, None] * dv)
     )
-    return float(weights @ energy), gradient
 
 
-def _smooth(grid: Grid, path: np.ndarray) -> tuple[BSpline, np.ndarray]:
+def _bending_objective(controls, first, second, weights):
+    """Integral r_body^2 * curvature^2 ds, independent of parameterization."""
+    tangent, acceleration = first @ controls, second @ controls
+    speed = np.linalg.norm(tangent, axis=1)
+    cross = tangent[:, 0] * acceleration[:, 1] - tangent[:, 1] * acceleration[:, 0]
+    radius2 = ROBOT_FOOTPRINT_RADIUS_M**2
+    energy = radius2 * cross**2 / speed**5
+    dv = ((2 * radius2 * cross / speed**5)[:, None]
+          * np.column_stack((acceleration[:, 1], -acceleration[:, 0]))
+          - (5 * energy / speed**2)[:, None] * tangent)
+    da = (2 * radius2 * cross / speed**5)[:, None] * np.column_stack(
+        (-tangent[:, 1], tangent[:, 0]))
+    return float(weights @ energy), (
+        first.T @ (weights[:, None] * dv) + second.T @ (weights[:, None] * da)
+    )
+
+
+def _smooth(grid: Grid, path: np.ndarray, start_yaw: float) -> tuple[BSpline, np.ndarray]:
     """Optimize one continuous curve for length, clearance and turning effort."""
     length = path_length(path)
-    controls = resample(path, 2 * ROBOT_FOOTPRINT_RADIUS_M)
-    degree = min(3, len(controls) - 1)
+    # One cubic representation at every length, including sub-body-length
+    # routes. Four controls are the cubic basis minimum, not a turn constraint.
+    count = max(4, math.ceil(length / (2 * ROBOT_FOOTPRINT_RADIUS_M)) + 1)
+    controls = points_at_arc(path, np.linspace(0., length, count))
+    degree = 3
     knots = np.r_[
         np.zeros(degree), np.linspace(0, 1, len(controls) - degree + 1), np.ones(degree)
     ]
     parameter = np.linspace(0, 1, max(2, math.ceil(length / SAFETY_STEP_M) + 1))
     identity = BSpline(knots, np.eye(len(controls)), degree)
-    basis, first = identity(parameter), identity.derivative()(parameter)
-    second = identity.derivative(2)(parameter) if degree >= 2 else np.zeros_like(basis)
-    weights = np.ones(len(parameter)) / (len(parameter) - 1)
-    weights[[0, -1]] *= 0.5
+    basis = identity(parameter)
+    first, second = identity.derivative(), identity.derivative(2)
+    # Gauss quadrature integrates straight spline segments exactly; trapezoids
+    # can otherwise lower the apparent length by collapsing control spacing.
+    edges = np.unique(np.r_[parameter, knots])
+    nodes, gauss_weights = np.polynomial.legendre.leggauss(4)
+    half = np.diff(edges) / 2
+    travel_u = ((edges[:-1] + half)[:, None] + half[:, None] * nodes).ravel()
+    weights = (half[:, None] * gauss_weights).ravel()
+    travel_basis, travel_first = identity(travel_u), first(travel_u)
+
+    # A clamped cubic has p'(0) parallel to P1-P0. Parameterize this
+    # handle by a positive length, so the prescribed heading cannot flip.
+    direction = np.array([math.cos(start_yaw), math.sin(start_yaw)])
+    offset = controls[1:] - controls[0]
+    seed_yaw = math.atan2(offset[0, 1], offset[0, 0])
+    turn = math.atan2(math.sin(start_yaw - seed_yaw), math.cos(start_yaw - seed_yaw))
+    # Preserve the obstacle-avoiding A* seed away from the initial turn.
+    # This initializes controls only; every interior control remains optimized.
+    arcs = np.arange(count - 1) * length / (count - 1)
+    angles = turn * np.linspace(1., 0., count - 1) * np.exp(-arcs / (2 * ROBOT_FOOTPRINT_RADIUS_M))
+    c, s = np.cos(angles), np.sin(angles)
+    controls[1:] = controls[0] + np.column_stack(
+        (c * offset[:, 0] - s * offset[:, 1], s * offset[:, 0] + c * offset[:, 1])
+    )
 
     def assemble(values):
-        return np.vstack((controls[0], values.reshape(-1, 2), controls[-1]))
+        handle = math.exp(values[0]) * direction
+        return np.vstack((controls[0], controls[0] + handle,
+                          values[1:].reshape(-1, 2), controls[-1]))
 
     def objective(values):
-        cost, gradient = _curve_objective(
-            assemble(values), basis, first, second, weights, grid, length
-        )
-        return cost, gradient[1:-1].ravel()
+        assembled = assemble(values)
+        # Split at every tangent-speed extremum: a narrow curvature peak
+        # must not hide between fixed quadrature nodes.
+        tangent = BSpline(knots, assembled, degree).derivative()
+        pieces = [PPoly.from_spline((tangent.t, tangent.c[:, k], tangent.k))
+                  for k in range(2)]
+        breaks = list(np.unique(knots))
+        for i, (lo, hi) in enumerate(zip(pieces[0].x[:-1], pieces[0].x[1:])):
+            if hi <= lo:
+                continue
+            squared = np.polyadd(*(np.polymul(piece.c[:, i], piece.c[:, i]) for piece in pieces))
+            for root in np.roots(np.polyder(squared)):
+                if np.isreal(root) and 0 < root.real < hi - lo:
+                    breaks.append(lo + float(root.real))
+
+        scale = np.linalg.norm(tangent.c, axis=1).max()
+        if np.any(np.linalg.norm(tangent(breaks), axis=1) <= np.finfo(float).eps * scale):
+            # Infinite energy outside the regular-curve domain lets the
+            # optimizer shorten its trial step without accepting a cusp.
+            return math.inf, np.zeros_like(values)
+
+        def integrand(u):
+            value, gradient = _bending_objective(
+                assembled, first([u]), second([u]), np.ones(1)
+            )
+            return np.r_[value, gradient.ravel()]
+
+        integral, error = quad_vec(integrand, 0., 1., points=sorted(set(breaks)),
+                                   epsabs=1e-7, epsrel=1e-6)
+        if not np.isfinite(integral).all() or error > 1e-7 + 1e-6 * np.linalg.norm(integral):
+            raise PlanningError("curve energy quadrature did not converge")
+        # Clearance uses the navigation grid's existing spatial quadrature;
+        # only curvature needs adaptive integration around tangent extrema.
+        cost, gradient = _travel_objective(assembled, travel_basis, travel_first, weights, grid)
+        cost += integral[0]
+        gradient += integral[1:].reshape(assembled.shape)
+        return cost, np.r_[gradient[1] @ (assembled[1] - assembled[0]),
+                           gradient[2:-1].ravel()]
 
     def clearance(values):
-        distance, gradient = grid.clearance_gradient(basis @ assemble(values))
-        jacobian = (basis[:, 1:-1, None] * gradient[:, None, :]).reshape(len(parameter), -1)
+        assembled = assemble(values)
+        distance, gradient = grid.clearance_gradient(basis @ assembled)
+        jacobian = np.column_stack((
+            basis[:, 1] * (gradient @ (assembled[1] - assembled[0])),
+            (basis[:, 2:-1, None] * gradient[:, None, :]).reshape(len(parameter), -1),
+        ))
         return distance - MIN_CLEARANCE_M, jacobian
 
     lower = grid.origin_xy + grid.cell_size_m * 0.5
     upper = grid.origin_xy + (np.array(grid.free.shape) - 0.5) * grid.cell_size_m
+    reach = min((upper[k] - controls[0, k]) / direction[k] if direction[k] > 0
+                else (lower[k] - controls[0, k]) / direction[k]
+                for k in range(2) if abs(direction[k]) > np.finfo(float).eps)
+    initial = np.r_[math.log(np.linalg.norm(controls[1] - controls[0])),
+                    controls[2:-1].ravel()]
     result = minimize(
-        objective, controls[1:-1].ravel(), jac=True, method="SLSQP",
-        bounds=list(zip(lower, upper)) * (len(controls) - 2),
+        objective, initial, jac=True, method="SLSQP",
+        bounds=[(math.log(np.finfo(float).eps * length), math.log(reach))]
+               + list(zip(lower, upper)) * (len(controls) - 3),
         constraints={
             "type": "ineq",
             "fun": lambda x: clearance(x)[0],
@@ -395,6 +466,7 @@ def plan_route(
     grid: Grid,
     start_xy: np.ndarray,
     goal_xy: np.ndarray,
+    start_yaw: float,
 ) -> Plan:
     start, goal = grid.snap(start_xy), grid.snap(goal_xy)
     cells = _astar(grid, start, goal)
@@ -402,6 +474,7 @@ def plan_route(
     curve_spline, path = _smooth(
         grid,
         _simplify_route(grid, discrete_path),
+        start_yaw,
     )
     length = path_length(path)
     clear, curve = grid.clearance(path), curvature(path)
@@ -433,8 +506,8 @@ def plan_route(
     return Plan(curve_spline, path.astype(np.float32), metrics, tags[0], tuple(tags))
 
 
-def source_route(grid: Grid, start_xy: np.ndarray, goal_xy: np.ndarray) -> Plan:
-    plan = plan_route(grid, start_xy, goal_xy)
+def source_route(grid: Grid, start_xy: np.ndarray, goal_xy: np.ndarray, start_yaw: float) -> Plan:
+    plan = plan_route(grid, start_xy, goal_xy, start_yaw)
     if not grid.safe(plan.path_xy):
         raise PlanningError("source route violates continuous clearance")
     return plan
@@ -443,7 +516,7 @@ def source_route(grid: Grid, start_xy: np.ndarray, goal_xy: np.ndarray) -> Plan:
 def candidate_pairs(
     grid: Grid, distance_range_m: tuple[float, float], seed: int, limit: int
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    eligible = np.argwhere(grid.clearance_m >= ENDPOINT_CLEARANCE_M)
+    eligible = np.argwhere(grid.free & (grid.clearance_m + 1e-9 >= MIN_CLEARANCE_M))
     rng, pairs, seen = np.random.default_rng(seed), [], set()
     minimum, maximum = distance_range_m
     for _ in range(40000):
@@ -455,9 +528,11 @@ def candidate_pairs(
             radius / grid.cell_size_m * np.array([math.cos(angle), math.sin(angle)])
         ).astype(int)
         if (
-            np.any(goal < 0)
+            np.array_equal(start, goal)
+            or np.any(goal < 0)
             or np.any(goal >= grid.free.shape)
-            or grid.clearance_m[tuple(goal)] < ENDPOINT_CLEARANCE_M
+            or not grid.free[tuple(goal)]
+            or grid.clearance_m[tuple(goal)] + 1e-9 < MIN_CLEARANCE_M
         ):
             continue
         key = tuple(np.concatenate([start, goal]))

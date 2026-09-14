@@ -1,4 +1,4 @@
-"""Audit configured HSSD routes and their training-format depth."""
+"""Audit configured expert routes and their training-format depth."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from curvenav.data_generation.geometry import (
     path_length,
     resample,
     sha256_file,
-    source_family,
 )
 from curvenav.data_generation.generate import SCHEMA
 
@@ -74,7 +73,7 @@ def validate_route_spacing(xy: np.ndarray, maximum_step: float) -> None:
     # two endpoint errors; the norm is 1-Lipschitz in that displacement.
     half_ulp = np.spacing(np.abs(xy)).astype(np.float64) / 2
     rounding_bound = np.linalg.norm(half_ulp[:-1] + half_ulp[1:], axis=1)
-    if np.any(spacing <= 0) or np.any(spacing > maximum_step + rounding_bound):
+    if np.any(spacing > maximum_step + rounding_bound):
         raise ValueError("route spacing exceeds the forward speed contract")
 
 
@@ -96,8 +95,9 @@ def audit_dataset(root: Path) -> dict[str, Any]:
     root = root.resolve()
     manifest = _read_json(root / "dataset_manifest.json")
     if manifest["schema"] != SCHEMA:
-        raise ValueError("expected forward policy-format depth route schema v4")
+        raise ValueError("expected forward policy-format depth route schema v5")
     records = _read_jsonl(root / "routes.jsonl")
+    families = {s["scene_id"]: s["source_family"] for s in manifest["scenes"]}
     observation = manifest["observation"]
     expected_image_shape = (observation["image_height"], observation["image_width"])
     grids: dict[tuple[str, str], Grid] = {}
@@ -152,10 +152,7 @@ def audit_dataset(root: Path) -> dict[str, Any]:
         key = (record["split"], record["scene_id"])
         if key not in grids:
             grids[key] = Grid.load(
-                root
-                / record["split"]
-                / f"dataset_hssd_{record['scene_id']}"
-                / "navigation_grid.npz"
+                directory.parent / "navigation_grid.npz"
             )
         grid = grids[key]
         if not grid.safe(xy):
@@ -175,6 +172,8 @@ def audit_dataset(root: Path) -> dict[str, Any]:
                 or np.any(controls[:, 0] > manifest["route_contract"]["expert_speed_m_s"] + 1e-6)
                 or np.any(abs(controls[:, 1]) > angular_limit + 1e-6)):
             reasons.append("forward_control_domain")
+        if abs(math.remainder(float(yaw[0]) - record["initial_yaw_rad"], 2 * math.pi)) > 1e-6:
+            reasons.append("initial_heading")
         yaw_change = np.arctan2(np.sin(np.diff(yaw)), np.cos(np.diff(yaw)))
         if np.any(abs(yaw_change) > period * angular_limit + 1e-6):
             reasons.append("angular_clock")
@@ -191,7 +190,7 @@ def audit_dataset(root: Path) -> dict[str, Any]:
             or not lower <= endpoint_distance < upper
         ):
             reasons.append("route_metadata")
-        if record["source_family"] != source_family(record["scene_id"]):
+        if record["source_family"] != families[record["scene_id"]]:
             reasons.append("source_family")
         signatures.append(
             (record["scene_id"], *np.round(np.concatenate((xy[0], xy[-1])), 4))
@@ -219,10 +218,16 @@ def audit_dataset(root: Path) -> dict[str, Any]:
         item["scene_id"] for item in records if item["split"] == "validation"
     }
     quotas = manifest["route_contract"]["routes_per_scene_by_distance"]
-    expected_per_scene = sum(quotas.values())
-    expected_scenes = {(s["split"], s["scene_id"]) for s in manifest["scenes"]}
-    expected_splits = Counter(s["split"] for s in manifest["scenes"])
-    expected_routes = expected_per_scene * len(expected_scenes)
+    expected_scenes = {(s["split"], s["scene_id"]): sum(quotas[s["scene_id"]].values())
+                       for s in manifest["scenes"]}
+    expected_splits, expected_bands = Counter(), Counter()
+    for (split, scene_id), count in expected_scenes.items():
+        expected_splits[split] += count
+        expected_bands.update(quotas[scene_id])
+    expected_routes = sum(expected_scenes.values())
+    scene_band_counts = Counter((r["scene_id"], r["endpoint_distance_band"]) for r in records)
+    expected_scene_bands = {(scene_id, band): count for scene_id, bands in quotas.items()
+                            for band, count in bands.items()}
     failures = {
         "schema": manifest.get("schema") != SCHEMA,
         "navigation_geometry": manifest.get("route_contract", {}).get(
@@ -230,9 +235,9 @@ def audit_dataset(root: Path) -> dict[str, Any]:
         )
         != expert_navigation_geometry_contract(),
         "route_count": len(records) != expected_routes or manifest.get("routes") != expected_routes,
-        "split_counts": dict(split_counts) != {k: v * expected_per_scene for k, v in expected_splits.items()},
-        "scene_route_counts": set(scene_counts) != expected_scenes or any(count != expected_per_scene for count in scene_counts.values()),
-        "distance_band_counts": dict(band_counts) != {k: v * len(expected_scenes) for k, v in quotas.items()},
+        "split_counts": dict(split_counts) != dict(expected_splits),
+        "scene_route_counts": dict(scene_counts) != expected_scenes,
+        "distance_band_counts": dict(band_counts) != dict(expected_bands) or dict(scene_band_counts) != expected_scene_bands,
         "duplicate_route_ids": len(records)
         - len({item["route_id"] for item in records}),
         "duplicate_routes": len(signatures) - len(set(signatures)),
@@ -240,8 +245,8 @@ def audit_dataset(root: Path) -> dict[str, Any]:
         "route_violations": route_violations,
         "scene_overlap": sorted(train_scenes & validation_scenes),
         "source_family_overlap": sorted(
-            {source_family(item) for item in train_scenes}
-            & {source_family(item) for item in validation_scenes}
+            {families[item] for item in train_scenes}
+            & {families[item] for item in validation_scenes}
         ),
         "partial_paths": [
             str(path.relative_to(root))

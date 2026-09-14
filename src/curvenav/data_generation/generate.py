@@ -1,14 +1,17 @@
-"""Generate bounded HSSD depth directly in the policy storage format."""
+"""Generate scene-balanced depth directly in the policy storage format."""
 
 from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import fcntl
 import hashlib
 import json
 import math
 import multiprocessing
 import os
+import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +28,9 @@ from curvenav.data.history import OBSERVATION_PERIOD_S
 from curvenav.config import DataConfig
 from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.data_generation.assets import (
-    HSSD_COMMIT,
-    HSSD_REPOSITORY,
     validate_assets,
 )
 from curvenav.data_generation.geometry import (
-    ENDPOINT_CLEARANCE_M,
     MIN_CLEARANCE_M,
     SAFETY_STEP_M,
     Grid,
@@ -40,7 +40,6 @@ from curvenav.data_generation.geometry import (
     timed_route,
     path_length,
     sha256_file,
-    source_family,
     source_route,
 )
 from curvenav.physical import (
@@ -53,7 +52,7 @@ from curvenav.physical import (
 
 
 GRID_CELL_M = 0.05
-SCHEMA = "curvenav_hssd_policy_depth_routes_v4"
+SCHEMA = "curvenav_policy_depth_routes_v5"
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -124,12 +123,13 @@ def create_simulator(
     scene_id: str,
     gpu: int,
     camera: dict[str, float | int],
+    scene_dataset: str,
 ):
     import habitat_sim
 
     settings = habitat_sim.SimulatorConfiguration()
     settings.scene_dataset_config_file = str(
-        asset_root / "hssd-hab.scene_dataset_config.json"
+        asset_root / scene_dataset
     )
     settings.scene_id = str(asset_root / "scenes" / f"{scene_id}.scene_instance.json")
     settings.gpu_device_id, settings.enable_physics = gpu, False
@@ -303,20 +303,34 @@ def generate_route(
     seed: int,
     data: DataConfig,
 ) -> dict[str, Any]:
-    route_name = f"run_{route_index + 1:04d}"
+    route_name = f"{distance_band}_{route_index + 1:04d}"
     pairs = candidate_pairs(
         grid,
         tuple(distance_range_m),
         stable_seed(seed, scene["scene_id"], route_name),
         config["candidate_limit"],
     )
-    directory = scene_dir / route_name
+    destination = scene_dir / route_name
+    if (destination / "metadata.json").is_file():
+        record = read_json(destination / "metadata.json")
+        if record["source_family"] != scene["source_family"]:
+            raise ValueError("cached source family differs from generation config")
+        return record
+    directory = scene_dir / (route_name + ".partial")
+    if directory.exists():
+        shutil.rmtree(directory)
+    # Independent of the path optimizer and fixed across endpoint retries:
+    # rejecting a difficult route must not silently resample an easier heading.
+    start_yaw = float(np.random.default_rng(
+        stable_seed(seed, scene["scene_id"], route_name + ":heading")
+    ).uniform(-math.pi, math.pi))
     for candidate_index, (start, goal) in enumerate(pairs):
         try:
             plan = source_route(
                 grid,
                 start,
                 goal,
+                start_yaw,
             )
             route_xy, route_yaw, habitat_xyz, snap_error, controls = sampled_route(
                 simulator,
@@ -366,14 +380,16 @@ def generate_route(
             directory / "depth.npy",
             data,
         )
-        route_id = f"{scene['split']}/dataset_hssd_{scene['scene_id']}/{route_name}"
+        route_id = str(destination.relative_to(root))
         record = {
             "route_id": route_id,
-            "route_directory": str(directory.relative_to(root)),
+            "route_directory": route_id,
             "split": scene["split"],
             "scene_id": scene["scene_id"],
-            "source_family": source_family(scene["scene_id"]),
+            "source": config["source"],
+            "source_family": scene["source_family"],
             "frames": len(route_xy),
+            "initial_yaw_rad": start_yaw,
             "timestamp_semantics": "uniform_sensor_clock",
             "motion_model": "forward_differential_drive_curve_clock",
             "route_arc_m": path_length(route_xy),
@@ -392,18 +408,50 @@ def generate_route(
             },
         }
         write_json(directory / "metadata.json", record)
+        directory.rename(destination)
         return record
     raise RuntimeError(
         f"{scene['scene_id']} {route_name} exhausted endpoint candidates"
     )
 
 
-def route_bands(config: dict[str, Any]) -> list[str]:
-    return [
-        name
-        for name, count in config["routes_per_scene_by_distance"].items()
-        for _ in range(count)
-    ]
+def route_quota(config: dict[str, Any], scene: dict[str, str]) -> dict[str, int]:
+    """Apportion exact split totals evenly over scenes, then over distance bands."""
+    scene_ids = sorted(s["scene_id"] for s in config["selected_scenes"] if s["split"] == scene["split"])
+    count, extra = divmod(config["routes_per_split"][scene["split"]], len(scene_ids))
+    count += scene_ids.index(scene["scene_id"]) < extra
+    bands = ("near", "middle", "far")
+    weights = config["distance_band_weights"]
+    denominator = sum(weights.values())
+    fractions = {band: divmod(count * weights[band], denominator) for band in bands}
+    quota = {band: fractions[band][0] for band in bands}
+    remainder = sorted(bands, key=lambda band: -fractions[band][1])
+    for band in remainder[:count - sum(quota.values())]:
+        quota[band] += 1
+    return quota
+
+
+def endpoint_distance_ranges(grid: Grid, quantiles: dict[str, list[float]], seed: int) -> dict[str, list[float]]:
+    """Stratify by a deterministic estimate of this scene's endpoint distribution.
+
+    The 8,192 pairs estimate quantiles, not a finite set of training tasks.
+    Actual route candidates are sampled independently. Zero and the bounding-box
+    diagonal include the complete distance support, including small scenes.
+    """
+    eligible = np.argwhere(grid.free & (grid.clearance_m + 1e-9 >= MIN_CLEARANCE_M))
+    if len(eligible) < 2:
+        raise PlanningError("scene has fewer than two safe endpoints")
+    rng = np.random.default_rng(stable_seed(seed, "distance_quantiles"))
+    pairs = eligible[rng.integers(len(eligible), size=(8192, 2))]
+    distances = np.linalg.norm(pairs[:, 1] - pairs[:, 0], axis=1) * grid.cell_size_m
+    distances = distances[distances > 0]
+    cuts = [quantiles[band][0] for band in ("near", "middle", "far")] + [1.]
+    edges = np.quantile(distances, cuts)
+    edges[0] = 0.
+    edges[-1] = np.nextafter(np.linalg.norm(np.ptp(eligible, axis=0)) * grid.cell_size_m, np.inf)
+    if np.any(np.diff(edges) <= 0):
+        raise PlanningError("scene has insufficient endpoint distance variation")
+    return {band: edges[i:i+2].tolist() for i, band in enumerate(("near", "middle", "far"))}
 
 
 def generate_scene(
@@ -411,42 +459,57 @@ def generate_scene(
     data: DataConfig,
 ) -> list[dict[str, Any]]:
     root_path = Path(root)
-    scene_dir = root_path / scene["split"] / f"dataset_hssd_{scene['scene_id']}"
-    scene_dir.mkdir(parents=True, exist_ok=False)
+    scene_dir = root_path / scene["split"] / f"{config['source']}_{scene['scene_id']}"
+    scene_dir.mkdir(parents=True, exist_ok=True)
+    quota = route_quota(config, scene)
+    expected = [scene_dir / f"{band}_{i + 1:04d}" / "metadata.json"
+                for band, count in quota.items()
+                for i in range(count)]
+    if all(p.is_file() for p in expected):
+        records = [read_json(p) for p in expected]
+        if any(r["source_family"] != scene["source_family"] for r in records):
+            raise ValueError("cached source family differs from generation config")
+        return records
     seed = stable_seed(config["seed"], scene["scene_id"]) % (2**31 - 1)
     simulator = create_simulator(
         Path(config["asset_root"]),
         scene["scene_id"],
         gpu,
         config["camera"],
+        config["scene_dataset"],
     )
     try:
-        grid, floor = build_grid(simulator, seed)
-        np.savez_compressed(
-            scene_dir / "navigation_grid.npz",
-            free=grid.free,
-            clearance_m=grid.clearance_m,
-            origin_xy=grid.origin_xy,
-            cell_size_m=grid.cell_size_m,
-            floor_height_m=floor,
-        )
-        records = [
-            generate_route(
-                simulator,
-                grid,
-                root_path,
-                scene_dir,
-                scene,
-                route_index,
-                band,
-                config["endpoint_distance_bands_m"][band],
-                config,
-                floor,
-                seed,
-                data,
-            )
-            for route_index, band in enumerate(route_bands(config))
-        ]
+        grid_path = scene_dir / "navigation_grid.npz"
+        navmesh_path = scene_dir / "scene.navmesh"
+        if grid_path.exists() and navmesh_path.exists():
+            if not simulator.pathfinder.load_nav_mesh(str(navmesh_path)):
+                raise RuntimeError(f"invalid cached navmesh: {navmesh_path}")
+            grid = Grid.load(grid_path)
+            with np.load(grid_path) as stored:
+                floor = float(stored["floor_height_m"])
+        else:
+            grid, floor = build_grid(simulator, seed)
+            simulator.pathfinder.save_nav_mesh(str(navmesh_path))
+            temporary = grid_path.with_name("navigation_grid.partial.npz")
+            np.savez_compressed(temporary, free=grid.free, clearance_m=grid.clearance_m,
+                               origin_xy=grid.origin_xy, cell_size_m=grid.cell_size_m,
+                               floor_height_m=floor)
+            os.replace(temporary, grid_path)
+        distance_ranges = endpoint_distance_ranges(grid, config["endpoint_distance_quantiles"], seed)
+        records = []
+        for band, count in quota.items():
+            for route_index in range(count):
+                cached = (scene_dir / f"{band}_{route_index + 1:04d}" / "metadata.json").is_file()
+                started = time.monotonic()
+                record = generate_route(
+                    simulator, grid, root_path, scene_dir, scene, route_index,
+                    band, distance_ranges[band], config, floor, seed, data,
+                )
+                records.append(record)
+                print(json.dumps({"route_id": record["route_id"], "frames": record["frames"],
+                                  "cached": cached, "seconds": round(time.monotonic() - started, 3),
+                                  "scene_completed": len(records), "scene_target": sum(quota.values())}),
+                      flush=True)
         print(
             json.dumps(
                 {
@@ -462,21 +525,13 @@ def generate_scene(
         simulator.close()
 
 
-def scene_batch(
-    batch: list[dict[str, str]], config: dict[str, Any], root: str, gpu: int,
-    data: DataConfig,
-) -> list[dict[str, Any]]:
-    records = []
-    for scene in batch:
-        records.extend(generate_scene(scene, config, root, gpu, data))
-    return records
-
-
 def validate_config(config: dict[str, Any], data: DataConfig) -> None:
     if not math.isfinite(config["expert_angular_speed_rad_s"]) or config["expert_angular_speed_rad_s"] <= 0:
         raise ValueError("expert_angular_speed_rad_s must be positive")
     if not math.isfinite(config["expert_speed_m_s"]) or config["expert_speed_m_s"] <= 0:
         raise ValueError("expert_speed_m_s must be positive")
+    if config["source"] not in ("hssd", "grscenes"):
+        raise ValueError("unsupported scene source")
     scenes = config["selected_scenes"]
     train = [item for item in scenes if item["split"] == "train"]
     validation = [item for item in scenes if item["split"] == "validation"]
@@ -484,29 +539,36 @@ def validate_config(config: dict[str, Any], data: DataConfig) -> None:
         raise ValueError("selected_scenes must contain train and validation scenes")
     if len({item["scene_id"] for item in scenes}) != len(scenes):
         raise ValueError("selected_scenes must be unique")
-    if {source_family(item["scene_id"]) for item in train} & {
-        source_family(item["scene_id"]) for item in validation
+    if {item["source_family"] for item in train} & {
+        item["source_family"] for item in validation
     }:
         raise ValueError("source-family split leakage")
-    bands = config["endpoint_distance_bands_m"]
-    quotas = config["routes_per_scene_by_distance"]
-    if list(bands) != ["near", "middle", "far"] or set(quotas) != set(bands):
+    bands = config["endpoint_distance_quantiles"]
+    weights = config["distance_band_weights"]
+    if set(bands) != {"near", "middle", "far"} or set(weights) != set(bands):
         raise ValueError("endpoint distance bands must be near, middle, and far")
-    distance_ranges = list(bands.values())
+    distance_ranges = [bands[band] for band in ("near", "middle", "far")]
     if not all(
         len(bounds) == 2
         and all(math.isfinite(float(value)) for value in bounds)
-        and 0 < bounds[0] < bounds[1]
+        and 0 <= bounds[0] < bounds[1] <= 1
         for bounds in distance_ranges
     ):
-        raise ValueError("endpoint distance ranges must be finite positive intervals")
+        raise ValueError("distance quantiles must be finite increasing intervals in [0, 1]")
+    if distance_ranges[0][0] != 0 or distance_ranges[-1][1] != 1:
+        raise ValueError("distance quantiles must cover all endpoint distances")
     if not all(
         math.isclose(left[1], right[0])
         for left, right in zip(distance_ranges[:-1], distance_ranges[1:])
     ):
         raise ValueError("endpoint distance ranges must be contiguous")
-    if any(type(count) is not int or count < 1 for count in quotas.values()):
-        raise ValueError("route distance quotas must be positive integers")
+    if any(type(weight) is not int or weight < 1 for weight in weights.values()):
+        raise ValueError("distance band weights must be positive integers")
+    totals = config["routes_per_split"]
+    if set(totals) != {"train", "validation"} or any(type(n) is not int or n < 1 for n in totals.values()):
+        raise ValueError("routes_per_split must give positive train and validation totals")
+    if any(min(route_quota(config, scene).values()) < 1 for scene in scenes):
+        raise ValueError("route totals must cover every scene and distance band")
     if config["observation_period_s"] != OBSERVATION_PERIOD_S:
         raise ValueError("expert observations must match the benchmark 10 Hz camera")
     if config["workers"] < 1 or config["gpu_device"] < 0:
@@ -536,7 +598,7 @@ def validate_config(config: dict[str, Any], data: DataConfig) -> None:
         raise ValueError("generation camera must match the benchmark Dingo policy")
 
 
-def generate(config_path: Path) -> dict[str, Any]:
+def _generate(config_path: Path) -> dict[str, Any]:
     config_path = config_path.resolve()
     config = read_json(config_path)
     project_root = config_path.parent.parent
@@ -547,23 +609,43 @@ def generate(config_path: Path) -> dict[str, Any]:
     asset_root = (project_root / config["asset_root"]).resolve()
     asset_manifest = read_json(asset_root / "download_manifest.json")
     selected_scene_ids = {item["scene_id"] for item in config["selected_scenes"]}
-    if (
-        asset_manifest.get("repository") != HSSD_REPOSITORY
-        or asset_manifest.get("commit") != HSSD_COMMIT
-        or not selected_scene_ids.issubset(asset_manifest.get("scenes", []))
-    ):
-        raise ValueError("HSSD assets do not match the frozen source contract")
-    validate_assets(asset_root, sorted(selected_scene_ids))
+    if (asset_manifest["repository"] != config["asset_repository"]
+            or asset_manifest["commit"] != config["asset_commit"]
+            or not selected_scene_ids.issubset(asset_manifest["scenes"])):
+        raise ValueError("scene assets do not match the frozen source contract")
+    if config["source"] == "hssd":
+        validate_assets(asset_root, sorted(selected_scene_ids))
+    else:
+        from curvenav.data_generation.grscenes import validate_prepared_assets
+        validate_prepared_assets(asset_root, config["selected_scenes"])
     if output.exists():
         raise FileExistsError(output)
+    packed_output = (project_root / config["packed_output_root"]).resolve()
+    if packed_output.exists():
+        raise FileExistsError(packed_output)
+    # Only observation/planning semantics enter the key. More routes or workers
+    # reuse the exact same per-band endpoint seeds and completed render files.
+    semantics = {key: config[key] for key in (
+        "seed", "source", "asset_repository", "asset_commit", "candidate_limit",
+        "camera", "observation_period_s", "expert_speed_m_s",
+        "expert_angular_speed_rad_s", "endpoint_distance_quantiles",
+    )}
+    semantics["observation"] = depth_camera_contract(data)
+    semantics["navigation_geometry"] = expert_navigation_geometry_contract()
+    semantics["code"] = {
+        name: sha256_file(Path(__file__).parent.parent / name)
+        for name in ("data_generation/generate.py", "data_generation/geometry.py",
+                     "data/depth.py", "physical.py")
+    }
+    semantics["asset_converter"] = asset_manifest.get("converter_sha256")
+    cache_key = hashlib.sha256(json.dumps(semantics, sort_keys=True).encode()).hexdigest()
+    cache = (project_root / config["route_cache_root"]).resolve() / cache_key
+    cache.mkdir(parents=True, exist_ok=True)
+    write_json(cache / "contract.json", semantics)
     partial = output.with_name(output.name + f".partial.{os.getpid()}")
     partial.mkdir(parents=True)
     config = {**config, "asset_root": str(asset_root), "output_root": str(output)}
     write_json(partial / "config.json", config)
-    batches = [
-        config["selected_scenes"][index :: config["workers"]]
-        for index in range(config["workers"])
-    ]
     context = multiprocessing.get_context("spawn")
     records = []
     with ProcessPoolExecutor(
@@ -571,27 +653,37 @@ def generate(config_path: Path) -> dict[str, Any]:
     ) as executor:
         futures = [
             executor.submit(
-                scene_batch,
-                batch,
+                generate_scene,
+                scene,
                 config,
-                str(partial),
+                str(cache),
                 config["gpu_device"],
                 data,
             )
-            for batch in batches
+            for scene in config["selected_scenes"]
         ]
         for future in as_completed(futures):
             records.extend(future.result())
+    # Publish only requested routes. Hard links share immutable depth bytes;
+    # the cache remains useful when extending scene/route quotas later.
+    for record in records:
+        relative = Path(record["route_directory"])
+        destination = partial / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        grid = destination.parent / "navigation_grid.npz"
+        if not grid.exists():
+            os.link(cache / relative.parent / grid.name, grid)
+        shutil.copytree(cache / relative, destination, copy_function=os.link)
     records.sort(key=lambda item: item["route_id"])
-    if len(records) != len(config["selected_scenes"]) * len(route_bands(config)):
+    if len(records) != sum(config["routes_per_split"].values()):
         raise RuntimeError(f"generated {len(records)} routes in {partial}")
     write_jsonl(partial / "routes.jsonl", records)
     manifest = {
         "schema": SCHEMA,
         "seed": config["seed"],
         "asset_root": str(asset_root),
-        "asset_repository": HSSD_REPOSITORY,
-        "asset_commit": HSSD_COMMIT,
+        "asset_repository": asset_manifest["repository"],
+        "asset_commit": asset_manifest["commit"],
         "output_root": str(output),
         "routes": len(records),
         "frames": sum(item["frames"] for item in records),
@@ -601,14 +693,16 @@ def generate(config_path: Path) -> dict[str, Any]:
         "route_contract": {
             "navigation_geometry": expert_navigation_geometry_contract(),
             "unperturbed": True,
+            "initial_heading": "uniform_world_yaw_fixed_before_endpoint_retries",
             "observation_period_s": config["observation_period_s"],
             "expert_speed_m_s": config["expert_speed_m_s"],
             "expert_angular_speed_rad_s": config["expert_angular_speed_rad_s"],
             "continuous_safety_step_m": SAFETY_STEP_M,
             "minimum_clearance_m": MIN_CLEARANCE_M,
             "horizontal_snap": "float32_storage_tolerance_only",
-            "endpoint_distance_bands_m": config["endpoint_distance_bands_m"],
-            "routes_per_scene_by_distance": config["routes_per_scene_by_distance"],
+            "endpoint_distance_quantiles": config["endpoint_distance_quantiles"],
+            "routes_per_scene_by_distance": {scene["scene_id"]: route_quota(config, scene)
+                                             for scene in config["selected_scenes"]},
         },
     }
     write_json(partial / "dataset_manifest.json", manifest)
@@ -617,8 +711,18 @@ def generate(config_path: Path) -> dict[str, Any]:
     summary = audit_dataset(partial)
     partial.rename(output)
     from curvenav.data.prepare import compile_policy_dataset
-    compile_policy_dataset(output, project_root / data.root, policy_config)
+    compile_policy_dataset(output, project_root / config["packed_output_root"], policy_config)
     return summary
+
+
+def generate(config_path: Path) -> dict[str, Any]:
+    config_path = config_path.resolve()
+    config = read_json(config_path)
+    cache = (config_path.parent.parent / config["route_cache_root"]).resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    with (cache / ".generation.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return _generate(config_path)
 
 
 def main(argv: list[str] | None = None) -> None:

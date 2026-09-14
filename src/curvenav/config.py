@@ -143,9 +143,9 @@ class TrajectoryDecoderConfig:
 class TrainingConfig:
     seed: int = 42
     gradient_accumulation_steps: int = 1
-    per_device_batch_size: int = 416
+    per_device_batch_size: int = 128
     samples_per_epoch: int = 40_960
-    epochs: int = 200
+    epochs: int = 50
     num_workers: int = 2
     prefetch_factor: int = 2
     warmup_epochs: int = 5

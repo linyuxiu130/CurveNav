@@ -27,6 +27,7 @@ torchinductor/
 /data/**
 !/data/README.md
 /outputs/*
+/online_evaluation/cache
 *.pt
 *.pth
 *.ckpt

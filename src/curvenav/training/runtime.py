@@ -15,11 +15,16 @@ def configure_cuda_training_backend() -> None:
 
 
 def compile_static_training_functions(policy: nn.Module) -> None:
-    """Fuse perception, scene preparation, and the single velocity field."""
+    """Fuse static training kernels and cache the measured fastest GEMM plans."""
     for module, name in (
         (policy.depth_encoder, "forward"),
         (policy.condition_encoder, "forward"),
         (policy.trajectory_decoder, "project_condition_memory"),
         (policy, "_predict_velocity"),
+        (policy.trajectory_evaluator, "project_condition_memory"),
+        (policy.trajectory_evaluator, "forward"),
     ):
-        setattr(module, name, torch.compile(getattr(module, name), fullgraph=True, dynamic=False))
+        setattr(module, name, torch.compile(
+            getattr(module, name), fullgraph=True, dynamic=False,
+            mode="max-autotune-no-cudagraphs",
+        ))

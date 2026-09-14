@@ -1,12 +1,12 @@
 """PointGoal-conditioned Flow Matching in physical curve coordinates."""
 
-import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
 from torch import Tensor, nn
 
 from curvenav.trajectory import IncrementalBSplineTrajectory
+from curvenav.models.blocks import ProjectedCondition
 from curvenav.types import (
     ConditionFeatures,
     PolicyCondition,
@@ -15,29 +15,46 @@ from curvenav.types import (
 )
 
 
-TRAINING_LOSS_NAMES = ("loss",)
+TRAINING_LOSS_NAMES = ("loss", "flow_loss", "critic_loss", "ranking_loss")
 INFERENCE_SOURCE_SEED = 20_260_828
+INFERENCE_CANDIDATES = 32
 FLOW_TIME_SAMPLING = "single_draw_logit_normal"
 FLOW_LOGIT_NORMAL_MEAN = -0.4
 FLOW_LOGIT_NORMAL_STD = 1.0
 
 
 @dataclass
-class CurveNavLoss:
-    loss: Tensor
+class CurveNavTrainingOutput:
+    flow_loss: Tensor
+    candidate_paths: Tensor
+    candidate_scores: Tensor
 
-    def logging_values(self) -> tuple[Tensor, ...]:
-        return (self.loss,)
+
+def repeat_condition(condition: ConditionFeatures, count: int) -> ConditionFeatures:
+    return ConditionFeatures(**{
+        f.name: getattr(condition, f.name).repeat_interleave(count, dim=0)
+        for f in fields(condition)
+    })
+
+
+def repeat_memory(
+    memory: tuple[ProjectedCondition, ...], count: int
+) -> tuple[ProjectedCondition, ...]:
+    return tuple(
+        tuple(value.repeat_interleave(count, dim=0) for value in layer)
+        for layer in memory
+    )
 
 
 class CurveNavPolicy(nn.Module):
-    """Learn conditional curve transport; deploy one reproducible source sample."""
+    """Generate 32 goal-conditioned curves and select the learned route-utility argmax."""
 
     def __init__(
         self,
         depth_encoder: nn.Module,
         condition_encoder: nn.Module,
         trajectory_decoder: nn.Module,
+        trajectory_evaluator: nn.Module,
         curve_codec: IncrementalBSplineTrajectory,
         planning_horizon_m: float,
         integration_steps: int,
@@ -46,6 +63,7 @@ class CurveNavPolicy(nn.Module):
         self.depth_encoder = depth_encoder
         self.condition_encoder = condition_encoder
         self.trajectory_decoder = trajectory_decoder
+        self.trajectory_evaluator = trajectory_evaluator
         self.curve_codec = curve_codec
         self._planning_horizon_m = float(planning_horizon_m)
         self.integration_steps = integration_steps
@@ -57,15 +75,13 @@ class CurveNavPolicy(nn.Module):
         generator = torch.Generator(device="cpu")
         generator.manual_seed(INFERENCE_SOURCE_SEED)
         inference_source = torch.randn(
+            INFERENCE_CANDIDATES,
             curve_codec.coordinate_dim,
             generator=generator,
         )
-        inference_source.mul_(
-            math.sqrt(curve_codec.coordinate_dim) / inference_source.norm()
-        )
         self.register_buffer(
             "inference_source",
-            inference_source.unsqueeze(0),
+            inference_source,
             persistent=True,
         )
 
@@ -95,7 +111,7 @@ class CurveNavPolicy(nn.Module):
         condition: PolicyCondition,
         target: TrajectoryTarget,
         source: Tensor,
-    ) -> CurveNavLoss:
+    ) -> CurveNavTrainingOutput:
         target.validate()
         clean = self.curve_codec.coordinates_from_values(target.curve_values.float())
         if source.shape != clean.shape:
@@ -111,30 +127,59 @@ class CurveNavPolicy(nn.Module):
         )
         state = (1 - time[:, None]) * clean + time[:, None] * source
         velocity = self._predict_velocity(state, time, encoded, memory)
-        return CurveNavLoss((velocity - (source - clean)).square().mean())
+        flow_loss = (velocity - (source - clean)).square().mean()
+        # Match deployment's actual two-step proposal distribution. Expert labels
+        # remain available when the early generator produces only poor proposals.
+        proposals = self._generate_coordinates(
+            repeat_condition(encoded, 3), repeat_memory(memory, 3),
+            torch.randn(len(clean) * 3, clean.shape[-1], device=clean.device),
+        ).unflatten(0, (len(clean), 3))
+        candidates = torch.cat((clean[:, None], proposals), dim=1).detach()
+        paths, _ = self.curve_codec.decode(candidates.flatten(0, 1))
+        critic_memory = self.trajectory_evaluator.project_condition_memory(encoded)
+        scores = self.trajectory_evaluator(
+            paths, condition.point_goal.repeat_interleave(4, dim=0),
+            repeat_condition(encoded, 4), repeat_memory(critic_memory, 4),
+        )
+        return CurveNavTrainingOutput(
+            flow_loss, paths.unflatten(0, (len(clean), 4)), scores.unflatten(0, (len(clean), 4))
+        )
+
+    @torch.no_grad()
+    def _generate_coordinates(self, encoded, memory, source: Tensor) -> Tensor:
+        state = source
+        for index in range(self.integration_steps):
+            time = torch.full(
+                (len(state),), 1 - index / self.integration_steps, device=state.device
+            )
+            state = state - self._predict_velocity(state, time, encoded, memory) / self.integration_steps
+        return state
 
     @torch.no_grad()
     def sample(self, condition: PolicyCondition) -> TrajectoryPrediction:
         encoded = self.encode_condition(condition)
         memory = self.trajectory_decoder.project_condition_memory(encoded)
-        state = self.inference_source.expand(len(condition.point_goal), -1)
-        # Reverse the data-to-noise interpolant, reusing the same scene memory.
-        for index in range(self.integration_steps):
-            time = torch.full(
-                (len(state),), 1 - index / self.integration_steps, device=state.device
-            )
-            state = (
-                state
-                - self._predict_velocity(state, time, encoded, memory)
-                / self.integration_steps
-            )
+        critic_memory = self.trajectory_evaluator.project_condition_memory(encoded)
+        batch = len(condition.point_goal)
+        repeated = repeat_condition(encoded, INFERENCE_CANDIDATES)
+        state = self._generate_coordinates(
+            repeated, repeat_memory(memory, INFERENCE_CANDIDATES),
+            self.inference_source.repeat(batch, 1),
+        )
         path, _ = self.curve_codec.decode(state)
-        return TrajectoryPrediction(path=path)
+        scores = self.trajectory_evaluator(
+            path, condition.point_goal.repeat_interleave(INFERENCE_CANDIDATES, dim=0),
+            repeated, repeat_memory(critic_memory, INFERENCE_CANDIDATES),
+        ).unflatten(0, (batch, INFERENCE_CANDIDATES))
+        candidates = path.unflatten(0, (batch, INFERENCE_CANDIDATES))
+        selected = scores.argmax(dim=1)
+        path = candidates[torch.arange(batch, device=state.device), selected]
+        return TrajectoryPrediction(path, candidates, scores, selected)
 
     def forward(
         self,
         condition: PolicyCondition,
         target: TrajectoryTarget,
         source: Tensor,
-    ) -> CurveNavLoss:
+    ) -> CurveNavTrainingOutput:
         return self.training_loss(condition, target, source)

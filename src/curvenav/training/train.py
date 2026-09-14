@@ -13,6 +13,8 @@ from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
 from curvenav.data.batch import unpack_policy_batch
+from curvenav.data.privileged import SourceConfigurationSpaceQuery
+from curvenav.training.critic import CurveNavCriterion
 from curvenav.data.loader import build_policy_training_loader
 from curvenav.factory import build_policy
 from curvenav.models import TRAINING_LOSS_NAMES
@@ -145,6 +147,10 @@ def run_training(
     )
     loader = loader_bundle.loader
     policy = build_policy(config)
+    criterion = CurveNavCriterion(
+        SourceConfigurationSpaceQuery.from_prepared_split(config.data.root, "train"),
+        policy.planning_horizon_m,
+    )
     compile_static_training_functions(policy)
     optimizer = build_optimizer(
         policy,
@@ -226,18 +232,20 @@ def run_training(
         optimizer.zero_grad(set_to_none=True)
         current_losses = torch.zeros_like(window_losses)
         for micro_step in range(micro_batches_per_step):
-            prepared = unpack_policy_batch(next(loader_iterator))
+            batch = next(loader_iterator)
+            prepared = unpack_policy_batch(batch)
             flow_source = torch.randn_like(prepared.target.curve_values)
             synchronize = micro_step + 1 == micro_batches_per_step
             synchronization_context = (
                 nullcontext() if synchronize else accelerator.no_sync(policy)
             )
             with synchronization_context:
-                losses = policy(
+                output = policy(
                     prepared.condition,
                     prepared.target,
                     flow_source,
                 )
+                losses = criterion(output, batch)
                 accelerator.backward(losses.loss * batch_weight)
             current_losses += (
                 torch.stack(losses.logging_values()).detach().float() * batch_weight

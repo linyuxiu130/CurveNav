@@ -79,7 +79,7 @@ def test_training_batch_contract_is_global_and_exact() -> None:
         }
     )
     assert config.training.gradient_accumulation_steps == 2
-    assert config.training.per_device_batch_size == 416
+    assert config.training.per_device_batch_size == 128
     with pytest.raises(TypeError, match="micro_batch_size"):
         config_from_mapping({"training": {"micro_batch_size": 128}})
     with pytest.raises(TypeError, match="global_batch_size"):

@@ -3,13 +3,14 @@
 CurveNav 是 PointGoal 条件的米制局部轨迹生成器。当前输入为深度图、逐帧内外参、
 重力对齐的机体位姿和时间戳；四帧共享视觉骨干与 SE(3) 几何对齐构建 BEV，
 局部世界坐标体素记忆保留已观测障碍。
-生成器使用两步条件 Flow Matching 输出 B-spline，由固定测评 MPC 执行。
+生成器使用两步条件 Flow Matching 并行输出 32 条 B-spline，独立的单头路线评价器
+选取最高分的一条，由固定测评 MPC 执行。
 传感器历史与异步推理分离；当前二维观测场不提供绝对无碰撞保证。
 
 唯一新观测契约拒绝旧深度数据、旧请求与旧 checkpoint，没有兼容或旧输入替代分支。
 架构、数学、输入定义与已验证边界见 [ARCHITECTURE.md](ARCHITECTURE.md)，
 重构原因见 [ARCHITECTURE_REVIEW.md](ARCHITECTURE_REVIEW.md)。源配置空间真值只用于
-标签安全证书与测评，不进入在线场景记忆。
+标签安全证书、评分头监督与测评，不进入在线场景记忆。
 
 ## 三条代码链路
 
@@ -48,7 +49,7 @@ checkpoint 测评。三条链路共用 `encoders/`、`conditioning/`、`models/`
 [online_evaluation/](online_evaluation/README.md)，支持 SanD、NavDP、X-NavDP 和
 CurveNav 接入，继续使用 `python -m navbench` 入口。各模型的启动适配器独立位于
 `online_evaluation/navbench/adapters/`；NavDP 与 XNavDP 共用 `navbench/vision/` 视觉骨干。
-本机测评缓存位于 `/shibo_huang/.cache/navbench`。
+本机测评缓存位于 `/shibo_huang/data/curvenav/cache/navbench`。
 下文 `/shibo_huang/` 路径和 `outputs/` 验证记录均为本机位置，并非 GitHub 附件。
 
 ## 运行流程
@@ -89,6 +90,31 @@ scripts/build_dataset.sh
 需要小批生产时，给 `scripts/build_dataset.sh` 传入配置，显式选择场景和路线配额；
 保留训练/验证场景隔离。生成完成后审核全部帧、轨迹与训练标签。
 
+新增 GRScenes/X-NavDP 59 场景使用同一生成器：
+
+```bash
+scripts/prepare_grscenes.sh configs/grscenes_dataset.json --seven-zip /shibo_huang/data/curvenav/cache/tools/7zip/7zz
+scripts/build_dataset.sh configs/grscenes_dataset.json
+```
+
+资产准备复用已安装的 Isaac USD 运行时、`trimesh` 和共享模型库；分卷解压需要 `7zz`。
+只导出场景几何，按 USD 单位、完整实例变换和轴约定转换为 Habitat 资产；不复制纹理。
+官方 59 个训练场景中配置 49 个训练、10 个验证，共 6,000 条完整路线（训练 5,000、验证 1,000）。
+`routes_per_split` 设置总数，`distance_band_weights` 按近/中/远 1:2:2 分配；各场景数量最多相差一条。
+按场景动态调度 8 个独立进程，在 GPU 1 渲染；日志逐条记录耗时、缓存命中和场景进度。
+验证组按场景 ID 前 15 位保守分组（9 个住宅、1 个商业变体）；这不是独立户型数的保证。
+官方 40 个测评场景不参与生产。近/中/远按每场景安全端点距离分位数定义，避免小场景
+被固定米制距离排除。新采样分布与旧 500 条不完全相同，效果需单独实验比较。
+初始世界朝向独立均匀采样，并作为样条起始切向的边界条件；端点重采样不改变朝向。
+端点与整条路线使用相同的本体膨胀后安全余量。平滑代价为
+`∫ [1 + exp(1-d/r) + r²κ²] ds`，其中 `r` 是本体半径，`d` 是配置空间余量；
+曲率是软代价，不设额外最小转弯半径。长度项使用分段高斯积分，曲率项自适应积分。
+
+场景网格、导航网格与已完成路线缓存在 `/shibo_huang/data/curvenav/cache/expert-routes`，
+缓存键包括生成代码和几何/传感器契约。增加场景或分档配额时复用已有路线；路线 ID
+为“分档＋档内序号”。生成目录通过硬链接引用不可变路线，重启后再次执行同一配置即可
+复用已完成内容。发布目标必须是新目录；若只需重做标签，使用 `curvenav-prepare-data --route-root ... --output ... --config ...`。训练使用新数据目录生成的 `config.yaml`。
+
 训练读取 `data/policy_dataset-depth-memory`，保存深度帧索引、专家曲线、逐样本内外参、
 SE(3) 相对位姿、观测年龄、因果障碍记忆和 source provenance。写盘后必须通过 source re-query certificate；
 Flow 坐标统计只从训练集拟合，写入准备目录的 `config.yaml`。所有入口使用当前 Conda 环境，不再引用旧虚拟环境路径。
@@ -112,9 +138,10 @@ CUDA_VISIBLE_DEVICES=1 scripts/evaluate_policy.sh \
 DDP loss 按全局均值缩放。`samples_per_epoch` 是每个逻辑 epoch 的样本预算，向下取完整
 全局批次，实际样本数及更新次数记录在启动日志和 checkpoint 中。改变批次会改变优化器
 更新频率；保持样本预算并不等于保持优化过程，学习率和收敛需要另行验证。
-4090 24 GiB 默认每卡 416、累积 1 次：单卡全局 416，双卡全局 832。
+加入路线评价训练后，默认每卡 128、累积 1 次：单卡全局 128，双卡全局 256。
+批次显存和吞吐必须按当前评价架构实测，不沿用旧共享净空头的性能结果。
 双卡使用同一配置，只需将启动命令中的 `CUDA_VISIBLE_DEVICES` 设为 `0,1`。
-默认样本预算下，实际每 epoch 处理 40,768 个样本；单卡 98 次更新，双卡 49 次更新。
+默认样本预算下，每 epoch 处理 40,960 个样本；单卡 320 次更新，双卡 160 次更新。
 训练批次、卡数和累积次数是 checkpoint 的恢复契约，恢复时必须保持一致。
 训练和测评的神经算子统一 BF16，要求 GPU 原生支持 BF16。标定几何、Flow 状态、
 Flow 积分、B-spline 解码和损失使用 FP32。

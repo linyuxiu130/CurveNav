@@ -19,7 +19,7 @@ from curvenav.data_generation.generate import (
     base_position_from_navmesh,
     camera_contract,
     configure_navmesh_settings,
-    route_bands,
+    route_quota,
     validate_config,
 )
 
@@ -31,7 +31,6 @@ from curvenav.data_generation.geometry import (
     Grid,
     path_length,
     plan_route,
-    source_family,
 )
 from curvenav.physical import (
     MAXIMUM_TRAVERSABLE_HEIGHT_M,
@@ -43,6 +42,7 @@ from curvenav.physical import (
 
 
 def test_route_speed_accounts_for_storage_rounding_without_allowing_overspeed():
+    validate_route_spacing(np.zeros((2, 2), np.float32), .03)
     for origin in (0., 30., -30., 1000.):
         xy = np.array([[origin, origin], [origin + .03, origin]], np.float32)
         validate_route_spacing(xy, .03)
@@ -75,7 +75,8 @@ def test_depth_stream_matches_policy_numpy_files(tmp_path, monkeypatch):
 
 
 def test_route_distance_schedule_is_exact_and_unperturbed(base_config: dict) -> None:
-    bands = route_bands(base_config)
+    quota = route_quota(base_config, base_config["selected_scenes"][0])
+    bands = [band for band, count in quota.items() for _ in range(count)]
 
     assert len(bands) == 25
     assert bands.count("near") == 5
@@ -95,16 +96,12 @@ def test_clearance_aware_planner_is_safe_and_deterministic() -> None:
     clearance[~free] = 0.0
     grid = Grid(free, clearance.astype(np.float32), np.zeros(2), 0.05)
 
-    first = plan_route(grid, np.array([0.6, 2.0]), np.array([3.4, 2.0]))
-    second = plan_route(grid, np.array([0.6, 2.0]), np.array([3.4, 2.0]))
+    first = plan_route(grid, np.array([0.6, 2.0]), np.array([3.4, 2.0]), 0.)
+    second = plan_route(grid, np.array([0.6, 2.0]), np.array([3.4, 2.0]), 0.)
 
     assert grid.safe(first.path_xy)
     assert np.allclose(first.path_xy, second.path_xy)
     assert path_length(first.path_xy) < 4.5
-
-
-def test_source_family_is_stable() -> None:
-    assert source_family("106366323_174226647") == "106366"
 
 
 def test_hssd_generator_uses_the_model_camera_contract() -> None:
@@ -184,12 +181,13 @@ def test_dingo_geometry_contract_is_derived_from_the_benchmark_asset() -> None:
 def test_config_rejects_family_leakage(base_config: dict) -> None:
     config = dict(base_config)
     config["selected_scenes"] = [
-        {"scene_id": f"{index + 100000}_a", "split": "train"} for index in range(16)
+        {"scene_id": f"{index + 100000}_a", "source_family": str(index + 100000), "split": "train"} for index in range(16)
     ] + [
-        {"scene_id": f"{index + 200000}_b", "split": "validation"} for index in range(4)
+        {"scene_id": f"{index + 200000}_b", "source_family": str(index + 200000), "split": "validation"} for index in range(4)
     ]
+    config["routes_per_split"] = {"train": 400, "validation": 100}
     validate_config(config, DataConfig())
-    config["selected_scenes"][-1]["scene_id"] = "100000_b"
+    config["selected_scenes"][-1]["source_family"] = "100000"
     with pytest.raises(ValueError, match="source-family"):
         validate_config(config, DataConfig())
 
@@ -325,13 +323,15 @@ def test_hssd_asset_download_is_atomic_and_commit_pinned(
 @pytest.fixture
 def base_config() -> dict:
     return {
-        "selected_scenes": [],
-        "endpoint_distance_bands_m": {
-            "near": [3.0, 6.0],
-            "middle": [6.0, 8.5],
-            "far": [8.5, 10.5],
+        "selected_scenes": [{"scene_id": "scene", "source_family": "family", "split": "train"}],
+        "source": "hssd",
+        "endpoint_distance_quantiles": {
+            "near": [0., 1/3],
+            "middle": [1/3, 2/3],
+            "far": [2/3, 1.],
         },
-        "routes_per_scene_by_distance": {"near": 5, "middle": 10, "far": 10},
+        "routes_per_split": {"train": 25, "validation": 25},
+        "distance_band_weights": {"near": 1, "middle": 2, "far": 2},
         "observation_period_s": 0.1,
         "expert_speed_m_s": 0.3,
         "expert_angular_speed_rad_s": 0.5,
@@ -372,7 +372,7 @@ def test_clearance_curve_energy_gradient_matches_finite_difference():
     from scipy.interpolate import BSpline
     from scipy.ndimage import distance_transform_edt
     from scipy.optimize._numdiff import approx_derivative
-    from curvenav.data_generation.geometry import _curve_objective
+    from curvenav.data_generation.geometry import _travel_objective, _bending_objective
     free = np.ones((80,80),bool)
     free[30:40,30:40] = False
     distance = distance_transform_edt(np.pad(free,1))[1:-1,1:-1]*.05
@@ -380,9 +380,14 @@ def test_clearance_curve_energy_gradient_matches_finite_difference():
     controls = np.array([[.617,.793],[1.037,.719],[1.843,1.017],[2.413,.613]])
     u = np.linspace(0,1,37)
     identity = BSpline([0,0,0,0,1,1,1,1],np.eye(4),3)
-    args = (identity(u),identity.derivative()(u),identity.derivative(2)(u),np.ones(37)/37,grid,2.)
-    value, gradient = _curve_objective(controls,*args)
-    numerical = approx_derivative(lambda x:_curve_objective(x.reshape(4,2),*args)[0],controls.ravel(),method='3-point',abs_step=1e-6)
+    def objective(controls):
+        travel, travel_gradient = _travel_objective(
+            controls, identity(u), identity.derivative()(u), np.ones(37)/37, grid)
+        bending, bending_gradient = _bending_objective(
+            controls, identity.derivative()(u), identity.derivative(2)(u), np.ones(37)/37)
+        return travel + bending, travel_gradient + bending_gradient
+    value, gradient = objective(controls)
+    numerical = approx_derivative(lambda x:objective(x.reshape(4,2))[0],controls.ravel(),method='3-point',abs_step=1e-6)
     assert np.isfinite(value)
     np.testing.assert_allclose(gradient.ravel(),numerical.ravel(),rtol=2e-4,atol=2e-5)
 
@@ -393,7 +398,7 @@ def test_clearance_optimization_keeps_a_narrow_feasible_corridor():
     free[:,28:34] = True
     distance = distance_transform_edt(np.pad(free,1))[1:-1,1:-1]*.05
     grid = Grid(free,distance,np.zeros(2),.05)
-    plan = plan_route(grid,np.array([.5,1.55]),np.array([3.5,1.55]))
+    plan = plan_route(grid,np.array([.5,1.55]),np.array([3.5,1.55]), 0.)
     assert grid.safe(plan.path_xy)
     assert grid.clearance(plan.path_xy).min() <= .15+1e-6
 
@@ -414,3 +419,34 @@ def test_route_audit_rejects_valid_but_misaligned_depth_pose():
     poses[1, 0, 3] -= .1
     with pytest.raises(ValueError, match='disagree'):
         validate_route_pose(xy, yaw + .1, poses)
+
+
+@pytest.mark.parametrize("goal", [[2.5, 3.5], [1.5, 2.5], [2.3, 2.5]])
+def test_prescribed_heading_reaches_side_and_rear_goals_forward(goal):
+    from scipy.ndimage import distance_transform_edt
+    from curvenav.data_generation.geometry import timed_route
+    free = np.ones((100, 100), bool)
+    clearance = distance_transform_edt(np.pad(free, 1))[1:-1, 1:-1] * .05
+    grid = Grid(free, clearance, np.zeros(2), .05)
+    plan = plan_route(grid, np.array([2.5, 2.5]), np.array(goal), 0.)
+    xy, yaw, control = timed_route(plan.curve, .1, .3, .5)
+    np.testing.assert_allclose(xy[[0, -1]], [[2.5, 2.5], goal], atol=1e-9)
+    assert abs(yaw[0]) < 1e-10
+    assert grid.safe(xy)
+    assert np.all(control[:, 0] > 0)
+    assert np.max(control[:, 0]) <= .3 + 1e-8
+    assert np.max(abs(control[:, 1])) <= .5 + 1e-8
+    assert np.max(abs(np.diff(np.unwrap(yaw)))) <= .05 + 1e-6
+    assert np.max(np.linalg.norm(np.diff(xy, axis=0), axis=1)) <= .03 + 1e-6
+
+
+def test_endpoint_sampling_uses_the_route_clearance_contract():
+    from scipy.ndimage import distance_transform_edt
+    from curvenav.data_generation.geometry import candidate_pairs
+    free = np.zeros((80, 80), bool)
+    free[:, 28:34] = True
+    clearance = distance_transform_edt(np.pad(free, 1))[1:-1, 1:-1] * .05
+    grid = Grid(free, clearance, np.zeros(2), .05)
+    pairs = candidate_pairs(grid, (.5, 2.), 42, 4)
+    assert len(pairs) == 4
+    assert all(grid.safe(np.stack(pair)) for pair in pairs)

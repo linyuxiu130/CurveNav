@@ -93,3 +93,6 @@ class TrajectoryTarget:
 @dataclass
 class TrajectoryPrediction:
     path: Tensor
+    candidates: Tensor
+    scores: Tensor
+    selected_index: Tensor

@@ -19,12 +19,15 @@ from curvenav.conditioning import (
 from curvenav.encoders.depth import DEPTH_ENCODER_TYPE
 from curvenav.encoders.configuration import CONFIGURATION_ENCODER_TYPE
 from curvenav.models import TRAJECTORY_DECODER_TYPE
+from curvenav.models.evaluator import EVALUATOR_TYPE, EVALUATOR_LAYERS
+from curvenav.training.critic import CRITIC_TARGET
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.batching import build_distributed_batch_layout
 from curvenav.precision import PRECISION_NAME
 from curvenav.trajectory import INCREMENTAL_CONTROL_PARAMETERIZATION_TYPE
 from curvenav.models.policy import (
     INFERENCE_SOURCE_SEED,
+    INFERENCE_CANDIDATES,
     FLOW_TIME_SAMPLING,
 )
 
@@ -108,9 +111,9 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "trajectory_dimensions": 2,
         "planar_axis_convention": "x_forward_y_left",
         "point_goal_semantics": (
-            "mission_destination_in_current_robot_xy_clamped_to_local_terminal"
+            "mission_destination_in_current_robot_xy"
         ),
-        "point_goal_conditioning": ("terminal_local_goal_intent_only"),
+        "point_goal_conditioning": ("generator_local_terminal_evaluator_mission_direction_log_distance"),
         "trajectory_supervision": (
             "source_cspace_gated_fixed_future_expert_planar_bspline_imitation"
         ),
@@ -118,14 +121,20 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "trajectory_endpoint_policy": "conditional_flow_curve",
         "curve_boundary_conditions": "fixed_robot_origin",
         "trajectory_decoder_type": TRAJECTORY_DECODER_TYPE,
-        "flow_source": "standard_gaussian_training_fixed_typical_inference_draw",
+        "flow_source": "standard_gaussian_training_fixed_iid_gaussian_candidate_bank",
         "inference_source_seed": INFERENCE_SOURCE_SEED,
+        "inference_candidates": INFERENCE_CANDIDATES,
+        "candidate_selection": "single_goal_conditioned_route_utility_argmax",
+        "critic_target": CRITIC_TARGET,
+        "trajectory_evaluator_type": EVALUATOR_TYPE,
+        "trajectory_evaluator_layers": EVALUATOR_LAYERS,
+        "critic_candidates": "one_expert_three_two_step_flow_proposals",
         "flow_path": "data_anchored_linear_stochastic_interpolant",
         "flow_solver": "explicit_euler_noise_to_data",
         "flow_time_embedding": "flow_time_mlp",
         "flow_time_sampling": FLOW_TIME_SAMPLING,
         "training_objective": (
-            "standardized_euclidean_conditional_flow_matching"
+            "conditional_flow_matching_plus_route_utility_regression_and_pairwise_ranking"
         ),
         "trajectory_prediction": ("conditional_flow_planar_cubic_bspline"),
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
@@ -168,7 +177,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             "native_navigation_grid_endpoint_inclusive_dense_0.025m_"
             "oob_non_executable"
         ),
-        "source_configuration_space_role": "dataset_certificate_and_evaluation_only",
+        "source_configuration_space_role": "dataset_certificate_critic_supervision_and_evaluation",
         "depth_configuration_space_role": (
             "target_independent_observed_bev_plus_current_curve_query"
         ),
@@ -245,7 +254,10 @@ def validate_training_resume(
     mixed_precision: str,
 ) -> None:
     """Reject any resume that would change samples, steps, or random streams."""
-    if checkpoint.get("config") != asdict(config):
+    expected_config = asdict(config)
+    # Moving artifacts does not change the optimizer, samples or random stream.
+    expected_config["training"]["output_dir"] = checkpoint["config"]["training"]["output_dir"]
+    if checkpoint["config"] != expected_config:
         raise ValueError("resume checkpoint configuration does not exactly match")
     expected = build_training_contract(config, world_size, mixed_precision)
     if checkpoint.get("training_contract") != expected:

@@ -23,6 +23,7 @@ curvenav-evaluate = "curvenav.evaluation.offline:main"
 curvenav-compare = "curvenav.evaluation.compare:main"
 
 [project.optional-dependencies]
+generation = ["trimesh>=4.0"]
 test = ["pytest>=8.0"]
 
 [tool.setuptools.packages.find]
