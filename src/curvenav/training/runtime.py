@@ -26,9 +26,5 @@ def compile_static_training_functions(policy: nn.Module) -> None:
     ):
         setattr(module, name, torch.compile(
             getattr(module, name), fullgraph=True, dynamic=False,
-            options={
-                "max_autotune": True,
-                # Triton GEMM autotuning faults on the validation tail's K=1 BF16 projection.
-                "max_autotune_gemm_backends": "ATEN",
-            },
+            mode="max-autotune-no-cudagraphs",
         ))

@@ -23,7 +23,14 @@ class FlowTimeEmbedding(nn.Module):
         )
 
     def forward(self, time: Tensor) -> Tensor:
-        return self.projection(time[:, None].float())
+        # A scalar affine map is an outer product, not a K=1 GEMM.
+        affine = self.projection[0]
+        value = torch.addcmul(
+            affine.bias.to(NEURAL_DTYPE),
+            time[:, None].to(NEURAL_DTYPE),
+            affine.weight[:, 0].to(NEURAL_DTYPE),
+        )
+        return self.projection[2](self.projection[1](value))
 
 
 class PlanarControlReadout(nn.Module):
