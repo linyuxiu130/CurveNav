@@ -93,7 +93,7 @@ def _validate(
     """Measure the EMA objective on each held-out sample without changing RNG."""
     model = accelerator.unwrap_model(policy)
     totals = torch.zeros(len(TRAINING_LOSS_NAMES) + 1, device=accelerator.device)
-    devices = [accelerator.device.index]
+    devices = [torch.cuda.current_device()]
     with torch.random.fork_rng(devices=devices), ema.average_parameters(model):
         torch.manual_seed(seed + accelerator.process_index)
         model.eval()
