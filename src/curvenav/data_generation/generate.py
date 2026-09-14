@@ -711,7 +711,9 @@ def _generate(config_path: Path) -> dict[str, Any]:
     summary = audit_dataset(partial)
     partial.rename(output)
     from curvenav.data.prepare import compile_policy_dataset
-    compile_policy_dataset(output, project_root / config["packed_output_root"], policy_config)
+    compile_policy_dataset(
+        (output,), project_root / config["packed_output_root"], policy_config
+    )
     return summary
 
 

@@ -109,7 +109,9 @@ def _planar_local(points: np.ndarray, origin: np.ndarray, yaw: float) -> np.ndar
     ).astype(np.float32, copy=False)
 
 
-def _route_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Example]]:
+def _route_examples_from_root(
+    root: Path, config: CurveNavConfig
+) -> dict[str, list[_Example]]:
     data = config.data
     source_manifest = json.loads(
         (root / "dataset_manifest.json").read_text(encoding="utf-8")
@@ -164,6 +166,17 @@ def _route_examples(root: Path, config: CurveNavConfig) -> dict[str, list[_Examp
             output[split].extend(examples)
             if index % 25 == 0:
                 print(f"Prepared causal geometry: {index}/{len(records)} routes", flush=True)
+    return output
+
+
+def _route_examples(
+    roots: tuple[Path, ...], config: CurveNavConfig
+) -> dict[str, list[_Example]]:
+    output: dict[str, list[_Example]] = {"train": [], "validation": []}
+    for root in roots:
+        source = _route_examples_from_root(root.expanduser().resolve(), config)
+        for split in output:
+            output[split].extend(source[split])
     return output
 
 
@@ -672,12 +685,14 @@ def _compile_split(
 
 
 def compile_policy_dataset(
-    route_root: Path,
+    route_roots: tuple[Path, ...],
     output_root: Path,
     config: CurveNavConfig,
 ) -> None:
     config.validate()
-    routes = _route_examples(route_root.expanduser().resolve(), config)
+    if not route_roots:
+        raise ValueError("at least one expert route root is required")
+    routes = _route_examples(route_roots, config)
     output_root = output_root.expanduser().resolve()
     building_root = output_root.with_name(output_root.name + ".building")
     replaced_root = output_root.with_name(output_root.name + ".replaced")
@@ -793,11 +808,11 @@ def compile_policy_dataset(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compile the CurveNav policy dataset")
-    parser.add_argument("--route-root", type=Path, required=True)
+    parser.add_argument("--route-root", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
-    compile_policy_dataset(args.route_root, args.output, load_config(args.config))
+    compile_policy_dataset(tuple(args.route_root), args.output, load_config(args.config))
 
 
 if __name__ == "__main__":

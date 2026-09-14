@@ -113,7 +113,7 @@ scripts/build_dataset.sh configs/grscenes_dataset.json
 场景网格、导航网格与已完成路线缓存在 `/shibo_huang/data/curvenav/cache/expert-routes`，
 缓存键包括生成代码和几何/传感器契约。增加场景或分档配额时复用已有路线；路线 ID
 为“分档＋档内序号”。生成目录通过硬链接引用不可变路线，重启后再次执行同一配置即可
-复用已完成内容。发布目标必须是新目录；若只需重做标签，使用 `curvenav-prepare-data --route-root ... --output ... --config ...`。训练使用新数据目录生成的 `config.yaml`。
+复用已完成内容。发布目标必须是新目录；若只需重做标签，使用 `curvenav-prepare-data --route-root ... --output ... --config ...`。合并数据源时重复传入 `--route-root`，编译器会在联合训练集上拟合 flow 坐标尺度。训练使用新数据目录生成的 `config.yaml`。
 
 训练读取 `data/policy_dataset-depth-memory`，保存深度帧索引、专家曲线、逐样本内外参、
 SE(3) 相对位姿、观测年龄、因果障碍记忆和 source provenance。写盘后必须通过 source re-query certificate；

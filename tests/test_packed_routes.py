@@ -91,8 +91,8 @@ def test_packed_routes_and_local_slicing_share_training_frames(tmp_path, monkeyp
         cell_size_m=np.array(0.1, dtype=np.float64),
     )
 
-    examples = _route_examples(tmp_path, config)
-    assert len(examples["train"]) == 4
+    examples = _route_examples((tmp_path, tmp_path), config)
+    assert len(examples["train"]) == 8
     np.testing.assert_array_equal(examples["train"][0].depth_indices, [0] * 4)
     np.testing.assert_array_equal(
         examples["train"][0].observation_valid, [False] * 3 + [True]
