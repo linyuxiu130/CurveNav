@@ -205,6 +205,7 @@ def build_training_checkpoint(
     ema: ExponentialMovingAverage,
     config: CurveNavConfig,
     step: int,
+    best_validation_loss: float,
     *,
     training_contract: Mapping[str, int | str],
     rng_states: Mapping[str, Tensor],
@@ -233,6 +234,7 @@ def build_training_checkpoint(
     return {
         "checkpoint_type": CHECKPOINT_TYPE,
         "step": step,
+        "best_validation_loss": best_validation_loss,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
@@ -323,6 +325,7 @@ def restore_training_state(
     expected_keys = {
         "checkpoint_type",
         "step",
+        "best_validation_loss",
         "model",
         "optimizer",
         "scheduler",

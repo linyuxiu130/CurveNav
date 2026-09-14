@@ -45,6 +45,7 @@ def checkpoint(config: CurveNavConfig, precision: str = BF16):
         ExponentialMovingAverage(model),
         config,
         0,
+        float("inf"),
         training_contract=contract,
         rng_states=rng,
     )

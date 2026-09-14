@@ -151,7 +151,7 @@ class TrainingConfig:
     warmup_epochs: int = 5
     min_learning_rate_factor: float = 0.01
     log_every_steps: int = 20
-    checkpoint_every_epochs: int = 20
+    checkpoint_every_epochs: int = 1
     output_dir: str = "outputs/train_policy-depth-memory"
     learning_rate: float = 2e-4
     weight_decay: float = 1e-2

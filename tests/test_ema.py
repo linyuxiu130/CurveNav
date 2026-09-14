@@ -44,3 +44,13 @@ def test_fused_ema_matches_parameterwise_lerp_exactly() -> None:
 
     for name, shadow in ema.shadow.items():
         assert torch.equal(shadow, reference[name])
+
+
+def test_average_parameters_restores_training_weights() -> None:
+    model = nn.Linear(1, 1, bias=False)
+    ema = ExponentialMovingAverage(model)
+    original = model.weight.detach().clone()
+    ema.shadow["weight"].fill_(3)
+    with ema.average_parameters(model):
+        assert model.weight.item() == 3
+    assert torch.equal(model.weight, original)

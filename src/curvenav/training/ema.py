@@ -1,5 +1,8 @@
 """Exponential moving average with one fused update over model parameters."""
 
+from contextlib import contextmanager
+from collections.abc import Iterator
+
 import torch
 from torch import nn
 
@@ -45,6 +48,20 @@ class ExponentialMovingAverage:
             raise ValueError("EMA state does not match model parameters")
         for name, parameter in named_parameters:
             parameter.copy_(self.shadow[name].to(device=parameter.device, dtype=parameter.dtype))
+
+    @contextmanager
+    @torch.no_grad()
+    def average_parameters(self, model: nn.Module) -> Iterator[None]:
+        """Temporarily expose the EMA policy without changing optimizer state."""
+        parameters = tuple(
+            parameter for parameter in model.parameters() if parameter.requires_grad
+        )
+        saved = tuple(parameter.detach().clone() for parameter in parameters)
+        self.copy_to(model)
+        try:
+            yield
+        finally:
+            torch._foreach_copy_(parameters, saved)
 
     def state_dict(self) -> dict[str, object]:
         return {

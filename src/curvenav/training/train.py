@@ -15,7 +15,10 @@ from curvenav.config_io import load_config
 from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.privileged import SourceConfigurationSpaceQuery
 from curvenav.training.critic import CurveNavCriterion
-from curvenav.data.loader import build_policy_training_loader
+from curvenav.data.loader import (
+    build_policy_training_loader,
+    build_policy_validation_loader,
+)
 from curvenav.factory import build_policy
 from curvenav.models import TRAINING_LOSS_NAMES
 from curvenav.precision import PRECISION_NAME
@@ -45,7 +48,9 @@ def _save_checkpoint(
     ema: ExponentialMovingAverage,
     config: CurveNavConfig,
     step: int,
+    best_validation_loss: float,
     training_contract: dict[str, int | str],
+    filenames: tuple[str, ...],
 ) -> None:
     accelerator.wait_for_everyone()
     cpu_rng_states = accelerator.gather(
@@ -65,13 +70,44 @@ def _save_checkpoint(
         ema,
         config,
         step,
+        best_validation_loss,
         training_contract=training_contract,
         rng_states={"cpu": cpu_rng_states, "cuda": cuda_rng_states},
     )
-    checkpoint_path = output_dir / "checkpoint.pt"
-    temporary_path = output_dir / ".checkpoint.tmp.pt"
-    accelerator.save(state, temporary_path)
-    temporary_path.replace(checkpoint_path)
+    for filename in filenames:
+        checkpoint_path = output_dir / filename
+        temporary_path = output_dir / f".{filename}.tmp"
+        accelerator.save(state, temporary_path)
+        temporary_path.replace(checkpoint_path)
+
+
+@torch.no_grad()
+def _validate(
+    accelerator: Accelerator,
+    policy: torch.nn.Module,
+    ema: ExponentialMovingAverage,
+    loader: CudaPrefetchLoader,
+    criterion: CurveNavCriterion,
+    seed: int,
+) -> dict[str, float]:
+    """Measure the EMA objective on each held-out sample without changing RNG."""
+    model = accelerator.unwrap_model(policy)
+    totals = torch.zeros(len(TRAINING_LOSS_NAMES) + 1, device=accelerator.device)
+    devices = [accelerator.device.index]
+    with torch.random.fork_rng(devices=devices), ema.average_parameters(model):
+        torch.manual_seed(seed + accelerator.process_index)
+        model.eval()
+        for batch in loader:
+            prepared = unpack_policy_batch(batch)
+            source = torch.randn_like(prepared.target.curve_values)
+            losses = criterion(model(prepared.condition, prepared.target, source), batch)
+            count = len(prepared.target.curve_values)
+            totals[:-1] += torch.stack(losses.logging_values()).float() * count
+            totals[-1] += count
+        model.train()
+    totals = accelerator.reduce(totals, reduction="sum")
+    means = (totals[:-1] / totals[-1]).tolist()
+    return dict(zip(TRAINING_LOSS_NAMES, means, strict=True))
 
 
 def run_training(
@@ -117,6 +153,7 @@ def run_training(
     total_steps = training_contract["total_steps"]
     checkpoint = None
     start_step = 0
+    best_validation_loss = float("inf")
     if resume_path is not None:
         checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
         validate_policy_contract(checkpoint, config)
@@ -127,6 +164,7 @@ def run_training(
             PRECISION_NAME,
         )
         start_step = int(checkpoint["step"])
+        best_validation_loss = float(checkpoint["best_validation_loss"])
         if not 0 <= start_step < total_steps:
             raise ValueError(
                 f"resume step must be in [0, {total_steps}), got {start_step}"
@@ -173,6 +211,25 @@ def run_training(
         loader,
         loader_bundle.depth_bank,
         accelerator.device,
+    )
+    validation_bundle = build_policy_validation_loader(
+        config.data,
+        config.trajectory,
+        batch_size=local_rank_batch_size,
+        num_workers=config.training.num_workers,
+        rank=accelerator.process_index,
+        world_size=accelerator.num_processes,
+    )
+    validation_loader = CudaPrefetchLoader(
+        validation_bundle.loader,
+        validation_bundle.depth_bank,
+        accelerator.device,
+    )
+    validation_criterion = CurveNavCriterion(
+        SourceConfigurationSpaceQuery.from_prepared_split(
+            config.data.root, "validation"
+        ),
+        accelerator.unwrap_model(policy).planning_horizon_m,
     )
     expected_loader_steps = remaining_steps * micro_batches_per_step
     if len(loader) != expected_loader_steps:
@@ -292,7 +349,32 @@ def run_training(
             window_steps = 0
             window_start = time.perf_counter()
 
-        if step % checkpoint_interval == 0:
+        if step % steps_per_epoch == 0:
+            validation = _validate(
+                accelerator,
+                policy,
+                ema,
+                validation_loader,
+                validation_criterion,
+                config.training.seed,
+            )
+            improved = validation["loss"] < best_validation_loss
+            best_validation_loss = min(best_validation_loss, validation["loss"])
+            accelerator.print(json.dumps({
+                "event": "validation",
+                "epoch": epoch,
+                "step": step,
+                **{f"validation_{name}": value for name, value in validation.items()},
+                "best_validation_loss": best_validation_loss,
+            }), flush=True)
+        else:
+            improved = False
+
+        filenames = (
+            (("checkpoint.pt",) if step % checkpoint_interval == 0 else ())
+            + (("best.pt",) if improved else ())
+        )
+        if filenames:
             _save_checkpoint(
                 accelerator,
                 policy,
@@ -301,7 +383,9 @@ def run_training(
                 ema,
                 config,
                 step=step,
+                best_validation_loss=best_validation_loss,
                 training_contract=training_contract,
+                filenames=filenames,
             )
 
     if step % checkpoint_interval != 0:
@@ -313,7 +397,9 @@ def run_training(
             ema,
             config,
             step=step,
+            best_validation_loss=best_validation_loss,
             training_contract=training_contract,
+            filenames=("checkpoint.pt",),
         )
     accelerator.print(
         json.dumps(

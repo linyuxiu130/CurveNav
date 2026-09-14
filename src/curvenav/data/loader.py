@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from torch.utils.data import DataLoader, default_convert
+from torch.utils.data import DataLoader, Subset, default_convert
 
 from curvenav.config import DataConfig, TrajectoryConfig
 from curvenav.data.depth_bank import PackedDepthBankSpec
@@ -25,9 +25,12 @@ def build_policy_validation_loader(
     trajectory: TrajectoryConfig,
     batch_size: int,
     num_workers: int,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> PolicyLoaderBundle:
     """Load precomputed labels; workers move only small fixed-shape tensors."""
-    dataset = PreparedPolicyDataset(data.root, "validation", data, trajectory)
+    base = PreparedPolicyDataset(data.root, "validation", data, trajectory)
+    dataset = Subset(base, range(rank, len(base), world_size))
     arguments = {
         "dataset": dataset,
         "batch_size": batch_size,
@@ -49,7 +52,7 @@ def build_policy_validation_loader(
     loader = DataLoader(**arguments)
     return PolicyLoaderBundle(
         loader=loader,
-        depth_bank=dataset.depth_bank,
+        depth_bank=base.depth_bank,
         samples=len(dataset),
     )
 
