@@ -2,6 +2,7 @@
 
 import argparse
 from dataclasses import dataclass, fields
+import hashlib
 import json
 from pathlib import Path
 import time
@@ -765,8 +766,11 @@ def run_evaluation(
     config: CurveNavConfig,
     checkpoint_path: Path,
     artifact_dir: Path | None = None,
+    samples_per_source: int = 512,
 ) -> dict[str, object]:
     started = time.perf_counter()
+    if samples_per_source < 0:
+        raise ValueError("samples_per_source must be nonnegative; 0 selects the full split")
     if not torch.cuda.is_available():
         raise RuntimeError("CurveNav evaluation requires CUDA")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -782,6 +786,7 @@ def run_evaluation(
         config.trajectory,
         batch_size=VALIDATION_BATCH_SIZE,
         num_workers=config.training.num_workers,
+        samples_per_source=samples_per_source or None,
     )
     loader = CudaPrefetchLoader(bundle.loader, bundle.depth_bank, torch.device("cuda"))
     source_query = SourceConfigurationSpaceQuery.from_prepared_split(
@@ -808,6 +813,16 @@ def run_evaluation(
         checkpoint=str(checkpoint_path.resolve()),
         checkpoint_step=int(checkpoint["step"]),
         weights="ema",
+        sampling={
+            "method": "source_balanced_without_replacement" if samples_per_source else "full",
+            "seed": 0,
+            "samples_per_source": samples_per_source,
+            "population_samples": len(bundle.loader.dataset.dataset),
+            "evaluated_samples": bundle.samples,
+            "indices_sha256": hashlib.sha256(
+                torch.tensor(bundle.loader.dataset.indices, dtype=torch.int64).numpy().tobytes()
+            ).hexdigest(),
+        },
         evaluation_wall_seconds_including_setup=time.perf_counter() - started,
     )
     if artifact_dir is not None:
@@ -836,8 +851,11 @@ def main() -> None:
     parser.add_argument("config", type=Path)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--artifact-dir", type=Path)
+    parser.add_argument("--samples-per-source", type=int, default=512,
+                        help="fixed samples per source scene (default: 512; 0: full validation)")
     args = parser.parse_args()
-    run_evaluation(load_config(args.config), args.checkpoint, args.artifact_dir)
+    run_evaluation(load_config(args.config), args.checkpoint, args.artifact_dir,
+                   samples_per_source=args.samples_per_source)
 
 
 if __name__ == "__main__":

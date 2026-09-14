@@ -13,6 +13,7 @@ from dataclasses import fields
 from curvenav.data.loader import (
     build_policy_training_loader,
     build_policy_validation_loader,
+    source_balanced_indices,
 )
 from curvenav.data.prepare import (
     _flow_coordinate_statistics,
@@ -33,6 +34,15 @@ from curvenav.training.batching import (
     DistributedStepBatchSampler,
     build_distributed_batch_layout,
 )
+
+
+def test_source_balanced_sampling_is_fixed_unique_and_covers_small_scenes():
+    sources = np.repeat([0, 2, 7], [100, 40, 3])
+    indices = source_balanced_indices(sources, 8)
+    assert indices == source_balanced_indices(sources, 8)
+    assert indices == sorted(set(indices))
+    assert np.unique(sources[indices], return_counts=True)[1].tolist() == [8, 8, 3]
+    assert source_balanced_indices(sources, 200) == list(range(len(sources)))
 
 
 def _write_dataset(root, count: int = 4) -> None:

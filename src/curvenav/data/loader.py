@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset, default_convert
 
@@ -20,6 +21,18 @@ class PolicyLoaderBundle:
     samples: int
 
 
+def source_balanced_indices(source_indices: np.ndarray, samples_per_source: int) -> list[int]:
+    """Fixed uniform sampling without replacement within every source scene."""
+    if samples_per_source < 1:
+        raise ValueError("samples_per_source must be positive")
+    rng = np.random.default_rng(0)
+    selected = []
+    for source in np.unique(source_indices):
+        indices = np.flatnonzero(source_indices == source)
+        selected.extend(rng.choice(indices, min(len(indices), samples_per_source), replace=False))
+    return np.sort(selected).tolist()
+
+
 def build_policy_validation_loader(
     data: DataConfig,
     trajectory: TrajectoryConfig,
@@ -27,10 +40,15 @@ def build_policy_validation_loader(
     num_workers: int,
     rank: int = 0,
     world_size: int = 1,
+    samples_per_source: int | None = None,
 ) -> PolicyLoaderBundle:
     """Load precomputed labels; workers move only small fixed-shape tensors."""
     base = PreparedPolicyDataset(data.root, "validation", data, trajectory)
-    dataset = Subset(base, range(rank, len(base), world_size))
+    indices = (
+        range(len(base)) if samples_per_source is None else
+        source_balanced_indices(base.arrays["source_grid_index"], samples_per_source)
+    )
+    dataset = Subset(base, indices[rank::world_size])
     arguments = {
         "dataset": dataset,
         "batch_size": batch_size,
