@@ -138,7 +138,7 @@ def test_prepared_dataset_has_one_fixed_tensor_contract(tmp_path) -> None:
     }
     assert sample["depth_indices"].dtype == torch.uint32
     assert sample["curve_values"].shape == (14,)
-    bank = load_packed_depth_bank(dataset.depth_bank, torch.device("cpu"))
+    bank = load_packed_depth_bank(dataset.depth_bank)
     depth = gather_depth_observations(bank, sample["depth_indices"].unsqueeze(0))
     assert depth.shape == (1, 4, 1, 126, 224)
 

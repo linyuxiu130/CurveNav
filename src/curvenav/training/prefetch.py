@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from curvenav.data.depth_bank import (
+    PackedDepthBank,
     PackedDepthBankSpec,
     load_packed_depth_bank,
 )
@@ -33,7 +34,7 @@ class CudaPrefetchLoader:
         self.loader = loader
         self.depth_bank_spec = depth_bank
         self.device = device
-        self._depth_bank: Tensor | None = None
+        self._depth_bank: PackedDepthBank | None = None
 
     def __len__(self) -> int:
         return len(self.loader)
@@ -44,7 +45,6 @@ class CudaPrefetchLoader:
         if self._depth_bank is None:
             self._depth_bank = load_packed_depth_bank(
                 self.depth_bank_spec,
-                torch.device("cpu"),
             )
         prefetch_stream = torch.cuda.Stream(device=self.device)
         with torch.cuda.stream(prefetch_stream):
@@ -75,15 +75,6 @@ class CudaPrefetchLoader:
         # The 10 Hz corpus grows independently of GPU capacity. Keep immutable
         # banks in host RAM and transfer only the selected four-frame batch.
         indices = batch["depth_indices"]
-        height, width = self._depth_bank.shape[-2:]
-        depth = torch.empty(
-            (*indices.shape, 1, height, width),
-            dtype=self._depth_bank.dtype,
-            pin_memory=True,
-        )
-        torch.index_select(
-            self._depth_bank, 0, indices.flatten().long(),
-            out=depth.view(-1, height, width),
-        )
+        depth = self._depth_bank.gather(indices, pin_memory=True)
         moved["depth"] = depth.to(self.device, non_blocking=True)
         return moved

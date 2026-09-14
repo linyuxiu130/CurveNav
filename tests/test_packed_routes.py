@@ -121,9 +121,7 @@ def test_packed_routes_and_local_slicing_share_training_frames(tmp_path, monkeyp
         config,
     )
     dataset = PreparedPolicyDataset(destination, "train", data, config.trajectory)
-    packed_depth = load_packed_depth_bank(
-        dataset.depth_bank, torch.device("cpu")
-    )
+    packed_depth = load_packed_depth_bank(dataset.depth_bank)
     sample = next(iter(DataLoader(dataset, batch_size=1, collate_fn=default_convert)))
     from curvenav.data.depth_bank import gather_depth_observations
 
