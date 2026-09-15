@@ -1,7 +1,7 @@
 """Held-out source-truth evaluation for CurveNav's single local policy."""
 
 import argparse
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 import hashlib
 import json
 from pathlib import Path
@@ -744,7 +744,7 @@ def evaluate_measurements(measurements: PolicyMeasurements) -> dict[str, object]
             .item(),
         },
         "raw_depth_collision_attribution": _collision_detection_summary(metrics),
-        "batch32_latency_ms_mean": measurements.batch_latency_ms.mean().item(),
+        "batch_latency_ms_mean": measurements.batch_latency_ms.mean().item(),
         "base_policy_forward_observations_per_second": (measurements.samples / seconds),
         "full_evaluation_observations_per_second": (
             measurements.samples / measurements.wall_seconds
@@ -767,10 +767,13 @@ def run_evaluation(
     checkpoint_path: Path,
     artifact_dir: Path | None = None,
     samples_per_source: int = 512,
+    batch_size: int = VALIDATION_BATCH_SIZE,
 ) -> dict[str, object]:
     started = time.perf_counter()
     if samples_per_source < 0:
         raise ValueError("samples_per_source must be nonnegative; 0 selects the full split")
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
     if not torch.cuda.is_available():
         raise RuntimeError("CurveNav evaluation requires CUDA")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -781,10 +784,18 @@ def run_evaluation(
     ema.load_state_dict(checkpoint["ema"])
     ema.copy_to(policy)
     policy.eval()
+    # Prepared targets are metric control points. Their training-set statistics
+    # validate the dataset only; inference keeps the checkpoint's normalization.
+    dataset_trajectory = load_config(Path(config.data.root) / "config.yaml").trajectory
+    dataset_trajectory = replace(
+        config.trajectory,
+        control_increment_mean_xy_m=dataset_trajectory.control_increment_mean_xy_m,
+        control_increment_std_xy_m=dataset_trajectory.control_increment_std_xy_m,
+    )
     bundle = build_policy_validation_loader(
         config.data,
-        config.trajectory,
-        batch_size=VALIDATION_BATCH_SIZE,
+        dataset_trajectory,
+        batch_size=batch_size,
         num_workers=config.training.num_workers,
         samples_per_source=samples_per_source or None,
     )
@@ -813,6 +824,7 @@ def run_evaluation(
         checkpoint=str(checkpoint_path.resolve()),
         checkpoint_step=int(checkpoint["step"]),
         weights="ema",
+        evaluation_batch_size=batch_size,
         sampling={
             "method": "source_balanced_without_replacement" if samples_per_source else "full",
             "seed": 0,
@@ -853,9 +865,10 @@ def main() -> None:
     parser.add_argument("--artifact-dir", type=Path)
     parser.add_argument("--samples-per-source", type=int, default=512,
                         help="fixed samples per source scene (default: 512; 0: full validation)")
+    parser.add_argument("--batch-size", type=int, default=VALIDATION_BATCH_SIZE)
     args = parser.parse_args()
     run_evaluation(load_config(args.config), args.checkpoint, args.artifact_dir,
-                   samples_per_source=args.samples_per_source)
+                   samples_per_source=args.samples_per_source, batch_size=args.batch_size)
 
 
 if __name__ == "__main__":
