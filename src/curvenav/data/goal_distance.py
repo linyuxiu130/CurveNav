@@ -25,7 +25,8 @@ class GoalDistanceQuery:
                 y1 = slice(max(0, dy), min(free.shape[1], free.shape[1] + dy))
                 valid = free[x0, y0] & free[x1, y1]
                 if dx and dy:
-                    # An edge cannot pass through either occupied corner cell.
+                    # Closed-cell contact, identical to the source path query:
+                    # a diagonal touches both side cells at their shared corner.
                     valid &= free[x1, y0] & free[x0, y1]
                 a, b = ids[x0, y0][valid], ids[x1, y1][valid]
                 rows.extend((a, b))

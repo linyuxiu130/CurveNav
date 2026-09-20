@@ -34,6 +34,25 @@ MPC_HORIZON_S = 30 * 0.1
 TERMINAL_COLLISION_WINDOW_M = 0.25
 
 
+def candidate_selection_metrics(
+    scores: Tensor, selected_index: Tensor, teacher_scores: Tensor, clearance_m: Tensor,
+) -> dict[str, Tensor]:
+    """Measure the deployed choice against source-map utility, never its own score."""
+    rows = torch.arange(len(scores), device=scores.device)
+    selected_utility = teacher_scores[rows, selected_index]
+    collision = clearance_m[rows, selected_index] < 0
+    safe_available = (clearance_m >= 0).any(dim=1)
+    return {
+        "selected_utility": selected_utility,
+        "candidate_safe_available": safe_available,
+        "candidate_collision_fraction": (clearance_m < 0).float().mean(1),
+        "selected_whole_curve_collision": collision,
+        "selection_missed_safe_candidate": safe_available & collision,
+        "selection_score_regret": teacher_scores.max(1).values - selected_utility,
+        "critic_score_mae": (scores - teacher_scores).abs().mean(1),
+    }
+
+
 @dataclass(frozen=True)
 class CollisionVisibilityAttribution:
     """Source collisions partitioned by deployed raw-depth evidence."""
@@ -198,7 +217,7 @@ def configuration_space_safety_metrics(
     configuration_field: Tensor,
     planning_horizon_m: float,
 ) -> dict[str, Tensor]:
-    """Evaluate path safety in a signed robot configuration-space field."""
+    """Diagnose represented raster geometry; source maps supply safety truth."""
     _validate_path(path, "path")
     if planning_horizon_m <= 0:
         raise ValueError("planning_horizon_m must be positive")
@@ -219,14 +238,14 @@ def configuration_space_safety_metrics(
         planning_horizon_m,
     )
     covered = active & sampled.support_observed
-    clearance = sampled.signed_clearance_m
+    clearance = sampled.estimated_clearance_m
     covered_clearance = clearance.masked_fill(~covered, torch.inf)
     minimum = covered_clearance.amin(dim=-1)
-    collision = covered & (clearance < 0.0)
-    margin_violation = covered & (clearance < SAFETY_CLEARANCE_M)
+    collision = covered & (sampled.clearance_upper_bound_m < 0.0)
+    margin_violation = covered & (sampled.clearance_upper_bound_m < SAFETY_CLEARANCE_M)
     maximum_margin_violation = torch.where(
         covered,
-        torch.relu(SAFETY_CLEARANCE_M - clearance),
+        torch.relu(SAFETY_CLEARANCE_M - sampled.clearance_upper_bound_m),
         torch.zeros_like(clearance),
     ).amax(dim=-1)
     return {
@@ -261,8 +280,8 @@ def collision_visibility_attribution(
     truth_free = source_query.active & ~truth_collision
     full_coverage = source_query.active & full.support_observed
     current_coverage = source_query.active & current.support_observed
-    full_recognized = full_coverage & (full.signed_clearance_m < 0.0)
-    current_recognized = current_coverage & (current.signed_clearance_m < 0.0)
+    full_recognized = full_coverage & (full.clearance_upper_bound_m < 0.0)
+    current_recognized = current_coverage & (current.clearance_upper_bound_m < 0.0)
     current_visible = truth_collision & current_recognized
     history_only_visible = truth_collision & full_recognized & ~current_recognized
     unrecognized = truth_collision & ~full_recognized

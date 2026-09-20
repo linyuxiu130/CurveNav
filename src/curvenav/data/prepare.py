@@ -193,6 +193,14 @@ def _route_examples(
     roots: tuple[Path, ...], config: CurveNavConfig
 ) -> dict[str, list[_Example]]:
     output: dict[str, list[_Example]] = {"train": [], "validation": []}
+    families = {"train": set(), "validation": set()}
+    for root in roots:
+        with (root.expanduser().resolve() / "routes.jsonl").open() as stream:
+            for line in stream:
+                record = json.loads(line)
+                families[record["split"]].add((record["source"], record["source_family"]))
+    if families["train"] & families["validation"]:
+        raise ValueError("source-family split leakage across expert route roots")
     for root in roots:
         source = _route_examples_from_root(root.expanduser().resolve(), config)
         for split in output:
@@ -305,7 +313,7 @@ def _source_metadata(examples: list[_Example]) -> _SourceMetadata:
     """Keep source C-space provenance out of the policy condition tensors."""
     grid_paths = tuple(
         sorted(
-            {example.source_grid_path.resolve() for example in examples},
+            {example.source_grid_path for example in examples},
             key=lambda path: path.as_posix(),
         )
     )
@@ -313,7 +321,7 @@ def _source_metadata(examples: list[_Example]) -> _SourceMetadata:
     return _SourceMetadata(
         grid_paths=grid_paths,
         grid_index=np.asarray(
-            [index[example.source_grid_path.resolve()] for example in examples],
+            [index[example.source_grid_path] for example in examples],
             dtype=np.int64,
         ),
         origin_xy=np.stack([example.source_origin_xy for example in examples]).astype(
@@ -627,6 +635,7 @@ def _compile_split(
         torch.from_numpy(curve_values),
     ).numpy()
     goal_distance = np.linalg.norm(point_goal, axis=1)
+    goal_bearing = np.abs(np.arctan2(point_goal[:, 1], point_goal[:, 0]))
     endpoint = reference_path[:, -1]
     goal_angle = np.degrees(
         np.arccos(
@@ -651,6 +660,11 @@ def _compile_split(
             "p50": float(np.quantile(goal_distance, 0.5)),
             "p95": float(np.quantile(goal_distance, 0.95)),
             "max": float(goal_distance.max()),
+        },
+        "goal_coverage": {
+            "near_goal_frames": int((goal_distance < 1.5).sum()),
+            "near_side_or_rear_frames": int(((goal_distance < 1.5) & (goal_bearing > np.pi / 3)).sum()),
+            "near_rear_frames": int(((goal_distance < 1.5) & (goal_bearing > np.pi / 2)).sum()),
         },
         "goal_prefix_angle_deg": {
             "mean": float(goal_angle.mean()),

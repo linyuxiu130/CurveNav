@@ -1,5 +1,5 @@
 data:
-  root: data/policy_dataset-depth-memory
+  root: /shibo_huang/data/curvenav/datasets/policy_hssd_grscenes7480
   observation_frames: 4
   expert_waypoint_spacing_m: 0.15
   future_steps: 24
@@ -15,35 +15,35 @@ model:
     spline_degree: 3
     num_path_points: 64
     control_increment_mean_xy_m:
-    - 0.19642330136755862
+    - 0.1796992762384781
     - 0.0
-    - 0.3915094997185144
-    - 0.00021861691377818637
-    - 0.5476898505751266
-    - -0.0014516595218387449
-    - 0.5035989823812841
-    - -0.006019467515492705
-    - 0.4582797710610274
-    - -0.01078719027836341
-    - 0.27792310350004706
-    - -0.010353431965547815
-    - 0.13242820373850755
-    - -0.005304436046028459
+    - 0.3168608613612687
+    - 0.0006750436285857214
+    - 0.42384974544777076
+    - -0.0017290624495437277
+    - 0.3675667517010234
+    - -0.001166730984816943
+    - 0.3244238541896543
+    - -0.0009650867178115088
+    - 0.18871128642370538
+    - 0.00036668856557577414
+    - 0.08828574467171063
+    - 4.3608479540697814e-05
     control_increment_std_xy_m:
-    - 0.050220991216198226
-    - 0.050220991216198226
-    - 0.11429249515751656
-    - 0.11429249515751656
-    - 0.2282398416282557
-    - 0.2282398416282557
-    - 0.27447920007578686
-    - 0.27447920007578686
-    - 0.31187694698071
-    - 0.31187694698071
-    - 0.22779275189818496
-    - 0.22779275189818496
-    - 0.1147950114801321
-    - 0.1147950114801321
+    - 0.05612170282132645
+    - 0.05612170282132645
+    - 0.20582668227880396
+    - 0.20582668227880396
+    - 0.30338064054639446
+    - 0.30338064054639446
+    - 0.3465629928545993
+    - 0.3465629928545993
+    - 0.36382020979384444
+    - 0.36382020979384444
+    - 0.2585386074239907
+    - 0.2585386074239907
+    - 0.12557243820553035
+    - 0.12557243820553035
   depth_encoder:
     model_dim: 384
     frame_tokens_height: 8
@@ -59,9 +59,9 @@ model:
     dropout: 0.0
 training:
   seed: 42
-  gradient_accumulation_steps: 1
-  per_device_batch_size: 128
-  samples_per_epoch: 40960
+  gradient_accumulation_steps: 2
+  per_device_batch_size: 64
+  samples_per_epoch: 1491456
   epochs: 50
   num_workers: 2
   prefetch_factor: 2
@@ -69,7 +69,7 @@ training:
   min_learning_rate_factor: 0.01
   log_every_steps: 20
   checkpoint_every_epochs: 1
-  output_dir: outputs/train_policy-depth-memory
+  output_dir: outputs/train-structured-exploration-7480
   learning_rate: 0.0002
   weight_decay: 0.01
   grad_clip_norm: 1.0

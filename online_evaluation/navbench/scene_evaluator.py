@@ -181,6 +181,10 @@ class Planner:
         local = np.einsum(
             "bji,bpj->bpi", current[:, :3, :3], world - current[:, None, :3, 3]
         )
+        # An all-zero policy path requests a stop, not a return to its capture
+        # position. Keep that reference at the current origin across latency.
+        stop = ~np.any(trajectory[active_ids] != 0, axis=(1, 2))
+        local[stop] = 0
         started = time.perf_counter()
         controls, states, desired_speed, maximum_curvature = self.mpc_controller.solve(local)
         mpc_seconds = time.perf_counter() - started

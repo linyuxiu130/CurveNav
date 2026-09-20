@@ -14,7 +14,9 @@ class ConfigurationFieldQuery:
     """Observed geometry and support at continuous robot-centre positions."""
 
     observed_features: Tensor
-    signed_clearance_m: Tensor
+    estimated_clearance_m: Tensor
+    clearance_lower_bound_m: Tensor
+    clearance_upper_bound_m: Tensor
     support_observed: Tensor
 
 
@@ -23,10 +25,13 @@ def query_configuration_field(
     path: Tensor,
     planning_horizon_m: float,
 ) -> ConfigurationFieldQuery:
-    """Query a continuous clearance lower bound and interpolated observations.
+    """Interpolate raster geometry; bound its continuous distance separately.
 
-    Channels are signed clearance, its planar unit gradient, ray coverage, and
-    the footprint-inflated obstacle indicator.  Geometry from an unobserved
+    Channels are raster-site clearance, its planar unit gradient, coverage, and
+    raster footprint overlap. For nonempty fields, bounds apply to represented
+    sites, not the physical scene or unseen obstacles. Empty fields retain the
+    positive finite distance sentinel and provide no overlap evidence.
+    Geometry from an unobserved
     corner is multiplied by zero before interpolation; interpolated coverage is
     retained explicitly so learned consumers can distinguish weak support from
     measured free space.
@@ -58,9 +63,8 @@ def query_configuration_field(
         ((1 - wx) * (1 - wy), wx * (1 - wy), (1 - wx) * wy, wx * wy),
         dim=-1,
     )
-    # Distance to a fixed obstacle set is 1-Lipschitz. Each node lower bound
-    # therefore gives d(p) >= d_lower(node) - ||p-node||. Their maximum remains
-    # a lower bound; bilinear distance interpolation does not have this property.
+    # Raster-site distance is 1-Lipschitz: d(node) +/- ||p-node|| bounds d(p).
+    # Bilinear interpolation is only an estimate, not either bound.
     node_x = torch.stack((x0, x1, x0, x1), dim=-1).float()
     node_y = torch.stack((y0, y0, y1, y1), dim=-1).float()
     nodes = torch.stack(
@@ -70,11 +74,13 @@ def query_configuration_field(
         ),
         dim=-1,
     )
-    corner_lower_bound = (
-        corners[..., 0]
-        - torch.linalg.vector_norm(path.float()[..., None, :] - nodes, dim=-1)
+    distance_to_node = torch.linalg.vector_norm(
+        path.float()[..., None, :] - nodes, dim=-1
     )
+    corner_lower_bound = corners[..., 0] - distance_to_node
+    corner_upper_bound = corners[..., 0] + distance_to_node
     lower_bound = corner_lower_bound.amax(dim=-1)
+    upper_bound = corner_upper_bound.amin(dim=-1)
     inside = (normalized.abs() <= 1).all(dim=-1)
     observed = corners[..., 3].clamp(0, 1)
     support_observed = inside & torch.where(
@@ -86,25 +92,15 @@ def query_configuration_field(
         corners[..., :3] * observed[..., None] * weights[..., None]
     ).sum(dim=-2)
     coverage = (observed * weights).sum(dim=-1, keepdim=True)
-    # Learned geometry uses only measured support, just like the BEV encoder.
-    # The all-node bound above remains available for geometric evaluation.
-    observed_lower_bound = corner_lower_bound.masked_fill(
-        observed == 0, -torch.inf
-    ).amax(dim=-1)
-    observed_lower_bound = torch.where(
-        (observed > 0).any(dim=-1), observed_lower_bound, 0.0
-    )
-    observed_geometry = torch.cat(
-        (observed_lower_bound[..., None] * coverage, observed_geometry[..., 1:]),
-        dim=-1,
-    )
-    forbidden = (corners[..., 4:5] * observed[..., None] * weights[..., None]).sum(
-        dim=-2
-    )
+    # Match the BEV's raster occupancy estimate. Distance bounds are diagnostics,
+    # not a threshold on the geometry supplied to learned consumers.
+    overlap = (corners[..., 4:5] * observed[..., None] * weights[..., None]).sum(-2)
     inside_value = inside[..., None].to(lower_bound.dtype)
     return ConfigurationFieldQuery(
-        observed_features=torch.cat((observed_geometry, coverage, forbidden), dim=-1)
+        observed_features=torch.cat((observed_geometry, coverage, overlap), dim=-1)
         * inside_value,
-        signed_clearance_m=lower_bound,
+        estimated_clearance_m=(corners[..., 0] * weights).sum(dim=-1),
+        clearance_lower_bound_m=lower_bound,
+        clearance_upper_bound_m=upper_bound,
         support_observed=support_observed,
     )

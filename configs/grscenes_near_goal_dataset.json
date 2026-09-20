@@ -1,6 +1,6 @@
 {
   "asset_root": "/shibo_huang/data/curvenav/assets/training/grscenes-hab",
-  "output_root": "/shibo_huang/data/curvenav/datasets/expert_grscenes59",
+  "output_root": "/shibo_huang/data/curvenav/datasets/expert_grscenes_near_goal980",
   "seed": 20260822,
   "workers": 8,
   "gpu_device": 1,
@@ -258,60 +258,6 @@
       "split": "train"
     },
     {
-      "scene_id": "MWBGLKQKTKJZ2AABAAAAAAA8_usd",
-      "source_family": "MWBGLKQKTKJZ2AA",
-      "domain": "home",
-      "split": "validation"
-    },
-    {
-      "scene_id": "MWBGLKQKTKJZ2AABAAAAAAI8_usd",
-      "source_family": "MWBGLKQKTKJZ2AA",
-      "domain": "home",
-      "split": "validation"
-    },
-    {
-      "scene_id": "MWBGLKQKTKJZ2AABAAAAAAQ8_usd",
-      "source_family": "MWBGLKQKTKJZ2AA",
-      "domain": "home",
-      "split": "validation"
-    },
-    {
-      "scene_id": "MWBGLKQKTKJZ2AABAAAAAAY8_usd",
-      "source_family": "MWBGLKQKTKJZ2AA",
-      "domain": "home",
-      "split": "validation"
-    },
-    {
-      "scene_id": "MWBGLKQKTKJZ2AABAAAAABA8_usd",
-      "source_family": "MWBGLKQKTKJZ2AA",
-      "domain": "home",
-      "split": "validation"
-    },
-    {
-      "scene_id": "MWBGLKQKTKJZ2AABAAAAABI8_usd",
-      "source_family": "MWBGLKQKTKJZ2AA",
-      "domain": "home",
-      "split": "validation"
-    },
-    {
-      "scene_id": "MWBGLKQKTKJZ2AABAAAAABQ8_usd",
-      "source_family": "MWBGLKQKTKJZ2AA",
-      "domain": "home",
-      "split": "validation"
-    },
-    {
-      "scene_id": "MWBGLKQKTKJZ2AABAAAAABY8_usd",
-      "source_family": "MWBGLKQKTKJZ2AA",
-      "domain": "home",
-      "split": "validation"
-    },
-    {
-      "scene_id": "MWBGLKQKTKJZ2AABAAAAACA8_usd",
-      "source_family": "MWBGLKQKTKJZ2AA",
-      "domain": "home",
-      "split": "validation"
-    },
-    {
       "scene_id": "MV4AFHQKTKJZ2AABAAAAADY8_usd",
       "source_family": "MV4AFHQKTKJZ2AA",
       "domain": "commercial",
@@ -364,12 +310,6 @@
       "source_family": "MWF4WLIKTIFZIAA",
       "domain": "commercial",
       "split": "train"
-    },
-    {
-      "scene_id": "MWHLEPQKTIFZIAABAAAAAAA8_usd",
-      "source_family": "MWHLEPQKTIFZIAA",
-      "domain": "commercial",
-      "split": "validation"
     }
   ],
   "policy_config": "configs/base.yaml",
@@ -378,52 +318,65 @@
   "scene_dataset": "grscenes.scene_dataset_config.json",
   "asset_repository": "InternRobotics/GRScenes",
   "asset_commit": "4760b9031881c985e3582075cb2d8dbde1530a68",
-  "packed_output_root": "/shibo_huang/data/curvenav/datasets/policy_grscenes59",
+  "packed_output_root": "/shibo_huang/data/curvenav/datasets/policy_hssd_grscenes7480",
   "route_cache_root": "/shibo_huang/data/curvenav/cache/expert-routes",
   "usd_root": "/shibo_huang/data/curvenav/assets/xnavdp-training",
   "archive_root": "/shibo_huang/data/curvenav/archives/scenes/grscenes100",
   "shared_scene_root": "/shibo_huang/data/curvenav/assets/evaluation/scenes",
   "routes_per_split": {
-    "train": 5000,
-    "validation": 1000
+    "train": 980
   },
   "endpoint_sampling": {
-    "distance_unit": "quantiles",
+    "distance_unit": "metres",
     "bands": {
-      "near": {
+      "near_left": {
         "range": [
-          0,
-          0.3333333333333333
+          0.5,
+          1.5
         ],
         "bearing_degrees": [
-          -180,
+          60,
+          120
+        ],
+        "weight": 1
+      },
+      "near_right": {
+        "range": [
+          0.5,
+          1.5
+        ],
+        "bearing_degrees": [
+          -120,
+          -60
+        ],
+        "weight": 1
+      },
+      "near_rear_left": {
+        "range": [
+          0.5,
+          1.5
+        ],
+        "bearing_degrees": [
+          120,
           180
         ],
         "weight": 1
       },
-      "middle": {
+      "near_rear_right": {
         "range": [
-          0.3333333333333333,
-          0.6666666666666666
+          0.5,
+          1.5
         ],
         "bearing_degrees": [
           -180,
-          180
+          -120
         ],
-        "weight": 2
-      },
-      "far": {
-        "range": [
-          0.6666666666666666,
-          1
-        ],
-        "bearing_degrees": [
-          -180,
-          180
-        ],
-        "weight": 2
+        "weight": 1
       }
     }
   },
-  "base_route_roots": []
+  "base_route_roots": [
+    "/shibo_huang/data/curvenav/datasets/expert_500",
+    "/shibo_huang/data/curvenav/datasets/expert_grscenes59"
+  ]
 }

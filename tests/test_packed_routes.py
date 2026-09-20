@@ -43,6 +43,7 @@ def test_packed_routes_and_local_slicing_share_training_frames(tmp_path, monkeyp
         "split": "train",
         "scene_id": "scene",
         "source": "hssd",
+        "source_family": "scene",
         "frames": 5,
     }
     (tmp_path / "routes.jsonl").write_text(json.dumps(record) + "\n")
@@ -187,7 +188,8 @@ def test_route_failure_after_planning_is_not_retried_or_erased(tmp_path, monkeyp
             None, SimpleNamespace(safe=lambda path: True), tmp_path, tmp_path,
             {"split": "train", "scene_id": "scene"}, 0, "near", [3., 6.],
             {"candidate_limit": 2, "observation_period_s": .1,
-             "expert_speed_m_s": .3, "expert_angular_speed_rad_s": .5},
+             "expert_speed_m_s": .3, "expert_angular_speed_rad_s": .5,
+             "endpoint_sampling": {"bands": {"near": {"bearing_degrees": [-180., 180.]}}}},
             0., 42, CurveNavConfig().data,
         )
     assert (tmp_path / "near_0001.partial/traj_xy.npy").is_file()
@@ -202,7 +204,7 @@ def test_label_safety_checks_fitted_tail_beyond_nominal_horizon(tmp_path):
     free[37:] = False
     clearance = np.where(free, 1., 0.).astype(np.float32)
     np.savez(p, free=free, clearance_m=clearance,
-             origin_xy=np.array([0., -.25]), cell_size_m=np.array(.1))
+             origin_xy=np.array([-.05, -.25]), cell_size_m=np.array(.1))
     source = _SourceMetadata((p,), np.array([0]), np.zeros((1, 2),np.float32),
                              np.zeros(1,np.float32), SourceConfigurationSpaceQuery.from_paths((p,)))
     path = torch.tensor([[[0., 0.], [3.8, 0.]]])

@@ -230,7 +230,7 @@ class ConditionalCurveFlowDecoder(nn.Module):
                 + self.position_embedding.to(tokens.dtype)
                 + self.time_embedding(time)[:, None]
                 + path_embedding.to(tokens.dtype)
-                + goal_embedding.to(tokens.dtype)
+                + (goal_embedding * condition.goal_present[:, :, None]).to(tokens.dtype)
             )
             for block, projected in zip(self.blocks, memory, strict=True):
                 tokens = block(tokens, projected, pair_geometry)

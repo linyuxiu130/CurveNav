@@ -11,7 +11,7 @@ from curvenav.types import DepthFeatures
 from .geometry import MetricDepthProjector
 
 
-DEPTH_ENCODER_TYPE = "depth_pixel_lift_se3_memory_v3"
+DEPTH_ENCODER_TYPE = "depth_pixel_lift_se3_causal_memory_timed_history_v6"
 
 
 def _channel_group_norm(channels: int) -> nn.GroupNorm:
@@ -60,8 +60,8 @@ class DepthObservationEncoder(nn.Module):
 
     Each image token retains its learned appearance feature and receives the
     corresponding measured ray endpoint transformed into the current robot
-    frame. The same projection constructs observed robot configuration space;
-    no PointGoal or map completion enters perception.
+    frame, with its acquisition age. Current robot configuration space comes
+    from the full sensor-clock memory; no PointGoal enters perception.
     """
 
     def __init__(

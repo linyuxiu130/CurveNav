@@ -51,6 +51,17 @@ def test_route_speed_accounts_for_storage_rounding_without_allowing_overspeed():
             validate_route_spacing(xy, .03)
 
 
+def test_sampled_endpoint_band_matches_rendered_and_stored_positions(monkeypatch, tmp_path):
+    xy = np.array([[0., 0.], [.499999999, 0.]])
+    monkeypatch.setattr(generation, "timed_route", lambda *args: (xy, np.zeros(2), np.zeros((2, 2))))
+    simulator = SimpleNamespace(pathfinder=SimpleNamespace(snap_point=lambda point: point))
+    sampled, _, rendered, _, _ = generation.sampled_route(simulator, SimpleNamespace(curve=None), 0., .1, .3, .5)
+    np.save(tmp_path / "xy.npy", sampled.astype(np.float32))
+    stored = np.load(tmp_path / "xy.npy")
+    assert np.linalg.norm(sampled[-1] - sampled[0]) == np.linalg.norm(stored[-1] - stored[0]) == .5
+    np.testing.assert_array_equal(rendered[:, [0, 2]], stored)
+
+
 def test_depth_stream_matches_policy_numpy_files(tmp_path, monkeypatch):
     from curvenav.config import DataConfig
     depth = np.empty((2, 360, 640), np.float32)
@@ -325,13 +336,12 @@ def base_config() -> dict:
     return {
         "selected_scenes": [{"scene_id": "scene", "source_family": "family", "split": "train"}],
         "source": "hssd",
-        "endpoint_distance_quantiles": {
-            "near": [0., 1/3],
-            "middle": [1/3, 2/3],
-            "far": [2/3, 1.],
-        },
+        "endpoint_sampling": {"distance_unit": "quantiles", "bands": {
+            "near": {"range": [0., 1/3], "bearing_degrees": [-180, 180], "weight": 1},
+            "middle": {"range": [1/3, 2/3], "bearing_degrees": [-180, 180], "weight": 2},
+            "far": {"range": [2/3, 1.], "bearing_degrees": [-180, 180], "weight": 2},
+        }},
         "routes_per_split": {"train": 25, "validation": 25},
-        "distance_band_weights": {"near": 1, "middle": 2, "far": 2},
         "observation_period_s": 0.1,
         "expert_speed_m_s": 0.3,
         "expert_angular_speed_rad_s": 0.5,

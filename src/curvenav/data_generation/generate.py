@@ -270,6 +270,8 @@ def sampled_route(
     route_xy, route_yaw, controls = timed_route(
         plan.curve, period_s, speed_m_s, angular_speed_rad_s
     )
+    # Render, classify endpoints and record metadata at the stored precision.
+    route_xy = route_xy.astype(np.float32)
     requested_xyz = np.column_stack(
         (route_xy[:, 0], np.full(len(route_xy), floor_m), route_xy[:, 1])
     )
@@ -319,12 +321,14 @@ def generate_route(
     directory = scene_dir / (route_name + ".partial")
     if directory.exists():
         shutil.rmtree(directory)
-    # Independent of the path optimizer and fixed across endpoint retries:
-    # rejecting a difficult route must not silently resample an easier heading.
-    start_yaw = float(np.random.default_rng(
+    # Fix the robot-frame goal bearing before endpoint retries. Habitat's XZ
+    # yaw has the opposite sign to the policy's XY yaw, so bearing = yaw-angle.
+    bearing = math.radians(float(np.random.default_rng(
         stable_seed(seed, scene["scene_id"], route_name + ":heading")
-    ).uniform(-math.pi, math.pi))
+    ).uniform(*config["endpoint_sampling"]["bands"][distance_band]["bearing_degrees"])))
     for candidate_index, (start, goal) in enumerate(pairs):
+        delta = goal - start
+        start_yaw = math.remainder(math.atan2(delta[1], delta[0]) + bearing, 2 * math.pi)
         try:
             plan = source_route(
                 grid,
@@ -349,7 +353,7 @@ def generate_route(
             continue
         directory.mkdir(parents=True, exist_ok=False)
         np.save(directory / "expert_controls.npy", controls.astype(np.float32), allow_pickle=False)
-        np.save(directory / "traj_xy.npy", route_xy.astype(np.float32), allow_pickle=False)
+        np.save(directory / "traj_xy.npy", route_xy, allow_pickle=False)
         np.save(directory / "traj_yaw.npy", route_yaw.astype(np.float32), allow_pickle=False)
         poses = np.broadcast_to(np.eye(4), (len(route_xy), 4, 4)).copy()
         c, sn = np.cos(route_yaw), np.sin(route_yaw)
@@ -390,6 +394,8 @@ def generate_route(
             "source_family": scene["source_family"],
             "frames": len(route_xy),
             "initial_yaw_rad": start_yaw,
+            "initial_goal_bearing_rad": bearing,
+            "endpoint_candidate_index": candidate_index,
             "timestamp_semantics": "uniform_sensor_clock",
             "motion_model": "forward_differential_drive_curve_clock",
             "route_arc_m": path_length(route_xy),
@@ -420,8 +426,8 @@ def route_quota(config: dict[str, Any], scene: dict[str, str]) -> dict[str, int]
     scene_ids = sorted(s["scene_id"] for s in config["selected_scenes"] if s["split"] == scene["split"])
     count, extra = divmod(config["routes_per_split"][scene["split"]], len(scene_ids))
     count += scene_ids.index(scene["scene_id"]) < extra
-    bands = ("near", "middle", "far")
-    weights = config["distance_band_weights"]
+    bands = sorted(config["endpoint_sampling"]["bands"])
+    weights = {band: config["endpoint_sampling"]["bands"][band]["weight"] for band in bands}
     denominator = sum(weights.values())
     fractions = {band: divmod(count * weights[band], denominator) for band in bands}
     quota = {band: fractions[band][0] for band in bands}
@@ -431,13 +437,16 @@ def route_quota(config: dict[str, Any], scene: dict[str, str]) -> dict[str, int]
     return quota
 
 
-def endpoint_distance_ranges(grid: Grid, quantiles: dict[str, list[float]], seed: int) -> dict[str, list[float]]:
-    """Stratify by a deterministic estimate of this scene's endpoint distribution.
+def endpoint_distance_ranges(grid: Grid, sampling: dict[str, Any], seed: int) -> dict[str, list[float]]:
+    """Resolve task strata in metres or scene-relative distance quantiles.
 
     The 8,192 pairs estimate quantiles, not a finite set of training tasks.
     Actual route candidates are sampled independently. Zero and the bounding-box
     diagonal include the complete distance support, including small scenes.
     """
+    bands = sampling["bands"]
+    if sampling["distance_unit"] == "metres":
+        return {band: list(spec["range"]) for band, spec in bands.items()}
     eligible = np.argwhere(grid.free & (grid.clearance_m + 1e-9 >= MIN_CLEARANCE_M))
     if len(eligible) < 2:
         raise PlanningError("scene has fewer than two safe endpoints")
@@ -445,13 +454,16 @@ def endpoint_distance_ranges(grid: Grid, quantiles: dict[str, list[float]], seed
     pairs = eligible[rng.integers(len(eligible), size=(8192, 2))]
     distances = np.linalg.norm(pairs[:, 1] - pairs[:, 0], axis=1) * grid.cell_size_m
     distances = distances[distances > 0]
-    cuts = [quantiles[band][0] for band in ("near", "middle", "far")] + [1.]
-    edges = np.quantile(distances, cuts)
-    edges[0] = 0.
-    edges[-1] = np.nextafter(np.linalg.norm(np.ptp(eligible, axis=0)) * grid.cell_size_m, np.inf)
-    if np.any(np.diff(edges) <= 0):
-        raise PlanningError("scene has insufficient endpoint distance variation")
-    return {band: edges[i:i+2].tolist() for i, band in enumerate(("near", "middle", "far"))}
+    extent = np.nextafter(np.linalg.norm(np.ptp(eligible, axis=0)) * grid.cell_size_m, np.inf)
+    ranges = {}
+    for band, spec in bands.items():
+        lo, hi = spec["range"]
+        bounds = [0. if lo == 0 else float(np.quantile(distances, lo)),
+                  extent if hi == 1 else float(np.quantile(distances, hi))]
+        if bounds[0] >= bounds[1]:
+            raise PlanningError("scene has insufficient endpoint distance variation")
+        ranges[band] = bounds
+    return ranges
 
 
 def generate_scene(
@@ -495,7 +507,7 @@ def generate_scene(
                                origin_xy=grid.origin_xy, cell_size_m=grid.cell_size_m,
                                floor_height_m=floor)
             os.replace(temporary, grid_path)
-        distance_ranges = endpoint_distance_ranges(grid, config["endpoint_distance_quantiles"], seed)
+        distance_ranges = endpoint_distance_ranges(grid, config["endpoint_sampling"], seed)
         records = []
         for band, count in quota.items():
             for route_index in range(count):
@@ -535,38 +547,33 @@ def validate_config(config: dict[str, Any], data: DataConfig) -> None:
     scenes = config["selected_scenes"]
     train = [item for item in scenes if item["split"] == "train"]
     validation = [item for item in scenes if item["split"] == "validation"]
-    if not train or not validation or len(train) + len(validation) != len(scenes):
-        raise ValueError("selected_scenes must contain train and validation scenes")
+    if not scenes or len(train) + len(validation) != len(scenes):
+        raise ValueError("selected_scenes must contain train or validation scenes")
     if len({item["scene_id"] for item in scenes}) != len(scenes):
         raise ValueError("selected_scenes must be unique")
     if {item["source_family"] for item in train} & {
         item["source_family"] for item in validation
     }:
         raise ValueError("source-family split leakage")
-    bands = config["endpoint_distance_quantiles"]
-    weights = config["distance_band_weights"]
-    if set(bands) != {"near", "middle", "far"} or set(weights) != set(bands):
-        raise ValueError("endpoint distance bands must be near, middle, and far")
-    distance_ranges = [bands[band] for band in ("near", "middle", "far")]
-    if not all(
-        len(bounds) == 2
-        and all(math.isfinite(float(value)) for value in bounds)
-        and 0 <= bounds[0] < bounds[1] <= 1
-        for bounds in distance_ranges
-    ):
-        raise ValueError("distance quantiles must be finite increasing intervals in [0, 1]")
-    if distance_ranges[0][0] != 0 or distance_ranges[-1][1] != 1:
-        raise ValueError("distance quantiles must cover all endpoint distances")
-    if not all(
-        math.isclose(left[1], right[0])
-        for left, right in zip(distance_ranges[:-1], distance_ranges[1:])
-    ):
-        raise ValueError("endpoint distance ranges must be contiguous")
-    if any(type(weight) is not int or weight < 1 for weight in weights.values()):
-        raise ValueError("distance band weights must be positive integers")
+    sampling = config["endpoint_sampling"]
+    if sampling["distance_unit"] not in ("metres", "quantiles") or not sampling["bands"]:
+        raise ValueError("endpoint sampling requires metres or quantiles and nonempty bands")
+    for name, spec in sampling["bands"].items():
+        if not name or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in name):
+            raise ValueError("endpoint band names must be lowercase identifiers")
+        bounds, bearing = spec["range"], spec["bearing_degrees"]
+        if (len(bounds) != 2 or not all(math.isfinite(v) for v in bounds)
+                or not 0 <= bounds[0] < bounds[1]
+                or (sampling["distance_unit"] == "quantiles" and bounds[1] > 1)):
+            raise ValueError("invalid endpoint distance interval")
+        if (len(bearing) != 2 or not all(math.isfinite(v) for v in bearing)
+                or not -180 <= bearing[0] < bearing[1] <= 180):
+            raise ValueError("goal bearings must be an increasing interval within [-180, 180]")
+        if type(spec["weight"]) is not int or spec["weight"] < 1:
+            raise ValueError("endpoint band weights must be positive integers")
     totals = config["routes_per_split"]
-    if set(totals) != {"train", "validation"} or any(type(n) is not int or n < 1 for n in totals.values()):
-        raise ValueError("routes_per_split must give positive train and validation totals")
+    if set(totals) != {s["split"] for s in scenes} or any(type(n) is not int or n < 1 for n in totals.values()):
+        raise ValueError("routes_per_split must give positive totals for the selected splits")
     if any(min(route_quota(config, scene).values()) < 1 for scene in scenes):
         raise ValueError("route totals must cover every scene and distance band")
     if config["observation_period_s"] != OBSERVATION_PERIOD_S:
@@ -628,7 +635,7 @@ def _generate(config_path: Path) -> dict[str, Any]:
     semantics = {key: config[key] for key in (
         "seed", "source", "asset_repository", "asset_commit", "candidate_limit",
         "camera", "observation_period_s", "expert_speed_m_s",
-        "expert_angular_speed_rad_s", "endpoint_distance_quantiles",
+        "expert_angular_speed_rad_s", "endpoint_sampling",
     )}
     semantics["observation"] = depth_camera_contract(data)
     semantics["navigation_geometry"] = expert_navigation_geometry_contract()
@@ -693,14 +700,14 @@ def _generate(config_path: Path) -> dict[str, Any]:
         "route_contract": {
             "navigation_geometry": expert_navigation_geometry_contract(),
             "unperturbed": True,
-            "initial_heading": "uniform_world_yaw_fixed_before_endpoint_retries",
+            "initial_heading": "robot_frame_goal_bearing_fixed_before_endpoint_retries",
             "observation_period_s": config["observation_period_s"],
             "expert_speed_m_s": config["expert_speed_m_s"],
             "expert_angular_speed_rad_s": config["expert_angular_speed_rad_s"],
             "continuous_safety_step_m": SAFETY_STEP_M,
             "minimum_clearance_m": MIN_CLEARANCE_M,
             "horizontal_snap": "float32_storage_tolerance_only",
-            "endpoint_distance_quantiles": config["endpoint_distance_quantiles"],
+            "endpoint_sampling": config["endpoint_sampling"],
             "routes_per_scene_by_distance": {scene["scene_id"]: route_quota(config, scene)
                                              for scene in config["selected_scenes"]},
         },
@@ -712,7 +719,8 @@ def _generate(config_path: Path) -> dict[str, Any]:
     partial.rename(output)
     from curvenav.data.prepare import compile_policy_dataset
     compile_policy_dataset(
-        (output,), project_root / config["packed_output_root"], policy_config
+        (*[project_root / path for path in config["base_route_roots"]], output),
+        project_root / config["packed_output_root"], policy_config
     )
     return summary
 

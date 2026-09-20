@@ -98,5 +98,6 @@ class PolicyConditionEncoder(nn.Module):
             frame_age=frame_age,
             motion_token=motion_token,
             terminal_goal=terminal_goal,
+            goal_present=torch.ones_like(point_goal[:, :1]),
             configuration_field=observation.configuration_field,
         )

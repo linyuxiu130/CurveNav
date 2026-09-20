@@ -14,7 +14,7 @@
     "focal_y_px": 326.398559570312,
     "forward_offset_m": 0.14309,
     "height_m": 0.31266,
-    "downward_pitch_degrees": 10.0
+    "downward_pitch_degrees": 10
   },
   "selected_scenes": [
     {
@@ -126,27 +126,47 @@
   "asset_commit": "4369cb9876214c7fbebcf552eb532380e4d287e4",
   "packed_output_root": "/shibo_huang/data/curvenav/datasets/policy_dataset-depth-memory",
   "route_cache_root": "/shibo_huang/data/curvenav/cache/expert-routes",
-  "endpoint_distance_quantiles": {
-    "near": [
-      0,
-      0.3333333333333333
-    ],
-    "middle": [
-      0.3333333333333333,
-      0.6666666666666666
-    ],
-    "far": [
-      0.6666666666666666,
-      1
-    ]
-  },
   "routes_per_split": {
     "train": 400,
     "validation": 100
   },
-  "distance_band_weights": {
-    "near": 1,
-    "middle": 2,
-    "far": 2
-  }
+  "endpoint_sampling": {
+    "distance_unit": "quantiles",
+    "bands": {
+      "near": {
+        "range": [
+          0,
+          0.3333333333333333
+        ],
+        "bearing_degrees": [
+          -180,
+          180
+        ],
+        "weight": 1
+      },
+      "middle": {
+        "range": [
+          0.3333333333333333,
+          0.6666666666666666
+        ],
+        "bearing_degrees": [
+          -180,
+          180
+        ],
+        "weight": 2
+      },
+      "far": {
+        "range": [
+          0.6666666666666666,
+          1
+        ],
+        "bearing_degrees": [
+          -180,
+          180
+        ],
+        "weight": 2
+      }
+    }
+  },
+  "base_route_roots": []
 }

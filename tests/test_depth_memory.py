@@ -18,6 +18,23 @@ from curvenav.types import PolicyCondition, TrajectoryTarget
 from curvenav.data.obstacle_memory import memory_grid_shape
 
 
+def test_rectangle_minima_match_every_pixel_including_unknown_depth():
+    from curvenav.data.obstacle_memory import _rectangle_minimum
+
+    rng = np.random.default_rng(42)
+    depth = rng.random((17, 23), dtype=np.float32)
+    depth[4, 6] = 0  # Unknown pixels inside a rectangle must prevent clearing.
+    x0, x1 = np.sort(rng.integers(0, 23, size=(2, 1000)), axis=0)
+    y0, y1 = np.sort(rng.integers(0, 17, size=(2, 1000)), axis=0)
+    x0[:2], x1[:2], y0[:2], y1[:2] = [0, 6], [22, 6], [0, 4], [16, 4]
+    expected = np.asarray([
+        depth[top:bottom + 1, left:right + 1].min()
+        for left, top, right, bottom in zip(x0, y0, x1, y1)
+    ])
+    np.testing.assert_array_equal(_rectangle_minimum(depth, x0, y0, x1, y1), expected)
+    assert _rectangle_minimum(depth, x0[:0], y0[:0], x1[:0], y1[:0]).size == 0
+
+
 def config():
     return CurveNavConfig(
         depth_encoder=DepthEncoderConfig(
@@ -171,31 +188,29 @@ def test_bev_distance_and_out_of_bounds_match_metric_grid():
     assert not raster.any()
 
 
-def test_raster_clearance_is_a_lower_bound_on_continuous_point_clearance():
+def test_raster_clearance_is_an_estimate_with_bounded_quantization_error():
     from curvenav.physical import ROBOT_FOOTPRINT_RADIUS_M
 
     projector = build_evaluation_projector(config())
     # Off-grid point close to a cell corner exercises both coordinate errors.
     point = torch.tensor([0.41, 0.29, 0.06])
     field = projector._configuration_field(
-        point.reshape(1, 1, 1, 1, 3),
-        torch.ones(1, 1, 1, 1, dtype=torch.bool),
         point.reshape(1, 1, 1, 3),
         torch.ones(1, 1, 1, dtype=torch.bool),
         torch.eye(4).reshape(1, 1, 4, 4),
         torch.ones(1, 1, dtype=torch.bool),
-        torch.zeros(1, memory_grid_shape(3.6), memory_grid_shape(3.6), dtype=torch.bool),
+        projector._rasterize(point[:2].reshape(1, 1, 2), torch.ones(1, 1, dtype=torch.bool),
+                             padding=projector.obstacle_padding)[:, 0],
     )
     axis = torch.linspace(-3.6, 3.6, 64)
     y, x = torch.meshgrid(axis, axis, indexing="ij")
     exact = (
         (x - point[0]).square() + (y - point[1]).square()
     ).sqrt() - ROBOT_FOOTPRINT_RADIUS_M
-    assert torch.all(field[0, 0] <= exact + 1e-6)
-    # Without the cell error bound the old calculation overestimates clearance.
-    assert torch.any(
-        field[0, 0] + projector.configuration_resolution_m / np.sqrt(2) > exact + 1e-4
-    )
+    error = projector.configuration_resolution_m / np.sqrt(2)
+    assert torch.all((field[0, 0] - exact).abs() <= error + 1e-6)
+    assert torch.any(field[0, 0] > exact + 1e-4)
+    assert torch.any(field[0, 0] < exact - 1e-4)
 
 
 def test_occluded_history_is_retained_and_padding_cannot_add_geometry():
@@ -367,16 +382,18 @@ def test_depth_flow_backward_and_strict_state_roundtrip(tmp_path):
     )
 
 
-def test_new_free_space_removes_contradicted_history_but_unknown_does_not():
+def test_historical_motion_evidence_retains_its_position_and_age():
     c = condition()
     c.depth[:, 0] = 0.2
     projector = build_evaluation_projector(config())
     result = projector(c)
-    assert not result.token_valid[:, 0].any()
+    assert result.token_valid[:, 0].all()
+    torch.testing.assert_close(result.points[:, 0, :, 0], torch.ones(1, 4))
+    torch.testing.assert_close(result.points[:, -1, :, 0], torch.full((1, 4), 2.))
+    assert c.observation_age_s[0, 0] == 1.6
+    # Historical rays do not certify current visibility when the current depth is unknown.
     c.depth[:, -1] = 0
-    assert not projector(c).token_valid[:, 0].any()
-    c.depth[:, 1:] = 0
-    assert projector(c).token_valid[:, 0].all()
+    assert projector(c).configuration_field[:, 3:].count_nonzero() == 0
 
 
 def test_world_coordinate_gauge_does_not_change_relative_memory():
@@ -423,10 +440,44 @@ def test_continuous_clearance_is_a_lipschitz_lower_bound():
     ).requires_grad_()
     query = query_configuration_field(field, points, 1.0)
     truth = points.norm(dim=-1)
-    assert (query.signed_clearance_m <= truth + 1e-6).all()
-    assert abs(query.signed_clearance_m[0, 0]) < 1e-6
-    query.signed_clearance_m.sum().backward()
+    assert (query.clearance_lower_bound_m <= truth + 1e-6).all()
+    assert (query.clearance_upper_bound_m >= truth - 1e-6).all()
+    assert abs(query.clearance_lower_bound_m[0, 0]) < 1e-6
+    query.clearance_lower_bound_m.sum().backward()
     assert torch.isfinite(points.grad).all()
+
+
+def test_negative_lower_bound_is_not_observed_collision():
+    from curvenav.configuration_space import query_configuration_field
+
+    field = torch.zeros(1, 5, 2, 2)
+    field[:, 0] = 0.1
+    field[:, 3] = 1
+    point = torch.zeros(1, 1, 2, requires_grad=True)
+    query = query_configuration_field(field, point, 1.0)
+    assert query.clearance_lower_bound_m.item() < 0
+    assert query.clearance_upper_bound_m.item() > 0
+    torch.testing.assert_close(query.observed_features[..., 0], torch.full((1, 1), .1))
+    assert query.observed_features[..., 4].item() == 0
+    query.observed_features.sum().backward()
+    assert torch.isfinite(point.grad).all()
+
+
+def test_query_interpolates_the_same_observed_occupancy_as_bev():
+    from curvenav.configuration_space import query_configuration_field
+    from curvenav.encoders.configuration import observed_configuration_features
+
+    field = torch.zeros(1, 5, 2, 2)
+    field[:, 3] = 1
+    field[:, 4, :, 0] = 1
+    points = torch.tensor([[[0., 0.], [-.25, .25]]], requires_grad=True)
+    features = query_configuration_field(field, points, 1.).observed_features
+    expected = torch.nn.functional.grid_sample(
+        observed_configuration_features(field), points[:, None], align_corners=True,
+    ).squeeze(2).transpose(1, 2)
+    torch.testing.assert_close(features, expected)
+    derivative = torch.autograd.grad(features[..., 4].sum(), points)[0]
+    torch.testing.assert_close(derivative[..., 0], torch.full((1, 2), -.5))
 
 
 def test_query_unknown_corners_cannot_change_observed_geometry():
@@ -479,19 +530,46 @@ def test_depth_pixel_feature_sampling_uses_backbone_stride_not_pool_bins():
     assert features.grad is not None and torch.isfinite(features.grad).all()
 
 
-def test_intermediate_free_space_prevents_old_obstacle_returning():
-    c = condition()
-    c.depth[:, 0] = .2
-    c.depth[:, -1] = 0
+@pytest.mark.parametrize("moving_obstacle", [False, True])
+def test_sensor_clock_memory_cannot_be_overwritten_by_sparse_history(moving_obstacle):
+    buffer = DepthContextBuffer(config().data)
+    buffer.reset(1)
+    k = np.array([[[100., 0, 112.], [0, 100., 63.], [0, 0, 1.]]], np.float32)
+    camera = np.array([[[0., 0, 1, 0], [-1., 0, 0, 0], [0, -1., 0, .06], [0, 0, 0, 1]]], np.float32)
+    for frame in range(17):
+        angle = frame * .01
+        pose = np.eye(4, dtype=np.float32)[None]
+        pose[0, :2, :2] = [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+        pose[0, 0, 3] = frame * .01
+        depth = np.full((1, 126, 224, 1), 5. if frame == 8 else 0., np.float32)
+        if frame == 0:
+            depth[:, 62:65, 110:114] = 1.
+        if moving_obstacle and frame in (8, 15):
+            optical = (np.array([1.5, -.5, .06]) - pose[0, :3, 3]) @ pose[0, :3, :3]
+            optical = (optical - camera[0, :3, 3]) @ camera[0, :3, :3]
+            u = int(100 * optical[0] / optical[2] + 112)
+            depth[:, 62:65, u-1:u+2] = optical[2]
+        snapshot = buffer.update(depth, pose, k, camera, np.array([frame * .1]))
+    c = PolicyCondition(point_goal=torch.tensor([[2., 0.]]), **{
+        key: torch.from_numpy(value) for key, value in snapshot.items()
+    })
     projector = build_evaluation_projector(config())
     result = projector(c)
-    assert not result.obstacle_valid[:, 0].any()
+    np.testing.assert_array_equal(np.rint(16 - snapshot["observation_age_s"][0] * 10), [0, 7, 15, 16])
+    assert result.obstacle_valid[:, 0].any()  # Retain where the obstacle was, with its age.
     without_old = replace(c, observation_valid=c.observation_valid.clone())
     without_old.observation_valid[:, 0] = False
     torch.testing.assert_close(result.configuration_field, projector(without_old).configuration_field)
-    # A masked newer frame cannot clear history.
-    c.observation_valid[:, 1:3] = False
-    assert projector(c).obstacle_valid[:, 0].any()
+    assert bool(c.obstacle_memory.any()) == moving_obstacle
+    if moving_obstacle:
+        world = np.array([[1., 0., .06], [1.5, -.5, .06]])
+        local = (world - pose[0, :3, 3]) @ pose[0, :3, :3]
+        cells = np.rint((local[:, :2] + 3.6) / (7.2 / 63)).astype(int)
+        assert result.configuration_field[0, 0, cells[0, 1], cells[0, 0]] > 0
+        assert result.configuration_field[0, 0, cells[1, 1], cells[1, 0]] < 0
+        assert result.obstacle_valid[:, 2].any()
+    else:
+        assert result.configuration_field[:, 3:].count_nonzero() == 0
 
 
 def test_selected_pixel_ray_and_metric_point_are_the_same_measurement():
@@ -526,10 +604,10 @@ def test_obstacle_outside_bev_still_inflates_into_boundary():
     projector = build_evaluation_projector(config())
     point = torch.tensor([3.65, 0., .06])
     field = projector._configuration_field(
-        point.reshape(1, 1, 1, 1, 3), torch.ones(1, 1, 1, 1, dtype=torch.bool),
         point.reshape(1, 1, 1, 3), torch.ones(1, 1, 1, dtype=torch.bool),
         torch.eye(4).reshape(1, 1, 4, 4), torch.ones(1, 1, dtype=torch.bool),
-        torch.zeros(1, memory_grid_shape(3.6), memory_grid_shape(3.6), dtype=torch.bool),
+        projector._rasterize(point[:2].reshape(1, 1, 2), torch.ones(1, 1, dtype=torch.bool),
+                             padding=projector.obstacle_padding)[:, 0],
     )
     assert field.shape == (1, 5, 64, 64)
     assert field[0, 0, 31:33, -1].max() < 0

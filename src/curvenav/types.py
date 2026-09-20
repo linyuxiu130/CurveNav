@@ -76,6 +76,7 @@ class ConditionFeatures:
     frame_age: Tensor
     motion_token: Tensor
     terminal_goal: Tensor
+    goal_present: Tensor
     configuration_field: Tensor
 
 

@@ -82,7 +82,7 @@ def policy_dataset_contract(
             "source_safe_expert_physical_increment_imitation"
         ),
         "source_configuration_space_truth": (
-            "native_navigation_grid_endpoint_inclusive_dense_0.025m_"
+            "native_navigation_grid_closed_cell_supercover_0.025m_"
             "oob_non_executable"
         ),
     }

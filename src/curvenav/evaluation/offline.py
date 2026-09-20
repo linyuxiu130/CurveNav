@@ -14,8 +14,10 @@ from curvenav.config import CurveNavConfig
 from curvenav.config_io import load_config
 from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.loader import build_policy_validation_loader
+from curvenav.data.obstacle_memory import ObstacleMemory
 from curvenav.data.privileged import SourceConfigurationSpaceQuery
 from curvenav.evaluation.metrics import (
+    candidate_selection_metrics,
     collision_visibility_attribution,
     configuration_space_safety_metrics,
     controller_tracking_metrics,
@@ -66,6 +68,30 @@ def _sample(
     prepared = unpack_policy_batch(batch)
     prediction = policy.sample(prepared.condition)
     return prepared, prediction
+
+
+def _current_frame_batch(batch: dict[str, Tensor], horizon_m: float, max_depth_m: float):
+    """Remove historical evidence, keeping current hits in the source voxel lattice."""
+    current = dict(batch)
+    valid = torch.zeros_like(batch["observation_valid"])
+    valid[:, -1] = True
+    current["observation_valid"] = valid
+    depth = batch["depth"][:, -1, 0].cpu().numpy()
+    intrinsic = batch["camera_intrinsics"][:, -1].cpu().numpy()
+    camera = batch["camera_to_body"][:, -1].cpu().numpy()
+    # Native XZ -> gravity-aligned world XY, matching the route producer. Absolute
+    # elevation cannot affect XY rasterization of a gravity-aligned single frame.
+    yaw = batch["source_yaw_rad"].cpu()
+    pose = torch.eye(4).repeat(len(depth), 1, 1)
+    pose[:, 0, 0], pose[:, 0, 1] = yaw.cos(), yaw.sin()
+    pose[:, 1, 0], pose[:, 1, 1] = -yaw.sin(), yaw.cos()
+    pose[:, :2, 3] = batch["source_origin_xy"].cpu() * torch.tensor([1., -1.])
+    memory = [
+        torch.from_numpy(ObstacleMemory(horizon_m, max_depth_m).update(d, k, c, p))
+        for d, k, c, p in zip(depth, intrinsic, camera, pose.numpy(), strict=True)
+    ]
+    current["obstacle_memory"] = torch.stack(memory).to(batch["depth"].device)
+    return current
 
 
 def _cached_interventions(
@@ -351,13 +377,8 @@ def measure_policy(
         end.synchronize()
         batch_latency.append(start.elapsed_time(end))
 
-        current_frame_batch = dict(batch)
-        current_frame_valid = torch.zeros_like(batch["observation_valid"])
-        current_frame_valid[:, -1] = True
-        current_frame_batch["observation_valid"] = current_frame_valid
-        current_frame_batch["obstacle_memory"] = torch.zeros_like(batch["obstacle_memory"])
         current_prepared, current_prediction = _sample(
-            policy, current_frame_batch
+            policy, _current_frame_batch(batch, policy.planning_horizon_m, policy.depth_encoder.max_depth_m)
         )
         depth_swap_prediction, point_goal_swap_prediction = _cached_interventions(
             policy, encoded, prepared.condition.point_goal
@@ -384,19 +405,10 @@ def measure_policy(
             prepared.condition.point_goal.float(),
         )
         candidate_labels = teacher(prediction.candidates, batch)
-        candidate_truth = candidate_labels.clearance_m
-        teacher_scores = candidate_labels.score
-        rows = torch.arange(len(candidate_truth), device=candidate_truth.device)
-        selected_truth = candidate_truth[rows, prediction.selected_index]
-        safe_available = (candidate_truth >= 0).any(dim=1)
-        metrics.update({
-            "candidate_safe_available": safe_available,
-            "candidate_collision_fraction": (candidate_truth < 0).float().mean(1),
-            "selected_whole_curve_collision": selected_truth < 0,
-            "selection_missed_safe_candidate": safe_available & (selected_truth < 0),
-            "selection_score_regret": teacher_scores.max(1).values - teacher_scores[rows, prediction.selected_index],
-            "critic_score_mae": (prediction.scores - teacher_scores).abs().mean(1),
-        })
+        metrics.update(candidate_selection_metrics(
+            prediction.scores, prediction.selected_index,
+            candidate_labels.score, candidate_labels.clearance_m,
+        ))
         metrics["valid_observation_frames"] = prepared.condition.observation_valid.sum(
             dim=-1
         )
@@ -534,8 +546,8 @@ def measure_policy(
         for name, value in {
             "predicted_path": prediction.path.float(),
             "candidate_scores": prediction.scores,
-            "candidate_clearance_m": candidate_truth,
-            "candidate_teacher_score": teacher_scores,
+            "candidate_clearance_m": candidate_labels.clearance_m,
+            "candidate_teacher_score": candidate_labels.score,
             "candidate_geodesic_progress_m": candidate_labels.progress_m,
             "selected_candidate_index": prediction.selected_index,
             "current_frame_predicted_path": current_prediction.path.float(),
@@ -632,7 +644,7 @@ def evaluate_measurements(measurements: PolicyMeasurements) -> dict[str, object]
         **policy_summary,
         "candidate_selection": {
             name: metrics[name].float().mean().item()
-            for name in ("candidate_safe_available", "candidate_collision_fraction",
+            for name in ("selected_utility", "candidate_safe_available", "candidate_collision_fraction",
                          "selected_whole_curve_collision", "selection_missed_safe_candidate",
                          "selection_score_regret", "critic_score_mae")
         },

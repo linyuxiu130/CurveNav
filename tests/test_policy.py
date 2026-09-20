@@ -17,6 +17,7 @@ from curvenav.config import (
 )
 from curvenav.models import TRAINING_LOSS_NAMES
 from curvenav.models.policy import repeat_condition
+from curvenav.models.exploration import structured_proposals
 from test_critic import criterion_loss
 from curvenav.encoders.configuration import observed_configuration_features
 from curvenav.models.blocks import (
@@ -43,6 +44,79 @@ def tiny_config() -> CurveNavConfig:
             model_dim=32, transformer_layers=4, transformer_heads=4
         ),
     )
+
+
+def test_structured_exploration_commutes_with_physical_spline_decoding():
+    codec = build_policy(tiny_config()).curve_codec
+    coordinates = torch.randn(4, 2, 14)
+    paths, _ = codec.decode(coordinates.flatten(0, 1))
+    goal, nogoal = paths.unflatten(0, (4, 2)).unbind(1)
+    alignment = torch.stack((torch.where(goal[:, 1, 0] * nogoal[:, 1, 0] < 0, -1., 1.), torch.ones(4)), -1)
+    nogoal = nogoal * alignment[:, None]
+    ratio = goal.diff(dim=1).norm(dim=-1).sum(1) / nogoal.diff(dim=1).norm(dim=-1).sum(1)
+    random = torch.full((4, 9), 0.8)
+    random[:, 4] = 0.1
+    random[:, 6:8] = torch.tensor([0.2, 0.6])
+    expected = (goal + (0.3 * ratio)[:, None, None] * nogoal) * torch.tensor([-0.85, 1.05])
+    random[1, 3] = 0.1  # no-goal-only before axis transform
+    expected[1] = nogoal[1] * torch.tensor([-0.85, 1.05])
+    random[2, 8] = 0.1  # restore original after all perturbations
+    expected[2] = goal[2]
+    random[3, 0] = 0.1  # straight base before mixing
+    line_controls = torch.zeros(1, 7, 2)
+    line_controls[0, :, 0] = torch.arange(1, 8) / 7 * 3.1
+    line, _ = codec.decode_values(line_controls.flatten(1))
+    expected[3] = (line[0] + 0.3 * ratio[3] * nogoal[3]) * torch.tensor([-0.85, 1.05])
+    values = structured_proposals(codec, coordinates, random)
+    actual, _ = codec.decode_values(values)
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(actual[:, 0], torch.zeros(4, 2), atol=0, rtol=0)
+
+
+def test_no_goal_mask_removes_goal_influence_without_changing_scene():
+    policy = build_policy(tiny_config()).eval()
+    encoded = policy.encode_condition(make_condition(2))
+    memory = policy.trajectory_decoder.project_condition_memory(encoded)
+    absent = replace(encoded, goal_present=torch.zeros(2, 1))
+    changed = replace(absent, terminal_goal=-10 * encoded.terminal_goal)
+    state, time = torch.randn(2, 14), torch.tensor([0.5, 1.])
+    first = policy._predict_velocity(state, time, absent, memory)
+    second = policy._predict_velocity(state, time, changed, memory)
+    torch.testing.assert_close(first, second, atol=0, rtol=0)
+    at_origin = replace(encoded, terminal_goal=torch.zeros_like(encoded.terminal_goal))
+    present = policy._predict_velocity(state, time, at_origin, memory)
+    missing = policy._predict_velocity(state, time, replace(at_origin, goal_present=torch.zeros(2, 1)), memory)
+    assert not torch.equal(present, missing)
+
+
+@pytest.mark.parametrize("goal_present", [0., 1.])
+def test_goal_dropout_flow_supervises_shared_generator_without_goal_leakage(monkeypatch, goal_present):
+    torch.manual_seed(2026)
+    policy = build_policy(tiny_config()).train()
+    inputs = make_condition(2)
+    monkeypatch.setattr(torch, "rand_like", lambda value: torch.full_like(value, goal_present))
+    clean = torch.randn(2, 14)
+    output = policy(inputs, TrajectoryTarget(policy.curve_codec.values_from_coordinates(clean)), torch.randn_like(clean))
+    output.flow_loss.backward()
+    goal_grad = sum(p.grad.abs().sum() for p in policy.trajectory_decoder.goal_geometry_embedding.parameters())
+    shared_grad = sum(p.grad.abs().sum() for p in policy.trajectory_decoder.velocity_readout.parameters())
+    scene_grad = sum(p.grad.abs().sum() for p in policy.depth_encoder.parameters() if p.grad is not None)
+    assert torch.isfinite(output.flow_loss)
+    assert shared_grad > 0 and scene_grad > 0
+    assert (goal_grad > 0).item() == bool(goal_present)
+
+
+def test_entire_nogoal_flow_is_independent_of_goal_and_keeps_fixed_origin():
+    torch.manual_seed(2026)
+    policy = build_policy(tiny_config()).eval()
+    inputs = make_condition(2)
+    first = policy.sample_nogoal(inputs)
+    second = policy.sample_nogoal(replace(inputs, point_goal=-7 * inputs.point_goal))
+    assert first.shape == (2, 32, 64, 2) and torch.isfinite(first).all()
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    torch.testing.assert_close(first[:, :, 0], torch.zeros(2, 32, 2), rtol=0, atol=0)
+    # Check independent noise is actually consumed; not a trained diversity claim.
+    assert first.flatten(2).std(dim=1).sum() > 0
 
 
 def make_condition(batch: int = 2) -> PolicyCondition:
@@ -135,13 +209,17 @@ def test_euler_sampling_refreshes_curve_geometry_but_caches_scene_kv(monkeypatch
     geometry_hook.remove()
     scene_hook.remove()
     torch.testing.assert_close(torch.stack(times)[:, 0], torch.tensor([1.0, 0.5]))
-    expected, _ = policy.curve_codec.decode(policy.inference_source.repeat(2, 1) - 1)
+    expected_values = structured_proposals(
+        policy.curve_codec, policy.inference_source.repeat(2, 1, 1) - 1,
+        policy.inference_exploration.repeat(2, 1),
+    )
+    expected, _ = policy.curve_codec.decode_values(expected_values)
     torch.testing.assert_close(prediction.candidates, expected.unflatten(0, (2, 32)))
     torch.testing.assert_close(prediction.path, prediction.candidates[torch.arange(2), prediction.scores.argmax(1)])
     assert len(scene) == 1 and len(geometry) == 2
     assert not torch.equal(geometry[0], geometry[1])
     encoded = policy.encode_condition(inputs)
-    encoded = repeat_condition(encoded, 32)
+    encoded = repeat_condition(encoded, 64)
     for state, actual in zip(states, geometry):
         path, _ = policy.curve_codec.decode(state)
         expected, _ = policy.trajectory_decoder._trajectory_geometry(path, encoded)
@@ -483,6 +561,26 @@ def test_reusable_cross_attention_excludes_invalid_history_tokens() -> None:
     torch.testing.assert_close(first, second)
 
 
+def test_shared_scene_kv_matches_repeated_kv_outputs_and_gradients():
+    torch.manual_seed(17)
+    policy = build_policy(tiny_config())
+    encoded = policy.encode_condition(make_condition(2))
+    tokens = encoded.tokens.detach().requires_grad_()
+    encoded = replace(encoded, tokens=tokens)
+    layer = ReusableConditionCrossAttention(32, 4, 0).eval()
+    memory = layer.project_condition(encoded)
+    query = torch.randn(6, 7, 32, requires_grad=True)
+    geometry = torch.randn(6, 7, tokens.shape[1], 7, requires_grad=True)
+    shared = layer(query, memory, geometry)
+    repeated = layer(query, tuple(value.repeat_interleave(3, dim=0) for value in memory), geometry)
+    torch.testing.assert_close(shared, repeated, atol=2e-6, rtol=2e-5)
+    variables = (query, geometry, tokens, *layer.parameters())
+    shared_grad = torch.autograd.grad(shared.square().sum(), variables, retain_graph=True)
+    repeated_grad = torch.autograd.grad(repeated.square().sum(), variables)
+    for actual, expected in zip(shared_grad, repeated_grad, strict=True):
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-4)
+
+
 def test_path_relative_attention_uses_physical_query_positions() -> None:
     torch.manual_seed(6)
     policy = build_policy(tiny_config())
@@ -532,6 +630,11 @@ def test_deployment_has_one_reproducible_path():
     second = policy.sample(inputs)
     assert [f.name for f in fields(first)] == ["path", "candidates", "scores", "selected_index"]
     torch.testing.assert_close(first.path, second.path, rtol=0, atol=0)
+    restored = build_policy(tiny_config()).eval()
+    restored.load_state_dict(policy.state_dict(), strict=True)
+    prediction = restored.sample(inputs)
+    torch.testing.assert_close(first.candidates, prediction.candidates, rtol=0, atol=0)
+    torch.testing.assert_close(first.scores, prediction.scores, rtol=0, atol=0)
 
 
 def test_goal_does_not_relocate_candidate_relative_scene_queries() -> None:

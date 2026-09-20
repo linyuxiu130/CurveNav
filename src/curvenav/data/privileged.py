@@ -16,7 +16,23 @@ from curvenav.trajectory import path_arc_length
 
 SOURCE_CONFIGURATION_QUERY_SPACING_M = PATH_CONFIGURATION_QUERY_SPACING_M
 SOURCE_CONFIGURATION_QUERY_TYPE = "source_dingo_signed_clearance_cell_lookup"
-SOURCE_CONFIGURATION_PATH_SAMPLING = "endpoint_inclusive_max_spacing"
+SOURCE_CONFIGURATION_PATH_SAMPLING = "closed_cell_supercover_max_spacing_v2"
+
+
+def _closed_grid_cells(coordinates: Tensor) -> Tensor:
+    """All cells touching a point; occupied cells include their edges and corners."""
+    nearest = coordinates.round()
+    # FP64 transform/interpolation roundoff at an analytically exact grid crossing.
+    tolerance = 4 * torch.finfo(coordinates.dtype).eps * coordinates.abs().clamp_min(1)
+    coordinates = torch.where((coordinates - nearest).abs() <= tolerance, nearest, coordinates)
+    high = coordinates.floor().long()
+    low = coordinates.ceil().long() - 1
+    return torch.stack((
+        high,
+        torch.stack((low[..., 0], high[..., 1]), -1),
+        torch.stack((high[..., 0], low[..., 1]), -1),
+        low,
+    ), -2)
 
 
 @dataclass(frozen=True)
@@ -47,24 +63,24 @@ class SourceConfigurationGrid:
         return cls(signed, origin, cell_size)
 
     def query_world(self, world_xy: np.ndarray) -> np.ndarray:
-        """Look up the source grid with its native piecewise-constant cells."""
+        """Use the same closed-cell clearance as continuous trajectory queries."""
         world_xy = np.asarray(world_xy, dtype=np.float64)
         if world_xy.ndim != 2 or world_xy.shape[1] != 2:
             raise ValueError("world_xy must have shape [N,2]")
-        cells = np.floor(
+        cells = _closed_grid_cells(torch.from_numpy(
             (world_xy - self.origin_xy) / self.cell_size_m
-        ).astype(np.int64)
-        values = np.full(len(cells), -np.inf, dtype=np.float32)
+        )).numpy()
+        values = np.full(cells.shape[:-1], -np.inf, dtype=np.float32)
         inside = (
-            (cells[:, 0] >= 0)
-            & (cells[:, 0] < self.signed_clearance_m.shape[0])
-            & (cells[:, 1] >= 0)
-            & (cells[:, 1] < self.signed_clearance_m.shape[1])
+            (cells[..., 0] >= 0)
+            & (cells[..., 0] < self.signed_clearance_m.shape[0])
+            & (cells[..., 1] >= 0)
+            & (cells[..., 1] < self.signed_clearance_m.shape[1])
         )
         values[inside] = self.signed_clearance_m[
             cells[inside, 0], cells[inside, 1]
         ]
-        return values
+        return values.min(-1)
 
 @dataclass(frozen=True)
 class SourcePathQuery:
@@ -158,11 +174,11 @@ class SourceConfigurationSpaceQuery:
         return (world - grid_origins[indices, None]) / cell_sizes[indices, None, None]
 
     def point_cells(self, local: Tensor, indices: Tensor, origin: Tensor, yaw: Tensor) -> Tensor:
-        return self.grid_coordinates(local, indices, origin, yaw).floor().long()
+        return _closed_grid_cells(self.grid_coordinates(local, indices, origin, yaw))[..., 0, :]
 
     @staticmethod
     def _trace_segments(path: Tensor, grid_path: Tensor, horizon: float) -> tuple[Tensor, Tensor, Tensor]:
-        """Visit every crossed half-open grid cell, preserving polyline vertices.
+        """Sample every cell interior and boundary crossed, preserving vertices.
 
         Grid-boundary crossings partition each original segment into intervals
         lying in a single cell. Their midpoints cannot miss a short corner cut.
@@ -197,27 +213,27 @@ class SourceConfigurationSpaceQuery:
         t = torch.stack(((left + right) * 0.5, right), -1).flatten(-2)
         local = (path[:, :-1, None].double()
                  + t[..., None] * (end - path[:, :-1])[..., None, :]).flatten(1, 2)
-        cells = (grid_start[..., None, :] + t[..., None] * grid_delta[..., None, :]).floor().long().flatten(1, 2)
+        coordinates = (grid_start[..., None, :] + t[..., None] * grid_delta[..., None, :]).flatten(1, 2)
         valid = ((right > left) & (used_length[..., None] > 0)).repeat_interleave(2, -1).flatten(1, 2)
         local = torch.cat((path[:, :1].double(), local), 1)
-        cells = torch.cat((grid_path[:, :1].floor().long(), cells), 1)
+        coordinates = torch.cat((grid_path[:, :1], coordinates), 1)
         valid = torch.cat((torch.ones_like(valid[:, :1]), valid), 1)
         # Stable compaction keeps active samples contiguous and in execution order.
         size = int(valid.sum(-1).max().item())
         order = (~valid).to(torch.int32).argsort(dim=-1, stable=True)[:, :size]
         active = valid.gather(1, order)
         local = local.gather(1, order[..., None].expand(-1, -1, 2))
-        cells = cells.gather(1, order[..., None].expand(-1, -1, 2))
+        coordinates = coordinates.gather(1, order[..., None].expand(-1, -1, 2))
         last = (active.sum(-1) - 1)[:, None, None].expand(-1, 1, 2)
         local = torch.where(active[..., None], local, local.gather(1, last))
-        cells = torch.where(active[..., None], cells, cells.gather(1, last))
-        return local.float(), cells, active
+        coordinates = torch.where(active[..., None], coordinates, coordinates.gather(1, last))
+        return local.float(), coordinates, active
 
     def query(
         self, path: Tensor, grid_index: Tensor, world_origin_xy: Tensor,
         world_yaw_rad: Tensor, planning_horizon_m: float,
     ) -> SourcePathQuery:
-        """Trace the original polyline, then reuse its exact integer cells."""
+        """Trace the polyline against closed occupied cells, including corner contact."""
         if path.ndim != 3 or path.shape[-1] != 2 or path.shape[1] < 2:
             raise ValueError("path must have shape [B,P,2], P >= 2")
         batch = path.shape[0]
@@ -229,14 +245,17 @@ class SourceConfigurationSpaceQuery:
         if (indices < 0).any() or (indices >= len(self.grids)).any():
             raise ValueError("source grid index is outside the prepared grid table")
         coordinates = self.grid_coordinates(path, indices, world_origin_xy, world_yaw_rad)
-        local, cells, active = self._trace_segments(path, coordinates, planning_horizon_m)
+        local, coordinates, active = self._trace_segments(path, coordinates, planning_horizon_m)
+        cells = _closed_grid_cells(coordinates)
         values, _, _, sizes, offsets = self._atlas(path.device)
-        shape = sizes[indices, None]
+        shape = sizes[indices, None, None]
         inside = (cells >= 0).all(-1) & (cells < shape).all(-1)
-        address = offsets[indices, None] + cells[..., 0] * shape[..., 1] + cells[..., 1]
+        address = offsets[indices, None, None] + cells[..., 0] * shape[..., 1] + cells[..., 1]
         # Select a valid address before the gather; out-of-map values remain unsafe.
         clearance = values[torch.where(inside, address, 0)].masked_fill(~inside, -planning_horizon_m)
-        return SourcePathQuery(local, clearance, inside, active, cells)
+        # Clearance covers every touching cell; progress uses the canonical cell
+        # only after the common collision-free prefix has been established.
+        return SourcePathQuery(local, clearance.amin(-1), inside.all(-1), active, cells[..., 0, :])
 
     def safety_metrics(
         self,

@@ -20,6 +20,7 @@ from curvenav.encoders.depth import DEPTH_ENCODER_TYPE
 from curvenav.encoders.configuration import CONFIGURATION_ENCODER_TYPE
 from curvenav.models import TRAJECTORY_DECODER_TYPE
 from curvenav.models.evaluator import EVALUATOR_TYPE, EVALUATOR_LAYERS
+from curvenav.models.exploration import EXPLORATION_TYPE, GOAL_DROPOUT_PROBABILITY
 from curvenav.training.critic import CRITIC_TARGET
 from curvenav.training.ema import ExponentialMovingAverage
 from curvenav.training.batching import build_distributed_batch_layout
@@ -71,6 +72,7 @@ def build_training_contract(
         "samples_per_epoch": steps_per_epoch * global_batch_size,
         "steps_per_epoch": steps_per_epoch,
         "total_steps": config.training.epochs * steps_per_epoch,
+        "checkpoint_selection": "max_source_utility_deployed32_scene512_v1",
     }
 
 
@@ -113,7 +115,8 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "point_goal_semantics": (
             "mission_destination_in_current_robot_xy"
         ),
-        "point_goal_conditioning": ("generator_local_terminal_evaluator_mission_direction_log_distance"),
+        "point_goal_conditioning": "generator_masked_local_terminal_evaluator_mission_direction_log_distance",
+        "goal_dropout_probability": GOAL_DROPOUT_PROBABILITY,
         "trajectory_supervision": (
             "source_cspace_gated_fixed_future_expert_planar_bspline_imitation"
         ),
@@ -124,17 +127,18 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "flow_source": "standard_gaussian_training_fixed_iid_gaussian_candidate_bank",
         "inference_source_seed": INFERENCE_SOURCE_SEED,
         "inference_candidates": INFERENCE_CANDIDATES,
+        "candidate_exploration": EXPLORATION_TYPE,
         "candidate_selection": "single_goal_conditioned_route_utility_argmax",
         "critic_target": CRITIC_TARGET,
         "trajectory_evaluator_type": EVALUATOR_TYPE,
         "trajectory_evaluator_layers": EVALUATOR_LAYERS,
-        "critic_candidates": "one_expert_three_two_step_flow_proposals",
+        "critic_candidates": "one_expert_three_structured_goal_nogoal_two_step_flow_proposals",
         "flow_path": "data_anchored_linear_stochastic_interpolant",
         "flow_solver": "explicit_euler_noise_to_data",
         "flow_time_embedding": "flow_time_mlp",
         "flow_time_sampling": FLOW_TIME_SAMPLING,
         "training_objective": (
-            "conditional_flow_matching_plus_calibrated_route_utility_regression"
+            "goal_dropout_flow_matching_plus_route_utility_huber"
         ),
         "trajectory_prediction": ("conditional_flow_planar_cubic_bspline"),
         "condition_encoder_type": CONDITION_ENCODER_TYPE,
@@ -146,6 +150,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             "se3_rigid_transform_used_for_metric_xyz_alignment_and_motion_state"
         ),
         "configuration_encoder_type": CONFIGURATION_ENCODER_TYPE,
+        "configuration_geometry": "observed_bilinear_raster_estimates_v2",
         "visual_compression": "metric_splat_and_observed_cspace_16x16_bev",
         "condition_context": "target_independent_metric_bev_plus_motion_tokens",
         "trajectory_condition_interaction": (
@@ -159,7 +164,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         ),
         "obstacle_memory": MEMORY_CONTRACT,
         "temporal_modeling": (
-            "depth_pixel_sample_stride16_se3_all_newer_consistency"
+            "timed_se3_image_evidence_sensor_clock_occupancy_current_visibility"
         ),
         "state_token_features": HISTORICAL_STATE_FEATURES,
         "state_translation_scale_m": (
@@ -174,7 +179,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
             "single_conditional_velocity_field"
         ),
         "source_configuration_space_truth": (
-            "native_navigation_grid_endpoint_inclusive_dense_0.025m_"
+            "native_navigation_grid_closed_cell_supercover_0.025m_"
             "oob_non_executable"
         ),
         "source_configuration_space_role": "dataset_certificate_critic_supervision_and_evaluation",
@@ -205,7 +210,7 @@ def build_training_checkpoint(
     ema: ExponentialMovingAverage,
     config: CurveNavConfig,
     step: int,
-    best_validation_loss: float,
+    best_validation_utility: float,
     *,
     training_contract: Mapping[str, int | str],
     rng_states: Mapping[str, Tensor],
@@ -234,7 +239,7 @@ def build_training_checkpoint(
     return {
         "checkpoint_type": CHECKPOINT_TYPE,
         "step": step,
-        "best_validation_loss": best_validation_loss,
+        "best_validation_utility": best_validation_utility,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
@@ -330,7 +335,7 @@ def restore_training_state(
     expected_keys = {
         "checkpoint_type",
         "step",
-        "best_validation_loss",
+        "best_validation_utility",
         "model",
         "optimizer",
         "scheduler",

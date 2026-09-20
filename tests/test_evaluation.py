@@ -10,6 +10,7 @@ from curvenav.evaluation.compare import (
     validate_reference_safety,
 )
 from curvenav.evaluation.metrics import (
+    candidate_selection_metrics,
     collision_visibility_attribution,
     configuration_space_safety_metrics,
     controller_tracking_metrics,
@@ -23,10 +24,47 @@ from curvenav.data.privileged import SourcePathQuery
 from curvenav.evaluation.offline import (
     _collision_detection_summary,
     _cached_interventions,
+    _current_frame_batch,
 )
 from curvenav.evaluation.report import _write_case_visualization, select_cases
 from curvenav.evaluation.protocol import evaluation_strata
 from curvenav.trajectory import resample_path_to_horizon
+
+
+def test_selection_metrics_use_true_selected_utility_not_predicted_score():
+    scores = torch.tensor([[10., 0.], [0., 20.]])
+    utility = torch.tensor([[-2., .5], [-1., .25]])
+    clearance = torch.tensor([[-.1, .2], [-.1, .2]])
+    metrics = candidate_selection_metrics(scores, scores.argmax(1), utility, clearance)
+    torch.testing.assert_close(metrics["selected_utility"], torch.tensor([-2., .25]))
+    torch.testing.assert_close(metrics["selection_score_regret"], torch.tensor([2.5, 0.]))
+    assert metrics["selection_missed_safe_candidate"].tolist() == [True, False]
+
+
+def test_current_frame_ablation_keeps_current_hits_in_the_same_world_voxels():
+    from curvenav.config import DataConfig
+    from curvenav.data.observation import DepthContextBuffer
+
+    buffer = DepthContextBuffer(DataConfig())
+    buffer.reset(1)
+    depth = np.full((1, 126, 224, 1), 5., np.float32)
+    depth[:, 62:65, 110:114] = 1.
+    k = np.array([[[100., 0, 112.], [0, 100., 63.], [0, 0, 1.]]], np.float32)
+    camera = np.array([[[0., 0, 1, 0], [-1., 0, 0, 0], [0, -1., 0, .06], [0, 0, 0, 1]]], np.float32)
+    pose = np.eye(4, dtype=np.float32)[None]
+    pose[0, :2, :2] = [[np.cos(.37), np.sin(.37)], [-np.sin(.37), np.cos(.37)]]
+    pose[0, :3, 3] = [1.23, -2.34, .073]
+    snapshot = buffer.update(depth, pose, k, camera, np.array([0.]))
+    batch = {key: torch.from_numpy(value) for key, value in snapshot.items()}
+    expected = batch['obstacle_memory'].clone()
+    batch['obstacle_memory'] = torch.ones_like(expected)  # Additional historical occupancy.
+    batch['source_origin_xy'] = torch.tensor([[1.23, 2.34]])
+    batch['source_yaw_rad'] = torch.tensor([.37])
+    actual = _current_frame_batch(batch, 3.6, 5.)
+    assert expected.any()
+    torch.testing.assert_close(actual['obstacle_memory'], expected)
+    assert batch['obstacle_memory'].all()
+    assert actual['observation_valid'].tolist() == [[False, False, False, True]]
 
 
 def test_cross_model_set_requires_explicit_axis_and_source_geometry(
@@ -206,7 +244,7 @@ def test_configuration_safety_uses_robot_configuration_space() -> None:
         ]
     )
     field = torch.zeros(3, 5, 9, 9)
-    field[:, 0] = torch.tensor([-0.05, 0.2, 1.0])[:, None, None]
+    field[:, 0] = torch.tensor([-0.05, 0.01, 1.0])[:, None, None]
     field[:2, 3] = 1.0
 
     metrics = configuration_space_safety_metrics(path, field, 1.0)

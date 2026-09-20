@@ -45,7 +45,7 @@ def checkpoint(config: CurveNavConfig, precision: str = BF16):
         ExponentialMovingAverage(model),
         config,
         0,
-        float("inf"),
+        float("-inf"),
         training_contract=contract,
         rng_states=rng,
     )
@@ -61,7 +61,7 @@ def test_checkpoint_records_the_clean_depth_grounded_flow_contract() -> None:
         "pointwise_geometry_increment_curve_flow_transformer"
     )
     assert contract["training_objective"] == (
-        "conditional_flow_matching_plus_calibrated_route_utility_regression"
+        "goal_dropout_flow_matching_plus_route_utility_huber"
     )
     assert contract["curve_coordinates"] == (
         "standardized_physical_bspline_control_increments"

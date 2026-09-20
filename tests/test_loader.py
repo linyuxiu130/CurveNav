@@ -110,7 +110,7 @@ def _write_dataset(root, count: int = 4) -> None:
             "source_configuration_space": {
                 "query": "source_dingo_signed_clearance_cell_lookup",
                 "spacing_m": 0.025,
-                "path_sampling": "endpoint_inclusive_max_spacing",
+                "path_sampling": "closed_cell_supercover_max_spacing_v2",
                 "out_of_bounds": "non_executable_negative_clearance",
                 "grids": [{"file": "source_configuration/00000.npz"}],
             },
@@ -321,7 +321,7 @@ def test_fixed_future_metric_horizon_is_independent_of_observation_density() -> 
 def test_final_production_curve_is_checked_in_source_configuration_space(
     tmp_path,
 ) -> None:
-    path = torch.tensor([[[-1.0, 0.0], [0.0, 0.0], [1.0, 0.0]]])
+    path = torch.tensor([[[-0.9, 0.0], [0.0, 0.0], [1.0, 0.0]]])
     grid_path = tmp_path / "navigation_grid.npz"
     clearance = np.ones((9, 9), dtype=np.float32)
     clearance[4, 4] = 0.05

@@ -74,6 +74,12 @@ class ReusableConditionCrossAttention(nn.Module):
         attention_mask = self.relative_bias(
             pair_geometry.to(dtype=projected_query.dtype)
         ).permute(0, 3, 1, 2)
+        # Candidates query the same scene independently. Concatenate their query
+        # rows, not their scene keys: softmax still runs only over scene tokens.
+        batch = key.shape[0]
+        candidates = query.shape[0] // batch
+        projected_query = projected_query.unflatten(0, (batch, candidates)).transpose(1, 2).flatten(2, 3)
+        attention_mask = attention_mask.unflatten(0, (batch, candidates)).transpose(1, 2).flatten(2, 3)
         attention_mask = attention_mask.masked_fill(~token_valid, float("-inf"))
         attended = functional.scaled_dot_product_attention(
             projected_query,
@@ -82,6 +88,7 @@ class ReusableConditionCrossAttention(nn.Module):
             attn_mask=attention_mask,
             dropout_p=self.dropout if self.training else 0.0,
         )
+        attended = attended.unflatten(2, (candidates, query.shape[1])).transpose(1, 2).flatten(0, 1)
         attended = attended.transpose(1, 2).flatten(-2)
         return self.out_proj(attended)
 
@@ -143,6 +150,7 @@ class ConditionalTrajectoryBlock(nn.Module):
                 frame_age=condition.frame_age,
                 motion_token=condition.motion_token,
                 terminal_goal=condition.terminal_goal,
+                goal_present=condition.goal_present,
                 configuration_field=condition.configuration_field,
             )
         )

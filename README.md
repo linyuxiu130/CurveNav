@@ -3,7 +3,7 @@
 CurveNav 是 PointGoal 条件的米制局部轨迹生成器。当前输入为深度图、逐帧内外参、
 重力对齐的机体位姿和时间戳；四帧共享视觉骨干与 SE(3) 几何对齐构建 BEV，
 局部世界坐标体素记忆保留已观测障碍。
-生成器使用两步条件 Flow Matching 并行输出 32 条 B-spline，独立的单头路线评价器
+生成器使用共享的有目标/无目标两步 Flow Matching，合成 32 条结构化 B-spline 候选，独立的单头路线评价器
 选取最高分的一条，由固定测评 MPC 执行。
 传感器历史与异步推理分离；当前二维观测场不提供绝对无碰撞保证。
 
@@ -100,11 +100,16 @@ scripts/build_dataset.sh configs/grscenes_dataset.json
 资产准备复用已安装的 Isaac USD 运行时、`trimesh` 和共享模型库；分卷解压需要 `7zz`。
 只导出场景几何，按 USD 单位、完整实例变换和轴约定转换为 Habitat 资产；不复制纹理。
 官方 59 个训练场景中配置 49 个训练、10 个验证，共 6,000 条完整路线（训练 5,000、验证 1,000）。
-`routes_per_split` 设置总数，`distance_band_weights` 按近/中/远 1:2:2 分配；各场景数量最多相差一条。
+`routes_per_split` 设置总数，`endpoint_sampling.bands` 设置距离区间、机器人坐标系下的目标方位角和权重；各场景数量最多相差一条。
 按场景动态调度 8 个独立进程，在 GPU 1 渲染；日志逐条记录耗时、缓存命中和场景进度。
 验证组按场景 ID 前 15 位保守分组（9 个住宅、1 个商业变体）；这不是独立户型数的保证。
 官方 40 个测评场景不参与生产。近/中/远按每场景安全端点距离分位数定义，避免小场景
 被固定米制距离排除。新采样分布与旧 500 条不完全相同，效果需单独实验比较。
+
+`configs/grscenes_near_goal_dataset.json` 在同一生成链路补充 980 条 0.5–1.5 m
+侧后方目标路线，只使用上述 49 个训练场景。目标相对方位在规划重试前固定，
+每条路线重新规划和渲染；`base_route_roots` 合并原专家数据，保留原验证任务。
+距离单位可选 `quantiles`（全场景覆盖）或 `metres`（定向补充），均复用相同的专家、审核和训练格式编译。
 初始世界朝向独立均匀采样，并作为样条起始切向的边界条件；端点重采样不改变朝向。
 端点与整条路线使用相同的本体膨胀后安全余量。平滑代价为
 `∫ [1 + exp(1-d/r) + r²κ²] ds`，其中 `r` 是本体半径，`d` 是配置空间余量；
@@ -116,7 +121,7 @@ scripts/build_dataset.sh configs/grscenes_dataset.json
 复用已完成内容。发布目标必须是新目录；若只需重做标签，使用 `curvenav-prepare-data --route-root ... --output ... --config ...`。合并数据源时重复传入 `--route-root`，编译器会在联合训练集上拟合 flow 坐标尺度。训练使用新数据目录生成的 `config.yaml`。
 逐轨迹障碍记忆缓存在 `$XDG_CACHE_HOME/curvenav/route_memory`；仓库启动脚本默认使用 `/shibo_huang/data/curvenav/cache`。首次计算后重复编译可复用，深度或位姿文件修改、相机标定和记忆实现变化会生成新的缓存键。联合统计更新无需重新计算这部分几何；标签拟合和最终数组写入仍会执行。
 
-训练读取 `data/policy_dataset-depth-memory`，保存深度帧索引、专家曲线、逐样本内外参、
+当前训练读取 `/shibo_huang/data/curvenav/datasets/policy_hssd_grscenes7480`，保存深度帧索引、专家曲线、逐样本内外参、
 SE(3) 相对位姿、观测年龄、因果障碍记忆和 source provenance。写盘后必须通过 source re-query certificate；
 Flow 坐标统计只从训练集拟合，写入准备目录的 `config.yaml`。所有入口使用当前 Conda 环境，不再引用旧虚拟环境路径。
 
@@ -129,26 +134,40 @@ Flow 坐标统计只从训练集拟合，写入准备目录的 `config.yaml`。�
 source scripts/common_env.sh
 PYTHONDONTWRITEBYTECODE=1 "${CURVENAV_PYTHON}" \
   -m pytest -q -p no:cacheprovider
-CUDA_VISIBLE_DEVICES=1 scripts/train_policy.sh data/policy_dataset-depth-memory/config.yaml
+CUDA_VISIBLE_DEVICES=1 scripts/train_policy.sh configs/base.yaml
 CUDA_VISIBLE_DEVICES=1 scripts/evaluate_policy.sh \
-  data/policy_dataset-depth-memory/config.yaml outputs/train_policy-depth-memory/checkpoint.pt
+  configs/base.yaml outputs/train-structured-exploration-7480/best.pt
 ```
 
 训练配置直接指定 `per_device_batch_size` 和 `gradient_accumulation_steps`，全局 batch
-由每卡微批 × GPU 数 × 累积次数计算，默认累积一次。每张卡始终执行完整固定形状的微批，
+由每卡微批 × GPU 数 × 累积次数计算，默认累积两次。每张卡始终执行完整固定形状的微批，
 DDP loss 按全局均值缩放。`samples_per_epoch` 是每个逻辑 epoch 的样本预算，向下取完整
 全局批次，实际样本数及更新次数记录在启动日志和 checkpoint 中。改变批次会改变优化器
 更新频率；保持样本预算并不等于保持优化过程，学习率和收敛需要另行验证。
-加入路线评价训练后，默认每卡 128、累积 1 次：单卡全局 128，双卡全局 256。
+结构化探索默认每卡 64、累积 2 次：单卡全局 128，双卡全局 256。
 批次显存和吞吐必须按当前评价架构实测，不沿用旧共享净空头的性能结果。
 双卡使用同一配置，只需将启动命令中的 `CUDA_VISIBLE_DEVICES` 设为 `0,1`。
-默认样本预算下，每 epoch 处理 40,960 个样本；单卡 320 次更新，双卡 160 次更新。
+默认训练集为合并后的 7,480 条轨迹：1,491,638 个训练状态、260,340 个验证状态；归一化统计来自该训练集。每 epoch 预算 1,491,456 个样本，双卡 5,826 次更新。补充的 980 条近距离侧后方专家由 `configs/grscenes_near_goal_dataset.json` 生产并合并，四个方向各 245 条，验证集不增加补充场景。
+
+每轮验证固定按场景抽取最多 512 个样本，使用 EMA 权重执行部署的 32 条生成与选择。
+`best.pt` 按所选轨迹的真实地图效用最大值保存；同时记录碰撞、选择遗憾和轨迹误差。
+训练 loss 用于观察拟合过程，不再作为最佳部署模型的选择标准。
 训练批次、卡数和累积次数是 checkpoint 的恢复契约，恢复时必须保持一致。
 训练和测评的神经算子统一 BF16，要求 GPU 原生支持 BF16。标定几何、Flow 状态、
 Flow 积分、B-spline 解码和损失使用 FP32。
-数据、训练与离线测评入口共用当前 Conda 环境；训练直接使用 `scripts/train_policy.sh`。
+数据、训练与离线测评入口共用当前 Conda 环境；训练直接使用 `scripts/train_policy.sh`。 编译工作缓存使用 PyTorch 默认本地临时目录，不再强制指向共享存储中的 Conda 缓存；checkpoint、数据与日志仍写入持久目录。
 本地训练停止时应向 torchrun 主进程发送 SIGINT 并等待各 rank 退出；不要强杀 tmux
 来代替正常停止。
+
+单独后训练评估头时，冻结生成器，复用部署的 32 条候选及现有地图效用监督：
+
+```bash
+python -m curvenav.training.evaluator_finetune configs/base.yaml outputs/train/checkpoints/best.pt \
+  --output outputs/evaluator/checkpoint.pt --steps 8192 --batch-size 8
+```
+
+配置必须与基础权重对应；`--output` 是文件路径，不能传目录。输出旁的 JSON 记录
+训练前后的离线选择指标。后训练权重仍需在线验证，不能仅凭 loss 下降替换正式模型。
 
 正式训练前必须在目标机器用同一命令做一个编译后稳定区间的吞吐 smoke；吞吐只报告
 完整 optimizer step 的全局 samples/s，不把首次静态编译计入。显卡拓扑若不支持可靠的
@@ -158,7 +177,7 @@ peer-DMA，可只通过 NCCL transport 环境变量选择 SHM，不改变模型�
 
 ```text
 configs/base.yaml          数据准备的模型与训练模板
-data/policy_dataset-depth-memory/config.yaml  含训练集拟合统计的实际训练配置
+configs/base.yaml  含训练集拟合统计的实际训练配置
 scripts/build_dataset.sh   唯一数据构建入口
 src/curvenav/data/         深度、source C-space query、编译与 loader
 src/curvenav/data_generation/ HSSD 资产、几何、生成与审计

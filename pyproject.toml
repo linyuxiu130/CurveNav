@@ -21,6 +21,7 @@ curvenav-train = "curvenav.training.train:main"
 curvenav-prepare-data = "curvenav.data.prepare:main"
 curvenav-evaluate = "curvenav.evaluation.offline:main"
 curvenav-compare = "curvenav.evaluation.compare:main"
+curvenav-finetune-evaluator = "curvenav.training.evaluator_finetune:main"
 
 [project.optional-dependencies]
 generation = ["trimesh>=4.0"]

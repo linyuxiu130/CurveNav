@@ -124,35 +124,31 @@ class MetricDepthProjector(nn.Module):
 
     def _configuration_field(
         self,
-        aligned_body_points: Tensor,
-        body_pixel: Tensor,
         surface_points: Tensor,
         surface_valid: Tensor,
         camera_to_current: Tensor,
         observation_valid: Tensor,
         obstacle_memory: Tensor,
     ) -> Tensor:
-        occupancy = self._rasterize(
-            aligned_body_points[..., :2],
-            body_pixel & observation_valid[..., None, None],
-            padding=self.obstacle_padding,
-        )
-        occupancy = occupancy | obstacle_memory[:, None]
+        # The sensor-clock memory already includes the current observation and
+        # every intervening clear. Historical image tokens are timed evidence,
+        # not another writer of the current occupied state.
+        occupancy = obstacle_memory[:, None]
         # Inflate before cropping: obstacles just outside the BEV still collide
         # with robot footprints whose centres are inside its boundary.
         pad = self.obstacle_padding
+        # Metric distance to the represented raster sites, not a physical
+        # clearance certificate. Keep discretization error out of learned values.
         signed_clearance = (
             self._euclidean_distance_transform(occupancy)[:, pad:-pad, pad:-pad]
             - ROBOT_FOOTPRINT_RADIUS_M
-            # Nearest-node rasterization moves a measured point by at most
-            # sqrt(2)*resolution/2. Triangle inequality makes this a lower
-            # bound on clearance to measured points at each grid node.
-            - self.configuration_resolution_m / math.sqrt(2)
         )
-        forbidden = signed_clearance[:, None] <= 0.0
+        raster_overlap = signed_clearance[:, None] <= 0.0
 
-        origin = camera_to_current[..., :2, 3][..., None, :]
-        endpoint = surface_points[..., :2]
+        # A past free-space ray does not establish visibility now: a moving
+        # obstacle may have entered it. Only current rays mark observed space.
+        origin = camera_to_current[:, -1:, :2, 3][..., None, :]
+        endpoint = surface_points[:, -1:, :, :2]
         alpha = torch.linspace(
             0.0,
             1.0,
@@ -162,14 +158,13 @@ class MetricDepthProjector(nn.Module):
         ray = origin[..., None, :] + alpha[None, None, None, :, None] * (
             endpoint[..., None, :] - origin[..., None, :]
         )
-        ray_valid = (surface_valid & observation_valid[..., None])[..., None].expand_as(
+        ray_valid = (surface_valid[:, -1:] & observation_valid[:, -1:, None])[..., None].expand_as(
             ray[..., 0]
         )
         observed = self._rasterize(ray, ray_valid)
-        # A measured obstacle makes every robot-centre configuration inside
-        # its footprint plus safety margin known-unsafe, even if that centre
-        # cell is not itself crossed by the camera ray.  Gating only on the
-        # obstacle pixel incorrectly hides most of the inflated C-obstacle.
+        # Include local evidence around represented obstacles even where no
+        # sampled ray crosses the robot centre. Coverage is not a free-space
+        # certificate, and raster overlap is not ground-truth collision.
         observed |= signed_clearance[:, None] <= EXTRA_CLEARANCE_M
 
         clearance = signed_clearance[:, None]
@@ -189,7 +184,7 @@ class MetricDepthProjector(nn.Module):
                 gradient_x / gradient_norm,
                 gradient_y / gradient_norm,
                 observed.float(),
-                forbidden.float(),
+                raster_overlap.float(),
             ),
             dim=1,
         )
@@ -221,62 +216,9 @@ class MetricDepthProjector(nn.Module):
         points = points + camera_to_current[..., None, None, :3, 3]
         valid = (depth > 0) & condition.observation_valid[..., None, None]
         hit = valid & (depth < 1)
-        # Discard old measured points contradicted by a newer free-space ray.
-        # Occluded or out-of-view history remains in the sixteen-observation window.
-        for newer in range(1, frames):
-            current_rotation = camera_to_current[:, newer, :3, :3]
-            current_origin = camera_to_current[:, newer, :3, 3]
-            in_current = torch.einsum(
-                "bij,bfhwi->bfhwj",
-                current_rotation,
-                points - current_origin[:, None, None, None],
-            )
-            z = in_current[..., 2]
-            current_k = k[:, newer]
-            u = (
-                current_k[:, None, None, None, 0, 0]
-                * in_current[..., 0]
-                / z.clamp_min(1e-6)
-                + current_k[:, None, None, None, 0, 2]
-                - 0.5
-            )
-            v = (
-                current_k[:, None, None, None, 1, 1]
-                * in_current[..., 1]
-                / z.clamp_min(1e-6)
-                + current_k[:, None, None, None, 1, 2]
-                - 0.5
-            )
-            inside = (z > 0) & (u >= 0) & (u <= width - 1) & (v >= 0) & (v <= height - 1)
-            # Use the nearest depth in the four surrounding pixels. Bilinear depth
-            # or one rounded pixel can invent free space across a depth discontinuity.
-            u0 = u.floor().clamp(0, width - 1).long()
-            v0 = v.floor().clamp(0, height - 1).long()
-            u1, v1 = (u0 + 1).clamp_max(width - 1), (v0 + 1).clamp_max(height - 1)
-            latest = depth[:, newer].flatten(1)
-            samples = [
-                latest.gather(1, (yy * width + xx).flatten(1)).reshape_as(depth)
-                for xx, yy in ((u0, v0), (u1, v0), (u0, v1), (u1, v1))
-            ]
-            measured = torch.stack(samples).amin(0) * self.max_depth_m
-            # Propagate the storage quantization bound through the optical-Z
-            # transform: z_current = a * Z_history + b. One FP16 epsilon over
-            # [0,max_depth] also covers the reserved endpoint encodings. This
-            # is a numerical tolerance, not an assumed sensor-noise model.
-            z_scale = torch.einsum(
-                "bi,bfij,bfhwj->bfhw",
-                current_rotation[:, :, 2],
-                camera_to_current[..., :3, :3],
-                rays,
-            ).abs()
-            tolerance = self.max_depth_m * torch.finfo(torch.float16).eps * (1 + z_scale)
-            contradicted = inside & (measured > 0) & (z < measured - tolerance)
-            historical = (
-                torch.arange(frames, device=depth.device)[None, :, None, None] < newer
-            )
-            contradicted = contradicted & condition.observation_valid[:, newer, None, None, None]
-            valid = valid & ~(historical & hit & contradicted)
-        hit = hit & valid
+        # Preserve historical measurements at their acquisition times. Ego-motion
+        # alignment does not move a dynamic object to its present position; the
+        # encoder's age features distinguish these from current observations.
         # This is a planar body-collision field, not a terrain-connectivity map.
         # A flat surface in the body band is still an obstacle (e.g. a platform).
         body_pixel = (
@@ -306,8 +248,6 @@ class MetricDepthProjector(nn.Module):
         surface, surface_depth, surface_valid, surface_indices = select(valid)
         obstacle, obstacle_depth, obstacle_valid, obstacle_indices = select(body_pixel)
         field = self._configuration_field(
-            points,
-            body_pixel,
             surface,
             surface_valid,
             camera_to_current,

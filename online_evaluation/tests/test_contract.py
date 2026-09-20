@@ -227,6 +227,28 @@ class PaperContractTests(unittest.TestCase):
         planner.reset_env(0, active=True)
         self.assertIsNone(planner.pop_action(current))
 
+    def test_planner_stop_stays_at_current_origin_after_async_motion(self):
+        def solve(paths):
+            np.testing.assert_array_equal(paths[0], 0)
+            # The ordinary route must still move from capture to current axes.
+            np.testing.assert_allclose(paths[1, 0], [0, .05, 0], atol=1e-7)
+            return np.zeros((2, 2, 2)), np.zeros((2, 3, 3)), np.zeros(2), np.zeros(2)
+
+        planner = Planner(None, SimpleNamespace(solve=solve), 2)
+        trajectory = np.zeros((2, 4, 3), dtype=np.float32)
+        trajectory[1, :, 0] = np.linspace(0, 1, 4)
+        source = np.tile(np.eye(4), (2, 1, 1))
+        current = source.copy()
+        current[:, :2, :2] = [[0, -1], [1, 0]]
+        current[:, 0, 3] = .05
+        planner.output_plan = (trajectory, source, np.zeros(2, dtype=np.int64), .1)
+        action, _, _ = planner.pop_action({
+            "body_to_world": current, "pointgoal": np.zeros((2, 2)),
+            "robot_pos": current[:, :3, 3],
+            "robot_quat": np.tile([0, 0, 2**-.5, 2**-.5], (2, 1)),
+        })
+        np.testing.assert_array_equal(action, 0)
+
     def test_policy_gpu_pool_enforces_weighted_memory_capacity(self):
         pool = PolicyGpuPool([5, 6], slots_per_gpu=2)
         with pool.reserve([5], slots_per_server=2):

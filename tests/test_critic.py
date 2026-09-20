@@ -23,6 +23,23 @@ def criterion_loss(output):
     return CurveNavCriterion(oracle(), 3.6)(output, source_batch(len(output.candidate_paths), output.candidate_paths.device))
 
 
+def test_score_loss_regresses_actual_candidate_utilities():
+    from curvenav.models.policy import CurveNavTrainingOutput
+    paths = torch.tensor([[[[0., 0.], [0., 0.]], [[0., 0.], [0., 2.]],
+                           [[0., 0.], [3., 2.]]]]).expand(2, -1, -1, -1)
+    scores = torch.tensor([[1., 2., -1.], [-2., .5, 3.]], requires_grad=True)
+    criterion = CurveNavCriterion(oracle(), 3.6)
+    batch = source_batch(2, 'cpu')
+    target = criterion.teacher(paths, batch).score
+    def loss(value):
+        return criterion(CurveNavTrainingOutput(torch.tensor(0.), paths, value), batch).critic_loss
+    actual = loss(scores)
+    expected = torch.nn.functional.smooth_l1_loss(scores, target)
+    torch.testing.assert_close(actual, expected)
+    gradient = torch.autograd.grad(actual, scores)[0]
+    torch.testing.assert_close(gradient, (scores - target).clamp(-1, 1) / scores.numel())
+
+
 def test_teacher_queries_body_clearance_whole_curve_and_is_batch_independent():
     # Endpoints clear, intermediate segment crosses wall beyond a nominal 0.5 m horizon.
     paths = torch.tensor([[[[0., 0.], [0., 3.]], [[0., 0.], [3., 0.]], [[0., 0.], [30., 0.]]]])
@@ -64,6 +81,22 @@ def test_teacher_prefers_progress_to_stopping_and_does_not_credit_wall_crossing(
     for i in range(3):
         alone = teacher(paths[:, i:i+1], batch)
         torch.testing.assert_close(alone.score[:, 0], labels.score[:, i])
+
+
+def test_teacher_ranking_follows_actual_goal_for_identical_safe_candidates():
+    teacher = RouteUtilityTeacher(oracle(), 3.6)
+    batch = source_batch(1, 'cpu')
+    paths = torch.tensor([[[[0., 0.], [0., 2.]], [[0., 0.], [0., -2.]]]])
+    forward = teacher(paths, batch)
+    backward = teacher(paths, {**batch, 'point_goal': -batch['point_goal']})
+    assert forward.score.argmax(1).item() == 0
+    assert backward.score.argmax(1).item() == 1
+    torch.testing.assert_close(forward.clearance_m, backward.clearance_m)
+    # Zero goal means arrival, not exploration: the utility favors stopping.
+    stopped = torch.zeros_like(paths[:, :1])
+    zero_goal = teacher(torch.cat((stopped, paths), dim=1),
+                        {**batch, 'point_goal': torch.zeros_like(batch['point_goal'])})
+    assert zero_goal.score.argmax(1).item() == 0
 
 
 def test_geodesic_progress_rewards_moving_away_from_goal_to_exit_dead_end():
@@ -111,6 +144,28 @@ def test_source_trace_detects_short_corner_crossing_and_preserves_vertices():
     torch.testing.assert_close(points[0], path[0, 0])
     torch.testing.assert_close(points[-1], path[0, -1])
     assert torch.diff(points, dim=0).norm(dim=-1).max() <= .025001
+
+
+def test_closed_cell_contacts_agree_with_geodesic_connectivity():
+    # All side-cell arrangements, both traversal directions, and exact edge contact.
+    for side_x, side_y in ((.2, .2), (-.1, .2), (.2, -.1), (-.1, -.1)):
+        grid = SourceConfigurationGrid(np.array([[.2, side_y], [side_x, .2]], np.float32), np.zeros(2), 1.)
+        query = SourceConfigurationSpaceQuery((grid,))
+        teacher = RouteUtilityTeacher(query, 3.6)
+        for reverse in (False, True):
+            batch = source_batch(1, 'cpu')
+            batch['source_origin_xy'][:] = 1.5 if reverse else .5
+            batch['point_goal'][:] = torch.tensor([[.1, 0.]])
+            path = torch.tensor([[[[0., 0.], [-1., 1.] if reverse else [1., -1.]]]])
+            result = teacher(path, batch)
+            assert bool(result.clearance_m[0, 0] < 0) == (min(side_x, side_y) < 0)
+            assert torch.isfinite(result.score).all()
+        np.testing.assert_allclose(grid.query_world(np.array([[1., 1.]])), min(.2, side_x, side_y))
+    # A segment lying on an occupied cell edge must also count as contact.
+    path = torch.tensor([[[0., 0.], [0., -.5]]])
+    result = query.query(path, torch.tensor([0]), torch.tensor([[1., .25]]), torch.tensor([0.]), 3.6)
+    assert result.minimum_clearance_m < 0
+    assert torch.all(result.clearance_m[result.active] < 0)
 
 
 def test_teacher_reuses_queried_cells_at_large_origin_boundary():

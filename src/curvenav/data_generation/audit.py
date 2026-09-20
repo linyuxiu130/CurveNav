@@ -193,8 +193,12 @@ def audit_dataset(root: Path) -> dict[str, Any]:
         if record["source_family"] != families[record["scene_id"]]:
             reasons.append("source_family")
         signatures.append(
-            (record["scene_id"], *np.round(np.concatenate((xy[0], xy[-1])), 4))
+            (record["scene_id"], *np.round(np.concatenate((xy[0], xy[-1], yaw[:1])), 4))
         )
+        delta = xy[-1] - xy[:-1]
+        goal_bearing = yaw[:-1] - np.arctan2(delta[:, 1], delta[:, 0])
+        goal_bearing = np.abs(np.arctan2(np.sin(goal_bearing), np.cos(goal_bearing)))
+        near = np.linalg.norm(delta, axis=1) < 1.5
         metrics.append(
             {
                 "route_id": route_id,
@@ -205,6 +209,9 @@ def audit_dataset(root: Path) -> dict[str, Any]:
                 "endpoint_distance_m": endpoint_distance,
                 "minimum_clearance_m": float(grid.clearance(resample(xy, 0.025)).min()),
                 "depth_invalid_fraction": invalid_fraction,
+                "near_goal_frames": int(near.sum()),
+                "near_side_or_rear_frames": int((near & (goal_bearing > math.pi / 3)).sum()),
+                "near_rear_frames": int((near & (goal_bearing > math.pi / 2)).sum()),
             }
         )
         if reasons:
@@ -268,6 +275,10 @@ def audit_dataset(root: Path) -> dict[str, Any]:
             "validation": len(validation_scenes),
         },
         "distance_band_counts": dict(band_counts),
+        "goal_coverage": {
+            name: sum(item[name] for item in metrics)
+            for name in ("near_goal_frames", "near_side_or_rear_frames", "near_rear_frames")
+        },
         "frames_per_route": _distribution([item["frames"] for item in metrics]),
         "route_arc_m": _distribution([item["route_arc_m"] for item in metrics]),
         "endpoint_distance_m": _distribution(

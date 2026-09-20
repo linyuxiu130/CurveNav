@@ -206,6 +206,9 @@ index 69be005..27ad0bf 100644
 +    env_config.observations.goal_pose = None
 @@ -548,0 +492 @@ def create_dingoeval_environment(scene_dir: str,
 +    env_config.seed = 1234
+@@ -552 +496 @@ def create_dingoeval_environment(scene_dir: str,
+-                                           'robot_visible': True,
++                                           'robot_visible': False,
 @@ -559 +502,0 @@ def create_dingoeval_environment(scene_dir: str,
 -    adjust_usd_scale(scale=scene_scale_value, is_clutter=is_clutter)
 diff --git a/baselines/x-navdp/src/environment/robots/__init__.py b/baselines/x-navdp/src/environment/robots/__init__.py

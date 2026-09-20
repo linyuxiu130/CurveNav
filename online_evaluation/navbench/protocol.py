@@ -56,7 +56,7 @@ def as_numpy(value):
 
 
 def policy_response(trajectory):
-    """Encode only the trajectory consumed by the released evaluator."""
+    """Encode a capture-frame path; an all-zero path requests a stop."""
     trajectory = as_numpy(trajectory)
     if trajectory is None:
         raise ValueError("policy returned no execution trajectory")

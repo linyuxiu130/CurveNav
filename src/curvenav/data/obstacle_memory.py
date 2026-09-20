@@ -20,6 +20,33 @@ def memory_grid_shape(horizon_m):
     return GRID_SIZE + 2 * padding
 
 
+def _rectangle_minimum(image, x0, y0, x1, y1):
+    """Exact inclusive rectangle minima using four overlapping dyadic blocks."""
+    height, width = y1 - y0 + 1, x1 - x0 + 1
+    ky = np.floor(np.log2(height)).astype(np.int64)
+    kx = np.floor(np.log2(width)).astype(np.int64)
+    result = np.empty(len(x0), dtype=image.dtype)
+    rows = image
+    for j in range(int(ky.max(initial=0)) + 1):
+        if j:
+            offset = 1 << (j - 1)
+            rows = np.minimum(rows[:-offset], rows[offset:])
+        blocks = rows
+        for i in range(int(kx.max(initial=0)) + 1):
+            if i:
+                offset = 1 << (i - 1)
+                blocks = np.minimum(blocks[:, :-offset], blocks[:, offset:])
+            selected = (ky == j) & (kx == i)
+            left, top = x0[selected], y0[selected]
+            right = x1[selected] - (1 << i) + 1
+            bottom = y1[selected] - (1 << j) + 1
+            result[selected] = np.minimum(
+                np.minimum(blocks[top, left], blocks[top, right]),
+                np.minimum(blocks[bottom, left], blocks[bottom, right]),
+            )
+    return result
+
+
 class ObstacleMemory:
     """Retain measured occupied volumes until observed clear or outside the local map."""
 
@@ -56,10 +83,9 @@ class ObstacleMemory:
             x0 = np.floor(np.clip(u, 0, w-1)).astype(np.int64)
             y0 = np.floor(np.clip(v, 0, h-1)).astype(np.int64)
             x1, y1 = np.minimum(x0+1, w-1), np.minimum(y0+1, h-1)
-            measured = np.asarray([
-                depth[yy0:yy1+1, xx0:xx1+1].min()
-                for xx0, yy0, xx1, yy1 in zip(x0.min(1), y0.min(1), x1.max(1), y1.max(1))
-            ]) * self.maximum
+            measured = _rectangle_minimum(
+                depth, x0.min(1), y0.min(1), x1.max(1), y1.max(1)
+            ) * self.maximum
             # The entire projected voxel rectangle must be observed free.
             # This tolerance covers normalized FP16 depth storage, not scene motion.
             clear = inside.all(1) & (

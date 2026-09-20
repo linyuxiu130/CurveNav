@@ -43,7 +43,7 @@ PINNED = {
     "src/environment/tasks/terminal_utils.py":
         "c6ab4f4cc392e339b83eceb8efbe631a6a4b32228557d7f8c14782ddda896044",
     "src/environment/env_wrapper.py":
-        "903666368ccbf3c3fa4b5f972df5ea7d084262188a6d3535a7f34cf76c462f50",
+        "098c3e6da6b420b87c15dc1dedcf03ad806d80e5ead2f5dcb515ad077418d2e9",
     "src/environment/scenes/default_scene.py":
         "1fe53196df705bc996d5ff087c03d61159ab58bcf54b7897008298969b8d1cf6",
     "src/environment/wheeled_tasks.py":

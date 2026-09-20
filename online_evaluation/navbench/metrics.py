@@ -49,7 +49,7 @@ def _validate_distributed_roots(roots: list[Path]) -> int | None:
 
     identity_fields = (
         "suite", "suite_definition_sha256", "model", "precision", "num_envs",
-        "runtime_revision", "checkpoint_sha256", "model_config_sha256", "seed",
+        "runtime_revision", "runtime_patch_sha256", "checkpoint_sha256", "model_config_sha256", "seed",
         "episodes_per_scene", "full_suite_scene_count", "shard_count",
         "shard_weights",
     )

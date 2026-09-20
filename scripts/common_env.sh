@@ -8,7 +8,7 @@ CURVENAV_PYTHON="${CONDA_PREFIX:?run conda activate curvenav-unified first}/bin/
 export PYTHONPATH="${CURVENAV_PROJECT_ROOT}/src"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/shibo_huang/data/curvenav/cache}"
 export CURVENAV_DEPTH_CACHE_DIR="${CURVENAV_DEPTH_CACHE_DIR:-/tmp/curvenav-depth-cache}"
-export TORCHINDUCTOR_CACHE_DIR="${CONDA_PREFIX}/torchinductor"
+# Keep PyTorch's local temporary compile cache; the Conda cache is on shared storage.
 export TORCHINDUCTOR_COMPILE_THREADS=8
 
 cd "${CURVENAV_PROJECT_ROOT}"

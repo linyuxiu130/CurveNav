@@ -68,14 +68,16 @@ def test_distance_strata_fit_small_scenes_and_cache_reuses_completed_routes(tmp_
     from curvenav.data_generation.geometry import Grid
 
     grid = Grid(np.ones((30, 40), bool), np.ones((30, 40), np.float32), np.zeros(2), .05)
-    quantiles = {"near": [0, 1/3], "middle": [1/3, 2/3], "far": [2/3, 1]}
-    ranges = generation.endpoint_distance_ranges(grid, quantiles, 42)
+    sampling = {"distance_unit": "quantiles", "bands": {
+        name: {"range": interval, "weight": 1, "bearing_degrees": [-180, 180]}
+        for name, interval in {"near": [0, 1/3], "middle": [1/3, 2/3], "far": [2/3, 1]}.items()}}
+    ranges = generation.endpoint_distance_ranges(grid, sampling, 42)
     assert 0 == ranges["near"][0] < ranges["near"][1] == ranges["middle"][0]
     assert ranges["middle"][1] == ranges["far"][0] < ranges["far"][1] < 3
-    assert ranges == generation.endpoint_distance_ranges(grid, quantiles, 42)
+    assert ranges == generation.endpoint_distance_ranges(grid, sampling, 42)
     scene = {"scene_id": "small", "source_family": "family", "split": "train"}
     config = {"source": "grscenes", "selected_scenes": [scene],
-              "routes_per_split": {"train": 3}, "distance_band_weights": {"near": 1, "middle": 2, "far": 2}}
+              "routes_per_split": {"train": 3}, "endpoint_sampling": sampling}
     records = []
     for band, count in generation.route_quota(config, scene).items():
         for i in range(count):
@@ -97,6 +99,33 @@ def test_short_expert_uses_the_same_cubic_without_empty_optimization():
     np.testing.assert_allclose(xy[:, 1], .5, atol=1e-8)
     np.testing.assert_allclose(yaw, 0, atol=1e-6)
     assert np.all(control[:, 0] >= 0) and control[:, 0].max() <= .3
+
+
+def test_near_goal_extension_uses_metric_ranges_and_preserves_held_out_scenes():
+    from curvenav.data_generation.generate import endpoint_distance_ranges, route_quota
+    from curvenav.data_generation.geometry import Grid
+    root = Path(__file__).resolve().parents[1]
+    original = json.loads((root / "configs/grscenes_dataset.json").read_text())
+    extension = json.loads((root / "configs/grscenes_near_goal_dataset.json").read_text())
+    validate_config(extension, load_config(root / "configs/base.yaml").data)
+    assert extension["selected_scenes"] == [s for s in original["selected_scenes"] if s["split"] == "train"]
+    for scene in extension["selected_scenes"]:
+        assert set(route_quota(extension, scene).values()) == {5}
+    grid = Grid(np.ones((30, 40), bool), np.ones((30, 40), np.float32), np.zeros(2), .05)
+    ranges = endpoint_distance_ranges(grid, extension["endpoint_sampling"], 42)
+    assert all(bounds == [.5, 1.5] for bounds in ranges.values())
+
+
+def test_merged_routes_check_actual_family_labels_across_roots(tmp_path):
+    from curvenav.data.prepare import _route_examples
+    roots = tuple(tmp_path / split for split in ("train", "validation"))
+    for root in roots:
+        root.mkdir()
+        (root / "routes.jsonl").write_text(json.dumps({
+            "source": "grscenes", "source_family": "same_layout", "split": root.name,
+        }) + "\n")
+    with pytest.raises(ValueError, match="source-family split leakage across"):
+        _route_examples(roots, None)
 
 
 def test_exact_split_totals_are_balanced_order_independent_and_extend_existing_routes():

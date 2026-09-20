@@ -105,7 +105,7 @@ class CurveNavCriterion:
     def __call__(self, output: CurveNavTrainingOutput, batch: dict[str, Tensor]) -> CurveNavLoss:
         target = self.teacher(output.candidate_paths, batch).score
         scores = output.candidate_scores
-        regression = F.smooth_l1_loss(scores, target)
+        regression = F.smooth_l1_loss(scores.float(), target)
         return CurveNavLoss(
             output.flow_loss + regression, output.flow_loss, regression
         )
