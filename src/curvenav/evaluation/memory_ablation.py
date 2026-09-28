@@ -28,10 +28,20 @@ def compare_memory(policy, condition, current=None):
             raise ValueError("current obstacles must match the boolean memory raster")
         variants['current_obstacles'] = current
     variants['empty_obstacle_memory'] = torch.zeros_like(condition.obstacle_memory)
+    encodings = {
+        name: policy.encode_condition(replace(condition, obstacle_memory=obstacles))
+        for name, obstacles in variants.items()
+    }
+    full, empty = encodings['full'], encodings['empty_obstacle_memory']
+    # Factor the two memory consumers apart. Keep positions, validity, coverage
+    # metadata and visual observations fixed; only replace the named channel.
+    encodings['empty_memory_tokens_only'] = replace(full, tokens=empty.tokens)
+    encodings['empty_path_geometry_only'] = replace(
+        full, configuration_field=empty.configuration_field,
+    )
     report, arrays = {}, {}
     base_paths = None
-    for name, obstacles in variants.items():
-        encoded = policy.encode_condition(replace(condition, obstacle_memory=obstacles))
+    for name, encoded in encodings.items():
         paths = policy.sample_candidate_paths(encoded)
         if base_paths is None:
             base_paths = paths
@@ -43,17 +53,18 @@ def compare_memory(policy, condition, current=None):
         lengths = selected_paths.diff(dim=1).norm(dim=-1).sum(dim=1)
         progress = condition.point_goal.norm(dim=-1) - (condition.point_goal - selected_paths[:, -1]).norm(dim=-1)
         report[name] = {
-            'occupied_cells': obstacles.sum(dim=(1, 2)).tolist(),
             'selected_index': selected.tolist(),
             'fixed_bank_selected_index': fixed_scores.argmax(dim=1).tolist(),
             'selected_length_m': lengths.tolist(),
             'selected_direct_goal_progress_m': progress.tolist(),
             'candidate_change_mean_m': (paths - base_paths).norm(dim=-1).mean(dim=(1, 2)).tolist(),
         }
+        if name in variants:
+            report[name]['occupied_cells'] = variants[name].sum(dim=(1, 2)).tolist()
         for key, value in {'paths': paths, 'scores': scores, 'fixed_bank_scores': fixed_scores}.items():
             arrays[f'{name}_{key}'] = value.float().cpu().numpy()
     baseline_scores = arrays['full_fixed_bank_scores']
-    for name in variants:
+    for name in encodings:
         report[name]['fixed_bank_score_change_mae'] = np.abs(
             arrays[f'{name}_fixed_bank_scores'] - baseline_scores,
         ).mean(axis=1).tolist()
@@ -83,7 +94,7 @@ def main():
     result = {
         'checkpoint': str(args.checkpoint.resolve()),
         'request': str(args.request.resolve()),
-        'interpretation': 'Fixed-bank scores isolate the critic; regenerated curves also change the actor. No collision or reachability guarantee.',
+        'interpretation': 'Fixed-bank scores isolate the critic. Token-only and geometry-only probes hold all token metadata fixed. These counterfactuals measure sensitivity, not correct obstacle avoidance or physical safety.',
         'variants': report,
     }
     (args.output / 'report.json').write_text(json.dumps(result, indent=2) + '\n')

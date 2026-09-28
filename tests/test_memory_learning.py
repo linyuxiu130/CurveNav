@@ -59,3 +59,11 @@ def test_memory_counterfactual_preserves_request_and_fixed_candidate_bank():
     encoded = policy.encode_condition(replace(condition, obstacle_memory=current))
     expected = policy.score_candidate_paths(encoded, condition.point_goal, torch.from_numpy(arrays['full_paths']))
     torch.testing.assert_close(expected.detach(), torch.from_numpy(arrays['current_obstacles_fixed_bank_scores']))
+    full_encoded = policy.encode_condition(condition)
+    for name, isolated in (
+        ('empty_memory_tokens_only', replace(full_encoded, tokens=encoded.tokens)),
+        ('empty_path_geometry_only', replace(full_encoded, configuration_field=encoded.configuration_field)),
+    ):
+        expected = policy.score_candidate_paths(isolated, condition.point_goal, torch.from_numpy(arrays['full_paths']))
+        torch.testing.assert_close(expected, torch.from_numpy(arrays[f'{name}_fixed_bank_scores']))
+        assert report[name]['fixed_bank_score_change_mae'][0] > 0
