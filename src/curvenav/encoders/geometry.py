@@ -42,8 +42,10 @@ class MetricDepthProjector(nn.Module):
         token_width: int,
         max_depth_m: float,
         planning_horizon_m: float,
+        geometry=(ROBOT_FOOTPRINT_RADIUS_M, BODY_OBSTACLE_MIN_Z_M, ROBOT_COLLISION_TOP_Z_M),
     ) -> None:
         super().__init__()
+        self.radius, self.min_z, self.max_z = geometry
         self.token_height, self.token_width = token_height, token_width
         self.max_depth_m = max_depth_m
         self.planning_horizon_m = planning_horizon_m
@@ -56,7 +58,7 @@ class MetricDepthProjector(nn.Module):
         )
         self.register_buffer("configuration_axis_m", axis)
         self.obstacle_padding = math.ceil(
-            (ROBOT_FOOTPRINT_RADIUS_M + EXTRA_CLEARANCE_M)
+            (self.radius + EXTRA_CLEARANCE_M)
             / self.configuration_resolution_m
         ) + 1
         index = torch.arange(
@@ -141,7 +143,7 @@ class MetricDepthProjector(nn.Module):
         # clearance certificate. Keep discretization error out of learned values.
         signed_clearance = (
             self._euclidean_distance_transform(occupancy)[:, pad:-pad, pad:-pad]
-            - ROBOT_FOOTPRINT_RADIUS_M
+            - self.radius
         )
         raster_overlap = signed_clearance[:, None] <= 0.0
 
@@ -223,8 +225,8 @@ class MetricDepthProjector(nn.Module):
         # A flat surface in the body band is still an obstacle (e.g. a platform).
         body_pixel = (
             hit
-            & (points[..., 2] >= BODY_OBSTACLE_MIN_Z_M)
-            & (points[..., 2] <= ROBOT_COLLISION_TOP_Z_M)
+            & (points[..., 2] >= self.min_z)
+            & (points[..., 2] <= self.max_z)
         )
 
         def select(mask):

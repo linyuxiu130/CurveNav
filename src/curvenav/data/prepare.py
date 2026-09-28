@@ -53,6 +53,24 @@ from curvenav.physical import EXTRA_CLEARANCE_M
 from curvenav.data.obstacle_memory import ObstacleMemory
 
 
+_PREPARE_CUDA_DEVICE = None
+
+
+def _initialize_prepare_cuda(device_queue):
+    global _PREPARE_CUDA_DEVICE
+    _PREPARE_CUDA_DEVICE = device_queue.get()
+    torch.cuda.set_device(_PREPARE_CUDA_DEVICE)
+    torch.set_num_threads(1)
+
+
+def _cuda_memory_path(cpu_path: Path) -> Path:
+    # Keep validated CPU caches reusable while independently invalidating the
+    # CUDA cache whenever its implementation changes.
+    digest = hashlib.sha256(cpu_path.stem.encode())
+    digest.update(Path(__file__).with_name("obstacle_memory_cuda.py").read_bytes())
+    return cpu_path.parent.with_name("route_memory_cuda") / (digest.hexdigest() + ".npy")
+
+
 def _route_memory_path(route_root: Path, data: DataConfig, intrinsic, extrinsic) -> Path:
     """Invalidate local derived memory when its inputs or implementation change."""
     digest = hashlib.sha256()
@@ -65,7 +83,7 @@ def _route_memory_path(route_root: Path, data: DataConfig, intrinsic, extrinsic)
                  Path(__file__).parents[1] / "physical.py"):
         digest.update(path.read_bytes())
     digest.update(str((data.future_steps * data.expert_waypoint_spacing_m,
-                       data.max_depth_m)).encode())
+                       data.max_depth_m, data.robot_geometry)).encode())
     digest.update(np.asarray(intrinsic, dtype=np.float64).tobytes())
     digest.update(np.asarray(extrinsic, dtype=np.float64).tobytes())
     cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
@@ -129,45 +147,48 @@ def _planar_local(points: np.ndarray, origin: np.ndarray, yaw: float) -> np.ndar
     ).astype(np.float32, copy=False)
 
 
-def _route_examples_from_root(
-    root: Path, config: CurveNavConfig
-) -> dict[str, list[_Example]]:
+def _route_tasks_from_root(root: Path, config: CurveNavConfig) -> list[tuple]:
     data = config.data
     source_manifest = json.loads(
         (root / "dataset_manifest.json").read_text(encoding="utf-8")
     )
     if (
         source_manifest.get("route_contract", {}).get("navigation_geometry")
-        != expert_navigation_geometry_contract()
+        != expert_navigation_geometry_contract(data)
     ):
         raise ValueError(
             "Expert routes must be planned against the stage and static objects"
         )
-    pitch = math.radians(data.camera_downward_pitch_degrees)
-    sine, cosine = math.sin(pitch), math.cos(pitch)
-    expected_camera_transform = np.asarray(
-        [
-            [0.0, -sine, cosine, data.camera_forward_offset_m],
-            [-1.0, 0.0, 0.0, 0.0],
-            [0.0, -cosine, -sine, data.camera_height_m],
-            [0.0, 0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-    camera = source_manifest.get("camera", {})
-    intrinsic = np.asarray(camera.get("image", {}).get("K", ()), dtype=np.float64)
-    body_from_camera = np.asarray(
-        camera.get("body_from_camera_optical", ()), dtype=np.float64
-    )
-    expected_intrinsic = BENCHMARK_INTRINSICS.matrix()
-    if (
-        intrinsic.shape != (3, 3)
-        or body_from_camera.shape != (4, 4)
-        or not np.allclose(intrinsic, expected_intrinsic, atol=1e-6)
-        or not np.allclose(body_from_camera, expected_camera_transform, atol=1e-6)
-    ):
-        raise ValueError("Expert camera calibration does not match CurveNav")
-    intrinsic = CANONICAL_INTRINSICS.matrix()
+    if data.embodiment == "dingo":
+        pitch = math.radians(data.camera_downward_pitch_degrees)
+        sine, cosine = math.sin(pitch), math.cos(pitch)
+        expected_camera_transform = np.asarray(
+            [
+                [0.0, -sine, cosine, data.camera_forward_offset_m],
+                [-1.0, 0.0, 0.0, 0.0],
+                [0.0, -cosine, -sine, data.camera_height_m],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        camera = source_manifest.get("camera", {})
+        intrinsic = np.asarray(camera.get("image", {}).get("K", ()), dtype=np.float64)
+        body_from_camera = np.asarray(
+            camera.get("body_from_camera_optical", ()), dtype=np.float64
+        )
+        expected_intrinsic = BENCHMARK_INTRINSICS.matrix()
+        if (
+            intrinsic.shape != (3, 3)
+            or body_from_camera.shape != (4, 4)
+            or not np.allclose(intrinsic, expected_intrinsic, atol=1e-6)
+            or not np.allclose(body_from_camera, expected_camera_transform, atol=1e-6)
+        ):
+            raise ValueError("Expert camera calibration does not match CurveNav")
+        intrinsic = CANONICAL_INTRINSICS.matrix()
+    else:
+        if source_manifest.get("camera") != {"calibration": "per_frame"}:
+            raise ValueError("R1Pro routes require recorded per-frame calibration")
+        intrinsic = body_from_camera = None
     if (
         source_manifest.get("schema") != "curvenav_policy_depth_routes_v5"
         or source_manifest.get("observation") != depth_camera_contract(data)
@@ -177,15 +198,18 @@ def _route_examples_from_root(
         json.loads(line)
         for line in (root / "routes.jsonl").read_text(encoding="utf-8").splitlines()
     ]
+    return [(record, root, data, intrinsic, body_from_camera) for record in records]
+
+
+def _route_examples_from_root(
+    root: Path, config: CurveNavConfig, pool: ProcessPoolExecutor
+) -> dict[str, list[_Example]]:
+    tasks = _route_tasks_from_root(root, config)
     output: dict[str, list[_Example]] = {"train": [], "validation": []}
-    with ProcessPoolExecutor(
-        max_workers=8, mp_context=multiprocessing.get_context("spawn")
-    ) as pool:
-        tasks = ((record, root, data, intrinsic, body_from_camera) for record in records)
-        for index, (split, examples) in enumerate(pool.map(_route_examples_worker, tasks), 1):
-            output[split].extend(examples)
-            if index % 25 == 0:
-                print(f"Prepared causal geometry: {index}/{len(records)} routes", flush=True)
+    for index, (split, examples) in enumerate(pool.map(_route_examples_worker, tasks), 1):
+        output[split].extend(examples)
+        if index % 25 == 0:
+            print(f"Prepared causal geometry: {index}/{len(tasks)} routes", flush=True)
     return output
 
 
@@ -201,10 +225,27 @@ def _route_examples(
                 families[record["split"]].add((record["source"], record["source_family"]))
     if families["train"] & families["validation"]:
         raise ValueError("source-family split leakage across expert route roots")
+    workers = int(os.environ.get("CURVENAV_PREPARE_WORKERS", "8"))
+    if workers < 1:
+        raise ValueError("CURVENAV_PREPARE_WORKERS must be positive")
+    tasks = []
     for root in roots:
-        source = _route_examples_from_root(root.expanduser().resolve(), config)
-        for split in output:
-            output[split].extend(source[split])
+        tasks.extend(_route_tasks_from_root(root.expanduser().resolve(), config))
+    context = multiprocessing.get_context("spawn")
+    pool_options = {}
+    if os.environ.get("CURVENAV_PREPARE_MEMORY_DEVICE", "cpu") == "cuda":
+        devices = torch.cuda.device_count()
+        if not devices:
+            raise RuntimeError("CUDA obstacle-memory preparation requires a GPU")
+        device_queue = context.Queue()
+        for index in range(workers):
+            device_queue.put(index % devices)
+        pool_options = dict(initializer=_initialize_prepare_cuda, initargs=(device_queue,))
+    with ProcessPoolExecutor(max_workers=workers, mp_context=context, **pool_options) as pool:
+        for index, (split, examples) in enumerate(pool.map(_route_examples_worker, tasks), 1):
+            output[split].extend(examples)
+            if index % 100 == 0:
+                print(f"Prepared causal geometry: {index}/{len(tasks)} routes", flush=True)
     return output
 
 
@@ -238,15 +279,32 @@ def _route_examples_worker(arguments):
         name=f"{record['source']}/{route_id}",
     )
     history = ObservationHistory()
-    memory = ObstacleMemory(data.future_steps * data.expert_waypoint_spacing_m, data.max_depth_m)
+    if data.embodiment == "r1pro":
+        intrinsic = np.load(route_root / "camera_intrinsics.npy")
+        body_from_camera = np.load(route_root / "camera_to_body.npy")
+        if intrinsic.shape != (len(xy), 3, 3) or body_from_camera.shape != (len(xy), 4, 4):
+            raise ValueError("Per-frame calibration must match the depth clock")
+    else:
+        intrinsic = np.broadcast_to(intrinsic, (len(xy), 3, 3))
+        body_from_camera = np.broadcast_to(body_from_camera, (len(xy), 4, 4))
+    memory = ObstacleMemory(data.future_steps * data.expert_waypoint_spacing_m, data.max_depth_m, data.robot_geometry)
     depth_frames = np.load(depth.source, mmap_mode="r")
     memory_path = _route_memory_path(route_root, data, intrinsic, body_from_camera)
+    if not memory_path.exists() and _PREPARE_CUDA_DEVICE is not None:
+        memory_path = _cuda_memory_path(memory_path)
+        if not memory_path.exists():
+            from curvenav.data.obstacle_memory_cuda import CudaObstacleMemory
+            memory = CudaObstacleMemory(
+                data.future_steps * data.expert_waypoint_spacing_m,
+                data.max_depth_m, data.robot_geometry, _PREPARE_CUDA_DEVICE,
+            )
     cached_memory = np.load(memory_path, mmap_mode="r") if memory_path.exists() else None
     if cached_memory is not None and (
         cached_memory.shape != (len(xy) - 1, memory.size, memory.size)
         or cached_memory.dtype != np.bool_
     ):
         raise ValueError(f"invalid route memory cache: {memory_path}")
+    route_memories = []
     for anchor in range(len(xy) - 1):
         frame_indices, relative, age, valid = history.update(
             anchor, poses[anchor], float(times[anchor])
@@ -256,26 +314,27 @@ def _route_examples_worker(arguments):
                 points, xy[anchor], float(yaw[anchor])
             )
         )
+        obstacle_memory = (cached_memory[anchor] if cached_memory is not None else
+                           memory.update(depth_frames[anchor], intrinsic[anchor], body_from_camera[anchor], poses[anchor]))
+        route_memories.append(obstacle_memory)
         full_local = transform(xy[anchor:])
+        # A stationary terminal suffix has no navigation curve to supervise.
+        if _arc_length(full_local) == 0:
+            continue
         local_path, reached_goal = _fixed_future(
             full_local, data.future_steps, data.expert_waypoint_spacing_m
         )
         examples.append(
             _Example(
-                obstacle_memory=(cached_memory[anchor] if cached_memory is not None else
-                                 memory.update(depth_frames[anchor], intrinsic, body_from_camera, poses[anchor])),
+                obstacle_memory=obstacle_memory,
                 depth_run=depth,
                 depth_indices=frame_indices,
                 point_goal=full_local[-1],
                 observation_to_current=relative,
                 observation_valid=valid,
                 observation_age_s=age,
-                camera_intrinsics=np.broadcast_to(
-                    intrinsic, (data.observation_frames, 3, 3)
-                ),
-                camera_to_body=np.broadcast_to(
-                    body_from_camera, (data.observation_frames, 4, 4)
-                ),
+                camera_intrinsics=intrinsic[frame_indices],
+                camera_to_body=body_from_camera[frame_indices],
                 source_grid_path=source_grid_path,
                 source_origin_xy=xy[anchor].copy(),
                 source_yaw_rad=float(yaw[anchor]),
@@ -288,7 +347,7 @@ def _route_examples_worker(arguments):
         memory_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = memory_path.with_suffix(f".{os.getpid()}.tmp")
         with temporary.open("wb") as stream:
-            np.save(stream, np.stack([example.obstacle_memory for example in examples]),
+            np.save(stream, np.stack(route_memories),
                     allow_pickle=False)
         os.replace(temporary, memory_path)
     return split, examples
@@ -340,17 +399,18 @@ def _source_minimum_clearance(
     planning_horizon_m: float,
 ) -> np.ndarray:
     """Evaluate prepared curves in bounded chunks against the source oracle."""
+    device = torch.device(os.environ.get("CURVENAV_PREPARE_QUERY_DEVICE", "cpu"))
     values = []
     for start in range(0, len(path), 2048):
         end = min(start + 2048, len(path))
         values.append(
             source.query.query(
-                path[start:end],
-                torch.from_numpy(source.grid_index[start:end]),
-                torch.from_numpy(source.origin_xy[start:end]),
-                torch.from_numpy(source.yaw_rad[start:end]),
+                path[start:end].to(device),
+                torch.from_numpy(source.grid_index[start:end]).to(device),
+                torch.from_numpy(source.origin_xy[start:end]).to(device),
+                torch.from_numpy(source.yaw_rad[start:end]).to(device),
                 max(planning_horizon_m, float(path_arc_length(path[start:end]).max())),
-            ).minimum_clearance_m.numpy()
+            ).minimum_clearance_m.cpu().numpy()
         )
     return np.concatenate(values)
 
@@ -404,6 +464,7 @@ def _audit_serialized_source_contract(
     query = SourceConfigurationSpaceQuery.from_paths(
         tuple(split_root / entry["file"] for entry in source_grids)
     )
+    device = torch.device(os.environ.get("CURVENAV_PREPARE_QUERY_DEVICE", "cpu"))
     expert_values = np.load(split_root / "curve_values.npy", mmap_mode="r")
     grid_index = np.load(split_root / "source_grid_index.npy", mmap_mode="r")
     origin_xy = np.load(split_root / "source_origin_xy.npy", mmap_mode="r")
@@ -428,10 +489,10 @@ def _audit_serialized_source_contract(
             )
         )
         expert_query = query.query(
-            expert_path, indices, origins, yaws,
+            expert_path.to(device), indices.to(device), origins.to(device), yaws.to(device),
             max(planning_horizon_m, float(path_arc_length(expert_path).max())),
         )
-        expert_minimum.append(expert_query.minimum_clearance_m.numpy())
+        expert_minimum.append(expert_query.minimum_clearance_m.cpu().numpy())
         expert_oob_count += int(
             (~expert_query.in_world_bounds).any(dim=-1).sum().item()
         )

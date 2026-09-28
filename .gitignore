@@ -46,3 +46,9 @@ config/local.env
 
 # Local recovery archives
 /backups/
+
+# External reference checkouts and locally reconstructed simulator fork
+/Offroad-Path-Planning/
+/overseec/
+/behavior_adapter/vendor/OmniGibson/
+/behavior_adapter/vendor/docs/

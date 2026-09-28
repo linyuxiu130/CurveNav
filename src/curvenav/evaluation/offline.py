@@ -10,7 +10,7 @@ import time
 import torch
 from torch import Tensor
 
-from curvenav.config import CurveNavConfig
+from curvenav.config import CurveNavConfig, DataConfig
 from curvenav.config_io import load_config
 from curvenav.data.batch import unpack_policy_batch
 from curvenav.data.loader import build_policy_validation_loader
@@ -70,7 +70,7 @@ def _sample(
     return prepared, prediction
 
 
-def _current_frame_batch(batch: dict[str, Tensor], horizon_m: float, max_depth_m: float):
+def _current_frame_batch(batch: dict[str, Tensor], horizon_m: float, max_depth_m: float, geometry=DataConfig().robot_geometry):
     """Remove historical evidence, keeping current hits in the source voxel lattice."""
     current = dict(batch)
     valid = torch.zeros_like(batch["observation_valid"])
@@ -87,7 +87,7 @@ def _current_frame_batch(batch: dict[str, Tensor], horizon_m: float, max_depth_m
     pose[:, 1, 0], pose[:, 1, 1] = -yaw.sin(), yaw.cos()
     pose[:, :2, 3] = batch["source_origin_xy"].cpu() * torch.tensor([1., -1.])
     memory = [
-        torch.from_numpy(ObstacleMemory(horizon_m, max_depth_m).update(d, k, c, p))
+        torch.from_numpy(ObstacleMemory(horizon_m, max_depth_m, geometry).update(d, k, c, p))
         for d, k, c, p in zip(depth, intrinsic, camera, pose.numpy(), strict=True)
     ]
     current["obstacle_memory"] = torch.stack(memory).to(batch["depth"].device)
@@ -351,7 +351,9 @@ def measure_policy(
 ) -> PolicyMeasurements:
     """Collect one deterministic path and one history ablation per observation."""
     policy.to(device).eval()
-    teacher = RouteUtilityTeacher(source_query, policy.planning_horizon_m)
+    projector = policy.depth_encoder.metric_projector
+    geometry = (projector.radius, projector.min_z, projector.max_z)
+    teacher = RouteUtilityTeacher(source_query, policy.planning_horizon_m, projector.radius)
     depth_projector.to(device).eval()
     warmup = next(iter(loader))
     _sample(policy, warmup)
@@ -378,7 +380,7 @@ def measure_policy(
         batch_latency.append(start.elapsed_time(end))
 
         current_prepared, current_prediction = _sample(
-            policy, _current_frame_batch(batch, policy.planning_horizon_m, policy.depth_encoder.max_depth_m)
+            policy, _current_frame_batch(batch, policy.planning_horizon_m, policy.depth_encoder.max_depth_m, geometry)
         )
         depth_swap_prediction, point_goal_swap_prediction = _cached_interventions(
             policy, encoded, prepared.condition.point_goal

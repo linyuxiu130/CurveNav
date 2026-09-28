@@ -1,0 +1,31 @@
+--- a/omnigibson/scenes/scene_base.py
++++ b/omnigibson/scenes/scene_base.py
+@@ -17,7 +17,6 @@
+ from omnigibson.macros import gm
+ from omnigibson.objects.usd_object import USDObject
+ from omnigibson.prims.xform_prim import XFormPrim
+-from omnigibson.robots import REGISTERED_ROBOTS
+ from omnigibson.systems import Cloth
+ from omnigibson.systems.micro_particle_system import FluidSystem
+ from omnigibson.systems.macro_particle_system import MacroParticleSystem
+@@ -437,7 +436,7 @@
+             bool: Whether this object should be loaded or not
+         """
+         # Check whether this is an agent and we allow agents
+-        return self._include_robots or obj_info["class_name"] not in REGISTERED_ROBOTS
++        return self._include_robots or obj_info["class_name"] != "Robot"
+ 
+     def load(self, idx, **kwargs):
+         """
+--- a/omnigibson/utils/usd_utils.py
++++ b/omnigibson/utils/usd_utils.py
+@@ -633,7 +633,8 @@
+ 
+         # Otherwise, convert to prim paths
+         prim_paths = self._get_prim_paths(objects_links_or_prim_paths)
+-        return th.tensor([self._PATH_TO_COL_IDX[scene_idx][path] for path in prim_paths])
++        col_map = self._PATH_TO_COL_IDX.get(scene_idx, {})
++        return th.tensor([col_map[path] for path in prim_paths if path in col_map], dtype=th.long)
+ 
+     def get_contact_pairs(self, scene_idx, query_set, with_set, current_only):
+         """

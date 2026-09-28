@@ -28,7 +28,7 @@ def _teacher(config, split: str, policy):
 
     return RouteUtilityTeacher(
         SourceConfigurationSpaceQuery.from_prepared_split(config.data.root, split),
-        policy.planning_horizon_m,
+        policy.planning_horizon_m, config.data.robot_radius_m,
     )
 
 

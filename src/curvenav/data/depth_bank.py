@@ -1,6 +1,7 @@
 """Immutable packed depth metadata and device materialization."""
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import os
@@ -50,11 +51,16 @@ class PackedDepthBank:
                     temporary, mode="w+", dtype=np.float16,
                     shape=(spec.total_frames, spec.height, spec.width),
                 )
-                for run in spec.runs:
+                def copy_run(run: PackedDepthRun) -> None:
                     source = np.load(run.path, mmap_mode="r")
                     if source.shape != (run.frames, spec.height, spec.width) or source.dtype != np.float16:
                         raise ValueError("invalid packed depth")
                     values[run.offset:run.offset + run.frames] = source
+                workers = max(1, int(os.environ.get("CURVENAV_DEPTH_CACHE_WORKERS", "16")))
+                # Runs occupy disjoint frame intervals. Parallel reads hide
+                # shared-filesystem latency while retaining one atomic cache.
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    list(pool.map(copy_run, spec.runs))
                 values.flush()
                 del values
                 os.replace(temporary, cache_path)

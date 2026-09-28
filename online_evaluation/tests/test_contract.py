@@ -554,14 +554,15 @@ class PaperContractTests(unittest.TestCase):
             repo = root / "repo"
             (repo / "assets/robots").mkdir(parents=True)
             (repo / "assets/robots/dingo.usd").write_text("robot")
-            episode = repo / "assets/scenes/internscenes_home/episode-scene"
+            episode = repo / "custom-episodes/episode-scene"
             episode.mkdir(parents=True)
             (episode / "pointgoal_start_goal_pairs.npy").write_bytes(b"episodes")
             (episode.parent / "models").mkdir()
             (episode.parent / "models/large.usd").write_text("external asset")
+            (repo / "assets/scenes").mkdir(parents=True)
             (repo / "assets/scenes/scene_split.json").write_text("{}")
             args = SimpleNamespace(
-                suite={"splits": {"home": {"scenes": ["episode-scene"]}, "commercial": {}}},
+                suite={"splits": {"home": {"scenes": ["episode-scene"], "episode_root": "custom-episodes"}, "commercial": {}}},
                 jobs=[SimpleNamespace(split="home")],
                 scene_root=scenes,
             )

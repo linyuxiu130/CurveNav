@@ -30,6 +30,7 @@ def build_policy(config: CurveNavConfig) -> CurveNavPolicy:
         dropout=depth.dropout,
         max_depth_m=config.data.max_depth_m,
         planning_horizon_m=planning_horizon_m,
+        geometry=config.data.robot_geometry,
     )
     configuration_encoder = ConfigurationSpaceEncoder(
         model_dim=condition.model_dim,
@@ -78,4 +79,5 @@ def build_evaluation_projector(config: CurveNavConfig) -> MetricDepthProjector:
         token_width=config.depth_encoder.frame_tokens_width,
         max_depth_m=data.max_depth_m,
         planning_horizon_m=data.future_steps * data.expert_waypoint_spacing_m,
+        geometry=data.robot_geometry,
     )

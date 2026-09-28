@@ -132,9 +132,14 @@ def trajectory_metrics(
     predicted_length = path_arc_length(path)
     reference_length = path_arc_length(reference_path)
     evaluation_length = reference_length.clamp_max(comparison_horizon_m)
-    if (evaluation_length <= 1e-6).any():
-        raise ValueError("reference trajectories must have positive length")
-    query = _uniform_distance(evaluation_length, COMPARISON_PATH_SAMPLES)
+    stationary_reference = evaluation_length <= 1e-6
+    # Reached-goal examples legitimately request a stop. Compare any predicted
+    # movement against the held reference endpoint over the normal horizon;
+    # sampling only distance zero would incorrectly score moving away as exact.
+    query_length = torch.where(
+        stationary_reference, comparison_horizon_m, evaluation_length,
+    )
+    query = _uniform_distance(query_length, COMPARISON_PATH_SAMPLES)
     predicted = resample_path_at_distance(path, query)
     reference = resample_path_at_distance(reference_path, query)
     displacement = torch.linalg.vector_norm(predicted - reference, dim=-1)
@@ -164,9 +169,10 @@ def trajectory_metrics(
         "fixed_horizon_ade_m": displacement.mean(dim=-1),
         "fixed_horizon_fde_m": displacement[:, -1],
         "comparison_horizon_m": evaluation_length,
-        "horizon_coverage_fraction": (
-            predicted_length / evaluation_length
-        ).clamp(max=1.0),
+        "horizon_coverage_fraction": torch.where(
+            stationary_reference, torch.ones_like(evaluation_length),
+            (predicted_length / evaluation_length.clamp_min(1e-6)).clamp(max=1.0),
+        ),
         "arc_length_m": predicted_length,
         "reference_arc_length_m": reference_length,
         "arc_length_error_m": (predicted_length - reference_length).abs(),

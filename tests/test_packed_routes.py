@@ -11,7 +11,8 @@ from curvenav.data_generation.generate import render_depth
 from curvenav.data.prepare import _route_examples
 
 
-def test_packed_routes_and_local_slicing_share_training_frames(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("stationary_tail", [False, True])
+def test_packed_routes_and_local_slicing_share_training_frames(tmp_path, monkeypatch, stationary_tail) -> None:
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     config = CurveNavConfig()
     data = config.data
@@ -25,16 +26,17 @@ def test_packed_routes_and_local_slicing_share_training_frames(tmp_path, monkeyp
         "depth": np.full((360,640),4.,np.float32),
     })
     render_depth(simulator,np.zeros((5,3)),np.zeros(5),route_directory/"depth.npy",data)
+    positions = np.array([0., .15, .3, .6, .6]) if stationary_tail else np.arange(5) * .15
     np.save(
         route_directory / "traj_xy.npy",
-        np.column_stack((np.arange(5) * 0.15, np.zeros(5))).astype(np.float32),
+        np.column_stack((positions, np.zeros(5))).astype(np.float32),
     )
     np.save(
         route_directory / "traj_yaw.npy",
         np.zeros(5, dtype=np.float32),
     )
     poses = np.broadcast_to(np.eye(4, dtype=np.float32), (5, 4, 4)).copy()
-    poses[:, 0, 3] = np.arange(5) * 0.15
+    poses[:, 0, 3] = positions
     np.save(route_directory / "body_to_world.npy", poses)
     np.save(route_directory / "timestamps.npy", np.arange(5, dtype=np.float64) * 0.1)
     record = {
@@ -94,7 +96,7 @@ def test_packed_routes_and_local_slicing_share_training_frames(tmp_path, monkeyp
     )
 
     examples = _route_examples((tmp_path, tmp_path), config)
-    assert len(examples["train"]) == 8
+    assert len(examples["train"]) == (6 if stationary_tail else 8)
     np.testing.assert_array_equal(examples["train"][0].depth_indices, [0] * 4)
     np.testing.assert_array_equal(
         examples["train"][0].observation_valid, [False] * 3 + [True]

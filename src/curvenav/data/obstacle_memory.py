@@ -14,9 +14,9 @@ VOXEL_M = PATH_CONFIGURATION_QUERY_SPACING_M
 MEMORY_CONTRACT = "local_world_voxels_025m_all_corners_depth_clearing_v1"
 
 
-def memory_grid_shape(horizon_m):
+def memory_grid_shape(horizon_m, radius_m=ROBOT_FOOTPRINT_RADIUS_M):
     resolution = 2 * horizon_m / (GRID_SIZE - 1)
-    padding = math.ceil((ROBOT_FOOTPRINT_RADIUS_M + EXTRA_CLEARANCE_M) / resolution) + 1
+    padding = math.ceil((radius_m + EXTRA_CLEARANCE_M) / resolution) + 1
     return GRID_SIZE + 2 * padding
 
 
@@ -50,11 +50,12 @@ def _rectangle_minimum(image, x0, y0, x1, y1):
 class ObstacleMemory:
     """Retain measured occupied volumes until observed clear or outside the local map."""
 
-    def __init__(self, horizon_m, max_depth_m):
+    def __init__(self, horizon_m, max_depth_m, geometry=(ROBOT_FOOTPRINT_RADIUS_M, BODY_OBSTACLE_MIN_Z_M, ROBOT_COLLISION_TOP_Z_M)):
+        self.radius, self.min_z, self.max_z = geometry
         self.horizon = horizon_m
         self.maximum = max_depth_m
         self.resolution = 2 * horizon_m / (GRID_SIZE - 1)
-        self.size = memory_grid_shape(horizon_m)
+        self.size = memory_grid_shape(horizon_m, self.radius)
         self.padding = (self.size - GRID_SIZE) // 2
         self.extent = horizon_m + self.padding * self.resolution
         self.voxels = np.empty((0, 3), dtype=np.int64)
@@ -97,7 +98,7 @@ class ObstacleMemory:
         rays = np.stack(((x-intrinsic[0,2])/intrinsic[0,0], (y-intrinsic[1,2])/intrinsic[1,1], np.ones_like(x)), -1)
         points = (rays * (depth*self.maximum)[...,None]) @ camera_to_body[:3,:3].T + camera_to_body[:3,3]
         hit = (depth > 0) & (depth < 1)
-        hit &= (points[...,2] >= BODY_OBSTACLE_MIN_Z_M) & (points[...,2] <= ROBOT_COLLISION_TOP_Z_M)
+        hit &= (points[...,2] >= self.min_z) & (points[...,2] <= self.max_z)
         hit &= (np.abs(points[...,:2]) <= self.extent).all(-1)
         world = points[hit] @ body_to_world[:3,:3].T + body_to_world[:3,3]
         new = np.floor(world / VOXEL_M).astype(np.int64)
@@ -105,8 +106,8 @@ class ObstacleMemory:
         world = (self.voxels[:,None] + self.corners) * VOXEL_M
         local = (world-body_to_world[:3,3]) @ body_to_world[:3,:3]
         intersects = (
-            (local[..., 2].min(1) <= ROBOT_COLLISION_TOP_Z_M)
-            & (local[..., 2].max(1) >= BODY_OBSTACLE_MIN_Z_M)
+            (local[..., 2].min(1) <= self.max_z)
+            & (local[..., 2].max(1) >= self.min_z)
         )
         local = local[intersects,...,:2]
         # Rasterize the entire projected voxel extent. No point replacement or

@@ -45,6 +45,15 @@ checkpoint 测评。三条链路共用 `encoders/`、`conditioning/`、`models/`
 数据集、场景资产、模型权重、运行结果、Conda 环境和编译缓存保留在本地，由
 [.gitignore](.gitignore) 排除。
 
+`behavior_adapter/` 包含 R1Pro 数据采集、训练入口和独立仿真查看器，见
+[适配器说明](behavior_adapter/README.md)。OmniGibson 的两处本地修复以
+[补丁和重建脚本](behavior_adapter/vendor/README.md) 保存，运行前须准备对应的
+BEHAVIOR v3.9.2 运行时。外部参考仓库 `Offroad-Path-Planning/`、`overseec/`
+保留在本机，不作为 CurveNav 源码上传。
+
+本仓库在线轨迹由模型生成并评分。数据生成及离线监督中的最短路工具用于历史
+训练标签，不是在线导航的路径生成器；后续记忆探索实验单独在实验分支进行。
+
 在线仿真测评的调度器、模型适配器、固定题目与运行时准备脚本也已纳入
 [online_evaluation/](online_evaluation/README.md)，支持 SanD、NavDP、X-NavDP 和
 CurveNav 接入，继续使用 `python -m navbench` 入口。各模型的启动适配器独立位于

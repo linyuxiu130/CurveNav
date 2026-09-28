@@ -1,5 +1,6 @@
 """Fixed CUDA runtime settings for CurveNav training."""
 
+import os
 import torch
 from torch import nn
 
@@ -16,6 +17,7 @@ def configure_cuda_training_backend() -> None:
 
 def compile_static_training_functions(policy: nn.Module) -> None:
     """Fuse static training kernels and cache the measured fastest GEMM plans."""
+    mode = os.environ.get("CURVENAV_COMPILE_MODE", "max-autotune-no-cudagraphs")
     for module, name in (
         (policy.depth_encoder, "forward"),
         (policy.condition_encoder, "forward"),
@@ -26,5 +28,5 @@ def compile_static_training_functions(policy: nn.Module) -> None:
     ):
         setattr(module, name, torch.compile(
             getattr(module, name), fullgraph=True, dynamic=False,
-            mode="max-autotune-no-cudagraphs",
+            mode=mode,
         ))

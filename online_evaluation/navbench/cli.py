@@ -44,7 +44,7 @@ PAPER_SEED = 1234
 STOP = threading.Event()
 ACTIVE: set[subprocess.Popen] = set()
 ACTIVE_LOCK = threading.Lock()
-INPUT_LAYOUT_VERSION = "linked-assets-v3"
+INPUT_LAYOUT_VERSION = "linked-assets-v4"
 
 
 @dataclass(frozen=True)
@@ -752,7 +752,7 @@ def prepare_upstream_inputs(args: argparse.Namespace, run_root: Path) -> Path:
         )
         for scene in args.suite["splits"][split]["scenes"]:
             shutil.copytree(
-                ROOT / "assets/scenes" / f"internscenes_{split}" / scene,
+                ROOT / args.suite["splits"][split]["episode_root"] / scene,
                 metadata / "pointgoal_start_pair" / scene,
             )
     try:

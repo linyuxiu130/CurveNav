@@ -169,6 +169,20 @@ def test_fixed_distance_metrics_match_identical_paths() -> None:
     assert metrics["horizon_coverage_fraction"].item() == 1
 
 
+def test_stationary_reference_rewards_stopping_and_penalizes_moving_away() -> None:
+    reference = torch.zeros(3, 3, 2)
+    reference[2, :, 0] = torch.tensor([0., 1., 2.])
+    predicted = reference.clone()
+    predicted[1, :, 0] = torch.tensor([0., 1., 2.])
+    metrics = trajectory_metrics(predicted, reference, torch.zeros(3, 2))
+    for value in metrics.values():
+        assert torch.isfinite(value).all()
+    torch.testing.assert_close(metrics["fixed_horizon_ade_m"], torch.tensor([0., 1., 0.]))
+    torch.testing.assert_close(metrics["fixed_horizon_fde_m"], torch.tensor([0., 2., 0.]))
+    torch.testing.assert_close(metrics["horizon_coverage_fraction"], torch.ones(3))
+    torch.testing.assert_close(metrics["comparison_horizon_m"], torch.tensor([0., 0., 2.]))
+
+
 def test_short_prediction_is_held_to_score_the_missing_horizon() -> None:
     reference = torch.tensor([[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]])
     short = torch.tensor([[[0.0, 0.0], [0.5, 0.0], [1.0, 0.0]]])

@@ -24,8 +24,9 @@ DEPTH_CONTEXT_FIELDS = frozenset(
 
 
 class DepthContextBuffer:
-    def __init__(self, data: DataConfig):
+    def __init__(self, data: DataConfig, obstacle_memory_factory=ObstacleMemory):
         self.data = data
+        self.obstacle_memory_factory = obstacle_memory_factory
         self.histories = []
         self.frames = []
         self.sequence = 0
@@ -37,16 +38,17 @@ class DepthContextBuffer:
         self.frames = [{} for _ in range(batch_size)]
         horizon_m = self.data.future_steps * self.data.expert_waypoint_spacing_m
         self.obstacle_memories = [
-            ObstacleMemory(horizon_m, self.data.max_depth_m) for _ in range(batch_size)
+            self.obstacle_memory_factory(horizon_m, self.data.max_depth_m, self.data.robot_geometry)
+            for _ in range(batch_size)
         ]
         self.sequence = 0
 
     def reset_env(self, env_id: int):
         self.histories[env_id] = ObservationHistory()
         self.frames[env_id].clear()
-        self.obstacle_memories[env_id] = ObstacleMemory(
+        self.obstacle_memories[env_id] = self.obstacle_memory_factory(
             self.data.future_steps * self.data.expert_waypoint_spacing_m,
-            self.data.max_depth_m,
+            self.data.max_depth_m, self.data.robot_geometry,
         )
 
     def update(

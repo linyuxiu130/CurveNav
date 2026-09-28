@@ -83,7 +83,7 @@ def depth_camera_contract(data: DataConfig) -> dict[str, int | float | str]:
         "image_height": data.image_height,
         "image_width": data.image_width,
         "max_depth_m": data.max_depth_m,
-        "intrinsic_matrix": CANONICAL_INTRINSICS.matrix().tolist(),
+        "intrinsic_matrix": (CANONICAL_INTRINSICS.matrix().tolist() if data.embodiment == "dingo" else "per_frame_calibrated"),
         "pixel_centres": "half_integer",
         "camera_forward_offset_m": data.camera_forward_offset_m,
         "camera_height_m": data.camera_height_m,

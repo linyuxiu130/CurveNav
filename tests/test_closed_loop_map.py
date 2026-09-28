@@ -32,7 +32,7 @@ def test_closed_loop_map_uses_robot_x_forward_y_left_contract() -> None:
     assert np.all(np.diff(indices) > 0)
 
 
-def test_closed_loop_map_has_explicit_free_and_obstacle_layers() -> None:
+def test_closed_loop_map_distinguishes_samples_from_unknown_space() -> None:
     matplotlib = pytest.importorskip("matplotlib")
 
     matplotlib.use("Agg")
@@ -47,8 +47,8 @@ def test_closed_loop_map_has_explicit_free_and_obstacle_layers() -> None:
     assert axis.get_xlim() == (-2.025, 3.025)
     assert axis.get_ylim() == (-1.025, 4.025)
     assert [item.get_label() for item in legend] == [
-        "navigable robot-center space",
-        "obstacle / non-navigable space",
+        "bins containing navigation samples",
+        "no navigation sample (unknown)",
     ]
     plt.close(figure)
 
@@ -74,7 +74,14 @@ def test_closed_loop_focus_is_task_local_and_clipped_to_the_map() -> None:
     assert axis.ylim == pytest.approx((-1.75, 2.25))
 
 
-def test_navigation_ply_samples_are_queried_as_native_cell_centres() -> None:
+def test_navigation_sample_bins_preserve_gaps_without_obstacle_claims() -> None:
+    # Real PLY samples are off-lattice: a missing bin can be millimetres from
+    # a navigation sample. This query measures bin coverage, not collision.
+    sampled = _rasterize_navigation_map(np.array([[0.024, 0.0], [0.076, 0.0]]))
+    np.testing.assert_array_equal(
+        _query_navigation_map(sampled, np.array([[0.024, 0.0], [0.026, 0.0]])),
+        [True, False],
+    )
     navigation = _rasterize_navigation_map(
         np.array([[0.0, 0.0], [0.10, 0.0]])
     )
@@ -102,13 +109,13 @@ def test_closed_loop_diagnostics_score_the_executed_prefix_and_replanning() -> N
         [plan, plan.copy()], [plan, plan.copy()], navigation
     )
 
-    assert metrics["plan_origin_free_fraction"] == 1.0
-    assert metrics["free_origin_plan_count"] == 2
-    assert metrics["future_plan_collision_fraction"] == 1.0
-    assert metrics["future_execution_prefix_0p5m_collision_fraction"] == 0.0
-    assert metrics["future_execution_prefix_1p0m_collision_fraction"] == 1.0
-    assert metrics["first_plan_execution_prefix_0p5m_collision"] is False
-    assert metrics["first_plan_execution_prefix_1p0m_collision"] is True
+    assert metrics["plan_origin_sample_coverage"] == 1.0
+    assert metrics["covered_origin_plan_count"] == 2
+    assert metrics["future_plan_sample_gap_fraction"] == 1.0
+    assert metrics["future_plan_prefix_0p5m_sample_gap_fraction"] == 0.0
+    assert metrics["future_plan_prefix_1p0m_sample_gap_fraction"] == 1.0
+    assert metrics["first_plan_prefix_0p5m_sample_gap"] is False
+    assert metrics["first_plan_prefix_1p0m_sample_gap"] is True
     assert metrics["adjacent_plan_pairs"] == 1
     assert metrics["adjacent_plan_first1m_world_disagreement_m_mean"] < 1e-12
 
@@ -121,10 +128,10 @@ def test_closed_loop_diagnostics_do_not_count_the_current_origin_as_future() -> 
 
     metrics = _closed_loop_plan_diagnostics([plan], [plan], navigation)
 
-    assert metrics["plan_origin_free_fraction"] == 0.0
-    assert metrics["free_origin_plan_count"] == 0
-    assert metrics["future_plan_collision_fraction"] == 0.0
-    assert metrics["future_execution_prefix_0p5m_collision_fraction"] == 0.0
+    assert metrics["plan_origin_sample_coverage"] == 0.0
+    assert metrics["covered_origin_plan_count"] == 0
+    assert metrics["future_plan_sample_gap_fraction"] == 0.0
+    assert metrics["future_plan_prefix_0p5m_sample_gap_fraction"] == 0.0
 
 
 def test_closed_loop_summary_weights_diagnostics_by_plans() -> None:
@@ -132,18 +139,18 @@ def test_closed_loop_summary_weights_diagnostics_by_plans() -> None:
         {
             "success": True,
             "total_plan_count": 1,
-            "free_origin_plan_count": 1,
+            "covered_origin_plan_count": 1,
             "adjacent_plan_pairs": 0,
-            "plan_origin_free_fraction": 1.0,
-            "future_plan_collision_fraction": 0.0,
-            "future_execution_prefix_0p5m_collision_fraction": 0.0,
-            "future_execution_prefix_1p0m_collision_fraction": 0.0,
-            "future_execution_prefix_0p5m_collision_given_free_origin_fraction": 0.0,
-            "future_execution_prefix_1p0m_collision_given_free_origin_fraction": 0.0,
-            "first_plan_execution_prefix_0p5m_collision": False,
-            "first_plan_execution_prefix_1p0m_collision": False,
-            "future_planned_point_free_fraction": 1.0,
-            "actual_position_free_fraction": 1.0,
+            "plan_origin_sample_coverage": 1.0,
+            "future_plan_sample_gap_fraction": 0.0,
+            "future_plan_prefix_0p5m_sample_gap_fraction": 0.0,
+            "future_plan_prefix_1p0m_sample_gap_fraction": 0.0,
+            "future_plan_prefix_0p5m_sample_gap_given_covered_origin_fraction": 0.0,
+            "future_plan_prefix_1p0m_sample_gap_given_covered_origin_fraction": 0.0,
+            "first_plan_prefix_0p5m_sample_gap": False,
+            "first_plan_prefix_1p0m_sample_gap": False,
+            "future_planned_point_sample_coverage": 1.0,
+            "actual_position_sample_coverage": 1.0,
             "mpc_desired_speed_mps_mean": 0.5,
             "mpc_curvature_limited_fraction": 0.0,
             "adjacent_plan_first1m_world_disagreement_m_mean": 0.0,
@@ -152,18 +159,18 @@ def test_closed_loop_summary_weights_diagnostics_by_plans() -> None:
         {
             "success": False,
             "total_plan_count": 3,
-            "free_origin_plan_count": 0,
+            "covered_origin_plan_count": 0,
             "adjacent_plan_pairs": 2,
-            "plan_origin_free_fraction": 0.0,
-            "future_plan_collision_fraction": 1.0,
-            "future_execution_prefix_0p5m_collision_fraction": 1.0,
-            "future_execution_prefix_1p0m_collision_fraction": 1.0,
-            "future_execution_prefix_0p5m_collision_given_free_origin_fraction": 0.0,
-            "future_execution_prefix_1p0m_collision_given_free_origin_fraction": 0.0,
-            "first_plan_execution_prefix_0p5m_collision": True,
-            "first_plan_execution_prefix_1p0m_collision": True,
-            "future_planned_point_free_fraction": 0.0,
-            "actual_position_free_fraction": 0.5,
+            "plan_origin_sample_coverage": 0.0,
+            "future_plan_sample_gap_fraction": 1.0,
+            "future_plan_prefix_0p5m_sample_gap_fraction": 1.0,
+            "future_plan_prefix_1p0m_sample_gap_fraction": 1.0,
+            "future_plan_prefix_0p5m_sample_gap_given_covered_origin_fraction": 0.0,
+            "future_plan_prefix_1p0m_sample_gap_given_covered_origin_fraction": 0.0,
+            "first_plan_prefix_0p5m_sample_gap": True,
+            "first_plan_prefix_1p0m_sample_gap": True,
+            "future_planned_point_sample_coverage": 0.0,
+            "actual_position_sample_coverage": 0.5,
             "mpc_desired_speed_mps_mean": 0.1,
             "mpc_curvature_limited_fraction": 1.0,
             "adjacent_plan_first1m_world_disagreement_m_mean": 0.2,
@@ -174,10 +181,10 @@ def test_closed_loop_summary_weights_diagnostics_by_plans() -> None:
     summary = _summarize_closed_loop(records)
 
     assert summary["successes"] == 1
-    assert summary["free_origin_plans"] == 1
-    assert summary["future_plan_collision_fraction"] == pytest.approx(0.75)
+    assert summary["covered_origin_plans"] == 1
+    assert summary["future_plan_sample_gap_fraction"] == pytest.approx(0.75)
     assert summary[
-        "future_execution_prefix_1p0m_collision_given_free_origin_fraction"
+        "future_plan_prefix_1p0m_sample_gap_given_covered_origin_fraction"
     ] == 0.0
     assert summary["mpc_desired_speed_mps_plan_mean"] == pytest.approx(0.2)
     assert summary["adjacent_plan_first1m_world_disagreement_m_mean"] == 0.2

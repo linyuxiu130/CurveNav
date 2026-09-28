@@ -1,5 +1,6 @@
 """Training-only obstacle-aware goal distances on immutable robot C-space."""
 
+import os
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import dijkstra
@@ -47,8 +48,15 @@ class GoalDistanceQuery:
             raise ValueError("training mission goal is not traversable in source C-space")
         key = (index, *cell.tolist())
         if key not in self.fields:
-            node = np.ravel_multi_index(cell, grid.signed_clearance_m.shape)
-            distances = dijkstra(self._graph(index), directed=True, indices=int(node))
+            if os.environ.get("CURVENAV_GOAL_DISTANCE_BACKEND", "scipy") == "numba":
+                from curvenav.data.grid_dijkstra import grid_distances
+                distances = grid_distances(
+                    grid.signed_clearance_m >= 0, grid.cell_size_m,
+                    int(cell[0]), int(cell[1]),
+                )
+            else:
+                node = np.ravel_multi_index(cell, grid.signed_clearance_m.shape)
+                distances = dijkstra(self._graph(index), directed=True, indices=int(node))
             self.fields[key] = distances.astype(np.float32).reshape(
                 grid.signed_clearance_m.shape
             )

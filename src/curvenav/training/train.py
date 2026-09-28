@@ -197,7 +197,7 @@ def run_training(
     policy = build_policy(config)
     criterion = CurveNavCriterion(
         SourceConfigurationSpaceQuery.from_prepared_split(config.data.root, "train"),
-        policy.planning_horizon_m,
+        policy.planning_horizon_m, config.data.robot_radius_m,
     )
     compile_static_training_functions(policy)
     optimizer = build_optimizer(
@@ -240,7 +240,7 @@ def run_training(
         SourceConfigurationSpaceQuery.from_prepared_split(
             config.data.root, "validation"
         ),
-        accelerator.unwrap_model(policy).planning_horizon_m,
+        accelerator.unwrap_model(policy).planning_horizon_m, config.data.robot_radius_m,
     )
     expected_loader_steps = remaining_steps * micro_batches_per_step
     if len(loader) != expected_loader_steps:

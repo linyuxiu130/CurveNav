@@ -47,7 +47,8 @@ class CandidateUtility:
 
 
 class RouteUtilityTeacher:
-    def __init__(self, source_query: SourceConfigurationSpaceQuery, planning_horizon_m: float):
+    def __init__(self, source_query: SourceConfigurationSpaceQuery, planning_horizon_m: float, robot_radius_m: float = ROBOT_FOOTPRINT_RADIUS_M):
+        self.robot_radius_m = robot_radius_m
         self.source_query = source_query
         self.horizon = planning_horizon_m
         self.goal_distance = GoalDistanceQuery(source_query)
@@ -82,7 +83,7 @@ class RouteUtilityTeacher:
             (progress - 0.5 * length) / self.horizon
             - contact
             - torch.asinh(
-                F.relu(EXTRA_CLEARANCE_M - minimum) / ROBOT_FOOTPRINT_RADIUS_M
+                F.relu(EXTRA_CLEARANCE_M - minimum) / self.robot_radius_m
             )
         )
         return CandidateUtility(score, minimum, progress)
@@ -99,8 +100,8 @@ class CurveNavLoss:
 
 
 class CurveNavCriterion:
-    def __init__(self, source_query: SourceConfigurationSpaceQuery, planning_horizon_m: float):
-        self.teacher = RouteUtilityTeacher(source_query, planning_horizon_m)
+    def __init__(self, source_query: SourceConfigurationSpaceQuery, planning_horizon_m: float, robot_radius_m: float = ROBOT_FOOTPRINT_RADIUS_M):
+        self.teacher = RouteUtilityTeacher(source_query, planning_horizon_m, robot_radius_m)
 
     def __call__(self, output: CurveNavTrainingOutput, batch: dict[str, Tensor]) -> CurveNavLoss:
         target = self.teacher(output.candidate_paths, batch).score

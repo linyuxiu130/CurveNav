@@ -7,6 +7,7 @@ from curvenav.physical import (
     DINGO_CAMERA_DOWNWARD_PITCH_DEGREES,
     DINGO_CAMERA_FORWARD_OFFSET_M,
     DINGO_CAMERA_HEIGHT_M,
+    ROBOT_FOOTPRINT_RADIUS_M, BODY_OBSTACLE_MIN_Z_M, ROBOT_COLLISION_TOP_Z_M,
 )
 
 
@@ -23,13 +24,32 @@ class DataConfig:
     camera_height_m: float = DINGO_CAMERA_HEIGHT_M
     camera_downward_pitch_degrees: float = DINGO_CAMERA_DOWNWARD_PITCH_DEGREES
 
+    embodiment: str = "dingo"
+    robot_radius_m: float = ROBOT_FOOTPRINT_RADIUS_M
+    obstacle_min_z_m: float = BODY_OBSTACLE_MIN_Z_M
+    obstacle_max_z_m: float = ROBOT_COLLISION_TOP_Z_M
+
+    @property
+    def robot_geometry(self):
+        return (self.robot_radius_m, self.obstacle_min_z_m, self.obstacle_max_z_m)
+
     def validate(self) -> None:
+        if self.embodiment not in ("dingo", "r1pro"):
+            raise ValueError("unsupported embodiment")
+        if (not all(math.isfinite(v) for v in self.robot_geometry)
+                or self.robot_radius_m <= 0 or self.obstacle_min_z_m >= self.obstacle_max_z_m):
+            raise ValueError("invalid robot collision geometry")
+        if not all(math.isfinite(v) for v in (self.camera_forward_offset_m, self.camera_height_m, self.camera_downward_pitch_degrees)):
+            raise ValueError("camera geometry must be finite")
+        if self.embodiment == "dingo" and self.robot_geometry != (ROBOT_FOOTPRINT_RADIUS_M, BODY_OBSTACLE_MIN_Z_M, ROBOT_COLLISION_TOP_Z_M):
+            raise ValueError("Dingo collision geometry must match the benchmark")
         if not self.root:
             raise ValueError("data.root cannot be empty")
         if self.observation_frames < 1 or self.future_steps < 1:
             raise ValueError("observation frames and future steps must be positive")
-        if (self.image_height, self.image_width) != (126, 224):
-            raise ValueError("CurveNav uses one calibrated 224x126 depth camera")
+        expected_size = (224, 224) if self.embodiment == "r1pro" else (126, 224)
+        if (self.image_height, self.image_width) != expected_size:
+            raise ValueError(f"{self.embodiment} requires depth shape {expected_size}")
         if not all(
             math.isfinite(value) and value > 0
             for value in (
@@ -48,7 +68,7 @@ class DataConfig:
             DINGO_CAMERA_HEIGHT_M,
             DINGO_CAMERA_DOWNWARD_PITCH_DEGREES,
         )
-        if camera != expected_camera:
+        if self.embodiment == "dingo" and camera != expected_camera:
             raise ValueError("data camera must match the benchmark Dingo")
 
 

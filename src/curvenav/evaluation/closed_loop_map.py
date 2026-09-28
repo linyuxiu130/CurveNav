@@ -25,7 +25,7 @@ class NavigationMap:
 
 
 def _rasterize_navigation_map(navigation_xy: np.ndarray) -> NavigationMap:
-    """Rasterize PLY samples as cell centres on their native 5 cm lattice."""
+    """Bin navigation samples for display; empty bins do not imply obstacles."""
     lattice = np.rint(
         np.asarray(navigation_xy, dtype=np.float64) / GLOBAL_MAP_RESOLUTION_M
     ).astype(np.int64)
@@ -49,7 +49,7 @@ def _rasterize_navigation_map(navigation_xy: np.ndarray) -> NavigationMap:
 
 
 def _draw_navigation_map(axis: object, navigation_map: NavigationMap) -> list[object]:
-    """Draw the frozen robot-center configuration space as the global base map."""
+    """Draw navigation sample coverage, without inferring obstacle occupancy."""
     from matplotlib.patches import Patch
 
     from matplotlib.colors import ListedColormap
@@ -66,8 +66,8 @@ def _draw_navigation_map(axis: object, navigation_map: NavigationMap) -> list[ob
     axis.set_ylim(navigation_map.extent[2:])
     axis.set_aspect("equal", adjustable="box")
     return [
-        Patch(facecolor="#fbfcfe", edgecolor="#94a3b8", label="navigable robot-center space"),
-        Patch(facecolor="#d7dce2", edgecolor="#94a3b8", label="obstacle / non-navigable space"),
+        Patch(facecolor="#fbfcfe", edgecolor="#94a3b8", label="bins containing navigation samples"),
+        Patch(facecolor="#d7dce2", edgecolor="#94a3b8", label="no navigation sample (unknown)"),
     ]
 
 
@@ -172,7 +172,7 @@ def _query_navigation_map(
     navigation_map: NavigationMap,
     world_xy: np.ndarray,
 ) -> np.ndarray:
-    """Query the same frozen robot-center raster that is rendered."""
+    """Query sample-bin coverage only, not physical traversability."""
     points = np.asarray(world_xy, dtype=np.float64)
     x_min, x_max, y_min, y_max = navigation_map.extent
     inside = (
@@ -231,11 +231,11 @@ def _closed_loop_plan_diagnostics(
     local_plans: list[np.ndarray],
     navigation_map: NavigationMap,
 ) -> dict[str, object]:
-    """Summarize safety, controller response, and actual replanning stability."""
+    """Summarize sample coverage, controller response and replanning stability."""
     if not world_plans or len(world_plans) != len(local_plans):
         raise ValueError("closed-loop diagnostics require aligned non-empty plans")
-    future_collision = []
-    prefix_collision = {0.5: [], 1.0: []}
+    future_sample_gap = []
+    prefix_sample_gap = {0.5: [], 1.0: []}
     origin_free = []
     free_points = 0
     total_points = 0
@@ -249,10 +249,10 @@ def _closed_loop_plan_diagnostics(
         free_points += int(free[future].sum())
         total_points += int(future.sum())
         origin_free.append(bool(free[0]))
-        future_collision.append(bool((~free[future]).any()))
-        for horizon_m in prefix_collision:
+        future_sample_gap.append(bool((~free[future]).any()))
+        for horizon_m in prefix_sample_gap:
             selected = future & (distance <= horizon_m + 1e-12)
-            prefix_collision[horizon_m].append(bool((~free[selected]).any()))
+            prefix_sample_gap[horizon_m].append(bool((~free[selected]).any()))
     for point_count in sorted({len(plan) for plan in local_plans}):
         batch = np.stack([
             plan[:, :2] for plan in local_plans if len(plan) == point_count
@@ -286,27 +286,27 @@ def _closed_loop_plan_diagnostics(
         return fraction(selected)
 
     return {
-        "plan_origin_free_fraction": fraction(origin_free),
-        "free_origin_plan_count": len(free_origin_indices),
-        "future_planned_point_free_fraction": free_points / max(total_points, 1),
-        "future_plan_collision_fraction": fraction(future_collision),
-        "future_execution_prefix_0p5m_collision_fraction": fraction(
-            prefix_collision[0.5]
+        "plan_origin_sample_coverage": fraction(origin_free),
+        "covered_origin_plan_count": len(free_origin_indices),
+        "future_planned_point_sample_coverage": free_points / max(total_points, 1),
+        "future_plan_sample_gap_fraction": fraction(future_sample_gap),
+        "future_plan_prefix_0p5m_sample_gap_fraction": fraction(
+            prefix_sample_gap[0.5]
         ),
-        "future_execution_prefix_1p0m_collision_fraction": fraction(
-            prefix_collision[1.0]
+        "future_plan_prefix_1p0m_sample_gap_fraction": fraction(
+            prefix_sample_gap[1.0]
         ),
-        "future_execution_prefix_0p5m_collision_given_free_origin_fraction": (
-            conditional_fraction(prefix_collision[0.5])
+        "future_plan_prefix_0p5m_sample_gap_given_covered_origin_fraction": (
+            conditional_fraction(prefix_sample_gap[0.5])
         ),
-        "future_execution_prefix_1p0m_collision_given_free_origin_fraction": (
-            conditional_fraction(prefix_collision[1.0])
+        "future_plan_prefix_1p0m_sample_gap_given_covered_origin_fraction": (
+            conditional_fraction(prefix_sample_gap[1.0])
         ),
-        "first_plan_execution_prefix_0p5m_collision": (
-            prefix_collision[0.5][0] if prefix_collision[0.5] else False
+        "first_plan_prefix_0p5m_sample_gap": (
+            prefix_sample_gap[0.5][0] if prefix_sample_gap[0.5] else False
         ),
-        "first_plan_execution_prefix_1p0m_collision": (
-            prefix_collision[1.0][0] if prefix_collision[1.0] else False
+        "first_plan_prefix_1p0m_sample_gap": (
+            prefix_sample_gap[1.0][0] if prefix_sample_gap[1.0] else False
         ),
         "mpc_desired_speed_mps_mean": float(
             np.mean(controller_values.get("mpc_desired_speed_mps", [0.0]))
@@ -417,7 +417,7 @@ def _render_episode(
         axis.scatter(
             executed[executed_unsafe, 0], executed[executed_unsafe, 1],
             s=13, c="#b91c1c", linewidths=0, alpha=0.85,
-            label="executed outside proxy free space", zorder=5,
+            label="executed outside sampled bins", zorder=5,
         )
     axis.scatter(
         executed[0, 0], executed[0, 1], marker="o", s=90, c="#22c55e",
@@ -462,7 +462,7 @@ def _render_episode(
         "rendered_plan_count": int(selected.size),
         "total_plan_count": int(plan_local.shape[0]),
         "stalled_step_fraction": float(stalled.mean()),
-        "actual_position_free_fraction": float(executed_free.mean()),
+        "actual_position_sample_coverage": float(executed_free.mean()),
         "final_goal_distance_m": final_goal_distance,
         **plan_diagnostics,
     }
@@ -473,7 +473,7 @@ def _render_scene_overview(
     navigation_map: NavigationMap,
     output_path: Path,
 ) -> dict[str, object]:
-    """Overlay every executed episode on one immutable global obstacle map."""
+    """Overlay executed episodes on the navigation-sample coverage map."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -576,8 +576,8 @@ def _render_scene_overview(
 def _summarize_closed_loop(records: list[dict[str, object]]) -> dict[str, object]:
     """Aggregate diagnostics with plans, not episodes, as the planning unit."""
     plans = sum(int(record["total_plan_count"]) for record in records)
-    free_origin_plans = sum(
-        int(record["free_origin_plan_count"]) for record in records
+    covered_origin_plans = sum(
+        int(record["covered_origin_plan_count"]) for record in records
     )
     pairs = sum(int(record["adjacent_plan_pairs"]) for record in records)
 
@@ -590,48 +590,48 @@ def _summarize_closed_loop(records: list[dict[str, object]]) -> dict[str, object
             for record in records
         ) / max(plans, 1)
 
-    def free_origin_plan_mean(name: str) -> float:
+    def covered_origin_plan_mean(name: str) -> float:
         return sum(
-            float(record[name]) * int(record["free_origin_plan_count"])
+            float(record[name]) * int(record["covered_origin_plan_count"])
             for record in records
-        ) / max(free_origin_plans, 1)
+        ) / max(covered_origin_plans, 1)
 
     return {
         "episodes": len(records),
         "successes": sum(bool(record["success"]) for record in records),
         "plans": plans,
-        "free_origin_plans": free_origin_plans,
-        "plan_origin_free_fraction": plan_mean("plan_origin_free_fraction"),
-        "future_plan_collision_fraction": plan_mean(
-            "future_plan_collision_fraction"
+        "covered_origin_plans": covered_origin_plans,
+        "plan_origin_sample_coverage": plan_mean("plan_origin_sample_coverage"),
+        "future_plan_sample_gap_fraction": plan_mean(
+            "future_plan_sample_gap_fraction"
         ),
-        "future_execution_prefix_0p5m_collision_fraction": plan_mean(
-            "future_execution_prefix_0p5m_collision_fraction"
+        "future_plan_prefix_0p5m_sample_gap_fraction": plan_mean(
+            "future_plan_prefix_0p5m_sample_gap_fraction"
         ),
-        "future_execution_prefix_1p0m_collision_fraction": plan_mean(
-            "future_execution_prefix_1p0m_collision_fraction"
+        "future_plan_prefix_1p0m_sample_gap_fraction": plan_mean(
+            "future_plan_prefix_1p0m_sample_gap_fraction"
         ),
-        "future_execution_prefix_0p5m_collision_given_free_origin_fraction": (
-            free_origin_plan_mean(
-                "future_execution_prefix_0p5m_collision_given_free_origin_fraction"
+        "future_plan_prefix_0p5m_sample_gap_given_covered_origin_fraction": (
+            covered_origin_plan_mean(
+                "future_plan_prefix_0p5m_sample_gap_given_covered_origin_fraction"
             )
         ),
-        "future_execution_prefix_1p0m_collision_given_free_origin_fraction": (
-            free_origin_plan_mean(
-                "future_execution_prefix_1p0m_collision_given_free_origin_fraction"
+        "future_plan_prefix_1p0m_sample_gap_given_covered_origin_fraction": (
+            covered_origin_plan_mean(
+                "future_plan_prefix_1p0m_sample_gap_given_covered_origin_fraction"
             )
         ),
-        "first_plan_execution_prefix_0p5m_collision_fraction": episode_mean(
-            "first_plan_execution_prefix_0p5m_collision"
+        "first_plan_prefix_0p5m_sample_gap_fraction": episode_mean(
+            "first_plan_prefix_0p5m_sample_gap"
         ),
-        "first_plan_execution_prefix_1p0m_collision_fraction": episode_mean(
-            "first_plan_execution_prefix_1p0m_collision"
+        "first_plan_prefix_1p0m_sample_gap_fraction": episode_mean(
+            "first_plan_prefix_1p0m_sample_gap"
         ),
-        "future_planned_point_free_fraction_episode_mean": episode_mean(
-            "future_planned_point_free_fraction"
+        "future_planned_point_sample_coverage_episode_mean": episode_mean(
+            "future_planned_point_sample_coverage"
         ),
-        "actual_position_free_fraction_episode_mean": episode_mean(
-            "actual_position_free_fraction"
+        "actual_position_sample_coverage_episode_mean": episode_mean(
+            "actual_position_sample_coverage"
         ),
         "mpc_desired_speed_mps_plan_mean": plan_mean(
             "mpc_desired_speed_mps_mean"
@@ -679,8 +679,8 @@ def render_run(checkpoint_root: Path) -> Path:
                 "navigation_file": str(navigation_file.resolve()),
                 "map_resolution_m": GLOBAL_MAP_RESOLUTION_M,
                 "map_semantics": (
-                    "frozen robot-center configuration space; occupied pixels are "
-                    "static obstacle or non-navigable space"
+                    "5 cm bins containing navigation PLY samples; empty bins are "
+                    "unknown, not collision or non-traversability labels"
                 ),
                 "dynamic_obstacle_layer": "unavailable in benchmark trace",
             })

@@ -11,6 +11,7 @@ from torch.optim.lr_scheduler import LRScheduler
 
 from curvenav.data.history import history_contract
 from curvenav.data.obstacle_memory import MEMORY_CONTRACT
+from curvenav.data.contracts import expert_navigation_geometry_contract
 from curvenav.config import CurveNavConfig
 from curvenav.conditioning import (
     CONDITION_ENCODER_TYPE,
@@ -92,6 +93,7 @@ def build_policy_contract(config: CurveNavConfig) -> dict[str, Any]:
         "future_steps": data.future_steps,
         "depth_image_size": [data.image_height, data.image_width],
         "max_depth_m": data.max_depth_m,
+        **({"robot_geometry": expert_navigation_geometry_contract(data)} if data.embodiment != "dingo" else {}),
         "camera_calibration": "per_frame_K_and_optical_camera_to_body_SE3",
         "depth_encoder_type": DEPTH_ENCODER_TYPE,
         "model_architecture": {

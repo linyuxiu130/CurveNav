@@ -9,6 +9,7 @@ from curvenav.layers import RMSNorm
 from curvenav.types import DepthFeatures
 
 from .geometry import MetricDepthProjector
+from curvenav.physical import ROBOT_FOOTPRINT_RADIUS_M, BODY_OBSTACLE_MIN_Z_M, ROBOT_COLLISION_TOP_Z_M
 
 
 DEPTH_ENCODER_TYPE = "depth_pixel_lift_se3_causal_memory_timed_history_v6"
@@ -73,6 +74,7 @@ class DepthObservationEncoder(nn.Module):
         dropout: float,
         max_depth_m: float,
         planning_horizon_m: float,
+        geometry=(ROBOT_FOOTPRINT_RADIUS_M, BODY_OBSTACLE_MIN_Z_M, ROBOT_COLLISION_TOP_Z_M),
     ) -> None:
         super().__init__()
         self.max_depth_m = float(max_depth_m)
@@ -91,7 +93,7 @@ class DepthObservationEncoder(nn.Module):
             frame_tokens_height,
             frame_tokens_width,
             max_depth_m,
-            planning_horizon_m,
+            planning_horizon_m, geometry,
         )
         self.geometry_projection = nn.Sequential(
             nn.Linear(6, model_dim),

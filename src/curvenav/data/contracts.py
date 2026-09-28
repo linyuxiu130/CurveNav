@@ -22,7 +22,13 @@ EXPERT_NAVIGATION_GEOMETRY_TYPE = (
 )
 
 
-def expert_navigation_geometry_contract() -> dict[str, float | str]:
+def expert_navigation_geometry_contract(data=None) -> dict[str, float | str]:
+    if data is not None and data.embodiment == "r1pro":
+        return {"type": EXPERT_NAVIGATION_GEOMETRY_TYPE, "embodiment": "r1pro",
+                "posture": "behavior_v3.9.2_default_fixed_no_payload",
+                "footprint_radius_m": data.robot_radius_m,
+                "body_obstacle_min_z_m": data.obstacle_min_z_m,
+                "collision_top_z_m": data.obstacle_max_z_m}
     return {
         "type": EXPERT_NAVIGATION_GEOMETRY_TYPE,
         "embodiment": "dingo",
