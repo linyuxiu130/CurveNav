@@ -1,8 +1,8 @@
-"""Experimental same-state Q-weighted Flow Matching; no path-search teacher.
+"""Conservative local policy improvement of the existing conditional flow.
 
-Adapted from X-NavDP's group weighting (arXiv:2607.28560), not its DDPM loss.
-Callers supply detached long-horizon Q estimates learned from actual rollouts.
-The production route utility critic is NOT such a Q function.
+Candidates come from the policy. Detached utilities reweight their endpoint
+measure; a frozen reference anchors the velocity field. No long-horizon Q,
+extra inference network, trajectory repair, top-k gate, or path search.
 """
 
 from dataclasses import replace
@@ -16,68 +16,87 @@ from curvenav.models.policy import (
 
 @torch.no_grad()
 def sample_learned_group(policy, condition, count=32):
-    """Return physical curve values [B,K,C] from raw goal/no-goal neural flows.
-
-    No straight templates, axis flips, graph search, or geometric curve repair.
-    Goal-agnostic proposals are subsequently evaluated against the mission goal.
-    """
-    if count < 2 or count % 2:
-        raise ValueError("count must be a positive even number >= 2")
+    """Raw goal-conditioned samples from the reference measure [B,K,14]."""
+    if count < 2:
+        raise ValueError("count must be >= 2")
     encoded = policy.encode_condition(condition)
     memory = policy.trajectory_decoder.project_condition_memory(encoded)
     batch = len(condition.point_goal)
     repeated = repeat_condition(encoded, count)
-    repeated = replace(
-        repeated,
-        goal_present=torch.tensor([1., 0.], device=condition.point_goal.device)
-        .repeat(batch * count // 2)[:, None],
-    )
-    source = torch.randn(
-        batch * count, policy.curve_codec.coordinate_dim,
-        device=condition.point_goal.device,
-    )
+    source = torch.randn(batch * count, policy.curve_codec.coordinate_dim,
+                         device=condition.point_goal.device)
     coordinates = policy._generate_coordinates(repeated, memory, source)
     return policy.curve_codec.values_from_coordinates(coordinates).unflatten(0, (batch, count))
 
 
-def group_weights(q_values, *, top_k=4, temperature=1.0):
-    """Normalize within each state; tied groups contribute zero actor gradient."""
-    if q_values.ndim != 2 or not 1 <= top_k <= q_values.shape[1]:
-        raise ValueError("Q must be [B,K], with 1 <= top_k <= K")
-    if not torch.isfinite(q_values).all() or not 0 < temperature < float('inf'):
-        raise ValueError("Q must be finite and temperature finite and positive")
-    q = q_values.detach().float()
-    centered = q - q.mean(dim=1, keepdim=True)
-    advantage = (centered / q.std(dim=1, keepdim=True, correction=0).clamp_min(1e-6)).clamp(-3, 3)
-    selected = torch.zeros_like(q, dtype=torch.bool)
-    selected.scatter_(1, q.topk(top_k, dim=1).indices, True)
-    selected &= advantage > 0
-    # Subtract the group maximum for stable exponentiation at low temperatures.
-    shifted = (advantage - advantage.amax(dim=1, keepdim=True)).double()
-    weights = torch.exp(shifted / temperature).float() * selected
-    return weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+def group_weights(utilities, *, temperature=.25, mix=.05):
+    """KL-tilted measure mixed with the original uniform candidate measure.
 
-
-def group_flow_loss(policy, condition, curve_values, q_values, *, top_k=4, temperature=1.0):
-    """One actor update from its own candidate bank and externally learned Q.
-
-    Per-state normalized weights are an explicit experimental choice. This does
-    not reproduce X-NavDP's online double-Q learner or implement a replay buffer.
-    Do not populate Q with straight-line progress and expect dead-end recovery.
+    w = (1-mix)/K + mix*softmax(U/temperature). Its total variation from
+    uniform is at most mix, and its expected supplied utility cannot decrease.
+    These are finite-bank statements, not guarantees about a fitted policy.
     """
-    if (curve_values.ndim != 3 or curve_values.shape[:2] != q_values.shape
+    if utilities.ndim != 2 or utilities.shape[1] < 2:
+        raise ValueError("utilities must be [B,K] with K >= 2")
+    if (not torch.isfinite(utilities).all() or not 0 < temperature < float('inf')
+            or not 0 <= mix <= 1):
+        raise ValueError("utilities and temperature must be finite; temperature > 0 and mix in [0,1]")
+    value = utilities.detach().double()
+    tilted = ((value - value.amax(1, keepdim=True)) / temperature).softmax(1).float()
+    return (1-mix) / utilities.shape[1] + mix * tilted
+
+
+def group_flow_loss(policy, reference, condition, curve_values, utilities, *,
+                    temperature=.25, mix=.05, preservation_weight=10.):
+    """Proximal change of the flow objective, anchored to the generating policy.
+
+    The reference must be an eval snapshot, excluded from the optimizer, with
+    the same requires_grad mask as the policy. Its outputs are detached. Matching
+    grad participation also matches BF16 forward kernels: a no-grad teacher can
+    otherwise create a spurious preservation gradient at identical weights.
+    Local utility is permitted; do not call it a learned long-horizon Q.
+    Improvement candidates must be goal-conditioned samples of that reference;
+    no-goal samples have a different base measure and are not silently mixed in.
+    Subtracting the original measure's flow loss removes self-reconstruction
+    drift: at the reference, the update vanishes continuously as mix -> 0.
+    The reference is needed only during training, never during inference.
+    """
+    if (curve_values.ndim != 3 or curve_values.shape[:2] != utilities.shape
             or curve_values.shape[0] != len(condition.point_goal)):
-        raise ValueError("curve_values [B,K,C] and Q [B,K] must match the observation batch")
-    weights = group_weights(q_values, top_k=top_k, temperature=temperature)
+        raise ValueError("curve_values [B,K,C] and utilities [B,K] must match observations")
+    if policy.training or reference.training or any(p.requires_grad != r.requires_grad
+                                 for p, r in zip(policy.parameters(), reference.parameters(), strict=True)):
+        raise ValueError("both policies must be in eval mode with matching grad masks")
+    if any(p.requires_grad for module in (policy.depth_encoder, policy.condition_encoder)
+           for p in module.parameters()):
+        raise ValueError("this small flow update requires frozen scene encoders")
+    if not mix < preservation_weight < float('inf'):
+        raise ValueError("preservation_weight must exceed mix for a positive quadratic")
+    weights = group_weights(utilities, temperature=temperature, mix=mix)
     batch, count = weights.shape
     clean = policy.curve_codec.coordinates_from_values(curve_values.detach().flatten(0, 1).float())
     source = torch.randn_like(clean)
     time = torch.sigmoid(torch.randn(len(clean), device=clean.device) * FLOW_LOGIT_NORMAL_STD + FLOW_LOGIT_NORMAL_MEAN)
+    state = (1-time[:, None])*clean + time[:, None]*source
     encoded = policy.encode_condition(condition)
+    repeated = repeat_condition(encoded, count)
     memory = policy.trajectory_decoder.project_condition_memory(encoded)
-    state = (1 - time[:, None]) * clean + time[:, None] * source
-    # Improve the goal-conditioned actor even when the useful proposal was no-goal.
-    velocity = policy._predict_velocity(state, time, repeat_condition(encoded, count), memory)
-    error = (velocity - (source - clean)).square().mean(dim=-1).reshape(batch, count)
-    active_groups = (weights.sum(dim=1) > 0).sum().clamp_min(1)
-    return (error * weights).sum() / active_groups
+    velocity = policy._predict_velocity(state, time, repeated, memory)
+    no_goal = replace(repeated, goal_present=torch.zeros_like(repeated.goal_present))
+    no_goal_velocity = policy._predict_velocity(state, time, no_goal, memory)
+    with torch.enable_grad():
+        # Both policies use the same frozen scene representation. Reuse it:
+        # independent CUDA scatter reductions can otherwise perturb BF16 tokens.
+        previous = encoded
+        previous_repeated = repeat_condition(previous, count)
+        previous_memory = reference.trajectory_decoder.project_condition_memory(previous)
+        baseline = reference._predict_velocity(state, time, previous_repeated, previous_memory).detach()
+        no_goal_baseline = reference._predict_velocity(state, time,
+            replace(previous_repeated, goal_present=torch.zeros_like(previous_repeated.goal_present)),
+            previous_memory).detach()
+    delta = velocity-baseline
+    # ||v-u||² - ||v0-u||², evaluated without subtracting two large losses.
+    change = (delta.square()+2*delta*(baseline-(source-clean))).mean(-1).reshape(batch, count)
+    preservation = (delta.square()+(no_goal_velocity-no_goal_baseline).square()).mean(-1).reshape(batch, count)
+    return (((weights-1/count)*change).sum(1)
+            + preservation_weight*preservation.mean(1)).mean()

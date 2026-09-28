@@ -1,4 +1,5 @@
 from dataclasses import replace
+from copy import deepcopy
 
 import pytest
 import torch
@@ -11,31 +12,55 @@ from test_policy import make_condition, tiny_config
 
 def test_group_weights_and_actor_update_preserve_same_state_credit():
     q = torch.tensor([[-8., -7., -6., -5.], [1., 1., 1., 1.]], requires_grad=True)
-    weights = group_weights(q, top_k=2)
-    torch.testing.assert_close(weights, group_weights(q + torch.tensor([[100.], [-50.]]), top_k=2))
+    weights = group_weights(q)
+    torch.testing.assert_close(weights, group_weights(q + torch.tensor([[100.], [-50.]])))
     assert not weights.requires_grad and weights[0, 3] > weights[0, 2] > 0
-    assert weights[0, :2].sum() == 0 and weights[1].sum() == 0
-    assert torch.isfinite(group_weights(q, top_k=2, temperature=1e-300)).all()
+    torch.testing.assert_close(weights.sum(1), torch.ones(2))
+    torch.testing.assert_close(weights[1], torch.full((4,), .25))
+    assert (.5*(weights-.25).abs().sum(1) <= .050001).all()
+    assert ((weights*q).sum(1) >= q.mean(1)-1e-6).all()
+    assert torch.isfinite(group_weights(q, temperature=1e-300)).all()
     with pytest.raises(ValueError, match='finite'):
         group_weights(torch.full((2, 4), float('nan')))
 
     torch.manual_seed(2026)
     policy = build_policy(tiny_config()).eval()
+    policy.depth_encoder.requires_grad_(False)
+    policy.condition_encoder.requires_grad_(False)
+    reference = deepcopy(policy).eval()
     condition = make_condition(2)
     # Sampling must not call the production hand-perturbed proposal constructor.
     policy._propose = lambda *args: pytest.fail('handcrafted proposals used')
+    generate = policy._generate_coordinates
+    def goal_only(encoded, memory, source):
+        assert torch.all(encoded.goal_present == 1)
+        return generate(encoded, memory, source)
+    policy._generate_coordinates = goal_only
     values = sample_learned_group(policy, condition, count=4)
     assert values.shape == (2, 4, policy.curve_codec.coordinate_dim)
     assert not values.requires_grad
-    loss = group_flow_loss(policy, condition, values, q, top_k=2)
+    rng = torch.get_rng_state()
+    loss = group_flow_loss(policy, reference, condition, values, q)
     loss.backward()
     gradient = sum(p.grad.abs().sum() for p in policy.trajectory_decoder.parameters() if p.grad is not None)
     assert torch.isfinite(loss) and gradient > 0 and q.grad is None
     assert all(p.grad is None for p in policy.trajectory_evaluator.parameters())
+    assert all(p.grad is None for p in reference.parameters())
     policy.zero_grad(set_to_none=True)
-    zero = group_flow_loss(policy, condition, values, torch.ones_like(q), top_k=2)
+    zero = group_flow_loss(policy, reference, condition, values, torch.ones_like(q))
     zero.backward()
     assert zero == 0
+    assert all(p.grad is None or torch.count_nonzero(p.grad) == 0 for p in policy.parameters())
+    policy.zero_grad(set_to_none=True)
+    torch.set_rng_state(rng)
+    small = group_flow_loss(policy, reference, condition, values, q, mix=.005)
+    small.backward()
+    small_gradient = sum(p.grad.abs().sum() for p in policy.trajectory_decoder.parameters() if p.grad is not None)
+    torch.testing.assert_close(small_gradient, .1*gradient, rtol=.02, atol=1e-7)
+    policy.zero_grad(set_to_none=True)
+    disabled = group_flow_loss(policy, reference, condition, values, q, mix=0.)
+    disabled.backward()
+    assert disabled == 0
     assert all(p.grad is None or torch.count_nonzero(p.grad) == 0 for p in policy.parameters())
 
 
