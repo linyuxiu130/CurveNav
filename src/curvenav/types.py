@@ -57,7 +57,7 @@ class ConfigurationFeatures:
 
 @dataclass
 class ConditionFeatures:
-    """Target-independent local scene memory and separate metric intents."""
+    """Scene memory and separate intents; candidate copies share the original configuration raster."""
 
     tokens: Tensor
     token_valid: Tensor
