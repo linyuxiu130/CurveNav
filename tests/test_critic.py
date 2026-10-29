@@ -1,9 +1,10 @@
 """Score supervision, exact candidate selection, and inference conditioning."""
 import numpy as np
+import pytest
 import torch
 
 from curvenav.data.privileged import SourceConfigurationGrid, SourceConfigurationSpaceQuery
-from curvenav.training.critic import CurveNavCriterion, RouteUtilityTeacher, candidate_query
+from curvenav.training.critic import RouteUtilityTeacher, candidate_query
 
 
 def oracle():
@@ -13,31 +14,10 @@ def oracle():
 
 
 def source_batch(batch, device):
-    return dict(source_grid_index=torch.zeros(batch, device=device, dtype=torch.long),
+    return dict(observed_field=torch.ones(batch,6,64,64,device=device), goal_present=torch.ones(batch, device=device, dtype=torch.bool), source_grid_index=torch.zeros(batch, device=device, dtype=torch.long),
                 source_origin_xy=torch.zeros(batch, 2, device=device),
                 source_yaw_rad=torch.zeros(batch, device=device),
                 point_goal=torch.tensor([[0., 3.]], device=device).expand(batch, -1))
-
-
-def criterion_loss(output):
-    return CurveNavCriterion(oracle(), 3.6)(output, source_batch(len(output.candidate_paths), output.candidate_paths.device))
-
-
-def test_score_loss_regresses_actual_candidate_utilities():
-    from curvenav.models.policy import CurveNavTrainingOutput
-    paths = torch.tensor([[[[0., 0.], [0., 0.]], [[0., 0.], [0., 2.]],
-                           [[0., 0.], [3., 2.]]]]).expand(2, -1, -1, -1)
-    scores = torch.tensor([[1., 2., -1.], [-2., .5, 3.]], requires_grad=True)
-    criterion = CurveNavCriterion(oracle(), 3.6)
-    batch = source_batch(2, 'cpu')
-    target = criterion.teacher(paths, batch).score
-    def loss(value):
-        return criterion(CurveNavTrainingOutput(torch.tensor(0.), paths, value), batch).critic_loss
-    actual = loss(scores)
-    expected = torch.nn.functional.smooth_l1_loss(scores, target)
-    torch.testing.assert_close(actual, expected)
-    gradient = torch.autograd.grad(actual, scores)[0]
-    torch.testing.assert_close(gradient, (scores - target).clamp(-1, 1) / scores.numel())
 
 
 def test_teacher_queries_body_clearance_whole_curve_and_is_batch_independent():
@@ -51,22 +31,44 @@ def test_teacher_queries_body_clearance_whole_curve_and_is_batch_independent():
         torch.testing.assert_close(alone[:, 0], truth[:, i])
 
 
+@pytest.mark.parametrize('device',['cpu','cuda'])
+def test_grouped_source_labels_keep_each_pose_goal_and_unpadded_candidates(device):
+    if device=='cuda' and not torch.cuda.is_available():pytest.skip('CUDA unavailable')
+    from curvenav.training.bspline_objective import label_critic_inputs
+    teacher=RouteUtilityTeacher(oracle(),3.6);calls=[]
+    def utility(paths,batch):
+        calls.append(tuple(paths.shape[:2]));return teacher(paths,batch)
+    paths=[torch.tensor([[[0.,0.],[0.,3.]],[[0.,0.],[3.,0.]],[[0.,0.],[0.,-1.]]],device=device),
+        torch.tensor([[[0.,0.],[0.,-2.]],[[0.,0.],[30.,0.]]],device=device)]
+    prepared=[];expected=[]
+    for row,bank in enumerate(paths):
+        batch=source_batch(1,device);batch['task_states']=[dict(panel='J',case={})]
+        batch['source_origin_xy'][:,0]=row*.05
+        batch['goal_present'][:]=row==0
+        if row:batch['point_goal'].zero_()
+        expected.append(teacher(bank[None],batch).score)
+        prepared.append(dict(paths=bank,qbatch=batch,utility=utility,expert_count=1-row))
+    label_critic_inputs(prepared)
+    assert calls==[(2,3)]
+    for p,target in zip(prepared,expected,strict=True):torch.testing.assert_close(p['targets'],target,rtol=1e-6,atol=1e-6)
+
+
 def test_score_is_goal_conditioned_and_selection_returns_exact_candidate():
-    from test_policy import tiny_config, make_condition
+    from test_policy import tiny_config, make_encoded_condition
     from curvenav.factory import build_policy
     torch.manual_seed(9)
     policy = build_policy(tiny_config()).eval()
-    condition = make_condition(1)
-    encoded = policy.encode_condition(condition)
+    encoded = make_encoded_condition(policy, 1)
     evaluator = policy.trajectory_evaluator
     memory = evaluator.project_condition_memory(encoded)
     path, _ = policy.curve_codec.decode(torch.randn(1, 14))
-    score = evaluator(path, condition.point_goal, encoded, memory)
-    other = evaluator(path, -condition.point_goal, encoded, memory)
+    score = evaluator(path, encoded.terminal_goal, encoded, memory)
+    other = evaluator(path, -encoded.terminal_goal, encoded, memory)
     assert not torch.equal(score, other)
-    prediction = policy.sample(condition)
-    assert prediction.candidates.shape[:2] == (1, 32)
-    torch.testing.assert_close(prediction.path[0], prediction.candidates[0, prediction.scores[0].argmax()], rtol=0, atol=0)
+    from curvenav.deployment.bspline_bundle import BSplineMemoryBundle
+    prediction = BSplineMemoryBundle(None, policy, None, {}, {}).candidates(encoded, encoded.terminal_goal)
+    assert prediction["paths"].shape == (16, 64, 2)
+    assert prediction["selected_index"] == int(prediction["scores"].argmax())
     assert policy.inference_source.unique(dim=0).shape[0] == 32
 
 
@@ -204,3 +206,70 @@ def test_packed_scene_queries_match_separate_maps_with_different_shapes_and_scal
         for name in ("local_path", "grid_cells", "clearance_m", "in_world_bounds"):
             torch.testing.assert_close(getattr(result, name)[row, result.active[row]],
                                        getattr(one, name)[0, one.active[0]], rtol=0, atol=0)
+
+
+def test_explicit_xy_grid_frame_preserves_asymmetric_obstacle_and_utility(tmp_path):
+    # Positive world Y contains a wall; negative Y is free. Mirroring changes Q labels.
+    clear = np.ones((30, 30), np.float32)
+    clear[8:13, 14:20] = -.1
+    path = tmp_path / 'canonical_xy.npz'
+    np.savez(path, free=clear > 0, clearance_m=clear, origin_xy=np.array([-1., -1.]),
+             cell_size_m=.1, coordinate_frame='canonical_world_xy')
+    query = SourceConfigurationSpaceQuery.from_paths((path,))
+    assert query.grids[0].coordinate_frame == 'canonical_world_xy'
+    origin = torch.tensor([[.05, .05]], dtype=torch.float64)
+    local = torch.tensor([[[0., 0.], [0., .8], [.3, -.6]]], dtype=torch.float64)
+    for yaw in (0., .73, -1.9):
+        angle = torch.tensor([yaw], dtype=torch.float64)
+        rotation = torch.tensor([[np.cos(yaw), -np.sin(yaw)],
+                                 [np.sin(yaw), np.cos(yaw)]], dtype=torch.float64)
+        expected_world = local @ rotation.T + origin[:, None]
+        actual = query.grid_coordinates(local, torch.tensor([0]), origin, angle)
+        torch.testing.assert_close(actual, (expected_world + 1) / .1)
+    paths = torch.tensor([[[[0., 0.], [0., .8]], [[0., 0.], [0., -.5]]]])
+    batch = source_batch(1, 'cpu')
+    batch['source_origin_xy'] = origin
+    batch['point_goal'] = torch.tensor([[0., -.5]])
+    labels = RouteUtilityTeacher(query, 3.6)(paths, batch)
+    assert labels.clearance_m[0, 0] < 0 < labels.clearance_m[0, 1]
+    assert labels.score[0, 1] > labels.score[0, 0]
+    # Source files without metadata retain the original Habitat XZ convention.
+    legacy_path = tmp_path / 'legacy_xz.npz'
+    np.savez(legacy_path, free=clear > 0, clearance_m=clear, origin_xy=np.array([-1., -1.]),cell_size_m=.1)
+    legacy = SourceConfigurationSpaceQuery.from_paths((legacy_path,))
+    mirrored = legacy.grid_coordinates(local, torch.tensor([0]), origin, torch.zeros(1,dtype=torch.float64))
+    torch.testing.assert_close(mirrored[..., 1], (origin[:, None, 1] - local[..., 1] + 1) / .1)
+
+
+def test_exploration_labels_ignore_hidden_goals_reward_motion_and_penalize_loops():
+    teacher = RouteUtilityTeacher(oracle(), 3.6)
+    batch = source_batch(1, 'cpu')
+    batch['goal_present'][:] = False
+    paths = torch.tensor([[[[0., 0.], [0., 0.], [0., 0.]],
+                           [[0., 0.], [0., 1.], [0., 2.]],
+                           [[0., 0.], [0., -1.], [0., -2.]],
+                           [[0., 0.], [0., 1.], [0., 0.]],
+                           [[0., 0.], [1.5, 0.], [3., 0.]]]])
+    labels = teacher(paths, batch)
+    # Even a hidden goal outside the world must be completely irrelevant.
+    changed = teacher(paths, {**batch, 'point_goal': torch.full((1, 2), 1000.)})
+    torch.testing.assert_close(labels.score, changed.score, rtol=0, atol=0)
+    assert labels.score[0, 1] > labels.score[0, 0] > labels.score[0, 3]
+    assert labels.score[0, 1] > labels.score[0, 4]
+    torch.testing.assert_close(labels.score[:, 1], labels.score[:, 2])
+    goal_batch = {**batch, 'goal_present': torch.ones(1, dtype=torch.bool), 'point_goal': torch.zeros(1, 2)}
+    assert teacher(paths, goal_batch).score.argmax(1).item() == 0
+
+
+def test_novelty_beyond_first_collision_cannot_raise_exploration_utility():
+    teacher=RouteUtilityTeacher(oracle(),3.6)
+    batch=source_batch(1,'cpu');batch['goal_present'][:]=False
+    path=torch.tensor([[[[0.,0.],[1.5,0.],[3.,0.]]]])
+    known=teacher(path,batch)
+    behind=batch['observed_field'].clone()
+    axis=torch.linspace(-3.6,3.6,64)
+    behind[:,3,:,axis>1.5]=0
+    unreachable=teacher(path,{**batch,'observed_field':behind})
+    torch.testing.assert_close(unreachable.score,known.score,rtol=0,atol=0)
+    unknown=teacher(path,{**batch,'observed_field':torch.zeros_like(behind)})
+    assert unknown.score>known.score

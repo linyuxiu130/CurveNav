@@ -47,16 +47,6 @@ class PolicyCondition:
 
 
 @dataclass
-class DepthFeatures:
-    """Learned image evidence plus the aligned observed configuration field."""
-
-    tokens: Tensor
-    token_valid: Tensor
-    metric_position: Tensor
-    configuration_field: Tensor
-
-
-@dataclass
 class ConfigurationFeatures:
     """One target-independent metric BEV memory."""
 
@@ -78,22 +68,3 @@ class ConditionFeatures:
     terminal_goal: Tensor
     goal_present: Tensor
     configuration_field: Tensor
-
-
-@dataclass
-class TrajectoryTarget:
-    """Expert physical B-spline controls used by the production codec."""
-
-    curve_values: Tensor
-
-    def validate(self) -> None:
-        if self.curve_values.ndim != 2:
-            raise ValueError("curve_values must have shape [B,C]")
-
-
-@dataclass
-class TrajectoryPrediction:
-    path: Tensor
-    candidates: Tensor
-    scores: Tensor
-    selected_index: Tensor

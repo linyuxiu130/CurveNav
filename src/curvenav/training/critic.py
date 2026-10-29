@@ -9,12 +9,11 @@ from torch.nn import functional as F
 
 from curvenav.data.goal_distance import GoalDistanceQuery
 from curvenav.data.privileged import SourceConfigurationSpaceQuery, SourcePathQuery
-from curvenav.models.policy import CurveNavTrainingOutput
 from curvenav.physical import EXTRA_CLEARANCE_M, ROBOT_FOOTPRINT_RADIUS_M
 from curvenav.trajectory import path_arc_length
 
 
-CRITIC_TARGET = "geodesic_progress_minus_half_length_contact_and_clearance_margin"
+CRITIC_TARGET = "omni_task_admissible_progress_novelty_failure_clearance"
 
 
 @torch.no_grad()
@@ -44,6 +43,7 @@ class CandidateUtility:
     score: Tensor
     clearance_m: Tensor
     progress_m: Tensor
+    failed: Tensor
 
 
 class RouteUtilityTeacher:
@@ -58,11 +58,22 @@ class RouteUtilityTeacher:
         b, count = paths.shape[:2]
         result, clearance = candidate_query(self.source_query, paths, batch, self.horizon)
         collision = (clearance < 0) & result.active
-        prefix = result.active & (collision.cumsum(-1) == 0)
+        failure=collision
+        if 'task_states' in batch:
+            from curvenav.data.fixed40_targets import task_failure_mask
+            local=result.local_path.unflatten(0,(b,count)).double().cpu().numpy()
+            yaw=batch['source_yaw_rad'].double().cpu().numpy();c,s=np.cos(yaw),np.sin(yaw)
+            rotation=np.stack((np.stack((c,-s),-1),np.stack((s,c),-1)),-2)
+            world=np.einsum('bcpj,bij->bcpi',local,rotation)+batch['source_origin_xy'].double().cpu().numpy()[:,None,None,:]
+            invalid=torch.as_tensor(task_failure_mask(world,batch['task_states']),device=paths.device).flatten(0,1)
+            failure=collision|(invalid&result.active)
+        prefix = result.active & (failure.cumsum(-1) == 0)
         last = (prefix.sum(-1) - 1).clamp_min(0)
         rows = torch.arange(b * count, device=paths.device)
         endpoint_cells = result.grid_cells[rows, last].unflatten(0, (b, count))
-        start_and_goal = torch.stack((torch.zeros_like(batch["point_goal"]), batch["point_goal"]), 1)
+        present = batch["goal_present"].bool().reshape(b)
+        goal = torch.where(present[:, None], batch["point_goal"], torch.zeros_like(batch["point_goal"]))
+        start_and_goal = torch.stack((torch.zeros_like(goal), goal), 1)
         fixed_cells = self.source_query.point_cells(
             start_and_goal, batch["source_grid_index"], batch["source_origin_xy"], batch["source_yaw_rad"],
         )
@@ -74,11 +85,23 @@ class RouteUtilityTeacher:
                 raise ValueError("source start is disconnected from mission goal")
             if not np.isfinite(distances[1:]).all():
                 raise ValueError("collision-free prefix crossed disconnected source components")
-            progress[row] = distances[0] - distances[1:]
+            # Without a mission, reward traversable displacement from the start.
+            progress[row] = distances[0] - distances[1:] if present[row] else distances[1:]
         progress = torch.as_tensor(progress, device=paths.device)
         minimum = clearance.masked_fill(~result.active, torch.inf).amin(-1).unflatten(0, (b, count))
-        contact = collision.any(-1).unflatten(0, (b, count)).float()
+        contact = failure.any(-1).unflatten(0, (b, count)).float()
         length = path_arc_length(paths.flatten(0, 1).float()).unflatten(0, (b, count))
+        if (~present).any():
+            # Progress and novelty end at the same last physically/task-valid point.
+            sampled=result.local_path.unflatten(0,(b,count))
+            segments=sampled[:,:,1:]-sampled[:,:,:-1]
+            valid_segments=(prefix[:,1:]&prefix[:,:-1]).unflatten(0,(b,count))
+            safe_length=segments.norm(dim=-1)*valid_segments
+            midpoint=(sampled[:,:,1:]+sampled[:,:,:-1])/(2*self.horizon)
+            coverage=F.grid_sample(batch['observed_field'][:,3:4].float(),midpoint.flatten(1,2).unsqueeze(2),align_corners=True).reshape(b,count,-1)
+            coverage_available=(midpoint.abs()<=1).all(-1)
+            novelty=((1-coverage)*coverage_available*safe_length).sum(-1)/safe_length.sum(-1).clamp_min(1e-12)
+            progress=progress*(1+(~present)[:,None]*novelty)
         score = (
             (progress - 0.5 * length) / self.horizon
             - contact
@@ -86,27 +109,4 @@ class RouteUtilityTeacher:
                 F.relu(EXTRA_CLEARANCE_M - minimum) / self.robot_radius_m
             )
         )
-        return CandidateUtility(score, minimum, progress)
-
-
-@dataclass
-class CurveNavLoss:
-    loss: Tensor
-    flow_loss: Tensor
-    critic_loss: Tensor
-
-    def logging_values(self) -> tuple[Tensor, ...]:
-        return self.loss, self.flow_loss, self.critic_loss
-
-
-class CurveNavCriterion:
-    def __init__(self, source_query: SourceConfigurationSpaceQuery, planning_horizon_m: float, robot_radius_m: float = ROBOT_FOOTPRINT_RADIUS_M):
-        self.teacher = RouteUtilityTeacher(source_query, planning_horizon_m, robot_radius_m)
-
-    def __call__(self, output: CurveNavTrainingOutput, batch: dict[str, Tensor]) -> CurveNavLoss:
-        target = self.teacher(output.candidate_paths, batch).score
-        scores = output.candidate_scores
-        regression = F.smooth_l1_loss(scores.float(), target)
-        return CurveNavLoss(
-            output.flow_loss + regression, output.flow_loss, regression
-        )
+        return CandidateUtility(score, minimum, progress,failure.any(-1).unflatten(0,(b,count)))

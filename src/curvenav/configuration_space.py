@@ -9,6 +9,8 @@ from torch import Tensor
 CONFIGURATION_FIELD_CHANNELS = 5
 
 
+
+
 @dataclass(frozen=True)
 class ConfigurationFieldQuery:
     """Observed geometry and support at continuous robot-centre positions."""
@@ -20,28 +22,18 @@ class ConfigurationFieldQuery:
     support_observed: Tensor
 
 
-def query_configuration_field(
+def _configuration_corners(
     configuration_field: Tensor,
     path: Tensor,
     planning_horizon_m: float,
-) -> ConfigurationFieldQuery:
-    """Interpolate raster geometry; bound its continuous distance separately.
-
-    Channels are raster-site clearance, its planar unit gradient, coverage, and
-    raster footprint overlap. For nonempty fields, bounds apply to represented
-    sites, not the physical scene or unseen obstacles. Empty fields retain the
-    positive finite distance sentinel and provide no overlap evidence.
-    Geometry from an unobserved
-    corner is multiplied by zero before interpolation; interpolated coverage is
-    retained explicitly so learned consumers can distinguish weak support from
-    measured free space.
-    """
-    if configuration_field.ndim != 4 or configuration_field.shape[1] != 5:
-        raise ValueError("configuration field must have five channels")
+):
+    """Gather candidate pixels directly from each shared scene raster."""
+    if configuration_field.ndim != 4 or configuration_field.shape[1] not in (5, 6, 7):
+        raise ValueError("configuration field requires five geometry channels and optional free evidence")
     if path.ndim != 3 or path.shape[-1] != 2:
         raise ValueError("path must have shape [B,P,2]")
-    if path.shape[0] != configuration_field.shape[0] or planning_horizon_m <= 0:
-        raise ValueError("path and configuration field batch dimensions must match")
+    if configuration_field.shape[0]<1 or path.shape[0] % configuration_field.shape[0] or planning_horizon_m <= 0:
+        raise ValueError("paths must contain the same number of candidates for every configuration field")
     normalized = path.float() / float(planning_horizon_m)
     height, width = configuration_field.shape[-2:]
     grid_x = ((normalized[..., 0] + 1.0) * 0.5 * (width - 1)).clamp(0, width - 1)
@@ -52,8 +44,8 @@ def query_configuration_field(
     flat = configuration_field.float().flatten(2)
 
     def gather(x: Tensor, y: Tensor) -> Tensor:
-        index = (y * width + x)[:, None].expand(-1, flat.shape[1], -1)
-        return flat.gather(2, index).transpose(1, 2)
+        index = (y * width + x).reshape(flat.shape[0],-1)[:, None].expand(-1, flat.shape[1], -1)
+        return flat.gather(2, index).transpose(1, 2).reshape(*path.shape[:2],flat.shape[1])
 
     corners = torch.stack(
         (gather(x0, y0), gather(x1, y0), gather(x0, y1), gather(x1, y1)),
@@ -63,6 +55,38 @@ def query_configuration_field(
         ((1 - wx) * (1 - wy), wx * (1 - wy), (1 - wx) * wy, wx * wy),
         dim=-1,
     )
+    return corners,weights,(normalized.abs()<=1).all(dim=-1),(x0,x1,y0,y1)
+
+
+def _observed_features(corners,weights,inside,represented_geometry):
+    observed=corners[...,3].clamp(0,1)
+    geometry=(corners[...,:3]*(1 if represented_geometry else observed[...,None])*weights[...,None]).sum(-2)
+    coverage=(observed*weights).sum(-1,keepdim=True)
+    overlap=(corners[...,4:5]*observed[...,None]*weights[...,None]).sum(-2)
+    free=(corners[...,5:]*weights[...,None]).sum(-2)
+    return torch.cat((geometry,coverage,overlap,free),-1)*inside[...,None].to(corners.dtype)
+
+
+def sample_configuration_features(configuration_field,path,planning_horizon_m,*,represented_geometry=False):
+    """Network inputs only; distance bounds and support diagnostics are computed on request."""
+    corners,weights,inside,_=_configuration_corners(configuration_field,path,planning_horizon_m)
+    return _observed_features(corners,weights,inside,represented_geometry)
+
+
+def query_configuration_field(
+    configuration_field: Tensor,
+    path: Tensor,
+    planning_horizon_m: float,
+    *, represented_geometry: bool = False,
+) -> ConfigurationFieldQuery:
+    """Interpolate observed features and bound represented sites' continuous distance.
+
+    Every scene serves an equal number of consecutive candidate paths. Unobserved
+    corners contribute no geometry unless represented_geometry is set; support
+    still requires observed evidence, so unseen space is never certified free.
+    """
+    corners,weights,inside,(x0,x1,y0,y1)=_configuration_corners(configuration_field,path,planning_horizon_m)
+    height,width=configuration_field.shape[-2:]
     # Raster-site distance is 1-Lipschitz: d(node) +/- ||p-node|| bounds d(p).
     # Bilinear interpolation is only an estimate, not either bound.
     node_x = torch.stack((x0, x1, x0, x1), dim=-1).float()
@@ -81,24 +105,14 @@ def query_configuration_field(
     corner_upper_bound = corners[..., 0] + distance_to_node
     lower_bound = corner_lower_bound.amax(dim=-1)
     upper_bound = corner_upper_bound.amin(dim=-1)
-    inside = (normalized.abs() <= 1).all(dim=-1)
     observed = corners[..., 3].clamp(0, 1)
     support_observed = inside & torch.where(
         weights > 0,
         observed > 0.5,
         torch.ones_like(observed, dtype=torch.bool),
     ).all(dim=-1)
-    observed_geometry = (
-        corners[..., :3] * observed[..., None] * weights[..., None]
-    ).sum(dim=-2)
-    coverage = (observed * weights).sum(dim=-1, keepdim=True)
-    # Match the BEV's raster occupancy estimate. Distance bounds are diagnostics,
-    # not a threshold on the geometry supplied to learned consumers.
-    overlap = (corners[..., 4:5] * observed[..., None] * weights[..., None]).sum(-2)
-    inside_value = inside[..., None].to(lower_bound.dtype)
     return ConfigurationFieldQuery(
-        observed_features=torch.cat((observed_geometry, coverage, overlap), dim=-1)
-        * inside_value,
+        observed_features=_observed_features(corners,weights,inside,represented_geometry),
         estimated_clearance_m=(corners[..., 0] * weights).sum(dim=-1),
         clearance_lower_bound_m=lower_bound,
         clearance_upper_bound_m=upper_bound,

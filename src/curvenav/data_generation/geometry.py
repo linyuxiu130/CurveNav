@@ -8,7 +8,6 @@ import hashlib
 import heapq
 import math
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 from scipy.interpolate import BSpline, PPoly, RectBivariateSpline
@@ -41,6 +40,7 @@ class Grid:
     clearance_m: np.ndarray
     origin_xy: np.ndarray
     cell_size_m: float
+    minimum_clearance_m: float = MIN_CLEARANCE_M
 
     @classmethod
     def load(cls, path: Path) -> "Grid":
@@ -114,7 +114,8 @@ class Grid:
             (field.ev(x, y, dx=1), field.ev(x, y, dy=1))
         )
 
-    def safe(self, path: np.ndarray, minimum_m: float = MIN_CLEARANCE_M) -> bool:
+    def safe(self, path: np.ndarray, minimum_m: float | None = None) -> bool:
+        minimum_m = self.minimum_clearance_m if minimum_m is None else minimum_m
         dense = resample(path, SAFETY_STEP_M)
         values = self.clearance(np.concatenate([path, dense]))
         return bool(np.isfinite(values).all() and np.all(values + 1e-9 >= minimum_m))
@@ -198,7 +199,7 @@ _NEIGHBORS = (
 
 def _astar(grid: Grid, start: np.ndarray, goal: np.ndarray) -> np.ndarray:
     shape = grid.free.shape
-    allowed = grid.free & (grid.clearance_m + 1e-9 >= MIN_CLEARANCE_M)
+    allowed = grid.free & (grid.clearance_m + 1e-9 >= grid.minimum_clearance_m)
     source, target = tuple(start), tuple(goal)
     cost = np.full(shape, np.inf)
     parent = np.full((*shape, 2), -1, dtype=np.int32)
@@ -283,6 +284,10 @@ def _travel_objective(controls, basis, first, weights, grid):
 def _bending_objective(controls, first, second, weights):
     """Integral r_body^2 * curvature^2 ds, independent of parameterization."""
     tangent, acceleration = first @ controls, second @ controls
+    return _bending_terms(tangent, acceleration, first, second, weights)
+
+
+def _bending_terms(tangent, acceleration, first, second, weights):
     speed = np.linalg.norm(tangent, axis=1)
     cross = tangent[:, 0] * acceleration[:, 1] - tangent[:, 1] * acceleration[:, 0]
     radius2 = ROBOT_FOOTPRINT_RADIUS_M**2
@@ -363,9 +368,14 @@ def _smooth(grid: Grid, path: np.ndarray, start_yaw: float) -> tuple[BSpline, np
             # optimizer shorten its trial step without accepting a cusp.
             return math.inf, np.zeros_like(values)
 
+        # Near a small tangent, basis @ world-controls loses significant digits.
+        # Evaluate derivative splines directly in translated coordinates instead.
+        relative_curve = BSpline(knots, assembled - assembled[:1], degree)
+        velocity, acceleration = relative_curve.derivative(), relative_curve.derivative(2)
+
         def integrand(u):
-            value, gradient = _bending_objective(
-                assembled, first([u]), second([u]), np.ones(1)
+            value, gradient = _bending_terms(
+                velocity([u]), acceleration([u]), first([u]), second([u]), np.ones(1)
             )
             return np.r_[value, gradient.ravel()]
 
@@ -388,7 +398,7 @@ def _smooth(grid: Grid, path: np.ndarray, start_yaw: float) -> tuple[BSpline, np
             basis[:, 1] * (gradient @ (assembled[1] - assembled[0])),
             (basis[:, 2:-1, None] * gradient[:, None, :]).reshape(len(parameter), -1),
         ))
-        return distance - MIN_CLEARANCE_M, jacobian
+        return distance - grid.minimum_clearance_m, jacobian
 
     lower = grid.origin_xy + grid.cell_size_m * 0.5
     upper = grid.origin_xy + (np.array(grid.free.shape) - 0.5) * grid.cell_size_m
@@ -466,16 +476,21 @@ def plan_route(
     grid: Grid,
     start_xy: np.ndarray,
     goal_xy: np.ndarray,
-    start_yaw: float,
+    start_yaw: float | None,
 ) -> Plan:
+    """None selects a spatial teacher tangent; a numeric yaw preserves kinematic labels."""
     start, goal = grid.snap(start_xy), grid.snap(goal_xy)
     cells = _astar(grid, start, goal)
     discrete_path = np.vstack([start_xy, grid.grid_to_world(cells), goal_xy])
-    curve_spline, path = _smooth(
-        grid,
-        _simplify_route(grid, discrete_path),
-        start_yaw,
-    )
+    simplified = _simplify_route(grid, discrete_path)
+    if start_yaw is None:
+        segments = np.diff(simplified, axis=0)
+        nonzero = np.flatnonzero(np.any(segments != 0, axis=1))
+        if not len(nonzero):
+            raise PlanningError("spatial route has no nonzero initial segment")
+        direction = segments[nonzero[0]]
+        start_yaw = math.atan2(direction[1], direction[0])
+    curve_spline, path = _smooth(grid, simplified, start_yaw)
     length = path_length(path)
     clear, curve = grid.clearance(path), curvature(path)
     heading = np.arctan2(np.diff(path, axis=0)[:, 1], np.diff(path, axis=0)[:, 0])
@@ -506,7 +521,7 @@ def plan_route(
     return Plan(curve_spline, path.astype(np.float32), metrics, tags[0], tuple(tags))
 
 
-def source_route(grid: Grid, start_xy: np.ndarray, goal_xy: np.ndarray, start_yaw: float) -> Plan:
+def source_route(grid: Grid, start_xy: np.ndarray, goal_xy: np.ndarray, start_yaw: float | None) -> Plan:
     plan = plan_route(grid, start_xy, goal_xy, start_yaw)
     if not grid.safe(plan.path_xy):
         raise PlanningError("source route violates continuous clearance")
@@ -516,7 +531,7 @@ def source_route(grid: Grid, start_xy: np.ndarray, goal_xy: np.ndarray, start_ya
 def candidate_pairs(
     grid: Grid, distance_range_m: tuple[float, float], seed: int, limit: int
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    eligible = np.argwhere(grid.free & (grid.clearance_m + 1e-9 >= MIN_CLEARANCE_M))
+    eligible = np.argwhere(grid.free & (grid.clearance_m + 1e-9 >= grid.minimum_clearance_m))
     rng, pairs, seen = np.random.default_rng(seed), [], set()
     minimum, maximum = distance_range_m
     for _ in range(40000):
@@ -532,7 +547,7 @@ def candidate_pairs(
             or np.any(goal < 0)
             or np.any(goal >= grid.free.shape)
             or not grid.free[tuple(goal)]
-            or grid.clearance_m[tuple(goal)] + 1e-9 < MIN_CLEARANCE_M
+            or grid.clearance_m[tuple(goal)] + 1e-9 < grid.minimum_clearance_m
         ):
             continue
         key = tuple(np.concatenate([start, goal]))

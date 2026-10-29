@@ -1,6 +1,6 @@
 data:
-  root: /shibo_huang/data/curvenav/datasets/policy_hssd_grscenes7480
-  observation_frames: 4
+  root: data/curvenav_expert
+  observation_frames: 6
   expert_waypoint_spacing_m: 0.15
   future_steps: 24
   image_height: 126
@@ -58,19 +58,10 @@ model:
     transformer_heads: 8
     dropout: 0.0
 training:
-  seed: 42
-  gradient_accumulation_steps: 2
-  per_device_batch_size: 64
-  samples_per_epoch: 1491456
   epochs: 50
-  num_workers: 2
-  prefetch_factor: 2
   warmup_epochs: 5
   min_learning_rate_factor: 0.01
-  log_every_steps: 20
   checkpoint_every_epochs: 1
-  output_dir: outputs/train-structured-exploration-7480
-  learning_rate: 0.0002
+  learning_rate: 1.0e-05
   weight_decay: 0.01
-  grad_clip_norm: 1.0
   ema_decay: 0.9999

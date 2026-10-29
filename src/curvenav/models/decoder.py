@@ -4,7 +4,7 @@ import torch
 from torch import Tensor, nn
 from curvenav.precision import NEURAL_DTYPE
 
-from curvenav.configuration_space import query_configuration_field
+from curvenav.configuration_space import sample_configuration_features
 from curvenav.layers import RMSNorm
 from curvenav.models.blocks import ConditionalTrajectoryBlock, ProjectedCondition
 from curvenav.types import ConditionFeatures
@@ -16,6 +16,7 @@ TRAJECTORY_DECODER_TYPE = "pointwise_geometry_increment_curve_flow_transformer"
 class FlowTimeEmbedding(nn.Module):
     def __init__(self, model_dim: int) -> None:
         super().__init__()
+        self.neural_dtype = NEURAL_DTYPE
         self.projection = nn.Sequential(
             nn.Linear(1, model_dim * 2),
             nn.SiLU(),
@@ -26,9 +27,9 @@ class FlowTimeEmbedding(nn.Module):
         # A scalar affine map is an outer product, not a K=1 GEMM.
         affine = self.projection[0]
         value = torch.addcmul(
-            affine.bias.to(NEURAL_DTYPE),
-            time[:, None].to(NEURAL_DTYPE),
-            affine.weight[:, 0].to(NEURAL_DTYPE),
+            affine.bias.to(self.neural_dtype),
+            time[:, None].to(self.neural_dtype),
+            affine.weight[:, 0].to(self.neural_dtype),
         )
         return self.projection[2](self.projection[1](value))
 
@@ -38,6 +39,7 @@ class PlanarControlReadout(nn.Module):
 
     def __init__(self, model_dim: int) -> None:
         super().__init__()
+        self.neural_dtype = NEURAL_DTYPE
         self.projection = nn.Linear(model_dim, 2)
 
     def forward(self, tokens: Tensor) -> Tensor:
@@ -60,10 +62,12 @@ class ConditionalCurveFlowDecoder(nn.Module):
         path_to_increment_weight: Tensor,
     ) -> None:
         super().__init__()
+        self.neural_dtype = NEURAL_DTYPE
         if layers < 1:
             raise ValueError("decoder layers must be positive")
         if coordinate_dim != 2 * control_tokens:
             raise ValueError("each trajectory token must be one planar increment")
+        self.represented_geometry = True
         self.control_tokens = control_tokens
         self.coordinate_dim = coordinate_dim
         self.planning_horizon_m = float(planning_horizon_m)
@@ -81,7 +85,7 @@ class ConditionalCurveFlowDecoder(nn.Module):
         )
         self.time_embedding = FlowTimeEmbedding(model_dim)
         self.path_geometry_embedding = nn.Sequential(
-            nn.Linear(7, model_dim),
+            nn.Linear(8, model_dim),
             nn.SiLU(),
             nn.Linear(model_dim, model_dim),
         )
@@ -107,12 +111,12 @@ class ConditionalCurveFlowDecoder(nn.Module):
         candidate_path: Tensor,
         condition: ConditionFeatures,
     ) -> tuple[Tensor, Tensor]:
-        query = query_configuration_field(
+        observed = sample_configuration_features(
             condition.configuration_field,
             candidate_path,
             self.planning_horizon_m,
+            represented_geometry=self.represented_geometry,
         )
-        observed = query.observed_features
         path_features = torch.cat(
             (
                 candidate_path.float() / self.planning_horizon_m,
@@ -128,7 +132,7 @@ class ConditionalCurveFlowDecoder(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         # Encode each position and its evidence together before reducing the
         # curve. A nonlinear encoder of raw means loses local distributions.
-        with torch.autocast(device_type=path_geometry.device.type, dtype=NEURAL_DTYPE):
+        with torch.autocast(device_type=path_geometry.device.type, dtype=self.neural_dtype):
             path = self.path_geometry_embedding(path_geometry).float()
             goal = self.goal_geometry_embedding(goal_geometry).float()
         return (
@@ -202,7 +206,7 @@ class ConditionalCurveFlowDecoder(nn.Module):
     ) -> tuple[ProjectedCondition, ...]:
         """Cache only scene K/V; trajectory geometry changes with flow state."""
         with torch.autocast(
-            device_type=condition.tokens.device.type, dtype=NEURAL_DTYPE
+            device_type=condition.tokens.device.type, dtype=self.neural_dtype
         ):
             return tuple(
                 block.project_condition(condition) for block in self.blocks
@@ -216,14 +220,12 @@ class ConditionalCurveFlowDecoder(nn.Module):
         condition: ConditionFeatures,
         memory: tuple[ProjectedCondition, ...],
     ) -> Tensor:
-        path_geometry, goal_geometry = self._trajectory_geometry(
-            candidate_path, condition
-        )
+        path_geometry, goal_geometry = self._trajectory_geometry(candidate_path, condition)
         path_embedding, goal_embedding = self._embed_trajectory_geometry(
             path_geometry, goal_geometry
         )
         pair_geometry = self._path_relative_geometry(candidate_path, condition)
-        with torch.autocast(device_type=state.device.type, dtype=NEURAL_DTYPE):
+        with torch.autocast(device_type=state.device.type, dtype=self.neural_dtype):
             tokens = self.state_embedding(state.reshape(-1, self.control_tokens, 2))
             tokens = (
                 tokens
@@ -234,4 +236,6 @@ class ConditionalCurveFlowDecoder(nn.Module):
             )
             for block, projected in zip(self.blocks, memory, strict=True):
                 tokens = block(tokens, projected, pair_geometry)
-            return self.velocity_readout(self.output_norm(tokens))
+            normalized = self.output_norm(tokens)
+            velocity = self.velocity_readout(normalized)
+            return velocity

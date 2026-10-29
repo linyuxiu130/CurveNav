@@ -11,20 +11,16 @@ dependencies = [
   "torch>=2.6,<2.8",
   "numpy>=1.24",
   "scipy>=1.10",
-  "matplotlib>=3.7",
   "PyYAML>=6.0",
-  "accelerate>=1.14",
 ]
 
 [project.scripts]
-curvenav-train = "curvenav.training.train:main"
-curvenav-prepare-data = "curvenav.data.prepare:main"
-curvenav-evaluate = "curvenav.evaluation.offline:main"
-curvenav-compare = "curvenav.evaluation.compare:main"
-curvenav-finetune-evaluator = "curvenav.training.evaluator_finetune:main"
+curvenav-init = "curvenav.deployment.bspline_bundle:main"
+curvenav-train = "curvenav.training.bspline_replay:main"
+curvenav-prepare-data = "curvenav.data.prepare_fixed40:main"
+curvenav-evaluate = "curvenav.evaluation.run_bspline40:main"
 
 [project.optional-dependencies]
-generation = ["trimesh>=4.0"]
 test = ["pytest>=8.0"]
 
 [tool.setuptools.packages.find]
@@ -32,5 +28,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["online_evaluation"]
+pythonpath = ["src"]
 addopts = "-ra"

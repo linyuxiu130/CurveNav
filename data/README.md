@@ -1,20 +1,26 @@
-# 训练数据
+# 专家数据
 
-当前唯一训练入口为 `data/policy_dataset-depth-clearance/config.yaml`。
-`bash scripts/build_dataset.sh` 生成并审计专家路线，然后直接编译为训练格式。
+当前六帧空间记忆模型使用原生 14 维 B-spline 专家标签。采集规则见
+[BSPLINE_MEMORY](../docs/BSPLINE_MEMORY.md)，统一入口是
+`python -m curvenav.data.prepare_fixed40`。
 
-| 目录 | 用途 |
-| --- | --- |
-| `scene_assets/hssd-hab/` | HSSD 场景、网格和材质 |
-| `../outputs/hssd_policy_depth_500_clearance/` | 500 条专家路线、10 Hz 深度与标定位姿、源配置空间和审计 |
-| `policy_dataset-depth-clearance/` | 训练/验证标签、深度索引和训练集拟合的归一化配置 |
+每条独立轨迹通过 `--partition train` 或 `--partition validation` 指定归属。
+按实际运动采集并保留所有状态；目标、完成条件和任务失败定义沿用各任务本身。
+源地图只供离线专家与标签使用，策略只接收真实因果观测和可见目标。
+当前训练默认从 `curvenav_expert/dataset_summary.json` 读取清单；更换数据阶段保留模型、优化器、EMA和RNG，重新计epoch。
+CPU 中间采集须经 `prepare_six_frame_replay` 在 CUDA 上重建记忆后才能用于训练。
 
-400 条路线用于训练，100 条用于验证，按场景隔离。深度直接保存为训练需要的
-224×126 FP16 光学深度；四帧历史通过索引引用，不重复保存图像。
-内参、外参、相对 SE(3) 位姿和时间戳使用统一观测合同。
+唯一维护的数据目录为 `curvenav_expert/`，后续采集直接更新该数据集。训练接入使用其中通过验收后
+发布的 `dataset_summary.json`；`HANDOFF.txt` 记录接入说明。原 194 条验证状态固定，
+新增轨迹只进入训练集。该验证仍为原40任务内留出状态，不代表未见场景泛化。
 
-专家曲线保存七个二维非原点 B-spline 控制点；原点固定。模型边界将控制点转换为
-标准化控制增量，解码后恢复米制轨迹。源配置空间用于数据审核和测评，不作为在线输入。
-
-生成完成需通过源几何审计与训练标签重新查询证书。旧 RGB-D / forward 数据集已清理；
+`captures/` 保存真实执行、原始深度和专家标签，`native/` 保存 CUDA 重放后的训练输入，
+`audit/` 保存准入、覆盖和当前验收结果；失败原因统一记在 `audit/maintenance.json`。
+CPU 采集不保存可由原始观测和写入选择重建的记忆计划；训练所需计划保留在 `native/`。
+清理记录与完整加载结果见 `audit/maintenance.json`。
 数据、场景及模型权重留在本地，不提交 Git。
+
+`inputs/` 仅保留任务、标定、采集计划和采集模型。所有可运行的采集与准备代码都维护在
+`src/curvenav/data/`。准备器会用同一模型重建 CUDA 记忆和记录候选，并更新来源哈希。
+`provenance/native_preparation.py` 是已准入数据所绑定的原始源码证据，不作为运行入口；
+每条轨迹清单绑定的源码快照保留原路径，相同内容共享存储。部分原数据因冻结验证的绝对路径绑定保留在 `outputs/`。

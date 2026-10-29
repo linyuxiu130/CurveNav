@@ -119,5 +119,6 @@ def test_rejects_invalid_trajectory_contract() -> None:
 
 
 def test_rejects_non_production_observation_frame_count() -> None:
-    with pytest.raises(ValueError, match="four depth observations"):
-        config_from_mapping({"data": {"observation_frames": 3}})
+    from curvenav.deployment.bspline_bundle import create_bundle
+    with pytest.raises(AssertionError):
+        create_bundle(config_from_mapping({"data":{"observation_frames":4}}))

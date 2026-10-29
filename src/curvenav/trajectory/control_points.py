@@ -175,3 +175,17 @@ class IncrementalBSplineTrajectory(nn.Module):
         coordinates: Tensor,
     ) -> tuple[Tensor, Tensor]:
         return self.decode(coordinates)
+
+
+def project_reference_tangent(codec, reference):
+    """Reuse the native fit in the reference tangent frame; preserve its endpoint.
+
+    Labels may require turning in place before translation. This does not add
+    that action to the controller or establish closed-loop executability.
+    """
+    tangent = torch.nn.functional.normalize(reference[:, 1] - reference[:, 0], dim=-1)
+    rotation = torch.stack((tangent, torch.stack((-tangent[:, 1], tangent[:, 0]), -1)), -1)
+    aligned = torch.einsum('bpi,bij->bpj', reference, rotation)
+    values, _ = codec.project_expert(aligned)
+    values = torch.einsum('bpj,bij->bpi', values.reshape(-1, 7, 2), rotation).flatten(1)
+    return values, codec.decode_values(values)[0]

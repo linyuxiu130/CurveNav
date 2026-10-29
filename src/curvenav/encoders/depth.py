@@ -6,7 +6,6 @@ from torch import Tensor, nn
 from curvenav.precision import NEURAL_DTYPE
 
 from curvenav.layers import RMSNorm
-from curvenav.types import DepthFeatures
 
 from .geometry import MetricDepthProjector
 from curvenav.physical import ROBOT_FOOTPRINT_RADIUS_M, BODY_OBSTACLE_MIN_Z_M, ROBOT_COLLISION_TOP_Z_M
@@ -57,13 +56,7 @@ def _resnet18_stage(in_channels: int, out_channels: int, stride: int) -> nn.Sequ
 
 
 class DepthObservationEncoder(nn.Module):
-    """Encode every registered depth frame with one shared visual backbone.
-
-    Each image token retains its learned appearance feature and receives the
-    corresponding measured ray endpoint transformed into the current robot
-    frame, with its acquisition age. Current robot configuration space comes
-    from the full sensor-clock memory; no PointGoal enters perception.
-    """
+    """Shared image backbone and learned embeddings for spatial-memory writes."""
 
     def __init__(
         self,
@@ -77,6 +70,7 @@ class DepthObservationEncoder(nn.Module):
         geometry=(ROBOT_FOOTPRINT_RADIUS_M, BODY_OBSTACLE_MIN_Z_M, ROBOT_COLLISION_TOP_Z_M),
     ) -> None:
         super().__init__()
+        self.neural_dtype = NEURAL_DTYPE
         self.max_depth_m = float(max_depth_m)
 
         self.backbone = nn.Sequential(
@@ -104,7 +98,6 @@ class DepthObservationEncoder(nn.Module):
             nn.Linear(1, model_dim), nn.SiLU(), nn.Linear(model_dim, model_dim)
         )
         self.output_norm = RMSNorm(model_dim)
-        self.dropout = nn.Dropout(dropout)
 
     @staticmethod
     def sample_pixel_features(features: Tensor, indices: Tensor, image_width: int) -> Tensor:
@@ -123,42 +116,8 @@ class DepthObservationEncoder(nn.Module):
                                 mode="bilinear", padding_mode="border", align_corners=False)
         return sampled.squeeze(2).transpose(1, 2).reshape(*indices.shape, features.shape[1]).to(features.dtype)
 
-    def forward(self, condition) -> DepthFeatures:
-        depth = condition.depth
-        visual_input = torch.cat((depth.float(), (depth > 0).float()), dim=2)
-        with torch.autocast(device_type=depth.device.type, dtype=NEURAL_DTYPE):
-            visual = self.spatial_projection(self.backbone(visual_input.flatten(0, 1)))
-        projection = self.metric_projector(condition)
-        visual = self.sample_pixel_features(visual, projection.pixel_indices, depth.shape[-1])
-        points = projection.points
-        selected_depth = projection.depth / self.max_depth_m
-        surface_hit = projection.depth < self.max_depth_m
-        body_obstacle = (
-            projection.obstacle_valid & condition.observation_valid[..., None]
-        )
-        token_valid = projection.token_valid & (projection.depth < self.max_depth_m)
-        geometry = torch.cat(
-            (
-                points / self.max_depth_m,
-                selected_depth[..., None],
-                surface_hit[..., None].to(points.dtype),
-                body_obstacle[..., None].to(points.dtype),
-            ),
-            dim=-1,
-        )
-        with torch.autocast(device_type=depth.device.type, dtype=NEURAL_DTYPE):
-            tokens = visual + self.geometry_projection(geometry.to(visual.dtype))
-            tokens = (
-                tokens
-                + self.time_projection(
-                    condition.observation_age_s[..., None].to(tokens.dtype)
-                )[:, :, None]
-            )
-        tokens = tokens * token_valid[..., None]
-        tokens = self.dropout(self.output_norm(tokens)).flatten(1, 2)
-        return DepthFeatures(
-            tokens=tokens,
-            token_valid=token_valid.flatten(1),
-            metric_position=points.flatten(1, 2),
-            configuration_field=projection.configuration_field,
-        )
+    def image_features(self, depth: Tensor) -> Tensor:
+        """Full-image CNN for independent depth[N,1,H,W] frames."""
+        visual_input = torch.cat((depth.float(), (depth > 0).float()), dim=1)
+        with torch.autocast(device_type=depth.device.type, dtype=self.neural_dtype):
+            return self.spatial_projection(self.backbone(visual_input))

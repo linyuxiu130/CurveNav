@@ -7,8 +7,6 @@ run without importing PyTorch or initializing a CUDA runtime.
 __all__ = [
     "CurveNavConfig",
     "PolicyCondition",
-    "TrajectoryPrediction",
-    "TrajectoryTarget",
     "build_policy",
 ]
 
@@ -22,12 +20,8 @@ def __getattr__(name: str):
         from .factory import build_policy
 
         return build_policy
-    if name in {"PolicyCondition", "TrajectoryPrediction", "TrajectoryTarget"}:
-        from .types import PolicyCondition, TrajectoryPrediction, TrajectoryTarget
+    if name == "PolicyCondition":
+        from .types import PolicyCondition
 
-        return {
-            "PolicyCondition": PolicyCondition,
-            "TrajectoryPrediction": TrajectoryPrediction,
-            "TrajectoryTarget": TrajectoryTarget,
-        }[name]
+        return PolicyCondition
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

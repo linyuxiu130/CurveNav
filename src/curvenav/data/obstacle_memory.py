@@ -26,7 +26,9 @@ def _rectangle_minimum(image, x0, y0, x1, y1):
     ky = np.floor(np.log2(height)).astype(np.int64)
     kx = np.floor(np.log2(width)).astype(np.int64)
     result = np.empty(len(x0), dtype=image.dtype)
-    rows = image
+    # FP16 values widen exactly; return minima in the original dtype below.
+    # NumPy CPU minimum is much faster in FP32 than software FP16 arithmetic.
+    rows = image.astype(np.float32) if image.dtype == np.float16 else image
     for j in range(int(ky.max(initial=0)) + 1):
         if j:
             offset = 1 << (j - 1)
@@ -47,6 +49,37 @@ def _rectangle_minimum(image, x0, y0, x1, y1):
     return result
 
 
+def volumes_observed_clear(world, depth, intrinsic, camera_to_world, maximum):
+    """Entire boxes are in front of valid depth; invalid or occluded pixels never clear.
+
+    world is [N,8,3] calibrated box corners. Shared by occupied-memory clearing
+    and experimental free-volume evidence, including FP16 depth tolerance.
+    """
+    optical = (world-camera_to_world[:3, 3]) @ camera_to_world[:3, :3]
+    z = optical[..., 2]
+    # Behind-camera corners cannot clear a voxel; only project positive Z.
+    positive_z = np.where(z > 0, z, 1.0)
+    u = intrinsic[0,0]*optical[...,0]/positive_z + intrinsic[0,2] - .5
+    v = intrinsic[1,1]*optical[...,1]/positive_z + intrinsic[1,2] - .5
+    h, w = depth.shape
+    inside = ((z > 0) & (u >= 0) & (u <= w-1) & (v >= 0) & (v <= h-1)).all(1)
+    clear = np.zeros(len(world), dtype=bool)
+    if not inside.any():
+        return clear
+    # Invisible boxes cannot be refuted. Do not query their clipped image rectangles.
+    u, v, z = u[inside], v[inside], z[inside]
+    x0 = np.floor(u).astype(np.int64)
+    y0 = np.floor(v).astype(np.int64)
+    x1, y1 = np.minimum(x0+1, w-1), np.minimum(y0+1, h-1)
+    measured = _rectangle_minimum(
+        depth, x0.min(1), y0.min(1), x1.max(1), y1.max(1)
+    ) * maximum
+    # The entire projected voxel rectangle must be observed free.
+    # This tolerance covers normalized FP16 depth storage, not scene motion.
+    clear[inside] = measured > z.max(1) + maximum * np.finfo(np.float16).eps
+    return clear
+
+
 class ObstacleMemory:
     """Retain measured occupied volumes until observed clear or outside the local map."""
 
@@ -61,6 +94,15 @@ class ObstacleMemory:
         self.voxels = np.empty((0, 3), dtype=np.int64)
         self.corners = np.asarray(list(itertools.product((0., 1.), repeat=3)))
 
+    def state_dict(self):
+        return {'contract': MEMORY_CONTRACT, 'voxels': self.voxels.copy()}
+
+    def load_state_dict(self, state):
+        voxels = state['voxels']
+        if state['contract'] != MEMORY_CONTRACT or voxels.ndim != 2 or voxels.shape[1] != 3 or voxels.dtype != np.int64:
+            raise ValueError('occupied-memory state requires calibrated int64 world voxels')
+        self.voxels = voxels.copy()
+
     def update(self, depth, intrinsic, camera_to_body, body_to_world):
         depth = np.asarray(depth, dtype=np.float32)
         camera_to_world = body_to_world @ camera_to_body
@@ -73,25 +115,7 @@ class ObstacleMemory:
             )
             self.voxels = self.voxels[nearby]
             world = world[nearby]
-            optical = (world-camera_to_world[:3, 3]) @ camera_to_world[:3, :3]
-            z = optical[..., 2]
-            # Behind-camera corners cannot clear a voxel; only project positive Z.
-            positive_z = np.where(z > 0, z, 1.0)
-            u = intrinsic[0,0]*optical[...,0]/positive_z + intrinsic[0,2] - .5
-            v = intrinsic[1,1]*optical[...,1]/positive_z + intrinsic[1,2] - .5
-            h, w = depth.shape
-            inside = (z > 0) & (u >= 0) & (u <= w-1) & (v >= 0) & (v <= h-1)
-            x0 = np.floor(np.clip(u, 0, w-1)).astype(np.int64)
-            y0 = np.floor(np.clip(v, 0, h-1)).astype(np.int64)
-            x1, y1 = np.minimum(x0+1, w-1), np.minimum(y0+1, h-1)
-            measured = _rectangle_minimum(
-                depth, x0.min(1), y0.min(1), x1.max(1), y1.max(1)
-            ) * self.maximum
-            # The entire projected voxel rectangle must be observed free.
-            # This tolerance covers normalized FP16 depth storage, not scene motion.
-            clear = inside.all(1) & (
-                measured > z.max(1) + self.maximum * np.finfo(np.float16).eps
-            )
+            clear = volumes_observed_clear(world, depth, intrinsic, camera_to_world, self.maximum)
             self.voxels = self.voxels[~clear]
 
         y, x = np.meshgrid(np.arange(depth.shape[0])+.5, np.arange(depth.shape[1])+.5, indexing='ij')

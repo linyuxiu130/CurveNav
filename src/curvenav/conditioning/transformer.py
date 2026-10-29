@@ -1,11 +1,10 @@
 """Target-independent fused metric memory and terminal PointGoal intent."""
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 
 from curvenav.layers import RMSNorm
-from curvenav.trajectory import local_terminal_goal
-from curvenav.types import ConditionFeatures, DepthFeatures
+from curvenav.types import ConditionFeatures
 
 from .motion import HistoricalMotionEncoder
 
@@ -18,14 +17,12 @@ class PolicyConditionEncoder(nn.Module):
 
     def __init__(
         self,
-        configuration_encoder: nn.Module,
         *,
         observation_frames: int,
         planning_horizon_m: float,
         model_dim: int,
     ) -> None:
         super().__init__()
-        self.configuration_encoder = configuration_encoder
         self.planning_horizon_m = float(planning_horizon_m)
         self.motion_encoder = HistoricalMotionEncoder(
             observation_frames=observation_frames,
@@ -34,25 +31,11 @@ class PolicyConditionEncoder(nn.Module):
         )
         self.memory_norm = RMSNorm(model_dim)
 
-    def forward(
-        self,
-        observation: DepthFeatures,
-        point_goal: Tensor,
-        observation_valid: Tensor,
-        observation_to_current: Tensor,
-        observation_age_s: Tensor,
-    ) -> ConditionFeatures:
+
+    def encode_configuration(self, configuration, field, point_goal, observation_valid,
+                             observation_to_current, observation_age_s):
+        """Consume the same BEV whether reconstructed offline or updated online."""
         batch = point_goal.shape[0]
-        if observation.tokens.ndim != 3 or observation.tokens.shape[0] != batch:
-            raise ValueError("depth tokens must have shape [B,N,D]")
-        if observation.token_valid.shape != observation.tokens.shape[:2]:
-            raise ValueError("depth token validity must have shape [B,N]")
-        configuration = self.configuration_encoder(
-            observation.configuration_field,
-            observation.tokens,
-            observation.metric_position,
-            observation.token_valid,
-        )
         motion = self.motion_encoder(
             observation_to_current, observation_age_s
         )
@@ -70,7 +53,7 @@ class PolicyConditionEncoder(nn.Module):
         )
         surface_hit = torch.cat(
             (
-                configuration.observed_fraction > 0.0,
+                configuration.observed_fraction,
                 torch.zeros_like(observation_valid[:, :-1]),
             ),
             dim=1,
@@ -89,7 +72,7 @@ class PolicyConditionEncoder(nn.Module):
             ),
             dim=1,
         )
-        terminal_goal = local_terminal_goal(point_goal, self.planning_horizon_m)
+        terminal_goal = point_goal.float()
         return ConditionFeatures(
             tokens=self.memory_norm(tokens) * token_valid[..., None],
             token_valid=token_valid,
@@ -99,5 +82,5 @@ class PolicyConditionEncoder(nn.Module):
             motion_token=motion_token,
             terminal_goal=terminal_goal,
             goal_present=torch.ones_like(point_goal[:, :1]),
-            configuration_field=observation.configuration_field,
+            configuration_field=field,
         )

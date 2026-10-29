@@ -13,8 +13,8 @@ from curvenav.physical import (
 
 @dataclass(frozen=True)
 class DataConfig:
-    root: str = "data/policy_dataset-depth-memory"
-    observation_frames: int = 4
+    root: str = "data/curvenav_expert"
+    observation_frames: int = 6
     expert_waypoint_spacing_m: float = 0.15
     future_steps: int = 24
     image_height: int = 126
@@ -198,10 +198,6 @@ class CurveNavConfig:
         self.data.validate()
         self.trajectory.validate()
         self.trajectory_decoder.validate()
-        if self.data.observation_frames != 4:
-            raise ValueError(
-                "CurveNav uses four depth observations: three past and one current"
-            )
         if (
             min(
                 self.depth_encoder.frame_tokens_height,

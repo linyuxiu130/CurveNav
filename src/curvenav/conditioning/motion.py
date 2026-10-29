@@ -24,6 +24,7 @@ class HistoricalMotionEncoder(nn.Module):
         model_dim: int,
     ) -> None:
         super().__init__()
+        self.neural_dtype = NEURAL_DTYPE
         if observation_frames < 2:
             raise ValueError("motion encoding requires a past observation")
         if translation_scale_m <= 0:
@@ -52,6 +53,6 @@ class HistoricalMotionEncoder(nn.Module):
             ),
             dim=-1,
         )
-        with torch.autocast(device_type=features.device.type, dtype=NEURAL_DTYPE):
+        with torch.autocast(device_type=features.device.type, dtype=self.neural_dtype):
             encoded = self.projection(features)
         return encoded + self.slot_embedding

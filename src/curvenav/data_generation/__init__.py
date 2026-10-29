@@ -1,1 +1,1 @@
-"""CurveNav HSSD expert-data generation."""
+"""Expert geometry and Habitat camera calibration."""

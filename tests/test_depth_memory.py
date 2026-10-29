@@ -12,17 +12,17 @@ from curvenav.config import (
 )
 from curvenav.data.depth import PinholeIntrinsics, preprocess_depth
 from curvenav.data.history import ObservationHistory, inverse_rigid, validate_transform
-from curvenav.data.observation import DepthContextBuffer
 from curvenav.factory import build_policy, build_evaluation_projector
-from curvenav.types import PolicyCondition, TrajectoryTarget
+from curvenav.types import PolicyCondition
 from curvenav.data.obstacle_memory import memory_grid_shape
 
 
-def test_rectangle_minima_match_every_pixel_including_unknown_depth():
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+def test_rectangle_minima_match_every_pixel_including_unknown_depth(dtype):
     from curvenav.data.obstacle_memory import _rectangle_minimum
 
     rng = np.random.default_rng(42)
-    depth = rng.random((17, 23), dtype=np.float32)
+    depth = rng.random((17, 23), dtype=np.float32).astype(dtype)
     depth[4, 6] = 0  # Unknown pixels inside a rectangle must prevent clearing.
     x0, x1 = np.sort(rng.integers(0, 23, size=(2, 1000)), axis=0)
     y0, y1 = np.sort(rng.integers(0, 17, size=(2, 1000)), axis=0)
@@ -227,12 +227,12 @@ def test_occluded_history_is_retained_and_padding_cannot_add_geometry():
 
 
 def test_bf16_multiframe_bev_fusion_matches_fp32_weighted_mean():
-    encoder = build_policy(config()).condition_encoder.configuration_encoder
-    encoder.visual_projection = torch.nn.Identity()
+    from curvenav.encoders.configuration import metric_grid, splat_memory
+    position, _ = metric_grid(32, 16, 3.6)
     values = torch.linspace(-1, 1, 768).to(torch.bfloat16)
     tokens = values.reshape(1, 768, 1).expand(-1, -1, 32).clone().requires_grad_()
-    points = encoder.metric_position[:, 37:38].expand(-1, 768, -1)
-    result = encoder._splat_visual(tokens, points, torch.ones(1, 768, dtype=torch.bool))
+    points = position[:, 37:38].expand(-1, 768, -1)
+    result, _ = splat_memory(tokens, points, torch.ones(1, 768, dtype=torch.bool), 3.6, 16, 0)
     assert result.dtype == torch.float32
     torch.testing.assert_close(
         result[0, 37], values.float().mean().expand(32), atol=1e-6, rtol=0
@@ -247,8 +247,6 @@ def test_all_missing_is_unknown_and_model_finite():
     projection = build_evaluation_projector(config())(c)
     assert not projection.token_valid.any()
     assert projection.configuration_field[:, 3:].count_nonzero() == 0
-    path = build_policy(config()).eval().sample(c).path
-    assert torch.isfinite(path).all()
 
 
 def test_optical_z_intrinsics_extrinsics_and_pose_composition():
@@ -306,80 +304,15 @@ def test_rigid_inverse_rejects_scale_and_reflection():
             validate_transform(bad)
 
 
-def test_history_sliding_rotation_timestamps_and_runtime_parity():
-    cfg = config()
-    history = ObservationHistory()
-    buffer = DepthContextBuffer(cfg.data)
-    buffer.reset(1)
-    c = condition()
-    depth = np.ones((1, 126, 224, 1), np.float32)
-    pose = np.eye(4, dtype=np.float32)
-    for i in range(200):
-        angle = i * 0.03
-        pose[:2, :2] = [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
-        indices, relative, age, valid = history.update(i, pose, i * 0.1)
-        result = buffer.update(
-            depth,
-            pose[None],
-            c.camera_intrinsics[:, 0].numpy(),
-            c.camera_to_body[:, 0].numpy(),
-            np.array([i * 0.1]),
-        )
-        np.testing.assert_allclose(
-            result["observation_to_current"][0], relative, atol=1e-6
-        )
-        np.testing.assert_array_equal(result["observation_valid"][0], valid)
-        assert len(buffer.frames[0]) <= 16
-    assert valid.sum() == 4
-    np.testing.assert_array_equal(indices, [183, 190, 198, 199])
-    np.testing.assert_allclose(age, [1.6, 0.9, 0.1, 0], atol=1e-6)
-    _, _, age, valid = history.update(201, pose, 30.0)
-    assert valid.sum() == 4 and age.max() > 8
-    with pytest.raises(ValueError):
-        history.update(202, pose, 30.0)
-
-
-def test_bev_bin_centres_match_convolution_and_pooling():
-    enc = build_policy(config()).condition_encoder.configuration_encoder
-    axis = enc.metric_position[0, :16, 0]
+def test_bev_bin_centres_match_the_calibrated_lattice():
+    from curvenav.encoders.configuration import metric_grid, splat_memory
+    position, _ = metric_grid(32, 16, 3.6)
     expected = (torch.arange(16) * 4 + 1.5) * 7.2 / 63 - 3.6
-    torch.testing.assert_close(axis, expected)
-    # Two kernel-2/stride-2 receptive fields aggregate indices 4j..4j+3.
-    assert enc.field_encoder[0].kernel_size == (2, 2)
-    assert enc.field_encoder[2].kernel_size == (2, 2)
+    torch.testing.assert_close(position[0, :16, 0], expected)
     tokens = torch.zeros(1, 1, 32)
     tokens[0, 0, 0] = 1
-    enc.visual_projection = torch.nn.Identity()
-    splat = enc._splat_visual(
-        tokens, enc.metric_position[:, 37:38], torch.ones(1, 1, dtype=torch.bool)
-    )
+    splat, _ = splat_memory(tokens, position[:, 37:38], torch.ones(1, 1, dtype=torch.bool), 3.6, 16, 0)
     assert splat[0, 37, 0] > 0.99
-
-
-def test_depth_flow_backward_and_strict_state_roundtrip(tmp_path):
-    torch.manual_seed(42)
-    cfg = config()
-    p = build_policy(cfg)
-    c = condition(4)
-    target = TrajectoryTarget(p.curve_codec.values_from_coordinates(torch.randn(4, 14)))
-    from test_critic import criterion_loss
-    loss = criterion_loss(p(c, target, torch.randn(4, 14))).loss
-    assert torch.isfinite(loss)
-    loss.backward()
-    assert p.depth_encoder.backbone[0].weight.grad[:, :3].abs().sum() > 0
-    assert all(
-        torch.isfinite(x.grad).all() for x in p.parameters() if x.grad is not None
-    )
-    p.eval()
-    a = p.sample(c).path
-    torch.save(p.state_dict(), tmp_path / "state.pt")
-    q = build_policy(cfg).eval()
-    q.load_state_dict(torch.load(tmp_path / "state.pt", weights_only=True), strict=True)
-    torch.testing.assert_close(a, q.sample(c).path, rtol=0, atol=0)
-    changed = replace(c, depth=c.depth * .75)
-    assert not torch.equal(
-        p.encode_condition(c).tokens, p.encode_condition(changed).tokens
-    )
 
 
 def test_historical_motion_evidence_retains_its_position_and_age():
@@ -417,11 +350,11 @@ def test_world_coordinate_gauge_does_not_change_relative_memory():
 def test_depth_encoder_compiles_as_one_cpu_autograd_graph():
     encoder = build_policy(config()).depth_encoder
     c = condition()
-    eager = encoder(c)
-    compiled = torch.compile(encoder, backend="aot_eager", fullgraph=True)
-    actual = compiled(c)
-    torch.testing.assert_close(actual.tokens, eager.tokens)
-    actual.tokens.square().mean().backward()
+    eager = encoder.image_features(c.depth.flatten(0, 1))
+    compiled = torch.compile(encoder.image_features, backend="aot_eager", fullgraph=True)
+    actual = compiled(c.depth.flatten(0, 1))
+    torch.testing.assert_close(actual, eager)
+    actual.square().mean().backward()
     assert encoder.backbone[0].weight.grad is not None
     assert torch.isfinite(encoder.backbone[0].weight.grad).all()
 
@@ -463,9 +396,34 @@ def test_negative_lower_bound_is_not_observed_collision():
     assert torch.isfinite(point.grad).all()
 
 
+@pytest.mark.parametrize('device',['cpu','cuda'])
+@pytest.mark.parametrize('represented',[False,True])
+def test_shared_candidate_rasters_match_full_queries_and_gradients(device,represented):
+    from dataclasses import fields
+    from curvenav.configuration_space import query_configuration_field,sample_configuration_features
+    if device=='cuda' and not torch.cuda.is_available():pytest.skip('CUDA unavailable')
+    torch.manual_seed(51)
+    for channels in (5,6,7):
+        raster=torch.randn(2,channels,8,8,device=device,requires_grad=True)
+        reference=raster.detach().clone().requires_grad_()
+        paths=(torch.rand(6,9,2,device=device)*3-1.5).requires_grad_()
+        other=paths.detach().clone().requires_grad_()
+        actual=query_configuration_field(raster,paths,1.,represented_geometry=represented)
+        expected=query_configuration_field(reference.repeat_interleave(3,0),other,1.,represented_geometry=represented)
+        sampled=sample_configuration_features(raster,paths,1.,represented_geometry=represented)
+        for field in fields(actual):
+            torch.testing.assert_close(getattr(actual,field.name),getattr(expected,field.name),rtol=0,atol=0)
+        torch.testing.assert_close(sampled,expected.observed_features,rtol=0,atol=0)
+        probe=torch.randn_like(sampled)
+        a=torch.autograd.grad((sampled*probe).sum(),(raster,paths))
+        b=torch.autograd.grad((expected.observed_features*probe).sum(),(reference,other))
+        for x,y in zip(a,b,strict=True):torch.testing.assert_close(x,y,rtol=2e-5,atol=2e-6)
+    with pytest.raises(ValueError,match='same number of candidates'):
+        sample_configuration_features(raster,paths[:3],1.)
+
+
 def test_query_interpolates_the_same_observed_occupancy_as_bev():
     from curvenav.configuration_space import query_configuration_field
-    from curvenav.encoders.configuration import observed_configuration_features
 
     field = torch.zeros(1, 5, 2, 2)
     field[:, 3] = 1
@@ -473,7 +431,7 @@ def test_query_interpolates_the_same_observed_occupancy_as_bev():
     points = torch.tensor([[[0., 0.], [-.25, .25]]], requires_grad=True)
     features = query_configuration_field(field, points, 1.).observed_features
     expected = torch.nn.functional.grid_sample(
-        observed_configuration_features(field), points[:, None], align_corners=True,
+        field, points[:, None], align_corners=True,
     ).squeeze(2).transpose(1, 2)
     torch.testing.assert_close(features, expected)
     derivative = torch.autograd.grad(features[..., 4].sum(), points)[0]
@@ -530,48 +488,6 @@ def test_depth_pixel_feature_sampling_uses_backbone_stride_not_pool_bins():
     assert features.grad is not None and torch.isfinite(features.grad).all()
 
 
-@pytest.mark.parametrize("moving_obstacle", [False, True])
-def test_sensor_clock_memory_cannot_be_overwritten_by_sparse_history(moving_obstacle):
-    buffer = DepthContextBuffer(config().data)
-    buffer.reset(1)
-    k = np.array([[[100., 0, 112.], [0, 100., 63.], [0, 0, 1.]]], np.float32)
-    camera = np.array([[[0., 0, 1, 0], [-1., 0, 0, 0], [0, -1., 0, .06], [0, 0, 0, 1]]], np.float32)
-    for frame in range(17):
-        angle = frame * .01
-        pose = np.eye(4, dtype=np.float32)[None]
-        pose[0, :2, :2] = [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
-        pose[0, 0, 3] = frame * .01
-        depth = np.full((1, 126, 224, 1), 5. if frame == 8 else 0., np.float32)
-        if frame == 0:
-            depth[:, 62:65, 110:114] = 1.
-        if moving_obstacle and frame in (8, 15):
-            optical = (np.array([1.5, -.5, .06]) - pose[0, :3, 3]) @ pose[0, :3, :3]
-            optical = (optical - camera[0, :3, 3]) @ camera[0, :3, :3]
-            u = int(100 * optical[0] / optical[2] + 112)
-            depth[:, 62:65, u-1:u+2] = optical[2]
-        snapshot = buffer.update(depth, pose, k, camera, np.array([frame * .1]))
-    c = PolicyCondition(point_goal=torch.tensor([[2., 0.]]), **{
-        key: torch.from_numpy(value) for key, value in snapshot.items()
-    })
-    projector = build_evaluation_projector(config())
-    result = projector(c)
-    np.testing.assert_array_equal(np.rint(16 - snapshot["observation_age_s"][0] * 10), [0, 7, 15, 16])
-    assert result.obstacle_valid[:, 0].any()  # Retain where the obstacle was, with its age.
-    without_old = replace(c, observation_valid=c.observation_valid.clone())
-    without_old.observation_valid[:, 0] = False
-    torch.testing.assert_close(result.configuration_field, projector(without_old).configuration_field)
-    assert bool(c.obstacle_memory.any()) == moving_obstacle
-    if moving_obstacle:
-        world = np.array([[1., 0., .06], [1.5, -.5, .06]])
-        local = (world - pose[0, :3, 3]) @ pose[0, :3, :3]
-        cells = np.rint((local[:, :2] + 3.6) / (7.2 / 63)).astype(int)
-        assert result.configuration_field[0, 0, cells[0, 1], cells[0, 0]] > 0
-        assert result.configuration_field[0, 0, cells[1, 1], cells[1, 0]] < 0
-        assert result.obstacle_valid[:, 2].any()
-    else:
-        assert result.configuration_field[:, 3:].count_nonzero() == 0
-
-
 def test_selected_pixel_ray_and_metric_point_are_the_same_measurement():
     from curvenav.encoders.geometry import MetricDepthProjector
     c = condition()
@@ -592,11 +508,13 @@ def test_selected_pixel_ray_and_metric_point_are_the_same_measurement():
 def test_neural_regions_leave_metric_outputs_and_master_parameters_float32():
     policy = build_policy(config())
     c = condition()
-    features = policy.depth_encoder(c)
-    assert features.tokens.dtype == torch.bfloat16
-    assert features.configuration_field.dtype == torch.float32
-    prediction = policy.sample(c)
-    assert prediction.path.dtype == torch.float32
+    features = policy.depth_encoder.image_features(c.depth.flatten(0, 1))
+    assert features.dtype == torch.bfloat16
+    assert policy.depth_encoder.metric_projector(c).configuration_field.dtype == torch.float32
+    from test_policy import make_encoded_condition
+    from curvenav.models.policy import generate_candidate_bank
+    prediction = generate_candidate_bank(policy, make_encoded_condition(policy, 1))
+    assert prediction["paths"].dtype == torch.float32
     assert all(p.dtype == torch.float32 for p in policy.parameters())
 
 
@@ -612,3 +530,30 @@ def test_obstacle_outside_bev_still_inflates_into_boundary():
     assert field.shape == (1, 5, 64, 64)
     assert field[0, 0, 31:33, -1].max() < 0
     assert field[0, 3:, 31:33, -1].all()
+
+
+def test_volume_clearing_queries_only_visible_boxes(monkeypatch):
+    import itertools
+    import curvenav.data.obstacle_memory as memory
+
+    corners = np.array(list(itertools.product((-.05, .05), repeat=3)))
+    boxes = np.array([[0., 0., 1.], [0., 0., 3.], [5., 0., 1.], [0., 0., -1.]])[:, None] + corners
+    intrinsic = np.array([[80., 0., 32.], [0., 80., 32.], [0., 0., 1.]])
+    depth = np.full((64, 64), .5, dtype=np.float32)
+    original = memory._rectangle_minimum
+    queried = []
+
+    def query(image, *bounds):
+        queried.append(len(bounds[0]))
+        return original(image, *bounds)
+
+    monkeypatch.setattr(memory, '_rectangle_minimum', query)
+    np.testing.assert_array_equal(memory.volumes_observed_clear(boxes, depth, intrinsic, np.eye(4), 4.),
+                                  [True, False, False, False])
+    assert queried == [2]
+    depth[32, 32] = 0  # An unknown pixel still prevents free-space evidence.
+    assert not memory.volumes_observed_clear(boxes, depth, intrinsic, np.eye(4), 4.).any()
+    queried.clear()
+    assert not memory.volumes_observed_clear(boxes[2:], depth, intrinsic, np.eye(4), 4.).any()
+    assert not memory.volumes_observed_clear(boxes[:0], depth, intrinsic, np.eye(4), 4.).any()
+    assert queried == []

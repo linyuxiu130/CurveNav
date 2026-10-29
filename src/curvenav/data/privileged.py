@@ -37,11 +37,16 @@ def _closed_grid_cells(coordinates: Tensor) -> Tensor:
 
 @dataclass(frozen=True)
 class SourceConfigurationGrid:
-    """Dingo centre-clearance values on one immutable world XZ grid."""
+    """Dingo centre-clearance values with an explicit world coordinate frame."""
 
     signed_clearance_m: np.ndarray
     origin_xy: np.ndarray
     cell_size_m: float
+    coordinate_frame: str = "habitat_xz"
+
+    def __post_init__(self):
+        if self.coordinate_frame not in ("habitat_xz", "canonical_world_xy"):
+            raise ValueError(f"unsupported source grid coordinate frame: {self.coordinate_frame}")
 
     @classmethod
     def load(cls, path: Path) -> "SourceConfigurationGrid":
@@ -50,6 +55,7 @@ class SourceConfigurationGrid:
             clearance = np.asarray(values["clearance_m"], dtype=np.float32)
             origin = np.asarray(values["origin_xy"], dtype=np.float64)
             cell_size = float(values["cell_size_m"])
+            frame = str(values["coordinate_frame"].item()) if "coordinate_frame" in values else "habitat_xz"
         if free.shape != clearance.shape or free.ndim != 2:
             raise ValueError(f"invalid navigation grid arrays: {path}")
         if origin.shape != (2,) or cell_size <= 0:
@@ -60,7 +66,7 @@ class SourceConfigurationGrid:
             clearance,
             -distance_inside_obstacle * cell_size,
         ).astype(np.float32)
-        return cls(signed, origin, cell_size)
+        return cls(signed, origin, cell_size, frame)
 
     def query_world(self, world_xy: np.ndarray) -> np.ndarray:
         """Use the same closed-cell clearance as continuous trajectory queries."""
@@ -157,6 +163,7 @@ class SourceConfigurationSpaceQuery:
                 np.stack([grid.origin_xy for grid in self.grids]),
                 np.array([grid.cell_size_m for grid in self.grids], dtype=np.float64),
                 sizes, offsets,
+                np.array([1. if grid.coordinate_frame == "canonical_world_xy" else -1. for grid in self.grids]),
             ))
         return self._atlases[device]
 
@@ -164,12 +171,13 @@ class SourceConfigurationSpaceQuery:
         self, local: Tensor, indices: Tensor, origin: Tensor, yaw: Tensor,
     ) -> Tensor:
         """One FP64 robot-to-native-grid transform, outside neural autocast."""
-        _, grid_origins, cell_sizes, _, _ = self._atlas(local.device)
+        _, grid_origins, cell_sizes, _, _, lateral_sign = self._atlas(local.device)
         local, origin, yaw = local.double(), origin.double(), yaw.double()
         cosine, sine = yaw.cos()[:, None], yaw.sin()[:, None]
+        lateral = local[..., 1] * lateral_sign[indices, None]
         world = torch.stack((
-            origin[:, None, 0] + cosine * local[..., 0] + sine * local[..., 1],
-            origin[:, None, 1] + sine * local[..., 0] - cosine * local[..., 1],
+            origin[:, None, 0] + cosine * local[..., 0] - sine * lateral,
+            origin[:, None, 1] + sine * local[..., 0] + cosine * lateral,
         ), -1)
         return (world - grid_origins[indices, None]) / cell_sizes[indices, None, None]
 
@@ -247,7 +255,7 @@ class SourceConfigurationSpaceQuery:
         coordinates = self.grid_coordinates(path, indices, world_origin_xy, world_yaw_rad)
         local, coordinates, active = self._trace_segments(path, coordinates, planning_horizon_m)
         cells = _closed_grid_cells(coordinates)
-        values, _, _, sizes, offsets = self._atlas(path.device)
+        values, _, _, sizes, offsets, _ = self._atlas(path.device)
         shape = sizes[indices, None, None]
         inside = (cells >= 0).all(-1) & (cells < shape).all(-1)
         address = offsets[indices, None, None] + cells[..., 0] * shape[..., 1] + cells[..., 1]

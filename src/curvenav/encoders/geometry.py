@@ -20,6 +20,18 @@ CONFIGURATION_GRID_SIZE = 64
 VISIBILITY_RAY_SAMPLES = 64
 
 
+def euclidean_distance_transform(mask, squared, resolution, maximum):
+    """Exact separable squared-Euclidean transform on a fixed metric grid."""
+    size=mask.shape[-1]
+    if mask.ndim!=4 or mask.shape[1:3]!=(1,size):
+        raise ValueError('distance mask does not match the configuration grid')
+    cost=torch.where(mask[:,0],torch.zeros((),device=mask.device),torch.full((),torch.inf,device=mask.device))
+    horizontal=(cost[:,:,None,:]+squared[None,None]).amin(dim=-1)
+    distance_squared=(horizontal[:,None,:,:]+squared[None,:,:,None]).amin(dim=2)
+    distance=distance_squared.sqrt()*resolution
+    return torch.where(torch.isfinite(distance),distance,maximum)
+
+
 @dataclass(frozen=True)
 class MetricDepthProjection:
     """One consistent per-cell surface and body-obstacle projection."""
@@ -28,7 +40,7 @@ class MetricDepthProjection:
     depth: Tensor
     obstacle_points: Tensor
     obstacle_valid: Tensor
-    configuration_field: Tensor
+    configuration_field: Tensor | None
     token_valid: Tensor
     pixel_indices: Tensor
 
@@ -107,22 +119,9 @@ class MetricDepthProjector(nn.Module):
 
     def _euclidean_distance_transform(self, mask: Tensor) -> Tensor:
         """Exact separable squared-Euclidean transform on the fixed grid."""
-        size = mask.shape[-1]
-        if mask.ndim != 4 or mask.shape[1:3] != (1, size):
-            raise ValueError("distance mask does not match the configuration grid")
-        occupied_cost = torch.where(
-            mask[:, 0],
-            torch.zeros((), device=mask.device),
-            torch.full((), torch.inf, device=mask.device),
-        )
-        squared = self.axis_squared_distance[:size, :size]
-        horizontal = (occupied_cost[:, :, None, :] + squared[None, None]).amin(dim=-1)
-        distance_squared = (horizontal[:, None, :, :] + squared[None, :, :, None]).amin(
-            dim=2
-        )
-        maximum = 2.0 * self.planning_horizon_m
-        distance = distance_squared.sqrt() * self.configuration_resolution_m
-        return torch.where(torch.isfinite(distance), distance, maximum)
+        size=mask.shape[-1]
+        return euclidean_distance_transform(mask,self.axis_squared_distance[:size,:size],
+            self.configuration_resolution_m,2*self.planning_horizon_m)
 
     def _configuration_field(
         self,
@@ -191,13 +190,16 @@ class MetricDepthProjector(nn.Module):
             dim=1,
         )
 
-    def forward(self, condition) -> MetricDepthProjection:
+    def forward(self, condition, *, with_field=True, dense_body=False) -> MetricDepthProjection:
         depth = condition.depth.float().squeeze(2)
         batch, frames, height, width = depth.shape
+        if dense_body and (batch, frames) != (1, 1):
+            raise ValueError('dense body measurements require one acquired frame')
         k = condition.camera_intrinsics.float()
-        camera_to_current = (
-            condition.observation_to_current.float() @ condition.camera_to_body.float()
-        )
+        with torch.autocast(device_type=depth.device.type, enabled=False):
+            camera_to_current = (
+                condition.observation_to_current.float() @ condition.camera_to_body.float()
+            )
         y, x = torch.meshgrid(
             torch.arange(height, device=depth.device) + 0.5,
             torch.arange(width, device=depth.device) + 0.5,
@@ -212,9 +214,10 @@ class MetricDepthProjector(nn.Module):
             dim=-1,
         )
         optical = rays * (depth * self.max_depth_m)[..., None]
-        points = torch.einsum(
-            "bfij,bfhwj->bfhwi", camera_to_current[..., :3, :3], optical
-        )
+        with torch.autocast(device_type=depth.device.type, enabled=False):
+            points = torch.einsum(
+                "bfij,bfhwj->bfhwi", camera_to_current[..., :3, :3], optical
+            )
         points = points + camera_to_current[..., None, None, :3, 3]
         valid = (depth > 0) & condition.observation_valid[..., None, None]
         hit = valid & (depth < 1)
@@ -255,7 +258,18 @@ class MetricDepthProjector(nn.Module):
             camera_to_current,
             condition.observation_valid,
             condition.obstacle_memory,
-        )
+        ) if with_field else None
+        if dense_body:
+            # Keep every observed body hit before the bounded world-cell pooling.
+            indices = torch.cat((surface_indices[~obstacle_valid],
+                body_pixel.flatten().nonzero().flatten()))[None, None]
+            selected = points.flatten(2, 3).gather(2, indices[..., None].expand(-1, -1, -1, 3))
+            return MetricDepthProjection(points=selected,
+                depth=depth.flatten(2).gather(2, indices) * self.max_depth_m,
+                obstacle_points=selected[..., :2],
+                obstacle_valid=body_pixel.flatten(2).gather(2, indices),
+                configuration_field=field, token_valid=valid.flatten(2).gather(2, indices),
+                pixel_indices=indices)
         return MetricDepthProjection(
             points=torch.where(obstacle_valid[..., None], obstacle, surface),
             depth=torch.where(obstacle_valid, obstacle_depth, surface_depth),
