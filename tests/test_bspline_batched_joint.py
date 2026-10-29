@@ -51,8 +51,11 @@ scalar=SimpleNamespace(losses=scalar_reference,live_condition=None,observed_risk
 
 class Decoder(torch.nn.Module):
     def __init__(self):
-        super().__init__();self.velocity=torch.nn.Linear(18,14)
-    def project_condition_memory(self,condition):return condition.tokens.mean((1,2))[:,None]
+        super().__init__();self.velocity=torch.nn.Linear(18,14);self.projections=0
+    def project_condition_memory(self,condition):
+        self.projections+=1
+        value=condition.tokens.mean((1,2))[:,None]
+        return ((value,value,condition.token_valid[:,:1]),)
 
 
 class ToyPolicy(torch.nn.Module):
@@ -61,7 +64,7 @@ class ToyPolicy(torch.nn.Module):
         self.curve_codec=build_policy(tiny_config()).curve_codec;self.integration_steps=2;self.planning_horizon_m=3.6
         self.register_buffer('inference_source',torch.randn(32,2,14));self.calls=[];self.q_calls=[]
     def _predict_velocity(self,state,time,condition,memory):
-        self.calls.append((len(state),len(memory)))
+        memory=memory[0][0];self.calls.append((len(state),len(memory)))
         m=memory.repeat_interleave(len(state)//len(memory),0)
         x=torch.cat((state,time[:,None],condition.goal_present,condition.terminal_goal[:,:1]*condition.goal_present,m),-1)
         return self.trajectory_decoder.velocity(x)
@@ -114,6 +117,7 @@ def test_true_batched_two_step_losses_and_all_gradients_match_fp32_sample_mean(m
     expected={name:torch.stack([r[name] for r in reference]).mean() for name in reference[0]}
     oldgrads=torch.autograd.grad(sum(expected.values()),params,allow_unused=True)
     actor.policy.calls.clear();actor.policy.q_calls.clear();counts['live']=0
+    actor.policy.trajectory_decoder.projections=0
     torch.manual_seed(1001);actual,bank=batched.batched_losses(actor,records)
     forward_calls=list(actor.policy.calls)
     newgrads=torch.autograd.grad(sum(actual.values()),params,allow_unused=True)
@@ -122,6 +126,7 @@ def test_true_batched_two_step_losses_and_all_gradients_match_fp32_sample_mean(m
         assert (old is None)==(new is None)
         if old is not None:torch.testing.assert_close(new,old,rtol=3e-5,atol=3e-6)
     assert counts['live']==6  # Original B1 history forward per item, real batch thereafter.
+    assert actor.policy.trajectory_decoder.projections==1
     assert forward_calls[0]==(6*2,6)
     assert len(forward_calls)==3  # CFM once, exactly two G calls for the entire mixed batch.
     assert actor.policy.q_calls==[(6,50)]
@@ -149,8 +154,10 @@ def test_recorded_q_cache_reuses_static_labels_but_refreshes_current_candidates(
     batched.label_critic_inputs([a])
     b=batched.prepare_critic_inputs(actor,item,condition.goal_present,torch.ones(16,64,2),utility)
     batched.label_critic_inputs([b])
-    assert calls==[32,17,17]
+    assert calls==[33,16,16]
     assert a['recorded_targets'] is b['recorded_targets']
+    assert a['expert_targets'] is b['expert_targets']
+    assert torch.equal(a['targets'][:,:1],b['targets'][:,:1])
     assert not torch.equal(a['targets'][:,1:],b['targets'][:,1:])
 
 

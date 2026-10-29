@@ -24,8 +24,8 @@ def repeat_condition(condition: ConditionFeatures, count: int) -> ConditionFeatu
     })
 
 
-def generate_candidate_bank(policy, condition, *, checkpoint_steps=False):
-    """Generate exactly sixteen task-conditioned curves through the same two Euler steps."""
+def generate_candidate_bank(policy, condition, *, checkpoint_steps=False,memory=None):
+    """Sixteen curves through two Euler steps; supplied memory uses this step's scene and weights."""
     count = INFERENCE_CANDIDATES
     batch_size = len(condition.tokens)
     present = condition.goal_present.bool()
@@ -37,7 +37,7 @@ def generate_candidate_bank(policy, condition, *, checkpoint_steps=False):
         policy.inference_source[None, count:2*count, 1])
     state = source.flatten(0, 1)
     queries = repeat_condition(condition, count)
-    memory = policy.trajectory_decoder.project_condition_memory(condition)
+    if memory is None:memory = policy.trajectory_decoder.project_condition_memory(condition)
     for step in range(INTEGRATION_STEPS):
         time = torch.full((len(state),), 1-step/INTEGRATION_STEPS, device=state.device)
         velocity = (checkpoint(policy._predict_velocity, state, time, queries, memory, use_reentrant=False)

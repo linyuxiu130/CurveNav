@@ -53,12 +53,13 @@ def prepare_critic_inputs(actor, item, goal_present, paths, utility):
             if len(item['q_expert_values']):expert,_=actor.policy.curve_codec.decode_values(item['q_expert_values'].to(device))
             else:expert=paths.new_empty((0,*paths.shape[1:]))
         recorded=item['critic_replay_paths'].to(device).detach()
-        cache[device]=(fixed,expert.detach(),recorded,utility(recorded[None],dict(fixed,goal_present=goal_present[:,0].bool())).score.detach())
-    fixed,expert,recorded,recorded_targets=cache[device]
+        targets=utility(torch.cat((expert,recorded))[None],dict(fixed,goal_present=goal_present[:,0].bool())).score.detach()
+        cache[device]=(fixed,expert.detach(),recorded,targets[:,:len(expert)],targets[:,len(expert):])
+    fixed,expert,recorded,expert_targets,recorded_targets=cache[device]
     qbatch=dict(fixed,goal_present=goal_present[:,0].bool())
     paths=paths.detach();expert_count=len(expert)
     if expert_count:paths=torch.cat((expert,paths))
-    return dict(paths=paths.detach(), qbatch=qbatch, utility=utility, expert_count=expert_count, recorded=recorded, recorded_targets=recorded_targets)
+    return dict(paths=paths.detach(), qbatch=qbatch, utility=utility, expert_count=expert_count,expert_targets=expert_targets, recorded=recorded, recorded_targets=recorded_targets)
 
 
 def label_critic_inputs(inputs):
@@ -66,14 +67,12 @@ def label_critic_inputs(inputs):
     groups=defaultdict(list)
     for prepared in inputs:groups[prepared['utility']].append(prepared)
     for utility,group in groups.items():
-        experts=max(p['expert_count'] for p in group)
-        paths=torch.stack([torch.cat((F.pad(p['paths'][:p['expert_count']],(0,0,0,0,0,experts-p['expert_count'])),
-            p['paths'][p['expert_count']:])) for p in group])
+        paths=torch.stack([p['paths'][p['expert_count']:] for p in group])
         batch={key:torch.cat([p['qbatch'][key] for p in group]) for key in group[0]['qbatch'] if key!='task_states'}
         batch['task_states']=[state for p in group for state in p['qbatch']['task_states']]
         targets=utility(paths,batch).score.detach()
         for row,p in enumerate(group):
-            p['targets']=torch.cat((targets[row,:p['expert_count']],targets[row,experts:]))[None]
+            p['targets']=torch.cat((p['expert_targets'],targets[row:row+1]),-1)
 
 def cat_conditions(conditions):
     return ConditionFeatures(**{f.name:torch.cat([getattr(c,f.name) for c in conditions],0) for f in fields(ConditionFeatures)})
@@ -84,7 +83,7 @@ def select_condition(condition,indices):
     return ConditionFeatures(**{f.name:getattr(condition,f.name).index_select(0,ids) for f in fields(ConditionFeatures)})
 
 
-def batched_cfm(actor,conditions,items):
+def batched_cfm(actor,conditions,items,memory):
     # One bridge per teacher; supervise the two actual Euler query times (1, 1/2).
     dropped_goals=[];indices=[];states=[];targets=[];times=[];count=INTEGRATION_STEPS;device=conditions.tokens.device
     time=torch.arange(count,0,-1,device=device,dtype=torch.float32)/count
@@ -112,7 +111,9 @@ def batched_cfm(actor,conditions,items):
             condition=replace(condition,goal_present=condition.goal_present.masked_fill(dropped,0),terminal_goal=condition.terminal_goal.masked_fill(dropped,0))
         # Keep the compiled batch fixed; padded queries contribute no loss or RNG draws.
         if padding:states.append(states[0].repeat(padding,1));times.append(time.repeat(padding))
-        memory=actor.policy.trajectory_decoder.project_condition_memory(condition)
+        if padding:
+            ids=torch.tensor(indices+[indices[0]]*padding,device=device)
+            memory=tuple(tuple(value.index_select(0,ids) for value in projected) for projected in memory)
         velocity=actor.policy._predict_velocity(torch.cat(states),torch.cat(times),repeat_condition(condition,count),memory)
         velocity=velocity[:len(indices)*count]
         errors=(velocity-torch.cat(targets)).square().reshape(len(indices),count,-1).mean((1,2))
@@ -204,8 +205,9 @@ def batched_losses(actor,records,*,cnn_cache=None):
         positions={key:index for index,key in enumerate(unique)}
         ids=torch.tensor([positions[id(item)] for item in items],device=condition.tokens.device)
         condition=select_condition(condition,ids);field=field.index_select(0,ids);logits=logits.index_select(0,ids)
-    cfm=batched_cfm(actor,condition,items)
-    bank=actor.native_bank(condition)
+    memory=actor.policy.trajectory_decoder.project_condition_memory(condition)
+    cfm=batched_cfm(actor,condition,items,memory)
+    bank=actor.native_bank(condition,memory=memory)
     trajectory=generated_trajectory_loss(actor,bank['paths'],items)
     batch=bank['values'].shape[0]
     paths,pad=dense_curve(bank['values'].flatten(0,1))

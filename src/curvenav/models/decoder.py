@@ -179,10 +179,9 @@ class ConditionalCurveFlowDecoder(nn.Module):
             self.path_to_increment_weight,
             torch.linalg.vector_norm(relative, dim=-1, keepdim=True),
         )
-        # Pool the linear position term before forming every scene pair; distances stay pointwise.
-        pooled=torch.einsum("cp,bpd->bcd",self.path_to_increment_weight,query_position.float())
-        relative=(condition.metric_position[:,None,:,:2]*self.path_to_increment_weight.sum(-1)[None,:,None,None]
-            -pooled[:,:,None,:])/self.planning_horizon_m
+        relative = torch.einsum(
+            "cp,bpnf->bcnf", self.path_to_increment_weight, relative
+        )
         return torch.cat(
             (
                 relative,

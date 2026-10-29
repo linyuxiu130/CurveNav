@@ -47,9 +47,10 @@ def test_grouped_source_labels_keep_each_pose_goal_and_unpadded_candidates(devic
         batch['goal_present'][:]=row==0
         if row:batch['point_goal'].zero_()
         expected.append(teacher(bank[None],batch).score)
-        prepared.append(dict(paths=bank,qbatch=batch,utility=utility,expert_count=1-row))
+        prepared.append(dict(paths=bank,qbatch=batch,utility=utility,expert_count=1-row,
+            expert_targets=expected[-1][:,:1-row].detach()))
     label_critic_inputs(prepared)
-    assert calls==[(2,3)]
+    assert calls==[(2,2)]
     for p,target in zip(prepared,expected,strict=True):torch.testing.assert_close(p['targets'],target,rtol=1e-6,atol=1e-6)
 
 

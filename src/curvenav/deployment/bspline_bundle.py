@@ -26,8 +26,8 @@ class BSplineMemoryBundle:
         plan,visual=memory.packet()
         return encode_memory(self.policy,self.head,plan,visual,goal,goal_present)[0]
 
-    def native_bank(self, condition, *, checkpoint_steps=False):
-        return generate_candidate_bank(self.policy, condition, checkpoint_steps=checkpoint_steps)
+    def native_bank(self, condition, *, checkpoint_steps=False,memory=None):
+        return generate_candidate_bank(self.policy, condition, checkpoint_steps=checkpoint_steps,memory=memory)
 
     def candidates(self, condition, goal):
         """Score the shared native bank and return its unchanged argmax curve."""
